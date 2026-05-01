@@ -1,0 +1,43 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: gamerai-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  coordinator:
+    build: ./coordinator
+    container_name: gamerai-coordinator
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    ports:
+      - "8000:8000"
+
+  worker:
+    build: ./worker
+    depends_on:
+      redis:
+        condition: service_healthy
+      coordinator:
+        condition: service_started
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      COORDINATOR_URL: http://coordinator:8000
+      OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
+      MODEL: ${MODEL:-llama3.2:1b}
+      POLL_INTERVAL: "2.5"
+      RATE_PER_TOKEN: "0.000005"
+      WORKER_SHARE: "0.7"
+      MOCK_INFERENCE: ${MOCK_INFERENCE:-false}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
