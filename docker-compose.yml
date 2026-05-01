@@ -11,27 +11,34 @@ services:
       retries: 5
 
   coordinator:
-    build: ./coordinator
+    build:
+      context: .
+      dockerfile: coordinator/Dockerfile
     container_name: gamerai-coordinator
     depends_on:
       redis:
         condition: service_healthy
     environment:
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
+      REDIS_URL: redis://redis:6379/0
+      DB_PATH: /data/gamerai.db
+      JOB_TIMEOUT_SECONDS: "120"
+      WORKER_TIMEOUT_SECONDS: "15"
+    volumes:
+      - ./data:/data
     ports:
       - "8000:8000"
 
   worker:
-    build: ./worker
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
     depends_on:
       redis:
         condition: service_healthy
       coordinator:
         condition: service_started
     environment:
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
+      REDIS_URL: redis://redis:6379/0
       COORDINATOR_URL: http://coordinator:8000
       OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
       MODEL: ${MODEL:-llama3.2:1b}
@@ -39,5 +46,23 @@ services:
       RATE_PER_TOKEN: "0.000005"
       WORKER_SHARE: "0.7"
       MOCK_INFERENCE: ${MOCK_INFERENCE:-false}
+      AVAILABILITY_WINDOW: ${AVAILABILITY_WINDOW:-always}
+      NETWORK_DELAY_MIN: "0.5"
+      NETWORK_DELAY_MAX: "3.0"
+      COLD_START_MIN: "2.0"
+      COLD_START_MAX: "8.0"
     extra_hosts:
       - "host.docker.internal:host-gateway"
+
+  client:
+    build:
+      context: .
+      dockerfile: client/Dockerfile
+    container_name: gamerai-client
+    depends_on:
+      coordinator:
+        condition: service_started
+    environment:
+      COORDINATOR_URL: http://coordinator:8000
+    ports:
+      - "8080:8080"

@@ -1,19 +1,19 @@
-import os
+"""Thin Redis factory. Keys live in shared.config."""
 import redis
 
-REDIS_HOST = os.getenv("REDIS_HOST", "redis")
-REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+from shared.config import redis_kwargs
 
-JOB_QUEUE = "job_queue"
-JOB_RESULTS = "job_results"
-WORKER_REGISTRY = "worker_registry"
-WORKER_EARNINGS = "worker_earnings"
-WORKER_HEARTBEATS = "worker_heartbeats"
+# re-export for callers that imported from here previously
+from shared.config import (  # noqa: F401
+    JOB_QUEUE,
+    JOB_RESULTS,
+    JOB_PROCESSING,
+    WORKER_REGISTRY,
+    WORKER_HEARTBEATS,
+    WORKER_STATUS,
+    WORKER_EARNINGS,
+)
 
 
 def get_client() -> redis.Redis:
-    return redis.Redis(
-        host=REDIS_HOST,
-        port=REDIS_PORT,
-        decode_responses=True,
-    )
+    return redis.Redis(decode_responses=True, **redis_kwargs())

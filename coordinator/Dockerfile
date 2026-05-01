@@ -1,15 +1,17 @@
 FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app
 
 WORKDIR /app
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY coordinator/requirements.txt ./coordinator/requirements.txt
+RUN pip install --no-cache-dir -r coordinator/requirements.txt
 
-COPY . .
+COPY shared/ ./shared/
+COPY coordinator/ ./coordinator/
 
 EXPOSE 8000
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "coordinator.main:app", "--host", "0.0.0.0", "--port", "8000"]
