@@ -166,6 +166,29 @@ def heartbeat(req: HeartbeatRequest):
     return {"ok": True}
 
 
+@app.post("/jobs/next")
+def next_job(req: WorkerIdent):
+    """HTTP-only job pickup for remote agents (e.g. the Windows gamer install).
+    Pops one job from the queue and returns it; the agent should immediately
+    POST /jobs/claim with the returned job_id."""
+    raw = r.lpop(JOB_QUEUE)
+    if not raw:
+        return {"job": None}
+    try:
+        job = json.loads(raw)
+    except json.JSONDecodeError:
+        return {"job": None}
+    log.info(
+        "job dispensed",
+        extra={
+            "event": "job_dispensed",
+            "job_id": job.get("job_id"),
+            "worker_id": req.worker_id,
+        },
+    )
+    return {"job": job}
+
+
 @app.post("/jobs/claim")
 def claim(req: JobClaimRequest):
     """Worker reports it has claimed a job. Coordinator records processing entry + DB row."""
