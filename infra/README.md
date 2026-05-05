@@ -19,7 +19,11 @@ ten minutes for ~$10/month.
   without external workers.
 - Internal services (Redis, SQLite-backed coordinator, web UI) bound to
   `127.0.0.1` only — Caddy is the only thing on the public internet.
-- A persisted `WORKER_TOKEN` ready to be used when you turn auth on.
+- Bearer-token auth on by default. The bootstrap generates a random
+  `API_TOKEN` and writes it to `.env.prod`; the coordinator middleware
+  (`shared/auth.py`) requires `Authorization: Bearer <API_TOKEN>` on every
+  request except `/health`. Disable by setting `API_TOKEN=` (empty) in
+  `.env.prod` and restarting — useful for testing.
 - Idempotent re-runs: re-running the bootstrap is safe.
 
 ---
@@ -84,17 +88,21 @@ to a GitHub Actions job over SSH if you want push-to-deploy.
 ## Connecting workers
 
 External gamer machines (anywhere on the internet) point their agent at
-the public URL:
+the public URL and provide the same `API_TOKEN` the bootstrap printed.
 
 ```jsonc
 // windows-agent/config.json on the gamer's machine
 {
-  "coordinator_url": "https://coordinator.example.com"
+  "coordinator_url": "https://coordinator.example.com",
+  "api_token": "<paste API_TOKEN from .env.prod>"
 }
 ```
 
+(The agent also reads `API_TOKEN` from the environment; pick whichever is
+more convenient.)
+
 The in-VPS mock worker exists so the system is functional even before any
-gamers join.
+gamers join. It picks up the token from `.env.prod` automatically.
 
 ---
 
@@ -114,25 +122,37 @@ Caddy on a subdomain.
 
 ---
 
-## Turning on bearer-token auth (before recruiting strangers)
+## Auth
 
-The default deploy is **open** — anyone who learns the coordinator URL can
-submit jobs. That's fine for a closed friends-and-family smoke test. Before
-opening it up, gate the API behind the generated token:
+Auth is enforced inside the coordinator (see `shared/auth.py`), gated by
+a single env var:
 
-1. Edit `/opt/gamerai/infra/Caddyfile`. Comment out the unguarded
-   `handle { ... }` block. Uncomment the `@authed` block at the bottom.
-2. Restart Caddy:
-   ```bash
-   docker compose -f /opt/gamerai/docker-compose.yml \
-     -f /opt/gamerai/infra/docker-compose.prod.yml \
-     restart caddy
-   ```
-3. Update worker / agent code to send the header
-   `Authorization: Bearer $WORKER_TOKEN` on every request to the
-   coordinator. The token is in `/opt/gamerai/.env.prod`. (This is a
-   ~10-line change in `worker/worker.py` and `windows-agent/agent.py` —
-   queued for a follow-up commit, not done in this kit.)
+| `API_TOKEN`           | behaviour                                                |
+| --------------------- | -------------------------------------------------------- |
+| set (any non-empty)   | every request must carry `Authorization: Bearer <token>` |
+| unset / empty         | auth disabled — open API (useful for tests + local dev)  |
+
+`/health` is always open so uptime probes don't need the token.
+
+The bootstrap script generates a random `API_TOKEN` and writes it to
+`.env.prod`. To disable temporarily for testing:
+
+```bash
+sed -i 's|^API_TOKEN=.*|API_TOKEN=|' /opt/gamerai/.env.prod
+sudo /opt/gamerai/infra/deploy.sh
+```
+
+Re-enable by writing a fresh token and redeploying:
+
+```bash
+sed -i "s|^API_TOKEN=.*|API_TOKEN=$(openssl rand -hex 32)|" \
+  /opt/gamerai/.env.prod
+sudo /opt/gamerai/infra/deploy.sh
+```
+
+The token is shared between the coordinator and every client (worker,
+Windows agent, web/CLI client). Rotate by running the second snippet
+above and updating each gamer's `windows-agent/config.json`.
 
 ---
 
@@ -150,8 +170,8 @@ docker compose -f /opt/gamerai/docker-compose.yml \
 # back up the SQLite ledger
 scp root@coordinator.example.com:/opt/gamerai/data/gamerai.db ./backup-$(date +%F).db
 
-# rotate the worker token
-sed -i "s|^WORKER_TOKEN=.*|WORKER_TOKEN=$(openssl rand -hex 32)|" \
+# rotate the API token
+sed -i "s|^API_TOKEN=.*|API_TOKEN=$(openssl rand -hex 32)|" \
   /opt/gamerai/.env.prod
 sudo /opt/gamerai/infra/deploy.sh
 ```
@@ -180,6 +200,6 @@ of Caddy.
 | -------------------------- | ------------------------------------------------------ |
 | `bootstrap.sh`             | one-shot VPS installer (run as root, idempotent)       |
 | `deploy.sh`                | re-pull + rebuild after a code change                  |
-| `Caddyfile`                | TLS reverse proxy, with optional bearer-auth variant   |
+| `Caddyfile`                | TLS reverse proxy (auth lives in the coordinator)      |
 | `docker-compose.prod.yml`  | overlay: adds Caddy, restricts internal ports          |
 | `README.md`                | this file                                              |

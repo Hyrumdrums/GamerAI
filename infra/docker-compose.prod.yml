@@ -42,7 +42,6 @@ services:
     environment:
       DOMAIN: ${DOMAIN}
       EMAIL: ${EMAIL}
-      WORKER_TOKEN: ${WORKER_TOKEN}
     volumes:
       - ./infra/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data

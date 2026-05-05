@@ -77,6 +77,7 @@ DEFAULTS = {
     },
     "model": None,
     "worker_id": None,
+    "api_token": None,
 }
 
 
@@ -90,6 +91,7 @@ class Config:
     cpu_sample_seconds: float
     model: Optional[str]
     worker_id: Optional[str]
+    api_token: Optional[str]
 
     @classmethod
     def load(cls, path: Optional[Path]) -> "Config":
@@ -99,6 +101,9 @@ class Config:
                 user = json.load(f)
             _deep_merge(data, user)
         idle = data["idle"]
+        # env overrides config so a single API_TOKEN export works
+        # for ad-hoc testing without touching config.json.
+        token = (os.getenv("API_TOKEN") or data.get("api_token") or "").strip()
         return cls(
             coordinator_url=str(data["coordinator_url"]).rstrip("/"),
             polling_interval=float(data["polling_interval_seconds"]),
@@ -108,6 +113,7 @@ class Config:
             cpu_sample_seconds=float(idle["cpu_sample_seconds"]),
             model=data.get("model"),
             worker_id=data.get("worker_id"),
+            api_token=token or None,
         )
 
 
@@ -204,11 +210,18 @@ def setup_logging(background: bool) -> logging.Logger:
 # Coordinator client
 # ---------------------------------------------------------------------------
 class Coordinator:
-    def __init__(self, base_url: str, worker_id: str, log: logging.Logger):
+    def __init__(
+        self,
+        base_url: str,
+        worker_id: str,
+        log: logging.Logger,
+        api_token: Optional[str] = None,
+    ):
         self.base = base_url
         self.worker_id = worker_id
         self.log = log
-        self.http = httpx.Client(timeout=30.0)
+        headers = {"Authorization": f"Bearer {api_token}"} if api_token else {}
+        self.http = httpx.Client(timeout=30.0, headers=headers)
 
     def _post(self, path: str, body: dict, timeout: float = 10.0) -> Optional[dict]:
         try:
@@ -439,11 +452,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 0
 
     log.info("agent starting on %s — worker_id=%s", platform.platform(), worker_id)
-    log.info("coordinator=%s polling=%ss idle threshold=%ss cpu<%s%%",
+    log.info("coordinator=%s polling=%ss idle threshold=%ss cpu<%s%% auth=%s",
              cfg.coordinator_url, cfg.polling_interval,
-             cfg.min_input_idle_seconds, cfg.max_cpu_percent)
+             cfg.min_input_idle_seconds, cfg.max_cpu_percent,
+             "on" if cfg.api_token else "off")
 
-    coord = Coordinator(cfg.coordinator_url, worker_id, log)
+    coord = Coordinator(cfg.coordinator_url, worker_id, log, cfg.api_token)
     if not coord.register():
         return 1
 

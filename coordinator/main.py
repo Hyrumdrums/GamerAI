@@ -5,11 +5,13 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 
 from coordinator.db import DB
 from coordinator.redis_client import get_client
 from coordinator.scheduler import Reaper
+from shared.auth import AUTH_ENABLED, check_authorization, is_public_path
 from shared.config import (
     JOB_PROCESSING,
     JOB_QUEUE,
@@ -74,7 +76,23 @@ async def lifespan(app: FastAPI):
             _reaper.stop()
 
 
-app = FastAPI(title="GamerAI Coordinator", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="GamerAI Coordinator", version="0.3.0", lifespan=lifespan)
+
+
+# ---------- auth (no-op when API_TOKEN env is unset) ----------
+@app.middleware("http")
+async def _auth_middleware(request: Request, call_next):
+    if not AUTH_ENABLED or is_public_path(request.url.path):
+        return await call_next(request)
+    if not check_authorization(request.headers.get("authorization")):
+        return JSONResponse({"detail": "unauthorized"}, status_code=401)
+    return await call_next(request)
+
+
+if AUTH_ENABLED:
+    log.info("auth enabled (bearer token required)", extra={"event": "auth_on"})
+else:
+    log.info("auth disabled (API_TOKEN unset)", extra={"event": "auth_off"})
 
 
 # ---------- helpers ----------

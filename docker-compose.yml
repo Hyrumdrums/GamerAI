@@ -23,6 +23,7 @@ services:
       DB_PATH: /data/gamerai.db
       JOB_TIMEOUT_SECONDS: "120"
       WORKER_TIMEOUT_SECONDS: "15"
+      API_TOKEN: ${API_TOKEN:-}
     volumes:
       - ./data:/data
     ports:
@@ -51,6 +52,7 @@ services:
       NETWORK_DELAY_MAX: "3.0"
       COLD_START_MIN: "2.0"
       COLD_START_MAX: "8.0"
+      API_TOKEN: ${API_TOKEN:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
@@ -64,5 +66,6 @@ services:
         condition: service_started
     environment:
       COORDINATOR_URL: http://coordinator:8000
+      API_TOKEN: ${API_TOKEN:-}
     ports:
       - "8080:8080"

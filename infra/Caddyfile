@@ -1,33 +1,13 @@
 # Caddy config for GamerAI MVP.
-# DOMAIN and EMAIL are injected by docker-compose.prod.yml from .env.prod.
+#
+# Caddy terminates TLS and reverse-proxies to the coordinator. Bearer-token
+# auth is enforced inside the coordinator itself (see shared/auth.py), so
+# Caddy stays simple: no auth middleware, just TLS + proxy. /health is
+# left open by the coordinator for uptime probes.
 
 {$DOMAIN} {
     tls {$EMAIL}
     encode zstd gzip
 
-    # ---- public health check ----
-    handle /health {
-        reverse_proxy coordinator:8000
-    }
-
-    # ---- coordinator API ----
-    #
-    # MVP default: open. Anyone with the URL can submit jobs.
-    # Fine for a closed friends-and-family test, NOT fine for real workers.
-    #
-    # To enable bearer-token auth, comment the `handle { ... }` block below
-    # and uncomment the auth-gated block. Then update workers/agents to send
-    # `Authorization: Bearer ${WORKER_TOKEN}` on every request.
-
-    handle {
-        reverse_proxy coordinator:8000
-    }
-
-    # --- auth-gated variant (uncomment to enable) ---
-    #
-    # @authed header Authorization "Bearer {$WORKER_TOKEN}"
-    # handle @authed {
-    #     reverse_proxy coordinator:8000
-    # }
-    # respond "unauthorized" 401
+    reverse_proxy coordinator:8000
 }

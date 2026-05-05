@@ -8,5 +8,6 @@
     "cpu_sample_seconds": 2
   },
   "model": null,
-  "worker_id": null
+  "worker_id": null,
+  "api_token": null
 }

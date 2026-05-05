@@ -11,6 +11,7 @@ from typing import Optional
 import httpx
 import redis
 
+from shared.auth import auth_headers
 from shared.config import (
     AVAILABILITY_WINDOW,
     COLD_START_AFTER_IDLE,
@@ -223,7 +224,7 @@ def main() -> None:
         extra={"event": "starting"},
     )
     r = connect_redis()
-    http = httpx.Client()
+    http = httpx.Client(headers=auth_headers())
     register(http)
 
     last_heartbeat = 0.0

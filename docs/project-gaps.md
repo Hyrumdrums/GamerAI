@@ -21,17 +21,14 @@ process it, and money could change hands honestly."**
 
 ## 1. Security & Trust
 
-### 🔴 No auth on the coordinator API
+### ~~🔴 No auth on the coordinator API~~ — done
 
-Every endpoint is open. Anyone who learns the URL can submit jobs,
-register a fake worker, or read every other worker's earnings. The
-Caddyfile has a commented bearer-auth variant, the bootstrap generates
-a `WORKER_TOKEN`, but **no client code sends the header**.
-
-**Fix:** ~30 lines. Add an optional `Authorization: Bearer ...` middleware
-to the coordinator (skip on `/health`); pass `WORKER_TOKEN` through the
-worker (`worker/worker.py`), the Windows agent (`windows-agent/agent.py`),
-and the web/CLI client. Then flip the auth-gated handle in the Caddyfile.
+Resolved. `shared/auth.py` is the single source of truth, gated by the
+`API_TOKEN` env var. Set → bearer required on every request except
+`/health`; unset → no-op (default for local dev and tests). All
+clients (worker, Windows agent, web UI, CLI) automatically include the
+header when the token is set. The bootstrap generates a random token at
+deploy time. See `infra/README.md` for the runbook.
 
 ### 🔴 No customer identity / API keys
 
@@ -331,8 +328,9 @@ README roadmap. Listing them here for completeness.
 If you ran a focused sprint on the items above, this is the order I'd
 work them in. Highest leverage first.
 
-1. **Ship bearer-auth end-to-end** (coordinator middleware + worker +
-   agent + flip the Caddyfile). Removes the open-API risk. **~1 day.**
+1. ~~**Ship bearer-auth end-to-end**.~~ ✅ Done — `shared/auth.py`,
+   middleware in the coordinator, all clients send the header when
+   `API_TOKEN` is set.
 2. **First three integration tests + GitHub Actions.** Removes the
    "every change might break it" risk. **~1 day.**
 3. **Worker capability registration + model registry.** Unblocks
