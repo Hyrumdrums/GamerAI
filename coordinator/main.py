@@ -9,14 +9,18 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from coordinator.db import DB
+from coordinator.idempotency import IdempotencyStore
+from coordinator.rate_limit import RateLimiter
 from coordinator.redis_client import get_client
 from coordinator.scheduler import Reaper
 from shared.auth import AUTH_ENABLED, check_authorization, is_public_path
 from shared.config import (
+    IDEMPOTENCY_TTL_SECONDS,
     JOB_PROCESSING,
     JOB_QUEUE,
     JOB_RESULTS,
     JOB_TIMEOUT_SECONDS,
+    RATE_LIMIT_PER_MIN,
     RATE_PER_TOKEN,
     WORKER_EARNINGS,
     WORKER_HEARTBEATS,
@@ -60,6 +64,8 @@ log = logging.getLogger("coordinator")
 # ---------- shared resources ----------
 r = get_client()
 db = DB()
+idem = IdempotencyStore(r, IDEMPOTENCY_TTL_SECONDS)
+rate_limiter = RateLimiter(r, RATE_LIMIT_PER_MIN)
 _reaper: Reaper | None = None
 
 
@@ -89,10 +95,34 @@ async def _auth_middleware(request: Request, call_next):
     return await call_next(request)
 
 
+# ---------- rate limit (no-op when RATE_LIMIT_PER_MIN <= 0) ----------
+def _client_ip(request: Request) -> str:
+    """Trust the first X-Forwarded-For when present (Caddy adds it),
+    otherwise fall back to the direct peer address."""
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        return fwd.split(",", 1)[0].strip() or "unknown"
+    return getattr(request.client, "host", "unknown")
+
+
+@app.middleware("http")
+async def _rate_limit_middleware(request: Request, call_next):
+    if not rate_limiter.enabled or is_public_path(request.url.path):
+        return await call_next(request)
+    if not rate_limiter.allow(_client_ip(request)):
+        return JSONResponse({"detail": "rate limit exceeded"}, status_code=429)
+    return await call_next(request)
+
+
 if AUTH_ENABLED:
     log.info("auth enabled (bearer token required)", extra={"event": "auth_on"})
 else:
     log.info("auth disabled (API_TOKEN unset)", extra={"event": "auth_off"})
+
+if rate_limiter.enabled:
+    log.info("rate limit %d/min/ip", RATE_LIMIT_PER_MIN, extra={"event": "rl_on"})
+else:
+    log.info("rate limit disabled", extra={"event": "rl_off"})
 
 
 # ---------- helpers ----------
@@ -114,9 +144,19 @@ def health():
 
 
 @app.post("/generate", response_model=GenerateResponse)
-def generate(req: GenerateRequest):
+def generate(req: GenerateRequest, request: Request):
     if not req.prompt or not req.prompt.strip():
         raise HTTPException(status_code=400, detail="prompt required")
+
+    # optional retry-safety: same Idempotency-Key returns the same job_id
+    idem_key = request.headers.get("idempotency-key")
+    existing = idem.lookup(idem_key)
+    if existing:
+        log.info(
+            "idempotent retry",
+            extra={"event": "idempotent_hit", "job_id": existing},
+        )
+        return GenerateResponse(job_id=existing)
 
     job_id = str(uuid.uuid4())
     submitted_at = time.time()
@@ -128,6 +168,7 @@ def generate(req: GenerateRequest):
     }
     db.insert_job(job_id, req.prompt, req.model, submitted_at)
     r.rpush(JOB_QUEUE, json.dumps(job))
+    idem.remember(idem_key, job_id)
     log.info(
         "queued job",
         extra={"event": "job_queued", "job_id": job_id},

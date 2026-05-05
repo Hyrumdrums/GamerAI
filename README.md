@@ -271,7 +271,7 @@ backups, and graduation criteria for moving to Terraform / AWS.
 
 | method | path                       | description                                           |
 | ------ | -------------------------- | ----------------------------------------------------- |
-| POST   | `/generate`                | `{prompt, model?}` → `{job_id}`                       |
+| POST   | `/generate`                | `{prompt, model?}` → `{job_id}`. Optional `Idempotency-Key` header makes retries safe. |
 | GET    | `/result/{job_id}`         | result JSON (status: `pending`/`running`/`complete`/`error`) |
 | GET    | `/workers`                 | list of workers + status, last_seen, totals          |
 | GET    | `/earnings`                | per-worker `{worker_id, total_tokens, total_usd}`    |
@@ -303,6 +303,9 @@ All services read from environment variables (see `shared/config.py`).
 | `COLD_START_MIN/MAX`      | `2.0` / `8.0` seconds            | worker      |
 | `RATE_PER_TOKEN`          | `0.000005`                       | platform    |
 | `WORKER_SHARE`            | `0.7`                            | platform    |
+| `API_TOKEN`               | _unset_ (auth disabled)          | all         |
+| `RATE_LIMIT_PER_MIN`      | `0` (disabled)                   | coordinator |
+| `IDEMPOTENCY_TTL_SECONDS` | `86400`                          | coordinator |
 
 ## 12. Project structure
 
@@ -471,4 +474,4 @@ this?" objection from enterprise customers.
 
 ## 15. License
 
-TBD.
+Apache-2.0. See `LICENSE` for the full text.

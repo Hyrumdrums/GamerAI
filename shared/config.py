@@ -62,6 +62,10 @@ AVAILABILITY_WINDOW = os.getenv("AVAILABILITY_WINDOW", "always")  # "always" | "
 RATE_PER_TOKEN = _float("RATE_PER_TOKEN", 0.000005)
 WORKER_SHARE = _float("WORKER_SHARE", 0.7)
 
+# --- abuse / retry safety (all opt-in; 0 / unset disables) ---
+IDEMPOTENCY_TTL_SECONDS = _int("IDEMPOTENCY_TTL_SECONDS", 86400)  # 24h
+RATE_LIMIT_PER_MIN = _int("RATE_LIMIT_PER_MIN", 0)
+
 
 # --- redis keys ---
 JOB_QUEUE = "job_queue"

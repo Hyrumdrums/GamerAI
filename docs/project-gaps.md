@@ -107,22 +107,19 @@ is down unless we look.
 every 30s. Better: Grafana Cloud free tier scraping `/metrics`. Best:
 add OTLP exporter and ship to a hosted observability stack.
 
-### 🟡 No rate limiting
+### ~~🟡 No rate limiting~~ — done
 
-A buggy customer (or a bored attacker) can drain the worker pool by
-submitting an unbounded number of jobs. Coordinator has no per-key or
-per-IP rate limit.
+Resolved. `coordinator/rate_limit.py` implements a per-IP fixed-window
+limiter, controlled by `RATE_LIMIT_PER_MIN` (0 / unset = disabled).
+Plumbed into the coordinator middleware after auth; honors
+`X-Forwarded-For` from Caddy.
 
-**Fix:** Caddy can do basic IP rate limiting today. Per-key limits
-land with the API-key work above.
+### ~~🟡 No idempotency on `/generate`~~ — done
 
-### 🟡 No idempotency on `/generate`
-
-Customer retries (network blip, timeout) create duplicate jobs and
-double-charge.
-
-**Fix:** accept an optional `Idempotency-Key` header; cache `(key →
-job_id)` for 24h; return the same `job_id` on retries.
+Resolved. Customers can pass an `Idempotency-Key` header on `/generate`;
+the same key returns the same `job_id` for 24h (configurable via
+`IDEMPOTENCY_TTL_SECONDS`). Implemented in `coordinator/idempotency.py`.
+No-op when no header is sent.
 
 ### 🟡 Single point of failure
 
@@ -141,13 +138,11 @@ debugging today, useless for compliance or analysis later.
 **Fix:** ship to a hosted log store (Grafana Loki, Better Stack,
 Axiom) when we add monitoring.
 
-### 🟢 No CI / CD
+### ~~🟢 No CI / CD~~ — done
 
-`.github/` doesn't exist. Every push is "hope I didn't break it."
-Tests don't exist either, so CI couldn't run anything yet.
-
-**Fix:** after the test suite below, add a GitHub Actions workflow
-that runs `pytest` + a smoke test of `docker compose up`.
+Resolved. `.github/workflows/ci.yml` runs the unittest suite,
+validates that `docker-compose.yml` and the prod overlay merge
+cleanly, and syntax-checks the bash scripts on every push and PR.
 
 ---
 
@@ -227,15 +222,19 @@ customers.
 
 ## 4. Engineering hygiene
 
-### 🔴 Zero automated tests
+### 🟡 Limited automated tests — partial
 
-No `pytest`, no smoke test, no fixtures. Every refactor risks
-breaking the loop and we'd find out only by clicking through the UI.
+Auth, idempotency, and rate-limit modules each have unit-test coverage
+in `tests/` (23 cases, stdlib `unittest`, no external services). CI
+runs them on every push (`.github/workflows/ci.yml`).
 
-**Fix:** start with three integration tests:
+Still missing:
 1. Submit a mock-inference job, assert `complete` and tokens > 0.
 2. Kill a worker mid-job, assert reaper requeues.
 3. Two workers, one job, assert exactly one completes it.
+
+These need either a live Redis or fakeredis. Defer until the next
+round.
 
 ### 🟡 No type checking in CI
 
@@ -294,15 +293,12 @@ form that mints an API key and a Stripe customer.
 **Fix:** small Phase 2b scope. Could outsource to Clerk + Stripe
 billing portal in a weekend.
 
-### 🟡 No legal: ToS, privacy policy, license file
+### 🟡 No legal: ToS, privacy policy — partial
 
-`README.md` says `License: TBD`. No terms for customers, no agreement
-for workers (they're literally running arbitrary computation for
-strangers).
-
-**Fix:** Apache-2.0 or MIT for the code (pick one); template ToS +
-privacy from Termly / iubenda; explicit worker agreement covering the
-"you run prompts you didn't write" risk.
+Code now licensed Apache-2.0 (see `LICENSE`). Still missing: customer
+Terms of Service, privacy policy, and an explicit worker agreement
+covering the "you run prompts you didn't write" risk. Pull from
+Termly / iubenda templates before recruiting non-friends.
 
 ### 🟢 No marketing surface
 
@@ -328,25 +324,19 @@ README roadmap. Listing them here for completeness.
 If you ran a focused sprint on the items above, this is the order I'd
 work them in. Highest leverage first.
 
-1. ~~**Ship bearer-auth end-to-end**.~~ ✅ Done — `shared/auth.py`,
-   middleware in the coordinator, all clients send the header when
-   `API_TOKEN` is set.
-2. **First three integration tests + GitHub Actions.** Removes the
-   "every change might break it" risk. **~1 day.**
-3. **Worker capability registration + model registry.** Unblocks
+1. ~~**Ship bearer-auth end-to-end**.~~ ✅ Done.
+2. ~~**Idempotency keys + rate limit + GitHub Actions CI.**~~ ✅ Done.
+3. ~~**License the code (Apache-2.0).**~~ ✅ Done.
+4. **Three coordinator integration tests** (job round-trip, reaper
+   requeue, two-worker one-job). Needs a redis test fixture. **~1 day.**
+5. **Worker capability registration + model registry.** Unblocks
    everything in Phase 4 and lets us safely host >1 model. **~1–2 days.**
-4. **Caddy IP rate limit + idempotency keys on `/generate`.** Cheap
-   abuse prevention. **~½ day.**
-5. **Uptime Kuma (or equivalent) hitting `/health`.** Now we know
-   when it's down. **~½ day.**
-6. **SQLite nightly backup cron with weekly rotation.** Now we don't
-   lose the ledger to a single bad reboot. **~½ day.**
-7. **License the code (Apache-2.0) + draft worker agreement + ToS.**
-   Required before any payouts. **~1 day with templates.**
-8. **Python SDK** (thin wrapper, OpenAI-compatible signature).
-   Lowers the bar for first paying users. **~1–2 days.**
-9. **Recruit 3 real gamer workers and run end-to-end with auth on.**
-   This is the actual experiment. **~½ day, plus calendar time.**
+6. **Uptime Kuma (or equivalent) hitting `/health`.** **~½ day.**
+7. **SQLite nightly backup cron with weekly rotation.** **~½ day.**
+8. **Worker agreement + ToS** from a template. **~½ day.**
+9. **Python SDK** (thin wrapper, OpenAI-compatible signature). **~1–2 days.**
+10. **Recruit 3 real gamer workers and run end-to-end.** The actual
+    experiment. **~½ day, plus calendar time.**
 
 That's ~10 working days of engineering plus the recruitment / business
 items. After that, reassess: is anyone using it? If yes, push into the

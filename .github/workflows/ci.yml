@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  unit-tests:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r coordinator/requirements.txt -r worker/requirements.txt
+
+      - name: Run unit tests
+        # Tests don't set API_TOKEN / RATE_LIMIT_PER_MIN, so all opt-in
+        # features are off. Anything that should "just work" must work
+        # with these env vars unset.
+        run: python -m unittest discover -v tests
+
+  compose-validate:
+    name: docker-compose lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate base + prod compose merge
+        env:
+          DOMAIN: ci.example.com
+          EMAIL: ci@example.com
+          API_TOKEN: ci-test
+        run: |
+          docker compose -f docker-compose.yml config --quiet
+          docker compose -f docker-compose.yml -f infra/docker-compose.prod.yml \
+            config --quiet
+
+  shellcheck:
+    name: Bash scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax-check bootstrap.sh and deploy.sh
+        run: |
+          bash -n infra/bootstrap.sh
+          bash -n infra/deploy.sh
