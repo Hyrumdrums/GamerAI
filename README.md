@@ -249,6 +249,24 @@ curl http://localhost:8000/earnings
 curl http://localhost:8000/metrics
 ```
 
+### Production deploy (MVP test)
+
+To stand up a public coordinator that real gamer machines can connect to,
+spin up an Ubuntu VPS (Hetzner CPX21 ~€8/mo works), point a domain at it,
+and run the one-shot installer:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/Hyrumdrums/GamerAI/main/infra/bootstrap.sh \
+  | sudo bash -s -- --domain coordinator.example.com --email you@example.com
+```
+
+The script installs Docker, configures `ufw`, clones the repo, generates a
+`WORKER_TOKEN`, and brings up the stack with Caddy in front of it
+(automatic Let's Encrypt TLS). Total time: ~10 minutes.
+
+See `infra/README.md` for the full runbook including auth-on procedure,
+backups, and graduation criteria for moving to Terraform / AWS.
+
 ## 10. API
 
 | method | path                       | description                                           |
@@ -338,13 +356,29 @@ All services read from environment variables (see `shared/config.py`).
 - [x] Structured logs + `/metrics`
 - [x] Simulated gamer realism (network delay, cold start, availability)
 
-### Phase 2 — AWS deployment + real GPU nodes
+### Phase 2 — public deployment + real GPU nodes
+
+**Phase 2a — single-VPS MVP test (current)**
+
+- [x] One-shot VPS bootstrap script (`infra/bootstrap.sh`)
+- [x] Caddy-fronted TLS via Let's Encrypt
+- [x] Production docker-compose overlay; internal services on localhost only
+- [x] `.env.prod` with generated `WORKER_TOKEN` (auth-ready, opt-in)
+- [ ] Bearer-auth wired through worker + Windows agent code
+- [ ] Real worker installer (one-line `curl | sh`, with auto-update)
+- [ ] Connect 3–5 real gamer machines and validate end-to-end loop
+
+**Phase 2b — production AWS (after MVP signal)**
 
 - [ ] Terraform under `infra/` (VPC, ECS Fargate, ElastiCache, RDS)
-- [ ] TLS + auth (API keys for customers, signed registration for workers)
-- [ ] Real worker installer (one-line `curl | sh` for gamers, with auto-update)
+- [ ] API keys for customers, signed registration for workers
 - [ ] Move SQLite → Postgres / DynamoDB
 - [ ] CloudWatch / OTLP log + metric ingestion
+- [ ] Multi-region for latency to gamers
+
+The VPS path keeps us shipping; Terraform comes when at least one of these
+is true: 10+ active workers, real money flowing, multi-region latency
+needs, or SQLite contention.
 
 ### Phase 3 — marketplace + dynamic pricing
 
