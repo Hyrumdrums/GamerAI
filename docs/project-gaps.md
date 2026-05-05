@@ -148,24 +148,30 @@ cleanly, and syntax-checks the bash scripts on every push and PR.
 
 ## 3. Product completeness
 
-### 🔴 Worker capability registration missing
+### ~~🔴 Worker capability registration missing~~ — done (data layer)
 
-A worker registers with just an ID. The coordinator has no idea if
-the worker can run a 70B model or only a 1B one. Required before any
-big-model work.
+`/register` now accepts an optional `capabilities` body
+(`vram_gb`, `gpu_model`, `bandwidth_class`, `models[]`, `notes`).
+Capabilities are stored in Redis and surfaced on `/workers`. Existing
+workers that send only `worker_id` keep working — capabilities are
+additive.
 
-**Fix:** add `vram_gb`, `gpu_model`, `bandwidth_class`, `model_list`
-to `/register`. Schedulers can then route by capability.
+Still pending: capability-aware *routing* (per-model queues, VRAM-
+aware dispatch). That's a Phase 4 scheduler change, not an MVP gap.
 
-### 🔴 Model registry missing
+### ~~🔴 Model registry missing~~ — done (catalog + validation)
 
-`model` is a free-form string in `/generate`. No metadata, no
-licensing, no shard plan, no min-VRAM. Required before serving more
-than one model.
+`coordinator/model_registry.py` now contains a curated catalog of
+known models (Llama 3 family, Mistral, Mixtral, DeepSeek-V3, Qwen,
+Phi, mock). Each entry tracks family, total/active params, min VRAM
+at INT4, and license. Surfaced via `GET /models`.
 
-**Fix:** small `models` table with id, family, parameters, license,
-min_vram, shard_plan, price_per_1m_in, price_per_1m_out. Phase 4a
-prerequisite.
+Set `STRICT_MODELS=true` to make `/generate` reject unknown model
+names with 400. Default is off (any string accepted) so tests and
+local dev with custom models keep working.
+
+Still pending: per-model pricing, license-aware routing, shard plans
+for big models. Same Phase 4 boundary as routing above.
 
 ### 🟡 No customer SDK
 
@@ -222,19 +228,22 @@ customers.
 
 ## 4. Engineering hygiene
 
-### 🟡 Limited automated tests — partial
+### ~~🟡 Limited automated tests~~ — done for MVP scope
 
-Auth, idempotency, and rate-limit modules each have unit-test coverage
-in `tests/` (23 cases, stdlib `unittest`, no external services). CI
-runs them on every push (`.github/workflows/ci.yml`).
+`tests/` now has **44 test cases** across six files:
 
-Still missing:
-1. Submit a mock-inference job, assert `complete` and tokens > 0.
-2. Kill a worker mid-job, assert reaper requeues.
-3. Two workers, one job, assert exactly one completes it.
+* `test_auth.py` — bearer-auth module (9 cases).
+* `test_idempotency.py` — idempotency store (7 cases).
+* `test_rate_limit.py` — rate limiter (7 cases).
+* `test_model_registry.py` — model catalog and strict-mode (11 cases).
+* `test_coordinator_e2e.py` — end-to-end FastAPI tests against
+  ``fakeredis`` + a tempfile SQLite DB. Covers: `/health`, `/models`,
+  job round-trip with earnings credit, idempotency through the HTTP
+  layer, capability registration round-trip, and reaper requeue (10
+  cases).
 
-These need either a live Redis or fakeredis. Defer until the next
-round.
+Open follow-ups (smaller priority): two-worker contention test,
+explicit auth-on test through the HTTP layer, real-Redis CI smoke.
 
 ### 🟡 No type checking in CI
 
@@ -327,10 +336,11 @@ work them in. Highest leverage first.
 1. ~~**Ship bearer-auth end-to-end**.~~ ✅ Done.
 2. ~~**Idempotency keys + rate limit + GitHub Actions CI.**~~ ✅ Done.
 3. ~~**License the code (Apache-2.0).**~~ ✅ Done.
-4. **Three coordinator integration tests** (job round-trip, reaper
-   requeue, two-worker one-job). Needs a redis test fixture. **~1 day.**
-5. **Worker capability registration + model registry.** Unblocks
-   everything in Phase 4 and lets us safely host >1 model. **~1–2 days.**
+4. ~~**Coordinator integration tests** (job round-trip, reaper requeue,
+   idempotency, capabilities).~~ ✅ Done — `test_coordinator_e2e.py`
+   with ``fakeredis``.
+5. ~~**Worker capability registration + model registry** (data layer).~~
+   ✅ Done — capability-aware *routing* deferred to Phase 4.
 6. **Uptime Kuma (or equivalent) hitting `/health`.** **~½ day.**
 7. **SQLite nightly backup cron with weekly rotation.** **~½ day.**
 8. **Worker agreement + ToS** from a template. **~½ day.**

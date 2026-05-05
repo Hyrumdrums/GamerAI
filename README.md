@@ -277,7 +277,8 @@ backups, and graduation criteria for moving to Terraform / AWS.
 | GET    | `/earnings`                | per-worker `{worker_id, total_tokens, total_usd}`    |
 | GET    | `/earnings/{worker_id}`    | single worker earnings record                         |
 | GET    | `/metrics`                 | totals, completed, avg latency, queue depth, etc.    |
-| POST   | `/register`                | worker self-registration                              |
+| GET    | `/models`                  | catalog of known models + strict-mode flag           |
+| POST   | `/register`                | worker self-registration; optional `capabilities` body |
 | POST   | `/heartbeat`               | worker liveness + status (`idle`/`busy`/`offline`)   |
 | POST   | `/jobs/claim`              | worker reports it has claimed a job                   |
 | POST   | `/jobs/complete`           | worker submits result; coordinator credits earnings   |
@@ -306,6 +307,7 @@ All services read from environment variables (see `shared/config.py`).
 | `API_TOKEN`               | _unset_ (auth disabled)          | all         |
 | `RATE_LIMIT_PER_MIN`      | `0` (disabled)                   | coordinator |
 | `IDEMPOTENCY_TTL_SECONDS` | `86400`                          | coordinator |
+| `STRICT_MODELS`           | `false` (any model name accepted) | coordinator |
 
 ## 12. Project structure
 

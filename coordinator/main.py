@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
+from coordinator import model_registry
 from coordinator.db import DB
 from coordinator.idempotency import IdempotencyStore
 from coordinator.rate_limit import RateLimiter
@@ -22,6 +23,8 @@ from shared.config import (
     JOB_TIMEOUT_SECONDS,
     RATE_LIMIT_PER_MIN,
     RATE_PER_TOKEN,
+    STRICT_MODELS,
+    WORKER_CAPABILITIES,
     WORKER_EARNINGS,
     WORKER_HEARTBEATS,
     WORKER_REGISTRY,
@@ -148,6 +151,12 @@ def generate(req: GenerateRequest, request: Request):
     if not req.prompt or not req.prompt.strip():
         raise HTTPException(status_code=400, detail="prompt required")
 
+    # optional model-registry validation (off unless STRICT_MODELS=true)
+    try:
+        model_registry.validate_or_raise(req.model, strict=STRICT_MODELS)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
     # optional retry-safety: same Idempotency-Key returns the same job_id
     idem_key = request.headers.get("idempotency-key")
     existing = idem.lookup(idem_key)
@@ -208,6 +217,12 @@ def register(req: WorkerIdent):
     r.sadd(WORKER_REGISTRY, req.worker_id)
     r.hset(WORKER_HEARTBEATS, req.worker_id, now)
     r.hset(WORKER_STATUS, req.worker_id, "idle")
+    if req.capabilities is not None:
+        r.hset(
+            WORKER_CAPABILITIES,
+            req.worker_id,
+            req.capabilities.model_dump_json(),
+        )
     db.upsert_worker(req.worker_id, "idle", now)
     log.info(
         "worker registered",
@@ -345,6 +360,16 @@ def complete(req: JobCompleteRequest):
 
 
 # ---------- observability ----------
+def _load_capabilities(worker_id: str) -> dict | None:
+    raw = r.hget(WORKER_CAPABILITIES, worker_id)
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+
 @app.get("/workers")
 def workers():
     rows = db.list_workers()
@@ -366,9 +391,19 @@ def workers():
                 "total_tokens": int(e["total_tokens"]) if e else 0,
                 "total_jobs": int(e["total_jobs"]) if e else 0,
                 "total_usd": round(float(e["total_usd"]), 8) if e else 0.0,
+                "capabilities": _load_capabilities(wid),
             }
         )
     return {"workers": out}
+
+
+@app.get("/models")
+def models():
+    """Catalog of models the coordinator knows about. See coordinator/model_registry.py."""
+    return {
+        "strict": STRICT_MODELS,
+        "models": [m.to_dict() for m in model_registry.list_all()],
+    }
 
 
 @app.get("/earnings")
