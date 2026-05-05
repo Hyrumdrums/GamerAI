@@ -1,0 +1,53 @@
+# Production overlay for the GamerAI MVP.
+#
+# Layered on top of the base docker-compose.yml. Differences from local dev:
+#
+# - Adds Caddy on :80/:443 with automatic Let's Encrypt TLS.
+# - Restricts internal services (coordinator, redis, client) to localhost-only
+#   port bindings; only Caddy faces the public internet.
+# - Defaults the in-VPS worker to mock inference (the VPS has no GPU; real
+#   inference comes from gamer machines connecting in via the public URL).
+# - restart: unless-stopped on every service so a reboot brings everything back.
+
+services:
+  redis:
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6379:6379"
+
+  coordinator:
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"
+
+  worker:
+    restart: unless-stopped
+    environment:
+      MOCK_INFERENCE: "${MOCK_INFERENCE:-true}"
+
+  client:
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: gamerai-caddy
+    restart: unless-stopped
+    depends_on:
+      - coordinator
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN}
+      EMAIL: ${EMAIL}
+      WORKER_TOKEN: ${WORKER_TOKEN}
+    volumes:
+      - ./infra/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:
