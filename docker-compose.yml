@@ -10,6 +10,21 @@ services:
       timeout: 3s
       retries: 5
 
+  ollama:
+    build:
+      context: .
+      dockerfile: ollama/Dockerfile
+    container_name: gamerai-ollama
+    ports:
+      - "11435:11434"
+    volumes:
+      - ./ollama-models:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   coordinator:
     build:
       context: .
@@ -37,10 +52,12 @@ services:
         condition: service_healthy
       coordinator:
         condition: service_started
+      ollama:
+        condition: service_healthy
     environment:
       REDIS_URL: redis://redis:6379/0
       COORDINATOR_URL: http://coordinator:8000
-      OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
+      OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
       MODEL: ${MODEL:-llama3.2:1b}
       POLL_INTERVAL: "2.5"
       RATE_PER_TOKEN: "0.000005"
@@ -51,8 +68,6 @@ services:
       NETWORK_DELAY_MAX: "3.0"
       COLD_START_MIN: "2.0"
       COLD_START_MAX: "8.0"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
 
   client:
     build:

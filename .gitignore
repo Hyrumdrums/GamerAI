@@ -10,3 +10,4 @@ __pycache__/
 *.db-wal
 *.db-shm
 data/
+ollama-models/

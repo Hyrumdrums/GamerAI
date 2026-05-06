@@ -3,7 +3,7 @@ import os
 
 import httpx
 from fastapi import FastAPI, Form, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 COORDINATOR_URL = os.getenv("COORDINATOR_URL", "http://coordinator:8000")
 
@@ -84,27 +84,114 @@ def index():
     return INDEX_HTML
 
 
+@app.get("/admin")
+def admin_redirect():
+    return RedirectResponse(url="/dashboard")
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
     async with httpx.AsyncClient() as c:
         m = (await c.get(f"{COORDINATOR_URL}/metrics", timeout=5)).json()
         w = (await c.get(f"{COORDINATOR_URL}/workers", timeout=5)).json()
-    rows = "".join(
-        f"<tr><td>{x['worker_id']}</td><td>{x['status']}</td>"
+        e = (await c.get(f"{COORDINATOR_URL}/earnings", timeout=5)).json()
+    
+    workers = w["workers"]
+    active_workers = [w for w in workers if w["status"] == "online"]
+    total_earnings = sum(w.get('total_usd', 0) for w in workers)
+    
+    # Worker table rows
+    worker_rows = "".join(
+        f"<tr><td><span style='color:{'#4CAF50' if x['status'] == 'online' else '#FF5722'};'>●</span> "
+        f"{x['worker_id'][-12:]}</td><td>{x['status']}</td>"
         f"<td>{x['total_jobs']}</td><td>{x['total_tokens']}</td>"
-        f"<td>${x['total_usd']}</td></tr>"
-        for x in w["workers"]
+        f"<td>${x['total_usd']:.6f}</td></tr>"
+        for x in workers
     )
+    
+    # Metrics table
     metrics_html = "".join(f"<tr><td>{k}</td><td>{v}</td></tr>" for k, v in m.items())
-    return f"""<!doctype html><html><head><meta charset="utf-8"><title>GamerAI dashboard</title>
-<style>body{{font-family:system-ui;max-width:900px;margin:2rem auto;padding:0 1rem}}
-table{{width:100%;border-collapse:collapse;font-size:.9rem;margin-bottom:2rem}}
-th,td{{padding:.4rem .6rem;border-bottom:1px solid #eee;text-align:left}}
-th{{background:#fafafa}}a{{color:#2d6cdf}}</style></head>
-<body><h1>Dashboard</h1><p><a href="/">&larr; back</a></p>
-<h2>Metrics</h2><table><tr><th>metric</th><th>value</th></tr>{metrics_html}</table>
-<h2>Workers</h2><table><tr><th>worker</th><th>status</th><th>jobs</th><th>tokens</th><th>usd</th></tr>{rows}</table>
+    
+    # Recent earnings
+    recent_earnings = ""
+    if e.get("workers"):
+        recent_earnings = "".join(
+            f"<tr><td>{w['worker_id'][-12:]}</td><td>{w['total_jobs']}</td>"
+            f"<td>{w['total_tokens']}</td><td>${w['total_usd']:.6f}</td></tr>"
+            for w in sorted(e["workers"], key=lambda x: x["total_usd"], reverse=True)[:5]
+        )
+    
+    html = f"""<!doctype html><html><head><meta charset="utf-8">
+<title>🎮 GamerAI Admin Dashboard</title>
+<style>
+body{{font-family:system-ui;max-width:1200px;margin:2rem auto;padding:0 1rem;background:#f8f9fa}}
+.header{{display:flex;justify-content:space-between;align-items:center;margin-bottom:2rem;padding:1rem;background:white;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1)}}
+.stats{{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:1rem;margin-bottom:2rem}}
+.stat-card{{padding:1.5rem;background:white;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1);text-align:center}}
+.stat-value{{font-size:2rem;font-weight:bold;color:#2d6cdf}}
+.stat-label{{color:#666;font-size:0.9rem;margin-top:0.5rem}}
+.section{{background:white;margin-bottom:2rem;padding:1.5rem;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1)}}
+h1{{margin:0;color:#333}}h2{{margin:0 0 1rem 0;color:#555;font-size:1.3rem}}
+table{{width:100%;border-collapse:collapse;font-size:.9rem}}
+th,td{{padding:.6rem;border-bottom:1px solid #eee;text-align:left}}
+th{{background:#f8f9fa;font-weight:600}}
+a{{color:#2d6cdf;text-decoration:none}}
+.refresh-btn{{padding:0.5rem 1rem;background:#2d6cdf;color:white;border:none;border-radius:4px;cursor:pointer}}
+</style>
+</head>
+<body>
+<div class="header">
+  <div>
+    <h1>🎮 GamerAI Admin Dashboard</h1>
+    <div style="color:#666">Distributed AI Inference Marketplace</div>
+  </div>
+  <div>
+    <button class="refresh-btn" onclick="location.reload()">🔄 Refresh</button>
+    <a href="/" style="margin-left:1rem">← Back to Client</a>
+  </div>
+</div>
+
+<div class="stats">
+  <div class="stat-card">
+    <div class="stat-value">{len(workers)}</div>
+    <div class="stat-label">Total Workers</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-value">{len(active_workers)}</div>
+    <div class="stat-label">Online Workers</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-value">{m.get('total_jobs', 0)}</div>
+    <div class="stat-label">Jobs Processed</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-value">${total_earnings:.4f}</div>
+    <div class="stat-label">Total Earnings</div>
+  </div>
+</div>
+
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:2rem">
+  <div class="section">
+    <h2>⚡ System Metrics</h2>
+    <table><tr><th>Metric</th><th>Value</th></tr>{metrics_html}</table>
+  </div>
+  
+  <div class="section">
+    <h2>🏆 Top Earners</h2>
+    <table><tr><th>Worker</th><th>Jobs</th><th>Tokens</th><th>Earnings</th></tr>{recent_earnings}</table>
+  </div>
+</div>
+
+<div class="section">
+  <h2>👥 All Workers</h2>
+  <table>
+    <tr><th>Worker ID</th><th>Status</th><th>Jobs</th><th>Tokens</th><th>Earnings</th></tr>
+    {worker_rows}
+  </table>
+</div>
+
 </body></html>"""
+    return html
 
 
 # ---------- proxy endpoints (avoids CORS for browser) ----------
