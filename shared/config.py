@@ -62,6 +62,13 @@ AVAILABILITY_WINDOW = os.getenv("AVAILABILITY_WINDOW", "always")  # "always" | "
 RATE_PER_TOKEN = _float("RATE_PER_TOKEN", 0.000005)
 WORKER_SHARE = _float("WORKER_SHARE", 0.7)
 
+# --- abuse / retry safety (all opt-in; 0 / unset disables) ---
+IDEMPOTENCY_TTL_SECONDS = _int("IDEMPOTENCY_TTL_SECONDS", 86400)  # 24h
+RATE_LIMIT_PER_MIN = _int("RATE_LIMIT_PER_MIN", 0)
+
+# --- model registry (off by default = legacy "any model name accepted") ---
+STRICT_MODELS = _bool("STRICT_MODELS", False)
+
 
 # --- redis keys ---
 JOB_QUEUE = "job_queue"
@@ -71,3 +78,4 @@ WORKER_REGISTRY = "worker_registry"
 WORKER_HEARTBEATS = "worker_heartbeats"
 WORKER_STATUS = "worker_status"
 WORKER_EARNINGS = "worker_earnings"
+WORKER_CAPABILITIES = "worker_capabilities"

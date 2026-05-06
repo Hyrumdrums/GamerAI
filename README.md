@@ -249,17 +249,36 @@ curl http://localhost:8000/earnings
 curl http://localhost:8000/metrics
 ```
 
+### Production deploy (MVP test)
+
+To stand up a public coordinator that real gamer machines can connect to,
+spin up an Ubuntu VPS (Hetzner CPX21 ~€8/mo works), point a domain at it,
+and run the one-shot installer:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/Hyrumdrums/GamerAI/main/infra/bootstrap.sh \
+  | sudo bash -s -- --domain coordinator.example.com --email you@example.com
+```
+
+The script installs Docker, configures `ufw`, clones the repo, generates a
+`WORKER_TOKEN`, and brings up the stack with Caddy in front of it
+(automatic Let's Encrypt TLS). Total time: ~10 minutes.
+
+See `infra/README.md` for the full runbook including auth-on procedure,
+backups, and graduation criteria for moving to Terraform / AWS.
+
 ## 10. API
 
 | method | path                       | description                                           |
 | ------ | -------------------------- | ----------------------------------------------------- |
-| POST   | `/generate`                | `{prompt, model?}` → `{job_id}`                       |
+| POST   | `/generate`                | `{prompt, model?}` → `{job_id}`. Optional `Idempotency-Key` header makes retries safe. |
 | GET    | `/result/{job_id}`         | result JSON (status: `pending`/`running`/`complete`/`error`) |
 | GET    | `/workers`                 | list of workers + status, last_seen, totals          |
 | GET    | `/earnings`                | per-worker `{worker_id, total_tokens, total_usd}`    |
 | GET    | `/earnings/{worker_id}`    | single worker earnings record                         |
 | GET    | `/metrics`                 | totals, completed, avg latency, queue depth, etc.    |
-| POST   | `/register`                | worker self-registration                              |
+| GET    | `/models`                  | catalog of known models + strict-mode flag           |
+| POST   | `/register`                | worker self-registration; optional `capabilities` body |
 | POST   | `/heartbeat`               | worker liveness + status (`idle`/`busy`/`offline`)   |
 | POST   | `/jobs/claim`              | worker reports it has claimed a job                   |
 | POST   | `/jobs/complete`           | worker submits result; coordinator credits earnings   |
@@ -285,6 +304,10 @@ All services read from environment variables (see `shared/config.py`).
 | `COLD_START_MIN/MAX`      | `2.0` / `8.0` seconds            | worker      |
 | `RATE_PER_TOKEN`          | `0.000005`                       | platform    |
 | `WORKER_SHARE`            | `0.7`                            | platform    |
+| `API_TOKEN`               | _unset_ (auth disabled)          | all         |
+| `RATE_LIMIT_PER_MIN`      | `0` (disabled)                   | coordinator |
+| `IDEMPOTENCY_TTL_SECONDS` | `86400`                          | coordinator |
+| `STRICT_MODELS`           | `false` (any model name accepted) | coordinator |
 
 ## 12. Project structure
 
@@ -338,13 +361,29 @@ All services read from environment variables (see `shared/config.py`).
 - [x] Structured logs + `/metrics`
 - [x] Simulated gamer realism (network delay, cold start, availability)
 
-### Phase 2 — AWS deployment + real GPU nodes
+### Phase 2 — public deployment + real GPU nodes
+
+**Phase 2a — single-VPS MVP test (current)**
+
+- [x] One-shot VPS bootstrap script (`infra/bootstrap.sh`)
+- [x] Caddy-fronted TLS via Let's Encrypt
+- [x] Production docker-compose overlay; internal services on localhost only
+- [x] `.env.prod` with generated `WORKER_TOKEN` (auth-ready, opt-in)
+- [ ] Bearer-auth wired through worker + Windows agent code
+- [ ] Real worker installer (one-line `curl | sh`, with auto-update)
+- [ ] Connect 3–5 real gamer machines and validate end-to-end loop
+
+**Phase 2b — production AWS (after MVP signal)**
 
 - [ ] Terraform under `infra/` (VPC, ECS Fargate, ElastiCache, RDS)
-- [ ] TLS + auth (API keys for customers, signed registration for workers)
-- [ ] Real worker installer (one-line `curl | sh` for gamers, with auto-update)
+- [ ] API keys for customers, signed registration for workers
 - [ ] Move SQLite → Postgres / DynamoDB
 - [ ] CloudWatch / OTLP log + metric ingestion
+- [ ] Multi-region for latency to gamers
+
+The VPS path keeps us shipping; Terraform comes when at least one of these
+is true: 10+ active workers, real money flowing, multi-region latency
+needs, or SQLite contention.
 
 ### Phase 3 — marketplace + dynamic pricing
 
@@ -355,6 +394,86 @@ All services read from environment variables (see `shared/config.py`).
 - [ ] Customer dashboards, billing, invoicing
 - [ ] Worker payout rails (Stripe Connect / crypto)
 
+### Phase 4 — frontier-model support (big-model expansion)
+
+Goal: serve frontier-class open models (Llama 3.1 405B, DeepSeek-V3 / R1,
+Mixtral 8x22B, Llama 3.2 Vision) on top of the same gamer-GPU network.
+
+Strategy is staged: start by reselling an existing public swarm to prove
+demand, then bring the engine in-house once we have enough workers to form
+private pipeline groups.
+
+**Phase 4a — Petals-backed big-model tier**
+
+- [ ] Wrap [Petals](https://petals.dev/) as a new worker type. Customer
+      jobs targeting frontier models route into the public swarm; small-
+      model jobs continue on our native Ollama path.
+- [ ] Add a `model_class` field (`small` / `frontier`) to the model
+      registry and per-class pricing (frontier tier ~5–10× small tier).
+- [ ] Worker capability registration: VRAM, bandwidth class, locale.
+      Required so the coordinator only sends a 70B+ request to a worker
+      that can actually serve it.
+- [ ] Draft-model speculative decoding for frontier requests to cut
+      end-to-end latency 2–3×.
+
+**Phase 4b — EXO-backed private pipelines**
+
+- [ ] Replace Petals dependency with [EXO](https://github.com/exo-explore/exo)
+      under the hood. Customer jobs run on private pipeline groups
+      assembled from *our* gamer workers, not anonymous swarm members.
+- [ ] Pipeline-group scheduling as a first-class coordinator primitive:
+      bind N workers into an ephemeral group with shared health/reaper
+      semantics, keep groups warm across jobs to amortize cold-start.
+- [ ] Worker-to-worker activation routing (WebSockets / QUIC). Coordinator
+      stays on the control plane; activations flow worker-to-worker.
+- [ ] Peer-to-peer weight distribution (SHARDCAST-style) so adding a new
+      model doesn't saturate platform egress.
+
+This stages the risk: Phase 4a proves customers will pay for big-model
+inference on our marketplace without us building any of the hard parts;
+Phase 4b is what makes us a real network instead of a Petals reseller.
+
+See `research/big-models-feasibility.md` for the underlying analysis.
+
+### Phase 5 — privacy tiers
+
+The Phase 4 architecture has an honest privacy gap: in pipeline-parallel
+inference, the worker that runs the embedding layer sees the customer's
+raw prompt. Middle workers see hidden-state vectors (not human-readable,
+but theoretically invertible). The last worker sees the output logits.
+
+We won't match a hyperscaler's "your data never leaves our datacenter"
+story by default, but we can offer tiered privacy that's good enough for
+most workloads — and better than centralized providers for some.
+
+- [ ] **Standard tier (default).** TLS in transit, prompts handled in
+      worker memory only, agent never writes prompts to disk, ephemeral
+      session keys per job.
+- [ ] **Private tier — client-side tokenization + embedding.** The
+      customer SDK runs the tokenizer and embedding layer locally and
+      sends *embeddings* into the pipeline, not raw text. No worker on
+      the network sees the prompt as text. Output logits are returned
+      to the client and decoded locally. Cheap to implement, large
+      privacy win.
+- [ ] **Vetted-pool tier.** KYC'd workers, reputation-gated, locale-
+      pinned (e.g., US-only, EU-only), audit log per job. Customers pay
+      a premium and pick the pool. Same model as private cloud regions.
+- [ ] **TEE tier (future).** Route jobs only to workers with confidential-
+      compute-capable GPUs (NVIDIA H100/H200 confidential mode, and
+      consumer cards as the feature trickles down). Hardware attestation
+      proves the worker can't observe the prompt or weights.
+- [ ] **Output redaction.** Coordinator-side optional pass that strips
+      common PII patterns from outputs before returning to the customer
+      (defense in depth, not a primary control).
+- [ ] **No-log audit mode.** For sensitive customers, the coordinator
+      stores only the billing record (job ID, token counts, worker IDs)
+      — not prompts, not outputs, not intermediate state.
+
+The client-side-embedding approach is the high-leverage one: it changes
+"strangers' GPUs see your prompts" to "strangers' GPUs see vectors that
+look like noise." That's the answer to the obvious "would you trust
+this?" objection from enterprise customers.
+
 ## 15. License
 
-TBD.
+Apache-2.0. See `LICENSE` for the full text.

@@ -5,17 +5,26 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 
+from coordinator import model_registry
 from coordinator.db import DB
+from coordinator.idempotency import IdempotencyStore
+from coordinator.rate_limit import RateLimiter
 from coordinator.redis_client import get_client
 from coordinator.scheduler import Reaper
+from shared.auth import AUTH_ENABLED, check_authorization, is_public_path
 from shared.config import (
+    IDEMPOTENCY_TTL_SECONDS,
     JOB_PROCESSING,
     JOB_QUEUE,
     JOB_RESULTS,
     JOB_TIMEOUT_SECONDS,
+    RATE_LIMIT_PER_MIN,
     RATE_PER_TOKEN,
+    STRICT_MODELS,
+    WORKER_CAPABILITIES,
     WORKER_EARNINGS,
     WORKER_HEARTBEATS,
     WORKER_REGISTRY,
@@ -58,6 +67,8 @@ log = logging.getLogger("coordinator")
 # ---------- shared resources ----------
 r = get_client()
 db = DB()
+idem = IdempotencyStore(r, IDEMPOTENCY_TTL_SECONDS)
+rate_limiter = RateLimiter(r, RATE_LIMIT_PER_MIN)
 _reaper: Reaper | None = None
 
 
@@ -74,7 +85,47 @@ async def lifespan(app: FastAPI):
             _reaper.stop()
 
 
-app = FastAPI(title="GamerAI Coordinator", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="GamerAI Coordinator", version="0.3.0", lifespan=lifespan)
+
+
+# ---------- auth (no-op when API_TOKEN env is unset) ----------
+@app.middleware("http")
+async def _auth_middleware(request: Request, call_next):
+    if not AUTH_ENABLED or is_public_path(request.url.path):
+        return await call_next(request)
+    if not check_authorization(request.headers.get("authorization")):
+        return JSONResponse({"detail": "unauthorized"}, status_code=401)
+    return await call_next(request)
+
+
+# ---------- rate limit (no-op when RATE_LIMIT_PER_MIN <= 0) ----------
+def _client_ip(request: Request) -> str:
+    """Trust the first X-Forwarded-For when present (Caddy adds it),
+    otherwise fall back to the direct peer address."""
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        return fwd.split(",", 1)[0].strip() or "unknown"
+    return getattr(request.client, "host", "unknown")
+
+
+@app.middleware("http")
+async def _rate_limit_middleware(request: Request, call_next):
+    if not rate_limiter.enabled or is_public_path(request.url.path):
+        return await call_next(request)
+    if not rate_limiter.allow(_client_ip(request)):
+        return JSONResponse({"detail": "rate limit exceeded"}, status_code=429)
+    return await call_next(request)
+
+
+if AUTH_ENABLED:
+    log.info("auth enabled (bearer token required)", extra={"event": "auth_on"})
+else:
+    log.info("auth disabled (API_TOKEN unset)", extra={"event": "auth_off"})
+
+if rate_limiter.enabled:
+    log.info("rate limit %d/min/ip", RATE_LIMIT_PER_MIN, extra={"event": "rl_on"})
+else:
+    log.info("rate limit disabled", extra={"event": "rl_off"})
 
 
 # ---------- helpers ----------
@@ -96,9 +147,25 @@ def health():
 
 
 @app.post("/generate", response_model=GenerateResponse)
-def generate(req: GenerateRequest):
+def generate(req: GenerateRequest, request: Request):
     if not req.prompt or not req.prompt.strip():
         raise HTTPException(status_code=400, detail="prompt required")
+
+    # optional model-registry validation (off unless STRICT_MODELS=true)
+    try:
+        model_registry.validate_or_raise(req.model, strict=STRICT_MODELS)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    # optional retry-safety: same Idempotency-Key returns the same job_id
+    idem_key = request.headers.get("idempotency-key")
+    existing = idem.lookup(idem_key)
+    if existing:
+        log.info(
+            "idempotent retry",
+            extra={"event": "idempotent_hit", "job_id": existing},
+        )
+        return GenerateResponse(job_id=existing)
 
     job_id = str(uuid.uuid4())
     submitted_at = time.time()
@@ -110,6 +177,7 @@ def generate(req: GenerateRequest):
     }
     db.insert_job(job_id, req.prompt, req.model, submitted_at)
     r.rpush(JOB_QUEUE, json.dumps(job))
+    idem.remember(idem_key, job_id)
     log.info(
         "queued job",
         extra={"event": "job_queued", "job_id": job_id},
@@ -149,6 +217,12 @@ def register(req: WorkerIdent):
     r.sadd(WORKER_REGISTRY, req.worker_id)
     r.hset(WORKER_HEARTBEATS, req.worker_id, now)
     r.hset(WORKER_STATUS, req.worker_id, "idle")
+    if req.capabilities is not None:
+        r.hset(
+            WORKER_CAPABILITIES,
+            req.worker_id,
+            req.capabilities.model_dump_json(),
+        )
     db.upsert_worker(req.worker_id, "idle", now)
     log.info(
         "worker registered",
@@ -286,6 +360,16 @@ def complete(req: JobCompleteRequest):
 
 
 # ---------- observability ----------
+def _load_capabilities(worker_id: str) -> dict | None:
+    raw = r.hget(WORKER_CAPABILITIES, worker_id)
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+
 @app.get("/workers")
 def workers():
     rows = db.list_workers()
@@ -307,9 +391,19 @@ def workers():
                 "total_tokens": int(e["total_tokens"]) if e else 0,
                 "total_jobs": int(e["total_jobs"]) if e else 0,
                 "total_usd": round(float(e["total_usd"]), 8) if e else 0.0,
+                "capabilities": _load_capabilities(wid),
             }
         )
     return {"workers": out}
+
+
+@app.get("/models")
+def models():
+    """Catalog of models the coordinator knows about. See coordinator/model_registry.py."""
+    return {
+        "strict": STRICT_MODELS,
+        "models": [m.to_dict() for m in model_registry.list_all()],
+    }
 
 
 @app.get("/earnings")

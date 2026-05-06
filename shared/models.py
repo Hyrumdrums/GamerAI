@@ -1,5 +1,5 @@
 """Shared pydantic schemas for the coordinator API."""
-from typing import Optional
+from typing import List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -13,8 +13,22 @@ class GenerateResponse(BaseModel):
     job_id: str
 
 
+class WorkerCapabilities(BaseModel):
+    """What a worker advertises it can run.
+
+    All fields are optional so a legacy ``/register`` call carrying just a
+    ``worker_id`` keeps working — capabilities are additive.
+    """
+    vram_gb: Optional[float] = None
+    gpu_model: Optional[str] = None       # e.g. "RTX 4090"
+    bandwidth_class: Optional[str] = None  # "low" | "medium" | "high"
+    models: List[str] = Field(default_factory=list)
+    notes: Optional[str] = None
+
+
 class WorkerIdent(BaseModel):
     worker_id: str
+    capabilities: Optional[WorkerCapabilities] = None
 
 
 class HeartbeatRequest(BaseModel):

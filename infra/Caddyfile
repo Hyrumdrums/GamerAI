@@ -1,0 +1,13 @@
+# Caddy config for GamerAI MVP.
+#
+# Caddy terminates TLS and reverse-proxies to the coordinator. Bearer-token
+# auth is enforced inside the coordinator itself (see shared/auth.py), so
+# Caddy stays simple: no auth middleware, just TLS + proxy. /health is
+# left open by the coordinator for uptime probes.
+
+{$DOMAIN} {
+    tls {$EMAIL}
+    encode zstd gzip
+
+    reverse_proxy coordinator:8000
+}

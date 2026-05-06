@@ -38,6 +38,9 @@ services:
       DB_PATH: /data/gamerai.db
       JOB_TIMEOUT_SECONDS: "120"
       WORKER_TIMEOUT_SECONDS: "15"
+      API_TOKEN: ${API_TOKEN:-}
+      RATE_LIMIT_PER_MIN: ${RATE_LIMIT_PER_MIN:-0}
+      IDEMPOTENCY_TTL_SECONDS: ${IDEMPOTENCY_TTL_SECONDS:-86400}
     volumes:
       - ./data:/data
     ports:
@@ -68,6 +71,7 @@ services:
       NETWORK_DELAY_MAX: "3.0"
       COLD_START_MIN: "2.0"
       COLD_START_MAX: "8.0"
+      API_TOKEN: ${API_TOKEN:-}
 
   client:
     build:
@@ -79,5 +83,6 @@ services:
         condition: service_started
     environment:
       COORDINATOR_URL: http://coordinator:8000
+      API_TOKEN: ${API_TOKEN:-}
     ports:
       - "8080:8080"

@@ -5,9 +5,17 @@ import httpx
 from fastapi import FastAPI, Form, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
+from shared.auth import auth_headers
+
 COORDINATOR_URL = os.getenv("COORDINATOR_URL", "http://coordinator:8000")
 
 app = FastAPI(title="GamerAI Web UI")
+
+
+def _client() -> httpx.AsyncClient:
+    """httpx client preconfigured with the coordinator base URL and any
+    bearer-token auth headers (no-op when API_TOKEN is unset)."""
+    return httpx.AsyncClient(base_url=COORDINATOR_URL, headers=auth_headers())
 
 INDEX_HTML = """<!doctype html>
 <html><head><meta charset="utf-8"><title>GamerAI</title>
@@ -91,16 +99,15 @@ def admin_redirect():
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
-    async with httpx.AsyncClient() as c:
-        m = (await c.get(f"{COORDINATOR_URL}/metrics", timeout=5)).json()
-        w = (await c.get(f"{COORDINATOR_URL}/workers", timeout=5)).json()
-        e = (await c.get(f"{COORDINATOR_URL}/earnings", timeout=5)).json()
-    
+    async with _client() as c:
+        m = (await c.get("/metrics", timeout=5)).json()
+        w = (await c.get("/workers", timeout=5)).json()
+        e = (await c.get("/earnings", timeout=5)).json()
+
     workers = w["workers"]
     active_workers = [w for w in workers if w["status"] == "online"]
     total_earnings = sum(w.get('total_usd', 0) for w in workers)
-    
-    # Worker table rows
+
     worker_rows = "".join(
         f"<tr><td><span style='color:{'#4CAF50' if x['status'] == 'online' else '#FF5722'};'>●</span> "
         f"{x['worker_id'][-12:]}</td><td>{x['status']}</td>"
@@ -197,8 +204,8 @@ a{{color:#2d6cdf;text-decoration:none}}
 # ---------- proxy endpoints (avoids CORS for browser) ----------
 @app.post("/api/generate")
 async def proxy_generate(payload: dict):
-    async with httpx.AsyncClient() as c:
-        r = await c.post(f"{COORDINATOR_URL}/generate", json=payload, timeout=10)
+    async with _client() as c:
+        r = await c.post("/generate", json=payload, timeout=10)
     if r.status_code >= 400:
         raise HTTPException(status_code=r.status_code, detail=r.text)
     return JSONResponse(r.json())
@@ -206,27 +213,27 @@ async def proxy_generate(payload: dict):
 
 @app.get("/api/result/{job_id}")
 async def proxy_result(job_id: str):
-    async with httpx.AsyncClient() as c:
-        r = await c.get(f"{COORDINATOR_URL}/result/{job_id}", timeout=10)
+    async with _client() as c:
+        r = await c.get(f"/result/{job_id}", timeout=10)
     return JSONResponse(r.json(), status_code=r.status_code)
 
 
 @app.get("/api/workers")
 async def proxy_workers():
-    async with httpx.AsyncClient() as c:
-        r = await c.get(f"{COORDINATOR_URL}/workers", timeout=10)
+    async with _client() as c:
+        r = await c.get("/workers", timeout=10)
     return JSONResponse(r.json())
 
 
 @app.get("/api/earnings")
 async def proxy_earnings():
-    async with httpx.AsyncClient() as c:
-        r = await c.get(f"{COORDINATOR_URL}/earnings", timeout=10)
+    async with _client() as c:
+        r = await c.get("/earnings", timeout=10)
     return JSONResponse(r.json())
 
 
 @app.get("/api/metrics")
 async def proxy_metrics():
-    async with httpx.AsyncClient() as c:
-        r = await c.get(f"{COORDINATOR_URL}/metrics", timeout=10)
+    async with _client() as c:
+        r = await c.get("/metrics", timeout=10)
     return JSONResponse(r.json())

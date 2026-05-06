@@ -19,6 +19,10 @@ import time
 import urllib.error
 import urllib.request
 
+# allow `python client/client.py ...` from the repo root
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from shared.auth import auth_headers  # noqa: E402
+
 DEFAULT_URL = os.getenv("COORDINATOR_URL", "http://localhost:8000")
 
 
@@ -27,6 +31,8 @@ def http(method: str, url: str, body: dict | None = None) -> dict:
     req = urllib.request.Request(url, data=data, method=method)
     if data is not None:
         req.add_header("Content-Type", "application/json")
+    for k, v in auth_headers().items():
+        req.add_header(k, v)
     with urllib.request.urlopen(req, timeout=30) as resp:
         return json.loads(resp.read().decode())
 

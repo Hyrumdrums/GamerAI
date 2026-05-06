@@ -1,0 +1,354 @@
+# Project Gaps — High-Level Review
+
+> Honest accounting of what's missing in GamerAI as of this branch.
+> Organized by severity and category. Cross-references to the roadmap
+> in the main README and the strategic research docs.
+
+The MVP works end-to-end locally and has a one-command public deploy.
+The gaps below are what stand between **"runs on my machine"** and
+**"a stranger could submit a job, a different stranger's GPU could
+process it, and money could change hands honestly."**
+
+---
+
+## Severity legend
+
+- **🔴 Critical** — blocks any external user touching the system.
+- **🟡 Important** — blocks real customers / real workers / real money.
+- **🟢 Later** — improves quality, scale, or developer experience.
+
+---
+
+## 1. Security & Trust
+
+### ~~🔴 No auth on the coordinator API~~ — done
+
+Resolved. `shared/auth.py` is the single source of truth, gated by the
+`API_TOKEN` env var. Set → bearer required on every request except
+`/health`; unset → no-op (default for local dev and tests). All
+clients (worker, Windows agent, web UI, CLI) automatically include the
+header when the token is set. The bootstrap generates a random token at
+deploy time. See `infra/README.md` for the runbook.
+
+### 🔴 No customer identity / API keys
+
+There's no concept of "who submitted this job." The `WORKER_TOKEN` above
+gates *access*, not *identity*. We can't bill, rate-limit, or attribute
+abuse without per-customer keys.
+
+**Fix:** add a tiny `api_keys` table; require `X-API-Key` on `/generate`
+and `/result`; record `customer_id` on every job row.
+
+### 🔴 No prompt safety / content controls
+
+A customer can submit anything. A worker is asked to compute it. Both
+sides could be unhappy: customers could be denied service for valid
+prompts a worker refuses; workers could be asked to generate content
+that violates their local laws or comfort.
+
+**Fix:** worker-side `block_categories` config, coordinator-side
+prompt-class tagging, opt-in pools per category. Same model as the
+privacy tier in Phase 5.
+
+### 🟡 No worker output verification
+
+The worker is trusted to report honest output and honest token counts.
+A malicious worker could return garbage and earn money for it.
+
+**Fix:** Phase 3 roadmap item; quickest win is k-of-n consensus on a
+random sample of jobs (run 5% of jobs on two workers, compare).
+
+### 🟡 Web UI dashboard has no auth
+
+Even bound to localhost (current default), once we expose it through
+Caddy on a subdomain it leaks worker IDs, earnings, and job prompts to
+anyone who guesses the URL.
+
+**Fix:** Caddy `basic_auth` is one line and good enough until we have
+real customer accounts.
+
+### 🟡 Workers can read every job
+
+Every worker connects to the same Redis queue (`BLPOP`) and sees all
+prompts in the queue header at minimum. There is no per-job ACL or
+encryption-at-rest in the queue.
+
+**Fix:** route through the coordinator (`/jobs/next` API) instead of
+direct Redis access. Already partially done — the worker has
+`/jobs/claim` and `/jobs/complete` calls but still pops from Redis
+directly. Tighten this loop.
+
+### 🟢 No TLS between worker and Redis
+
+Local-only today. Once we have remote workers, the Caddy+coordinator
+hop is TLS but the worker→Redis path is not. Worth fixing once Redis
+is no longer co-resident with the coordinator (Phase 2b ElastiCache).
+
+---
+
+## 2. Reliability & Ops
+
+### 🔴 No backups, no DR
+
+`infra/README.md` says "scp the SQLite file." That's not a backup
+strategy, that's a memo. A reboot in the middle of a write window
+could corrupt the ledger.
+
+**Fix:** add a nightly cron in the prod compose that runs
+`sqlite3 .backup` to a timestamped file; rotate weekly; optional
+off-host upload (S3 / B2 / Hetzner Storage Box).
+
+### 🟡 No monitoring / alerting
+
+`/metrics` exists. Nothing scrapes it. We won't know the coordinator
+is down unless we look.
+
+**Fix:** simplest: Uptime Kuma in the prod compose, hits `/health`
+every 30s. Better: Grafana Cloud free tier scraping `/metrics`. Best:
+add OTLP exporter and ship to a hosted observability stack.
+
+### ~~🟡 No rate limiting~~ — done
+
+Resolved. `coordinator/rate_limit.py` implements a per-IP fixed-window
+limiter, controlled by `RATE_LIMIT_PER_MIN` (0 / unset = disabled).
+Plumbed into the coordinator middleware after auth; honors
+`X-Forwarded-For` from Caddy.
+
+### ~~🟡 No idempotency on `/generate`~~ — done
+
+Resolved. Customers can pass an `Idempotency-Key` header on `/generate`;
+the same key returns the same `job_id` for 24h (configurable via
+`IDEMPOTENCY_TTL_SECONDS`). Implemented in `coordinator/idempotency.py`.
+No-op when no header is sent.
+
+### 🟡 Single point of failure
+
+One VPS holds Redis, the coordinator, the SQLite ledger, and Caddy.
+Any of: kernel update, disk full, OOM kill, unattended-upgrade reboot
+mid-job — takes the whole system down.
+
+**Fix:** acceptable for MVP test. Documented in the graduation
+criteria; resolved by Phase 2b AWS multi-AZ.
+
+### 🟢 No log retention strategy
+
+Logs go to stdout / `docker logs`. Restarts wipe history. Useful for
+debugging today, useless for compliance or analysis later.
+
+**Fix:** ship to a hosted log store (Grafana Loki, Better Stack,
+Axiom) when we add monitoring.
+
+### ~~🟢 No CI / CD~~ — done
+
+Resolved. `.github/workflows/ci.yml` runs the unittest suite,
+validates that `docker-compose.yml` and the prod overlay merge
+cleanly, and syntax-checks the bash scripts on every push and PR.
+
+---
+
+## 3. Product completeness
+
+### ~~🔴 Worker capability registration missing~~ — done (data layer)
+
+`/register` now accepts an optional `capabilities` body
+(`vram_gb`, `gpu_model`, `bandwidth_class`, `models[]`, `notes`).
+Capabilities are stored in Redis and surfaced on `/workers`. Existing
+workers that send only `worker_id` keep working — capabilities are
+additive.
+
+Still pending: capability-aware *routing* (per-model queues, VRAM-
+aware dispatch). That's a Phase 4 scheduler change, not an MVP gap.
+
+### ~~🔴 Model registry missing~~ — done (catalog + validation)
+
+`coordinator/model_registry.py` now contains a curated catalog of
+known models (Llama 3 family, Mistral, Mixtral, DeepSeek-V3, Qwen,
+Phi, mock). Each entry tracks family, total/active params, min VRAM
+at INT4, and license. Surfaced via `GET /models`.
+
+Set `STRICT_MODELS=true` to make `/generate` reject unknown model
+names with 400. Default is off (any string accepted) so tests and
+local dev with custom models keep working.
+
+Still pending: per-model pricing, license-aware routing, shard plans
+for big models. Same Phase 4 boundary as routing above.
+
+### 🟡 No customer SDK
+
+Customers use raw curl. That's fine for the founder. It's not fine
+for indie devs who are our Phase 1 ICP.
+
+**Fix:** thin Python + JS clients (`pip install gamerai`,
+`npm i gamerai`) that wrap `/generate` + `/result` polling, expose an
+OpenAI-compatible `chat.completions.create` interface, and handle
+auth/retries.
+
+### 🟡 No streaming / SSE on `/result`
+
+Customers must poll. Adds latency, wastes their CPU and our requests.
+
+**Fix:** add a Server-Sent Events stream on the coordinator that
+forwards tokens as the worker produces them. Cheap once worker
+reports per-token.
+
+### 🟡 No batch endpoint
+
+Async/batch is our positioned strength, but we don't actually ship a
+batch API. Customers have to fan out one-job-at-a-time.
+
+**Fix:** `POST /generate/batch` with a list of prompts; returns a
+`batch_id`; per-job results retrievable as they complete or as a zip
+when done.
+
+### 🟡 Token counts are estimates
+
+`len(text) // 4` when Ollama doesn't report. Earnings drift ±10%.
+
+**Fix:** load the model's tokenizer in the worker and use it for
+counts. Adds a few MB per worker, removes the drift.
+
+### 🟢 Auto-update for the Windows agent
+
+Today: gamer manually downloads new exe. With even mild adoption that
+becomes a maintenance nightmare and a security liability (no way to
+ship a fix).
+
+**Fix:** signed binaries + on-startup version check + self-replace.
+Or, easier, ship via Squirrel / NSIS auto-updater.
+
+### 🟢 No customer dashboard
+
+Web UI shows worker / job state. Customers have no view of their
+spend, key, usage trend, or limits.
+
+**Fix:** post Phase 2b. Currently irrelevant — there are no
+customers.
+
+---
+
+## 4. Engineering hygiene
+
+### ~~🟡 Limited automated tests~~ — done for MVP scope
+
+`tests/` now has **44 test cases** across six files:
+
+* `test_auth.py` — bearer-auth module (9 cases).
+* `test_idempotency.py` — idempotency store (7 cases).
+* `test_rate_limit.py` — rate limiter (7 cases).
+* `test_model_registry.py` — model catalog and strict-mode (11 cases).
+* `test_coordinator_e2e.py` — end-to-end FastAPI tests against
+  ``fakeredis`` + a tempfile SQLite DB. Covers: `/health`, `/models`,
+  job round-trip with earnings credit, idempotency through the HTTP
+  layer, capability registration round-trip, and reaper requeue (10
+  cases).
+
+Open follow-ups (smaller priority): two-worker contention test,
+explicit auth-on test through the HTTP layer, real-Redis CI smoke.
+
+### 🟡 No type checking in CI
+
+`shared/models.py` uses Pydantic, but nothing enforces types across
+the codebase. Subtle bugs (status string typos, key-name drift) slip
+through.
+
+**Fix:** add `mypy --strict` to the pre-commit and CI pipelines.
+
+### 🟡 SQLite under concurrency is not a tested path
+
+The coordinator is single-process today, so write contention is a
+non-issue. The minute we scale horizontally (multiple coordinator
+replicas), SQLite breaks.
+
+**Fix:** acknowledged in the graduation criteria. Plan: switch to
+Postgres in Phase 2b, not before.
+
+### 🟢 Shared schemas live in `shared/` but only the Python services
+use them
+
+When we ship the JS SDK, schemas drift. Worth generating both Python
+and TS types from a single source (e.g., a small JSON schema or
+`pydantic` → `pydantic-to-typescript`).
+
+### 🟢 Dockerfiles are unpinned
+
+`FROM python:3.11` not `FROM python:3.11.9-slim-bookworm@sha256:...`.
+Builds aren't reproducible; CVE introduction is silent.
+
+---
+
+## 5. Business / go-to-market
+
+### 🔴 No payout rails
+
+Earnings are tracked, not paid. A gamer has zero incentive to install
+the agent until we can write them money.
+
+**Fix:** start with Stripe Connect for ACH payouts; minimum threshold
+($25); 1099 handling.
+
+### 🟡 No pricing tier structure
+
+Single `RATE_PER_TOKEN` flat across all models. We can't charge more
+for 70B than for 1B.
+
+**Fix:** per-model pricing in the model registry above.
+
+### 🟡 No customer signup flow
+
+The system has no /signup, no /login, no Stripe customer creation, no
+quota assignment. To get to first revenue we need at minimum a sign-up
+form that mints an API key and a Stripe customer.
+
+**Fix:** small Phase 2b scope. Could outsource to Clerk + Stripe
+billing portal in a weekend.
+
+### 🟡 No legal: ToS, privacy policy — partial
+
+Code now licensed Apache-2.0 (see `LICENSE`). Still missing: customer
+Terms of Service, privacy policy, and an explicit worker agreement
+covering the "you run prompts you didn't write" risk. Pull from
+Termly / iubenda templates before recruiting non-friends.
+
+### 🟢 No marketing surface
+
+No landing page, no docs site, no demo video. Fine while the founder
+is the only customer; required before recruiting beyond the friend
+circle.
+
+---
+
+## 6. Strategic / forward-looking
+
+These are documented in `research/big-models-feasibility.md` and the
+README roadmap. Listing them here for completeness.
+
+- Big-model support (Petals → EXO) — Phase 4 in the roadmap.
+- Privacy tiers (client-side embedding, vetted pools, TEE) — Phase 5.
+- Energy-aware routing — Phase 4 long-tail.
+
+---
+
+## 7. Suggested 30-day priority list
+
+If you ran a focused sprint on the items above, this is the order I'd
+work them in. Highest leverage first.
+
+1. ~~**Ship bearer-auth end-to-end**.~~ ✅ Done.
+2. ~~**Idempotency keys + rate limit + GitHub Actions CI.**~~ ✅ Done.
+3. ~~**License the code (Apache-2.0).**~~ ✅ Done.
+4. ~~**Coordinator integration tests** (job round-trip, reaper requeue,
+   idempotency, capabilities).~~ ✅ Done — `test_coordinator_e2e.py`
+   with ``fakeredis``.
+5. ~~**Worker capability registration + model registry** (data layer).~~
+   ✅ Done — capability-aware *routing* deferred to Phase 4.
+6. **Uptime Kuma (or equivalent) hitting `/health`.** **~½ day.**
+7. **SQLite nightly backup cron with weekly rotation.** **~½ day.**
+8. **Worker agreement + ToS** from a template. **~½ day.**
+9. **Python SDK** (thin wrapper, OpenAI-compatible signature). **~1–2 days.**
+10. **Recruit 3 real gamer workers and run end-to-end.** The actual
+    experiment. **~½ day, plus calendar time.**
+
+That's ~10 working days of engineering plus the recruitment / business
+items. After that, reassess: is anyone using it? If yes, push into the
+big-model plan in Phase 4. If no, the gap is in distribution and
+pricing, not the platform.
