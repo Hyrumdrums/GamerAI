@@ -3,8 +3,11 @@
 ## Quick Start
 
 ```bash
-# 1. Start the system
-MOCK_INFERENCE=false docker compose up
+# 1. Start the system (with local Ollama for real inference)
+MOCK_INFERENCE=false docker compose --profile local-inference up
+
+# 1b. Or skip Ollama and use mock workers
+docker compose up
 
 # 2. Test inference
 python client/client.py "Explain quantum computing briefly"

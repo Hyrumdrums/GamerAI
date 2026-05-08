@@ -61,7 +61,7 @@ The script:
 1. Installs Docker Engine and the Compose plugin.
 2. Configures `ufw` to allow only `:22`, `:80`, `:443`.
 3. Clones this repo to `/opt/gamerai`.
-4. Generates `/opt/gamerai/.env.prod` with a random `WORKER_TOKEN`.
+4. Generates `/opt/gamerai/.env.prod` with a random `API_TOKEN`.
 5. Brings up the stack with the production overlay.
 6. Prints the URL, the worker token, and the redeploy command.
 

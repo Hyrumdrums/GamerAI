@@ -10,13 +10,17 @@ services:
       timeout: 3s
       retries: 5
 
+  # Opt-in: only starts when --profile local-inference is passed.
+  # Prod runs MOCK_INFERENCE=true and doesn't need this — real inference
+  # comes from external gamer machines, not the VPS.
   ollama:
+    profiles: ["local-inference"]
     build:
       context: .
       dockerfile: ollama/Dockerfile
     container_name: gamerai-ollama
     ports:
-      - "11435:11434"
+      - "127.0.0.1:11435:11434"
     volumes:
       - ./ollama-models:/root/.ollama
     healthcheck:
