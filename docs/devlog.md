@@ -5,6 +5,70 @@ entries on top. Skim for context before resuming work.
 
 ---
 
+## 2026-05-08 — Real inference on the VPS
+
+VPS is no longer mock-mode. Currently serving `llama3.2:1b` from the in-VPS
+worker over public TLS at `https://ai.dallinlayton.com/`.
+
+### What changed on the box
+
+```bash
+# 1. Brought up the previously profile-gated ollama service
+docker compose --env-file .env.prod \
+  -f docker-compose.yml -f infra/docker-compose.prod.yml \
+  --profile local-inference up -d ollama
+
+# 2. Pulled the model (1.3 GB)
+docker exec gamerai-ollama ollama pull llama3.2:1b
+
+# 3. Flipped /opt/gamerai/.env.prod
+MOCK_INFERENCE=false   # was true
+
+# 4. Recreated worker so it picks up the new env
+docker compose --env-file .env.prod \
+  -f docker-compose.yml -f infra/docker-compose.prod.yml \
+  --profile local-inference up -d worker
+```
+
+`infra/deploy.sh` doesn't include `--profile local-inference`. If you re-deploy
+via the script, ollama won't come back up automatically. Either re-run the
+profile-aware command above, or extend `deploy.sh` to detect when MOCK_INFERENCE
+is false and pass the profile.
+
+### Performance baseline
+
+| Model | Hardware | Latency (38-prompt → 65-completion) | Throughput |
+|---|---|---|---|
+| `llama3.2:1b` | CPX21, 3 vCPU AMD, no GPU | ~10 s | ~6.5 tok/s |
+
+Adequate for pipeline validation. Way too slow for customer-facing serving;
+real inference is supposed to come from gamer machines.
+
+### Resource state with model loaded
+
+```
+RAM total:    3.7 GB
+Used:         1.9 GB  (ollama 1.94 GB / 3.7 GB — model weights resident)
+Available:    1.5 GB
+Swap:         none
+```
+
+Headroom is fine for the current workload. **Do not pull a 3B or 7B model on
+this box** — it will OOM. Larger models go on gamer machines, not the VPS.
+
+### Followups worth doing
+
+- Decide whether the VPS keeps running real inference, or reverts to mock once
+  external workers are connecting. Argument for reverting: VPS isn't supposed
+  to be a worker, and the 1.9 GB of resident weight competes with future
+  coordinator load. Argument for keeping: a no-workers-online state still has
+  *something* to answer prompts.
+- Teach `infra/deploy.sh` to honor a flag (or read `.env.prod`) so re-deploys
+  don't silently lose the ollama service.
+- Add a swap file (~2 GB) so an OOM doesn't kill the coordinator.
+
+---
+
 ## 2026-05-07 — First public deploy
 
 **Live:** https://ai.dallinlayton.com (Let's Encrypt cert, auto-renewed by Caddy)
