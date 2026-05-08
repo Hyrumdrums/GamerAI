@@ -59,8 +59,6 @@ services:
         condition: service_healthy
       coordinator:
         condition: service_started
-      ollama:
-        condition: service_healthy
     environment:
       REDIS_URL: redis://redis:6379/0
       COORDINATOR_URL: http://coordinator:8000
