@@ -20,8 +20,9 @@ set -euo pipefail
 DOMAIN=""
 EMAIL=""
 BRANCH="${BRANCH:-main}"
-REPO="${REPO:-https://github.com/Hyrumdrums/GamerAI.git}"
+REPO="${REPO:-git@github.com:Hyrumdrums/GamerAI.git}"
 INSTALL_DIR="${INSTALL_DIR:-/opt/gamerai}"
+DEPLOY_KEY="${DEPLOY_KEY:-/root/.ssh/github_deploy}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -80,13 +81,29 @@ if ! command -v docker >/dev/null; then
 fi
 
 # ---------- 4. clone or update repo ----------
+# If REPO is an SSH URL we expect a deploy key at $DEPLOY_KEY (placed there
+# out-of-band — the bootstrap can't pull it down because the repo is private).
 log "syncing repo at $INSTALL_DIR..."
+GIT_ENV=()
+if [[ "$REPO" == git@* ]]; then
+  [[ -f "$DEPLOY_KEY" ]] || { echo "ERROR: $DEPLOY_KEY missing — scp the deploy private key first" >&2; exit 1; }
+  chmod 600 "$DEPLOY_KEY"
+  mkdir -p /root/.ssh && chmod 700 /root/.ssh
+  ssh-keyscan -t ed25519,rsa github.com >> /root/.ssh/known_hosts 2>/dev/null
+  sort -u -o /root/.ssh/known_hosts /root/.ssh/known_hosts
+  GIT_ENV=(env "GIT_SSH_COMMAND=ssh -i $DEPLOY_KEY -o IdentitiesOnly=yes")
+fi
 if [[ -d "$INSTALL_DIR/.git" ]]; then
-  git -C "$INSTALL_DIR" fetch --quiet origin
-  git -C "$INSTALL_DIR" checkout --quiet "$BRANCH"
-  git -C "$INSTALL_DIR" pull --ff-only --quiet origin "$BRANCH"
+  "${GIT_ENV[@]}" git -C "$INSTALL_DIR" fetch --quiet origin
+  "${GIT_ENV[@]}" git -C "$INSTALL_DIR" checkout --quiet "$BRANCH"
+  "${GIT_ENV[@]}" git -C "$INSTALL_DIR" pull --ff-only --quiet origin "$BRANCH"
 else
-  git clone --quiet --branch "$BRANCH" "$REPO" "$INSTALL_DIR"
+  "${GIT_ENV[@]}" git clone --quiet --branch "$BRANCH" "$REPO" "$INSTALL_DIR"
+fi
+# Persist the deploy key into the repo's git config so future deploy.sh runs
+# don't need GIT_SSH_COMMAND in the environment.
+if [[ ${#GIT_ENV[@]} -gt 0 ]]; then
+  git -C "$INSTALL_DIR" config core.sshCommand "ssh -i $DEPLOY_KEY -o IdentitiesOnly=yes"
 fi
 
 # ---------- 5. env file (preserves existing token on re-run) ----------
