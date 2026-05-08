@@ -11,6 +11,9 @@ docker compose up --build
 # open http://localhost:8080
 ```
 
+Live: https://ai.dallinlayton.com — see [`docs/devlog.md`](docs/devlog.md) for
+deploy details, decisions, and operational runbook.
+
 ---
 
 ## 1. Product overview
