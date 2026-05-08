@@ -12,12 +12,14 @@
 services:
   redis:
     restart: unless-stopped
-    ports:
+    # !override replaces the base compose ports list entirely (compose
+    # otherwise appends, leading to a double-bind on both 0.0.0.0 and 127.0.0.1).
+    ports: !override
       - "127.0.0.1:6379:6379"
 
   coordinator:
     restart: unless-stopped
-    ports:
+    ports: !override
       - "127.0.0.1:8000:8000"
 
   worker:
@@ -27,7 +29,7 @@ services:
 
   client:
     restart: unless-stopped
-    ports:
+    ports: !override
       - "127.0.0.1:8080:8080"
 
   caddy:
