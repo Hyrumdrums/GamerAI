@@ -60,7 +60,7 @@ if ! swapon --show=NAME --noheadings | grep -qx "$SWAPFILE"; then
   fallocate -l "${SWAP_SIZE_MB}M" "$SWAPFILE" 2>/dev/null \
     || dd if=/dev/zero of="$SWAPFILE" bs=1M count="$SWAP_SIZE_MB" status=none
   chmod 600 "$SWAPFILE"
-  mkswap -q "$SWAPFILE"
+  mkswap "$SWAPFILE" >/dev/null
   swapon "$SWAPFILE"
   if ! grep -q "^$SWAPFILE " /etc/fstab; then
     echo "$SWAPFILE none swap sw 0 0" >> /etc/fstab
