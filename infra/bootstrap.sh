@@ -144,10 +144,15 @@ fi
 # ---------- 6. bring services up ----------
 log "starting services (this builds images on first run)..."
 cd "$INSTALL_DIR"
+PROFILE_ARGS=()
+if grep -q '^MOCK_INFERENCE=false' "$ENV_FILE" 2>/dev/null; then
+  PROFILE_ARGS=(--profile local-inference)
+fi
 docker compose \
   --env-file "$ENV_FILE" \
   -f docker-compose.yml \
   -f infra/docker-compose.prod.yml \
+  "${PROFILE_ARGS[@]}" \
   up -d --build
 
 # ---------- 7. summary ----------
