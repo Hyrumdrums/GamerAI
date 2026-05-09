@@ -52,6 +52,21 @@ apt-get update -y
 apt-get install -y --no-install-recommends \
   ca-certificates curl gnupg git openssl ufw
 
+# ---------- 1b. swap (cheap OOM insurance on a 4 GB box) ----------
+SWAPFILE="${SWAPFILE:-/swapfile}"
+SWAP_SIZE_MB="${SWAP_SIZE_MB:-2048}"
+if ! swapon --show=NAME --noheadings | grep -qx "$SWAPFILE"; then
+  log "creating ${SWAP_SIZE_MB}MB swap at $SWAPFILE..."
+  fallocate -l "${SWAP_SIZE_MB}M" "$SWAPFILE" 2>/dev/null \
+    || dd if=/dev/zero of="$SWAPFILE" bs=1M count="$SWAP_SIZE_MB" status=none
+  chmod 600 "$SWAPFILE"
+  mkswap -q "$SWAPFILE"
+  swapon "$SWAPFILE"
+  if ! grep -q "^$SWAPFILE " /etc/fstab; then
+    echo "$SWAPFILE none swap sw 0 0" >> /etc/fstab
+  fi
+fi
+
 # ---------- 2. firewall ----------
 if command -v ufw >/dev/null; then
   log "configuring firewall (allow 22, 80, 443)..."
