@@ -5,6 +5,75 @@ entries on top. Skim for context before resuming work.
 
 ---
 
+## 2026-05-09 — Strategy refresh: AI toolbox, not chat
+
+Reframing the product from "distributed chat API" to "distributed AI toolbox"
+of independent, retryable, latency-tolerant jobs. The architecture we already
+built (job-based, queued, capability-aware on the data layer) supports this
+without redesign — it just needs schema extensions and a second worker type.
+
+### What changed in the docs
+
+- README § 1 — toolbox framing + "Tools supported" table (chat MVP; image +
+  search next; docs/code expansion; music/voice later; video and frontier
+  training out of scope).
+- README § 14 — old Phase 3 ("marketplace + dynamic pricing") split into
+  **3a (multi-tool foundations)** and **3b (marketplace dynamics)**. 3a is
+  now the next-up phase after the Windows-worker test.
+- README § 10 — API table notes the planned `job_type` field on `/generate`
+  and per-tool queue routing.
+- `business.md` — added a "Supported tools" section, updated roadmap to
+  reflect public deploy + toolbox.
+- `docs/project-gaps.md` — capability-aware routing promoted from Phase 4
+  to Phase 3a.
+
+### Schema sketch (not yet implemented)
+
+```
+GenerateRequest:
+  job_type: "chat" | "image" | "search"  (default "chat" for back-compat)
+  params:   discriminated union of ChatParams | ImageParams | SearchParams
+
+WorkerCapabilities:
+  + tools: List[ToolType]  (e.g. ["chat", "image"])
+
+Redis:
+  job_queue:chat, job_queue:image, job_queue:search   (was: job_queue)
+
+DB jobs table:
+  + job_type TEXT NOT NULL DEFAULT 'chat'
+  + result_blob TEXT   (base64/URL for non-text outputs)
+```
+
+Worker side: `BLPOP` over `[job_queue:t for t in capabilities.tools]`. No
+new component, no broker rewrite — implicit routing via queue subscription.
+
+Search runs *inside the coordinator* (no GPU lift); it fetches results, then
+dispatches an internal chat job with augmented context. Image generation is
+a real new worker mode (SDXL-class, ~8–12 GB VRAM).
+
+### Sequence (not commitments — pending decision)
+
+1. Real Windows worker test on chat (the milestone we were already heading
+   toward — needed first, regardless of toolbox plan).
+2. Phase 3a: `job_type` + capability routing schema, behind back-compat
+   shim. ~3 days.
+3. Web-search tool (centralized, no new worker type). ~1 day.
+4. Image-gen worker mode + SDXL backend on Windows agent. ~1 week.
+5. Unified toolbox UI (slash-commands or tabs).
+
+### Open questions
+
+- Earnings ledger needs per-tool rates (per-token doesn't apply to images).
+  Cleanest schema: rename `total_tokens` → `total_units` and add a `unit`
+  column. Defer until image gen actually ships.
+- Quality variance across heterogeneous workers (1B vs 13B chat) is a real
+  UX risk under the "abstract model complexity" principle. May need to
+  expose a tier hint (Fast / Better / Best) instead of pretending the
+  network is uniform.
+
+---
+
 ## 2026-05-08 — Real inference on the VPS
 
 VPS is no longer mock-mode. Currently serving `llama3.2:1b` from the in-VPS

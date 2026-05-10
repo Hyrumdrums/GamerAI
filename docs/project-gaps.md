@@ -156,8 +156,12 @@ Capabilities are stored in Redis and surfaced on `/workers`. Existing
 workers that send only `worker_id` keep working — capabilities are
 additive.
 
-Still pending: capability-aware *routing* (per-model queues, VRAM-
-aware dispatch). That's a Phase 4 scheduler change, not an MVP gap.
+Still pending: capability-aware *routing*. **Promoted from Phase 4 to
+Phase 3a** by the 2026-05-09 strategy refresh — the multi-tool toolbox
+plan (chat / image / search) requires per-tool routing, so we get this
+on the critical path. Plumbing is small: add `tools[]` to capabilities,
+namespace queues as `job_queue:<tool>`, have workers `BLPOP` only the
+queues that match their advertised tools. See README § 14 Phase 3a.
 
 ### ~~🔴 Model registry missing~~ — done (catalog + validation)
 

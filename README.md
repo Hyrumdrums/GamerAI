@@ -1,10 +1,15 @@
 # GamerAI
 
-> **A distributed AI inference marketplace where idle gaming PCs earn money running models for paying customers.**
+> **A distributed AI toolbox — chat, images, and web-augmented answers — running
+> on idle gaming PCs that earn money for their owners.**
 
-This repo is a fully local, containerized MVP of that marketplace. One command
-brings up a coordinator, Redis queue, SQLite store, a web UI, and any number
-of worker nodes that simulate gamer machines.
+This repo is a fully local, containerized MVP. One command brings up a
+coordinator, Redis queue, SQLite store, a web UI, and any number of worker
+nodes that simulate gamer machines.
+
+The MVP today serves a single tool (chat). The architecture is job-based and
+capability-routed by design, so adding image generation and web-augmented
+answers is additive — see § 14 (Roadmap) for the multi-tool plan.
 
 ```bash
 docker compose up --build
@@ -18,18 +23,37 @@ deploy details, decisions, and operational runbook.
 
 ## 1. Product overview
 
-GamerAI is a **distributed inference marketplace**.
+GamerAI is a **distributed AI toolbox** running on a marketplace of consumer GPUs.
 
-- **Workers** (gamers) install a small client on their machine. When idle,
-  the machine joins the network and runs inference jobs. They earn USD per
-  token of output.
-- **Customers** (developers, apps, end users) submit prompts via the API or
-  web UI. Their requests are dispatched to the cheapest available worker.
-- **The platform** runs the coordinator, queue, and ledger, and takes a
-  percentage of each transaction.
+- **Workers** (gamers) install a small client and advertise the tools they can
+  run (chat, image generation, eventually doc/code/voice). When idle, the
+  machine joins the network and earns money for jobs it serves.
+- **Customers** submit jobs via a unified API or web UI. The coordinator routes
+  each job to a worker that advertises the matching capability.
+- **The platform** runs the coordinator, queue, ledger, and centralized
+  helpers (e.g. web search), and takes a percentage of each transaction.
 
-The network is fully **per-job**: payouts are computed on every completed
-inference and credited to the worker's earnings ledger.
+The network is fully **per-job and per-tool**: every completed job is priced
+in its natural unit (tokens for chat, images for SDXL, requests for search)
+and credited to the worker's earnings ledger.
+
+### Tools
+
+| Status   | Tool          | Model class            | Why it fits a distributed network |
+| -------- | ------------- | ---------------------- | --------------------------------- |
+| **MVP, live** | Chat          | 7B–13B (currently 1B for VPS demo) | Independent jobs, latency-tolerant, low VRAM |
+| Next     | Web-augmented answers | small chat + search API | No GPU lift; centralized; biggest perceived-IQ bump for small models |
+| Next     | Image generation | SDXL-class (~8–12 GB VRAM) | Independent jobs, async-friendly, high demo wow |
+| Expansion | Document tools (summarize, rewrite, chunked analysis) | 7B–13B | High retention, same hardware envelope as chat |
+| Expansion | Coding assistant | 7B–13B | Frequent, small jobs, plays to the chat envelope |
+| Later    | Music generation (MusicGen) | varies | Async / queued; longer runtimes |
+| Later    | Voice (batch STT/TTS) | varies | Real-time voice deliberately out of scope |
+| Out of scope | Tightly-coupled multi-node, real-time low-latency, frontier training | — | Network constraints make these unwise |
+
+The principle behind the list: pick tools that are **independent, retryable,
+and tolerant of moderate latency**, because that is the shape of jobs a
+heterogeneous gamer network can serve well. See [`business.md`](business.md)
+for the strategic framing.
 
 ## 2. Problem statement
 
@@ -276,16 +300,23 @@ backups, and graduation criteria for moving to Terraform / AWS.
 | ------ | -------------------------- | ----------------------------------------------------- |
 | POST   | `/generate`                | `{prompt, model?}` → `{job_id}`. Optional `Idempotency-Key` header makes retries safe. |
 | GET    | `/result/{job_id}`         | result JSON (status: `pending`/`running`/`complete`/`error`) |
-| GET    | `/workers`                 | list of workers + status, last_seen, totals          |
+| GET    | `/workers`                 | list of workers + status, last_seen, totals, capabilities |
 | GET    | `/earnings`                | per-worker `{worker_id, total_tokens, total_usd}`    |
 | GET    | `/earnings/{worker_id}`    | single worker earnings record                         |
 | GET    | `/metrics`                 | totals, completed, avg latency, queue depth, etc.    |
 | GET    | `/models`                  | catalog of known models + strict-mode flag           |
-| POST   | `/register`                | worker self-registration; optional `capabilities` body |
+| POST   | `/register`                | worker self-registration; optional `capabilities` body (`vram_gb`, `gpu_model`, `tools[]`, `models[]`) |
 | POST   | `/heartbeat`               | worker liveness + status (`idle`/`busy`/`offline`)   |
 | POST   | `/jobs/claim`              | worker reports it has claimed a job                   |
 | POST   | `/jobs/complete`           | worker submits result; coordinator credits earnings   |
 | GET    | `/health`                  | redis ping                                            |
+
+> Multi-tool API (planned, see § 14 Phase 3). `/generate` will accept a
+> `job_type` field (`chat` | `image` | `search`) discriminating a typed
+> `params` block; legacy `{prompt, model}` payloads will still work as
+> implicit `job_type=chat`. Routing is via per-tool Redis queues
+> (`job_queue:chat`, `job_queue:image`, …) that workers subscribe to based
+> on their advertised `tools[]` capability.
 
 ## 11. Configuration
 
@@ -388,9 +419,38 @@ The VPS path keeps us shipping; Terraform comes when at least one of these
 is true: 10+ active workers, real money flowing, multi-region latency
 needs, or SQLite contention.
 
-### Phase 3 — marketplace + dynamic pricing
+### Phase 3 — AI toolbox + marketplace
 
-- [ ] Multiple model tiers with per-tier pricing
+The strategic reframing: the platform is not a chat API, it's a *job-based
+toolbox* of independent, retryable, latency-tolerant AI workloads. Phase 3
+turns the chat-only MVP into a multi-tool product and adds the marketplace
+plumbing that lets it scale.
+
+**Phase 3a — multi-tool foundations**
+
+- [ ] `job_type` on `/generate` (`chat` | `image` | `search`) with a
+      discriminated-union `params` block. Legacy `{prompt, model}` keeps
+      working as implicit `job_type=chat`.
+- [ ] Worker `capabilities.tools[]` registration; coordinator routes via
+      per-tool Redis queues (`job_queue:chat`, `job_queue:image`, …).
+      Workers `BLPOP` only the queues that match their advertised tools.
+- [ ] DB schema: add `job_type` and `result_blob` columns to `jobs`;
+      backfill default `chat` for existing rows.
+- [ ] Web-search tool — runs *server-side* on the coordinator. Fetches
+      results from a search API, prepends them to the prompt as context,
+      then dispatches a chat job. No new worker type needed; biggest
+      perceived-intelligence boost for small models.
+- [ ] Image-generation worker mode — `windows-agent --tool=image` boots
+      an SDXL pipeline and registers `tools=["chat", "image"]` (or
+      `["image"]` if the box is too small for chat). Earnings priced per
+      image, not per token.
+- [ ] Unified "toolbox" UI — slash-commands or tabs in the web client so
+      one chat surface can dispatch any of the three job types.
+
+**Phase 3b — marketplace dynamics**
+
+- [ ] Multiple model tiers with per-tier pricing (chat-7B vs chat-13B,
+      image-SDXL vs image-SD1.5, etc.).
 - [ ] Dynamic pricing based on supply/demand
 - [ ] Worker reputation + slashing for bad output
 - [ ] Result verification (challenge jobs, k-of-n consensus)
