@@ -84,6 +84,27 @@ Three trends converge:
    and Copilot per seat across a family adds up fast when one contributor's
    gaming PC could serve them all.
 
+## The supply-demand challenge (and how we balance it)
+
+Paid demand and gamer supply are **anti-correlated** in a single time
+zone — paid demand peaks 9–6 weekdays, gamer supply peaks overnight
+and weekends. Three structural levers balance the curve:
+
+1. **BATCH paid tier** (above) lets non-urgent paid work fill off-peak
+   supply at half price.
+2. **Geographic contributor recruiting** — EU and APAC contributors fill
+   US business hours; same shape in reverse. The "advertise for more
+   supply" motion is geo-specific, not generic.
+3. **Utilization-driven signals** — when network use rises, a dashboard
+   alert ("Usage is growing — consider adjusting your uptime to reach
+   the next tier") nudges offline GOLD+ contributors to spin up.
+   When use is low, paid-customer acquisition (dev forums,
+   comparison pages, BATCH campaigns) drives demand.
+
+Two acquisition motions, one signal loop: **low utilization triggers
+paid-customer marketing; high utilization triggers contributor
+recruiting.** The audiences barely overlap.
+
 ## Business Model
 
 The economics are layered:
@@ -93,13 +114,35 @@ contribution; no money changes hands. The contributor is the primary
 user, not a labor force.
 
 **Layer 2 — Paid customer tiers (Phase 3b+).**
-- CASUAL — households without a gaming PC, flat monthly fee
-- DEVELOPER — per-token API, between Haiku ($1.25/1M) and self-hosted
-- ENTERPRISE — volume + SLA + dedicated worker pools
+- **CASUAL** — households without a gaming PC, flat monthly fee
+- **DEVELOPER** — realtime per-token API, ~$1.50/1M tokens (between
+  Haiku $1.25/1M and self-hosted)
+- **BATCH** — non-realtime per-token, ~$0.75/1M tokens, scheduled into
+  low-utilization windows (the supply-soak lever; lets paid customers
+  fund off-peak supply at half price)
+- **ENTERPRISE** — volume + SLA + dedicated worker pools + privacy-tier
+  routing
 
-**Layer 3 — Bonus payouts.** 80% of paid revenue → opt-in PRO/PLATINUM
+**Layer 3 — Bonus payouts.** 80% of paid revenue → opt-in GOLD+
 contributors who actually served the paid jobs (per-token). 20% →
-platform for coordinator infra and future development.
+platform for coordinator infra and future development. Tier promotion
+is instant (low friction); paid-pool eligibility requires 1 week of
+sustained uptime + minimum claim rate (reliability proof).
+
+**Realistic contributor earnings** (US-median electricity, after
+electricity cost, 80% worker share):
+
+| GPU | 1 hr/day active | 3 hr/day | 8 hr/day saturated |
+|---|---:|---:|---:|
+| Basic (RTX 3060) | $3/mo | $9/mo | $24/mo |
+| Mid (RTX 4070) | $8/mo | $22/mo | $58/mo |
+| High (RTX 4090) | $11/mo | $32/mo | $87/mo |
+
+Margin per million tokens served stays at 60–90% even on basic GPUs in
+expensive electricity. The community pull (status, free suite, host for
+your people) is the primary contributor motivation; bonus payouts are
+the cherry on top — meaningful at the high end, "Netflix-sub money"
+on basic gear.
 
 **Sustainability target:** at $1.50/1M tokens to DEVELOPER customers,
 two paying developers + one PLATINUM contributor in the paid pool covers

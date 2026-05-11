@@ -183,27 +183,36 @@ Contributing is free; access is tiered by what you actually contribute.
 |---|---|---|
 | **BRONZE** | Agent installed, intermittent uptime | Full toolbox; small monthly quota; 1 invite slot |
 | **SILVER** | ~4 hrs/day average uptime | 5× quota; 3 invites; queue priority over BRONZE |
-| **GOLD** | ~12 hrs/day; multi-tool capable | 20× quota; 10 invites; opt-in to paid-job pool |
+| **GOLD** | ~12 hrs/day; multi-tool capable | 20× quota; 10 invites; eligible for paid-pool opt-in |
 | **PLATINUM** | ~20+ hrs/day; high-VRAM card | Effectively unlimited; first dibs on new tools; full paid-pool participation |
 
-Tier promotion is **uncapped meritocracy** — anyone willing to run a
-4090 24/7 can be PLATINUM. Scarcity (when paid demand outstrips supply)
-gets fought by recruiting more contributors, not by gatekeeping tier
-slots. The PRO/PLATINUM badge stays prestigious because the effort is
-real, not because the slots are.
+Tier promotion is **uncapped meritocracy** and **low-friction**: anyone
+with a 4090 and a 24/7 availability toggle can hit PLATINUM tier on day
+one. The status loop should never feel gated.
+
+**Paid-pool eligibility is decoupled from tier promotion.** The opt-in
+toggle for serving paid customer jobs only appears after the agent has
+demonstrated **1 week of sustained uptime + minimum claim rate**. Tier
+gets you the status; reliability proof gets you the earnings.
 
 Tier maintenance requires **both uptime AND actual jobs served** — an
-agent that idles online while refusing jobs (a forked agent, for example)
-falls down the ladder. The coordinator measures claimed-jobs-per-hour
-as the source of truth.
+agent that idles online while refusing jobs (a fork, for example) falls
+down the ladder. The coordinator measures claimed-jobs-per-hour as the
+source of truth.
 
 ### Layer 2 — Paid customer tiers (Phase 3b+; not MVP launch)
 
-| Tier | Audience | Pricing shape |
-|---|---|---|
-| **CASUAL** | Households without a gaming PC | Flat monthly fee, generous-but-capped quota |
-| **DEVELOPER** | App builders | Per-token API; priced between Anthropic Haiku ($1.25/1M) and self-hosted |
-| **ENTERPRISE** | Companies | Volume contract + dedicated worker pool + SLA |
+| Tier | Audience | Latency | Pricing shape |
+|---|---|---|---|
+| **CASUAL** | Households without a gaming PC | Realtime | Flat monthly fee, generous-but-capped quota |
+| **DEVELOPER** | App builders | <30s realtime | Per-token API; ~$1.50/1M tokens (between Haiku $1.25/1M and self-hosted) |
+| **BATCH** | Bulk workloads (embeddings, doc summarization, classification) | <24h | ~$0.75/1M tokens — scheduled into low-utilization windows |
+| **ENTERPRISE** | Companies | SLA-defined | Volume contract + dedicated worker pool + privacy-tier routing |
+
+**BATCH** is the supply-soak lever: when network utilization is low,
+batch jobs fill the slack instead of requiring more advertising. AWS
+Spot Instances as the proven analog (50–70% discount for time-flexible
+work; most enterprise AI workloads are batch-friendly).
 
 Paid customer demand is served from a **separate priority queue** that
 only contributors at GOLD+ who **opt in** can see. Free contributor
@@ -225,11 +234,33 @@ which attracts more PLATINUM uptime, which grows total network
 capacity, which benefits free contributors too. The platform never
 extracts from contributor activity — only from paid activity, capped.
 
+### Realistic earnings by GPU class
+
+Honest numbers for what a contributor actually nets after electricity,
+at US-median $0.16/kWh and the $1.50/1M-tokens × 80% split:
+
+| GPU | Per 1M tokens (margin) | 1 hr/day active | 3 hr/day | 8 hr/day saturated |
+|---|---:|---:|---:|---:|
+| Basic (RTX 3060, 170 W, 30 tok/s) | $0.95 (79%) | $3/mo | $9/mo | **$24/mo** |
+| Mid (RTX 4070, 200 W, 70 tok/s) | $1.07 (89%) | $8/mo | $22/mo | **$58/mo** |
+| High (RTX 4090, 450 W, 100 tok/s) | $1.00 (83%) | $11/mo | $32/mo | **$87/mo** |
+
+Per-token margin holds at 60–90% even on basic GPUs in expensive
+electricity territory. But **idle overhead bites basic GPUs hard** — a
+3060 left loaded 24/7 burns ~$3.50/mo in idle power, which can wipe a
+light-demand month. The demand-driven uptime signal (see § 14 Phase
+3b.ii) is load-bearing for basic-GPU profitability, not optional.
+
+Practical framing:
+- **Basic-GPU pitch**: free AI for you + invitees; near-zero power cost
+  when demand is low; occasional Netflix-sub bonus when network is busy.
+- **High-end-GPU pitch**: real secondary income at saturation
+  (~$80–90/mo even in California), plus community status.
+
 ### Sustainability target
 
 Coordinator infra: ~€8/month today; ~$50/month at 1k users; ~$200/month
-at 10k users. At a DEVELOPER paid tier of **$1.50/1M tokens** (above
-self-hosted, below Haiku), the break-even math:
+at 10k users. Break-even at the $1.50/1M DEVELOPER tier:
 
 - $50/month coordinator = 33M tokens/month of paid usage
 - 33M tokens at 50 tok/s = ~6 hours/day of one PLATINUM contributor in
@@ -237,8 +268,8 @@ self-hosted, below Haiku), the break-even math:
 
 Translation: **two paying developer customers + one PLATINUM
 contributor covers the founder's coordinator bill indefinitely.** A
-year-one milestone, not a unicorn target — and the explicit answer to
-"how does the founder stop self-hosting at a loss."
+year-one milestone, not a unicorn target — the explicit answer to "how
+does the founder stop self-hosting at a loss."
 
 ## 6. Contributor value proposition
 
@@ -574,13 +605,32 @@ quotas.
 **3b.ii — Paid customer layer**
 
 - [ ] Paid customer onboarding (signup, billing, API key issuance).
-      Three tiers: CASUAL flat-fee, DEVELOPER per-token API,
-      ENTERPRISE volume contracts.
+      Four tiers: CASUAL flat-fee, DEVELOPER realtime per-token,
+      BATCH non-realtime per-token, ENTERPRISE volume contracts.
 - [ ] Paid-job priority queue, separate from the contributor queue.
+      BATCH scheduler that fills jobs into low-utilization windows.
 - [ ] Opt-in toggle on the contributor agent — GOLD+ contributors can
-      enable serving paid jobs.
+      enable serving paid jobs (gated on 1-week reliability proof).
 - [ ] Bonus payout ledger (per-token earnings for paid jobs served).
 - [ ] Stripe Connect (or equivalent) for monthly contributor payouts.
+- [ ] **Supply-demand signal loop** — utilization-driven acquisition
+      triggers:
+
+      | Util | State | Action |
+      |---|---|---|
+      | <50% | Spare | Paid-customer acquisition (BATCH campaigns, dev forums) |
+      | 50–70% | Steady | No action |
+      | 70% | Yellow | Ops attention; DEVELOPER discount campaigns |
+      | 85% | Tight | Dashboard alert to offline GOLD+ contributors: "Usage is growing — consider adjusting your uptime to reach the next tier" |
+      | 90%+ | Surge | New-signup pricing surge; cap CASUAL signups |
+
+      Two-direction acquisition runs against the loop: low utilization
+      triggers paid-customer marketing (HN, r/MachineLearning, API
+      aggregator listings); high utilization triggers contributor
+      recruiting, **geographically targeted** to fix the time-of-day
+      anti-correlation (paid demand peaks 9–6 weekdays, gamer supply
+      peaks overnight/weekends — recruit EU/APAC contributors to fill
+      US business hours).
 
 **3b.iii — Trust & verification**
 

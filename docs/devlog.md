@@ -162,6 +162,43 @@ enterprise paid customers, not optional garnish.
 - Whether the coordinator should expose a leaderboard / public tier
   rankings, or keep tiers private.
 
+### Late-day refinements (same date)
+
+Subsequent discussion landed several additional model details, all now
+in README §5 / §14 and business.md:
+
+- **Tier promotion is instant** based on hardware + availability
+  declaration; **paid-pool eligibility** requires 1-week sustained
+  uptime + minimum claim rate. Decoupled to keep status frictionless
+  while gating earnings on real reliability.
+- **BATCH paid tier** added between CASUAL and DEVELOPER (~$0.75/1M
+  tokens, <24h latency). The supply-soak lever — fills off-peak
+  capacity at half price; modeled on AWS Spot. Most enterprise AI
+  workloads (embeddings, classification, doc analysis) are
+  batch-friendly.
+- **Realistic earnings by GPU class** documented in §5: basic 3060
+  nets ~$24/mo saturated, 4070 ~$58/mo, 4090 ~$87/mo (US-median
+  electricity, after 80% worker share). Margin per million tokens
+  holds 60–90% even in expensive electricity, but idle overhead bites
+  basic GPUs — demand-driven uptime signals are load-bearing for
+  3060-class contributors, not optional.
+- **Time-of-day anti-correlation** identified as the #1 unsolved
+  network constraint (paid demand peaks 9–6 weekdays, supply peaks
+  overnight). Three structural fixes documented: BATCH tier,
+  geographic contributor recruiting, eventual work-machine tier.
+- **Utilization-driven signal loop** with concrete thresholds
+  (50/70/85/90%) documented in §14 Phase 3b.ii. Two-direction
+  acquisition: low util → paid-customer marketing (HN, dev forums,
+  comparison pages); high util → geo-targeted contributor recruiting.
+- **Notification UX** principle: tier framing first, earnings second.
+  "Usage is growing — consider adjusting your uptime to reach the
+  next tier" — earnings mention gated to paid-pool-eligible
+  contributors only. No push notifications, no casino-style urgency.
+- **Honest pre-onboarding messaging** about earnings: "PLATINUM
+  qualifies you to earn; whether you do depends on demand." Visible
+  network-demand stats in the agent dashboard to prevent
+  disappointed-PLATINUM churn.
+
 ---
 
 ## 2026-05-09 — Strategy refresh: AI toolbox, not chat
