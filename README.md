@@ -1,15 +1,22 @@
 # GamerAI
 
-> **A distributed AI toolbox — chat, images, and web-augmented answers — running
-> on idle gaming PCs that earn money for their owners.**
+> **A community-powered AI suite — chat, images, and web-augmented answers —
+> where contributing a gaming PC earns you tier-based access for yourself and
+> the people you invite.**
 
 This repo is a fully local, containerized MVP. One command brings up a
 coordinator, Redis queue, SQLite store, a web UI, and any number of worker
-nodes that simulate gamer machines.
+nodes that simulate contributor machines.
 
 The MVP today serves a single tool (chat). The architecture is job-based and
 capability-routed by design, so adding image generation and web-augmented
 answers is additive — see § 14 (Roadmap) for the multi-tool plan.
+
+**Membership is contribute-to-use.** When you run the agent, your GPU serves
+jobs from the network's shared queue anonymously — not just your own
+invitees. A paid customer layer (Phase 3b+) funds bonus payouts to opt-in
+contributors who serve paying users, but free contributors always get
+priority. See § 5 (Economics).
 
 ```bash
 docker compose up --build
@@ -23,19 +30,34 @@ deploy details, decisions, and operational runbook.
 
 ## 1. Product overview
 
-GamerAI is a **distributed AI toolbox** running on a marketplace of consumer GPUs.
+GamerAI is a **community-powered AI suite** running on a network of
+contributor gaming PCs. Three actors:
 
-- **Workers** (gamers) install a small client and advertise the tools they can
-  run (chat, image generation, eventually doc/code/voice). When idle, the
-  machine joins the network and earns money for jobs it serves.
-- **Customers** submit jobs via a unified API or web UI. The coordinator routes
-  each job to a worker that advertises the matching capability.
-- **The platform** runs the coordinator, queue, ledger, and centralized
-  helpers (e.g. web search), and takes a percentage of each transaction.
+- **Contributors** install a small agent and advertise the tools their
+  hardware can run (chat, image generation, eventually doc/code/voice).
+  When the machine is idle, the agent serves jobs from the network's
+  **shared queue** — anonymously from the contributor's POV. In return,
+  contributors get tier-based access to the network's full AI suite for
+  themselves and the people they invite. Tier (BRONZE → PLATINUM) is
+  earned by uptime + capability + actual jobs served, not paid for.
+- **Invitees** are non-contributing friends, family, household members
+  invited by a contributor. Their usage comes from the inviter's quota;
+  the inviter sets their cap. Invitees do not need their own hardware.
+- **Paid customers** (Phase 3b+, not MVP) — CASUAL households,
+  DEVELOPER per-token API users, ENTERPRISE volume customers — pay for
+  access. Paid revenue funds bonus payouts to opt-in PRO/PLATINUM
+  contributors who serve paying jobs, and a capped share covers
+  coordinator infrastructure.
 
-The network is fully **per-job and per-tool**: every completed job is priced
-in its natural unit (tokens for chat, images for SDXL, requests for search)
-and credited to the worker's earnings ledger.
+**The coordinator** runs job routing, the tier engine, accounting, and
+centralized helpers (e.g. web search). It is the only platform-owned
+component; everything else (compute, data, models) lives on contributor
+machines. The platform never extracts from contributors — paid revenue
+only ever flows to bonus payouts + infra costs.
+
+The network is fully **per-job and per-tool**: every completed job is
+priced in its natural unit (tokens for chat, images for SDXL, requests
+for search) and credited to the contributor's ledger.
 
 ### Tools
 
@@ -68,14 +90,18 @@ The gap between #1 and #2 is the opportunity.
 
 ## 3. Solution
 
-A **two-sided marketplace** with:
+A **contribute-to-use community network** with an optional paid layer:
 
-- A **coordinator** that accepts jobs, queues them, dispatches to idle workers,
-  and tracks per-job payouts.
-- **Worker nodes** running on consumer hardware. They poll for jobs, run
-  inference locally (Ollama / llama.cpp / vLLM in production), and submit
-  results.
-- **Customers** that submit prompts via REST or a UI.
+- A **coordinator** that accepts jobs, queues them, dispatches to idle
+  contributors, tracks per-member contribution + consumption, and
+  enforces tier-based quotas. Eventually routes paid customer jobs to
+  the opt-in pool.
+- **Contributor agents** running on consumer hardware. They poll for
+  jobs from the shared queue, run inference locally (Ollama / llama.cpp
+  / vLLM), submit results, and earn tier-based access in return.
+- **Members and invitees** that submit prompts via REST or a UI; in a
+  future phase, paid customers do the same with separately metered
+  access.
 
 This MVP simulates the entire loop on a single host using Docker Compose.
 Nothing in the architecture assumes a single host beyond the default
@@ -142,58 +168,133 @@ coordinator records a deadline in Redis (`job_processing` hash). A background
 **reaper thread** scans for expired deadlines and **requeues** the job so it
 isn't lost if a worker disappears mid-job.
 
-## 5. Business model
+## 5. Economics
 
-### Revenue
+The economics are **three layers stacked**: free contributor-tier access
+forms the foundation, an optional paid customer layer funds the
+coordinator and bonus payouts, and PRO/PLATINUM contributors can opt
+into earning from paid jobs.
 
-Customers pay per token. Default reference pricing baked into the MVP:
+### Layer 1 — Contribute compute, earn tiered access (MVP)
+
+Contributing is free; access is tiered by what you actually contribute.
+
+| Tier | Criteria (target) | Benefits |
+|---|---|---|
+| **BRONZE** | Agent installed, intermittent uptime | Full toolbox; small monthly quota; 1 invite slot |
+| **SILVER** | ~4 hrs/day average uptime | 5× quota; 3 invites; queue priority over BRONZE |
+| **GOLD** | ~12 hrs/day; multi-tool capable | 20× quota; 10 invites; opt-in to paid-job pool |
+| **PLATINUM** | ~20+ hrs/day; high-VRAM card | Effectively unlimited; first dibs on new tools; full paid-pool participation |
+
+Tier promotion is **uncapped meritocracy** — anyone willing to run a
+4090 24/7 can be PLATINUM. Scarcity (when paid demand outstrips supply)
+gets fought by recruiting more contributors, not by gatekeeping tier
+slots. The PRO/PLATINUM badge stays prestigious because the effort is
+real, not because the slots are.
+
+Tier maintenance requires **both uptime AND actual jobs served** — an
+agent that idles online while refusing jobs (a forked agent, for example)
+falls down the ladder. The coordinator measures claimed-jobs-per-hour
+as the source of truth.
+
+### Layer 2 — Paid customer tiers (Phase 3b+; not MVP launch)
+
+| Tier | Audience | Pricing shape |
+|---|---|---|
+| **CASUAL** | Households without a gaming PC | Flat monthly fee, generous-but-capped quota |
+| **DEVELOPER** | App builders | Per-token API; priced between Anthropic Haiku ($1.25/1M) and self-hosted |
+| **ENTERPRISE** | Companies | Volume contract + dedicated worker pool + SLA |
+
+Paid customer demand is served from a **separate priority queue** that
+only contributors at GOLD+ who **opt in** can see. Free contributor
+tiers are never degraded by paid demand — if paid demand exceeds opt-in
+supply, paid customers see queue delays or capped service, not
+contributors.
+
+### Layer 3 — Bonus payouts to opt-in contributors
+
+Paid revenue distribution:
 
 ```
-$5 per 1M tokens   →   RATE_PER_TOKEN = $0.000005 / token
+80% → contributor who served the paid job (per-token payout)
+20% → platform (coordinator infra + future development)
 ```
 
-(For comparison: GPT-4o is ~$10/1M output tokens, Claude Haiku is ~$1.25/1M.
-GamerAI targets the value tier with consumer GPUs.)
+This **aligns incentives**: adding paid customers grows the prize pool,
+which attracts more PLATINUM uptime, which grows total network
+capacity, which benefits free contributors too. The platform never
+extracts from contributor activity — only from paid activity, capped.
 
-### Costs
+### Sustainability target
 
-The platform pays workers a fixed share per token:
+Coordinator infra: ~€8/month today; ~$50/month at 1k users; ~$200/month
+at 10k users. At a DEVELOPER paid tier of **$1.50/1M tokens** (above
+self-hosted, below Haiku), the break-even math:
 
-```
-WORKER_SHARE = 0.7      # gamer keeps 70%
-PLATFORM     = 0.3      # platform keeps 30%
-```
+- $50/month coordinator = 33M tokens/month of paid usage
+- 33M tokens at 50 tok/s = ~6 hours/day of one PLATINUM contributor in
+  the paid pool
 
-### Margin
+Translation: **two paying developer customers + one PLATINUM
+contributor covers the founder's coordinator bill indefinitely.** A
+year-one milestone, not a unicorn target — and the explicit answer to
+"how does the founder stop self-hosting at a loss."
 
-```
-worker payout per token   = $0.000005 * 0.70 = $0.0000035
-platform margin per token = $0.000005 * 0.30 = $0.0000015
-```
+## 6. Contributor value proposition
 
-At 1B tokens/month: **$1,500/month gross margin** before infra costs (which
-are minimal — coordinator + Redis + DB; the GPUs are not on the platform's
-balance sheet).
+Why someone runs the agent on their gaming PC. The dial that controls
+each of these is **uptime + capability + jobs served** (i.e. your tier):
 
-## 6. Worker value proposition
+- **Be the host.** You're the person who runs AI for your household,
+  friend group, D&D group, coworking space — whoever you invite.
+- **Your own access** to the full toolbox, tiered by what you
+  contribute. PLATINUM contributors effectively never hit their cap.
+- **Status that compounds.** Tier badges on the leaderboard; first
+  access to new tools as they ship; longer Ollama keep-alive windows so
+  your latency stays low.
+- **Opt-in paid-pool bonuses at GOLD+.** Earn per-token payouts on paid
+  customer jobs you serve. Power consumption scales with paid demand,
+  and so do the payouts — power bill and bonus are correlated, not
+  decoupled.
+- **No exclusivity.** Leave the network at any time; in-flight jobs are
+  automatically requeued by the reaper. Your tier drops over time if
+  you stop contributing, but rejoining is one-click.
 
-- **Passive income** from a machine that's already on.
-- **Zero work when idle** — workers respect an availability window and skip
-  inference outside it.
-- **Transparent earnings** — every completed job credits the ledger; check
-  `GET /earnings/{worker_id}` or the dashboard at any time.
-- **No exclusivity** — workers can leave the network at any time; in-flight
-  jobs are automatically requeued by the reaper.
+**Power draw scales with demand, not uptime.** A contributor's marginal
+power cost: ~0 W when no jobs are arriving, ~30 W during the Ollama
+keep-alive window after a recent job, ~250–400 W during active
+inference. Leaving the agent online overnight on a quiet network costs
+near-zero; bursts of real power happen when there are real users (and,
+at GOLD+, real payouts).
 
-## 7. Customer value proposition
+## 7. User experience
 
-- **Cheaper inference** — consumer GPUs at scale undercut hyperscaler pricing
-  for many workloads.
-- **Scalable background processing** — async-friendly API, no rate limits
-  beyond the size of the worker pool.
-- **Optional privacy angle** — open-source models running on independent
-  nodes; the platform never sees the model weights and customers can pin
-  jobs to vetted worker pools (future).
+Two distinct audiences, both reaching the same coordinator:
+
+### For contributors and their invitees (the default audience)
+
+- **No subscription.** You're already paying with idle GPU cycles.
+- **Prompts handled by community-contributed GPUs**, not OpenAI's or
+  Anthropic's data centers. Your data is not used to train anyone's
+  model.
+- **Full toolbox in one place** — chat, image, search, and whatever
+  ships next, behind a unified UI.
+
+> **Privacy framing — honest version.** Under the membership rule, your
+> prompts traverse the contributor network (not the public internet,
+> not a hyperscaler) but they do flow through random contributors'
+> GPUs, not specifically your inviter's machine. For sensitive
+> prompts, the Phase 5 client-side embedding tier removes raw text
+> from the wire — that's the answer to "is this private *enough*."
+
+### For paid customers (Phase 3b+)
+
+- **Undercut Anthropic Haiku on price** — gaming-PC supply is
+  structurally cheaper than data-center supply.
+- **Async-friendly API**, no rate limits beyond the size of the opt-in
+  PRO/PLATINUM pool.
+- **Opt-in privacy-tier routing** for enterprise: pin jobs to vetted
+  worker pools, client-side embedding for the strictest cases.
 
 ## 8. Limitations (honest)
 
@@ -419,12 +520,13 @@ The VPS path keeps us shipping; Terraform comes when at least one of these
 is true: 10+ active workers, real money flowing, multi-region latency
 needs, or SQLite contention.
 
-### Phase 3 — AI toolbox + marketplace
+### Phase 3 — AI toolbox + community plumbing + paid layer
 
 The strategic reframing: the platform is not a chat API, it's a *job-based
-toolbox* of independent, retryable, latency-tolerant AI workloads. Phase 3
-turns the chat-only MVP into a multi-tool product and adds the marketplace
-plumbing that lets it scale.
+toolbox* of independent, retryable, latency-tolerant AI workloads served
+by a contributor network. Phase 3 turns the chat-only MVP into a multi-
+tool product, adds membership + tier infrastructure, then layers in the
+optional paid customer revenue.
 
 **Phase 3a — multi-tool foundations**
 
@@ -447,15 +549,51 @@ plumbing that lets it scale.
 - [ ] Unified "toolbox" UI — slash-commands or tabs in the web client so
       one chat surface can dispatch any of the three job types.
 
-**Phase 3b — marketplace dynamics**
+**Phase 3b — community plumbing first, paid layer second**
 
-- [ ] Multiple model tiers with per-tier pricing (chat-7B vs chat-13B,
-      image-SDXL vs image-SD1.5, etc.).
+The strategic order: community/tier infrastructure ships before the
+paid layer. Without tiers and invites, the paid pool has nothing to
+opt into; without membership accounting, there's no fair way to gate
+quotas.
+
+**3b.i — Membership and tier engine**
+
+- [ ] Member token issuance (replaces the single shared API token).
+      Tokens identify a contributor; coordinator records them on every
+      job for tier accounting.
+- [ ] Tier promotion engine — measures uptime + capability + claimed-
+      jobs-per-hour; promotes/demotes contributors across BRONZE →
+      PLATINUM nightly.
+- [ ] Per-tier quota enforcement on `/generate`. Free quota = sum of
+      contributor's own + each invitee's remaining allowance.
+- [ ] Invitee/invite flow — contributor invites by email; sets cap
+      (% of own quota or absolute tokens); revokes/adjusts anytime.
+- [ ] Host admin UI — manage invitees, see your tier, see jobs
+      contributed vs. jobs consumed.
+
+**3b.ii — Paid customer layer**
+
+- [ ] Paid customer onboarding (signup, billing, API key issuance).
+      Three tiers: CASUAL flat-fee, DEVELOPER per-token API,
+      ENTERPRISE volume contracts.
+- [ ] Paid-job priority queue, separate from the contributor queue.
+- [ ] Opt-in toggle on the contributor agent — GOLD+ contributors can
+      enable serving paid jobs.
+- [ ] Bonus payout ledger (per-token earnings for paid jobs served).
+- [ ] Stripe Connect (or equivalent) for monthly contributor payouts.
+
+**3b.iii — Trust & verification**
+
+Demoted from Phase 3 critical-path under the tier-based meritocracy
+model — bad actors fall down the ladder organically. Still worth
+shipping when there's real volume:
+
 - [ ] Dynamic pricing based on supply/demand
-- [ ] Worker reputation + slashing for bad output
-- [ ] Result verification (challenge jobs, k-of-n consensus)
-- [ ] Customer dashboards, billing, invoicing
-- [ ] Worker payout rails (Stripe Connect / crypto)
+- [ ] Worker reputation scoring (independent of tier, e.g. "did the
+      response satisfy the user")
+- [ ] Result verification (challenge jobs, k-of-n consensus on a
+      random sample)
+- [ ] Customer dashboards, billing history, invoicing
 
 ### Phase 4 — frontier-model support (big-model expansion)
 
@@ -492,22 +630,34 @@ private pipeline groups.
 - [ ] Peer-to-peer weight distribution (SHARDCAST-style) so adding a new
       model doesn't saturate platform egress.
 
-This stages the risk: Phase 4a proves customers will pay for big-model
-inference on our marketplace without us building any of the hard parts;
-Phase 4b is what makes us a real network instead of a Petals reseller.
+This stages the risk: Phase 4a proves paid customers will pay for big-
+model inference through our coordinator without us building any of the
+hard parts; Phase 4b is what makes us a real network instead of a Petals
+reseller.
 
 See `research/big-models-feasibility.md` for the underlying analysis.
 
 ### Phase 5 — privacy tiers
 
-The Phase 4 architecture has an honest privacy gap: in pipeline-parallel
-inference, the worker that runs the embedding layer sees the customer's
+The community-powered model has a baseline privacy story: prompts
+traverse the contributor network, not a hyperscaler — no training-on-
+prompts, no surveillance harvesting. But under the membership rule
+(contributors serve the shared queue, not just their own invitees),
+strangers' GPUs do see prompts in cleartext. That's fine for most
+casual use; it's not fine for enterprise customers or sensitive
+prompts.
+
+Phase 4 adds an additional privacy gap when pipeline-parallel inference
+ships: the worker that runs the embedding layer sees the customer's
 raw prompt. Middle workers see hidden-state vectors (not human-readable,
 but theoretically invertible). The last worker sees the output logits.
 
 We won't match a hyperscaler's "your data never leaves our datacenter"
 story by default, but we can offer tiered privacy that's good enough for
-most workloads — and better than centralized providers for some.
+most workloads — and better than centralized providers for some. The
+**client-side embedding tier** (below) is the load-bearing item for
+enterprise paid customers and any contributor who wants a real privacy
+guarantee.
 
 - [ ] **Standard tier (default).** TLS in transit, prompts handled in
       worker memory only, agent never writes prompts to disk, ephemeral

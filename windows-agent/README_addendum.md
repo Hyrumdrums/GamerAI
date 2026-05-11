@@ -17,13 +17,31 @@ internal services.
    - no keyboard or mouse input for **60+ seconds**, AND
    - CPU usage below **30%**.
 3. When idle, it asks the coordinator for the next job, runs inference, and
-   submits the result. Earnings (USD per token) are credited to your
-   `worker_id` and printed to the log every ~10 minutes.
+   submits the result. Tokens served are credited to your contribution
+   ledger and drive your tier (BRONZE → PLATINUM) on the network. Tier
+   determines your monthly quota for using the network's AI suite plus
+   how many invitees you can grant access to.
 4. The instant the user touches the keyboard/mouse — or CPU rises — the
    agent reports `offline` and stops accepting new jobs. The current job (if
    any) finishes; nothing is killed mid-inference.
 
 All thresholds are tunable in `config.json`.
+
+### Power draw is demand-driven, not uptime-driven
+
+A common worry: "if I leave the agent online overnight, will my power bill
+explode?" No — power scales with paid demand, not uptime:
+
+| State | GPU draw (marginal) |
+|---|---:|
+| Online, no jobs | ~0 W |
+| Online, model warm (Ollama keep-alive window) | ~30 W |
+| Active inference | ~250–400 W |
+
+So "leave it on overnight" costs near-zero on a quiet network.
+Contributors burning real power are also serving real demand — and, at
+GOLD+ in the opt-in paid pool, earning per-token bonuses that offset
+that power cost.
 
 ---
 
@@ -117,19 +135,25 @@ If you want to use a real local model instead of mock inference, install
 
 ---
 
-## How earnings work
+## How contribution accounting works
 
-Every completed job credits your worker:
+Two parallel ledgers track what your agent does on the network:
 
-```
-earnings_usd = completion_tokens * RATE_PER_TOKEN * WORKER_SHARE
-```
+### 1. Contribution ledger (every contributor)
 
-Defaults on the platform: `RATE_PER_TOKEN = $0.000005`, `WORKER_SHARE = 0.7`.
+Every completed job credits your contributor record with:
+- **tokens contributed** — how much work your GPU served the network
+- **tokens consumed** — how much you (and your invitees) drew from the
+  network's shared pool
 
-The coordinator is the source of truth — your local `state.json` is just a
-mirror so you can see totals without a network call. Verify against the
-coordinator any time:
+These two numbers drive your **tier** (BRONZE → PLATINUM). The
+coordinator promotes/demotes contributors nightly based on uptime,
+capability, and the ratio of claimed jobs to online time. Tier sets your
+monthly quota, invite slots, and eligibility for the paid pool.
+
+The coordinator is the source of truth — your local `state.json` is just
+a mirror so you can see totals without a network call. Verify against
+the coordinator any time:
 
 ```
 GET  https://<coordinator>/earnings/<worker_id>
@@ -137,8 +161,24 @@ GET  https://<coordinator>/earnings/<worker_id>
 
 Or run `agent.exe --status` to see what the agent has tracked locally.
 
-Payouts in this MVP are **simulated only**. There is no real cash settlement
-yet — see the main README's roadmap for Phase 3 (marketplace + payout rails).
+### 2. Bonus payouts (opt-in, GOLD+)
+
+Once the **paid customer layer** ships (Phase 3b.ii in the main README
+roadmap), GOLD+ contributors can opt into serving paid jobs. When you
+do:
+
+```
+bonus_usd = paid_completion_tokens * paid_rate_per_token * 0.80
+```
+
+80% of the paid customer's per-token price goes to whichever
+contributor served the job. 20% goes to the platform to cover
+coordinator infrastructure and future development.
+
+Bonus payouts are **simulated only** in today's MVP — there is no real
+cash settlement yet. The infrastructure to issue real payouts (Stripe
+Connect, ACH, 1099s) ships with Phase 3b.ii. See the main README's
+roadmap.
 
 ---
 
@@ -192,9 +232,12 @@ Read this before installing on someone else's machine.
 - **The agent uses HTTP only by default.** In production, set
   `coordinator_url` to an HTTPS endpoint. Otherwise prompts and results
   travel in cleartext.
-- **No auth in the MVP.** Anyone with the coordinator URL can submit jobs
-  that your machine may run. Run only against coordinators you control or
-  trust until auth lands (Phase 2 in the main roadmap).
+- **Auth is the membership gate.** Once membership ships (Phase 3b.i),
+  the `api_token` in `config.json` IS your contributor identity — it's
+  how the coordinator credits your tier and accounts for the people you
+  invite. Do not share it; do not run without it. Today (pre-membership),
+  the token is optional; do not run against an unauthenticated
+  coordinator you don't control.
 - **The agent does not run as a Windows service or with elevated privileges.**
   It runs in the current user's session. To stop it: close the window, or
   kill `agent.exe` from Task Manager. The Inno Setup uninstaller removes

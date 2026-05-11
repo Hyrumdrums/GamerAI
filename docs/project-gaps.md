@@ -30,14 +30,20 @@ clients (worker, Windows agent, web UI, CLI) automatically include the
 header when the token is set. The bootstrap generates a random token at
 deploy time. See `infra/README.md` for the runbook.
 
-### 🔴 No customer identity / API keys
+### 🔴 No membership identity / tier accounting
 
-There's no concept of "who submitted this job." The `WORKER_TOKEN` above
-gates *access*, not *identity*. We can't bill, rate-limit, or attribute
-abuse without per-customer keys.
+There's no concept of "who submitted this job." The `API_TOKEN` above
+gates *network access*, not *which member submitted what*. Under the
+community-powered model (see README § 5 Economics), we need per-member
+identity to: (a) credit contributors for compute served, (b) enforce
+per-tier quotas on consumption, (c) attribute jobs through the
+Alice → Bob invitee chain, (d) eventually bill paid customers.
 
-**Fix:** add a tiny `api_keys` table; require `X-API-Key` on `/generate`
-and `/result`; record `customer_id` on every job row.
+**Fix:** member token issuance per identity (contributor, invitee, paid
+customer). Coordinator records the submitting member on every job row;
+the tier engine reads contribution + consumption rates from the ledger
+to promote/demote BRONZE → PLATINUM. Same plumbing later supports
+per-customer billing for the Phase 3b.ii paid layer.
 
 ### 🔴 No prompt safety / content controls
 
@@ -282,36 +288,59 @@ Builds aren't reproducible; CVE introduction is silent.
 
 ## 5. Business / go-to-market
 
-### 🔴 No payout rails
+### 🔴 No invite / membership flow
 
-Earnings are tracked, not paid. A gamer has zero incentive to install
-the agent until we can write them money.
+The system has no signup, no invite, no per-member identity. Under the
+community-powered model the contributor IS the first user, so we need:
+contributor onboarding (the Windows agent installer is most of this),
+the Alice → Bob invitee flow (contributor invites by email + sets cap),
+and a host admin UI for managing invitees / seeing one's own tier.
 
-**Fix:** start with Stripe Connect for ACH payouts; minimum threshold
-($25); 1099 handling.
+**Fix:** Phase 3b.i critical-path work. The agent installer covers most
+of the contributor side; the invite + admin UI is the new build.
 
-### 🟡 No pricing tier structure
+### 🔴 No payout rails — for the paid-revenue → bonus flow (Phase 3b.ii)
 
-Single `RATE_PER_TOKEN` flat across all models. We can't charge more
-for 70B than for 1B.
+Severity preserved, scope reframed. Under contribute-to-use, free
+contributors are not paid — they're rewarded with tier-based access.
+But once the **paid customer layer** ships, 80% of paid revenue flows
+back to opt-in GOLD+/PLATINUM contributors who served the paid jobs.
+That flow needs real money rails.
 
-**Fix:** per-model pricing in the model registry above.
+**Fix:** Stripe Connect for monthly contributor payouts; minimum
+threshold ($25); 1099 handling. Required for Phase 3b.ii, not before.
 
-### 🟡 No customer signup flow
+### 🟡 No tier structure
 
-The system has no /signup, no /login, no Stripe customer creation, no
-quota assignment. To get to first revenue we need at minimum a sign-up
-form that mints an API key and a Stripe customer.
+Severity preserved, scope expanded. Tier structure spans both sides of
+the network:
 
-**Fix:** small Phase 2b scope. Could outsource to Clerk + Stripe
-billing portal in a weekend.
+- **Contributor tiers** (BRONZE → PLATINUM) gate quota, invite slots,
+  paid-pool opt-in eligibility. Driven by uptime + capability +
+  claimed-jobs-per-hour metric.
+- **Paid customer tiers** (CASUAL / DEVELOPER / ENTERPRISE) gate pricing
+  shape, SLA, and privacy-routing options.
+- **Per-model pricing** for paid customers (a chat-13B call should cost
+  more than chat-7B; SDXL images priced separately).
+
+**Fix:** ships alongside the member identity work in 3b.i, then
+expands for paid pricing in 3b.ii.
 
 ### 🟡 No legal: ToS, privacy policy — partial
 
-Code now licensed Apache-2.0 (see `LICENSE`). Still missing: customer
-Terms of Service, privacy policy, and an explicit worker agreement
-covering the "you run prompts you didn't write" risk. Pull from
-Termly / iubenda templates before recruiting non-friends.
+Code now licensed Apache-2.0 (see `LICENSE`). Still missing under the
+community-powered framing:
+- **Community ToS + acceptable-use policy** — covers all members
+  (contributors and invitees), not just paid customers.
+- **Contributor agreement** — covers the "your GPU runs prompts you
+  didn't write, including from invitees you don't know" risk, plus the
+  opt-in paid-pool participation contract.
+- **Paid-customer commercial ToS** — Phase 3b.ii prerequisite.
+- **Privacy policy** — must be honest about the membership rule (your
+  prompts traverse the contributor network, not specifically your
+  inviter's GPU). See README § 5 privacy framing note.
+
+Pull from Termly / iubenda templates before recruiting non-friends.
 
 ### 🟢 No marketing surface
 
@@ -347,12 +376,23 @@ work them in. Highest leverage first.
    ✅ Done — capability-aware *routing* deferred to Phase 4.
 6. **Uptime Kuma (or equivalent) hitting `/health`.** **~½ day.**
 7. **SQLite nightly backup cron with weekly rotation.** **~½ day.**
-8. **Worker agreement + ToS** from a template. **~½ day.**
-9. **Python SDK** (thin wrapper, OpenAI-compatible signature). **~1–2 days.**
-10. **Recruit 3 real gamer workers and run end-to-end.** The actual
-    experiment. **~½ day, plus calendar time.**
+8. **Member identity + tier accounting** — per-member tokens, jobs
+   recorded against the submitter, daily tier evaluation. The
+   foundation for everything else under the community-powered model.
+   **~2 days.**
+9. **Invite / admin flow (Alice → Bob)** — contributor invites by email,
+   sets cap, host admin UI for tier + invitees. **~2–3 days.**
+10. **Community ToS + contributor agreement** from a template. **~½ day.**
+11. **Recruit 3 real gamer contributors and run end-to-end.** The
+    actual experiment. **~½ day, plus calendar time.**
 
-That's ~10 working days of engineering plus the recruitment / business
+Notably *not* on this list anymore: per-token pricing rollout, Stripe
+Connect, customer signup, marketing landing page, Python SDK. Those all
+move down to Phase 3b.ii once the membership/tier engine is in place —
+selling paid access to a network that doesn't yet have a member identity
+or a tier ladder is putting the cart before the horse.
+
+That's ~10 working days of engineering plus the recruitment / community
 items. After that, reassess: is anyone using it? If yes, push into the
-big-model plan in Phase 4. If no, the gap is in distribution and
-pricing, not the platform.
+paid-customer layer (3b.ii) and the big-model plan in Phase 4. If no,
+the gap is in distribution and recruitment, not the platform.

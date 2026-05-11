@@ -1,71 +1,124 @@
-# Startup Pitch: Decentralized AI Compute Network
+# Startup Pitch: Community-Powered AI Network
 
 ## One-liner
-We turn idle gaming PCs into a global, energy-aware **AI toolbox**—chat,
-images, web-augmented answers, and more—delivered without massive data
-centers.
+Plug your gaming PC into a community AI network. You contribute idle compute
+to the shared pool; you and the people you invite get tier-based access to
+the network's full AI suite — chat, images, web-augmented answers, and more.
+Paying customers (later) help fund the contributors who serve them.
+
+## Core mechanic — contribute-to-use
+Contributing compute is the membership requirement. When you run the agent,
+your GPU serves jobs from the network's shared queue anonymously — not just
+your own invitees. In return, you earn tier-based access (BRONZE → PLATINUM)
+that scales with your uptime and what your hardware can run. No subscription,
+no per-token billing, no data leaving for OpenAI's data center.
 
 ## The Problem
-AI demand is exploding—but the infrastructure model is breaking.
+AI demand is exploding — and the infrastructure model is breaking.
 
-Hyperscale data centers (like the proposed Utah project backed by Kevin O'Leary) require:
+Hyperscale data centers (like the proposed Utah project backed by
+Kevin O'Leary) require:
 - gigawatts of power
 - massive land use
 - heavy water consumption
 - Communities are pushing back
-- Energy supply is becoming the bottleneck—not chips
+- Energy supply is becoming the bottleneck — not chips
 
-At the same time:
-- Millions of high-end GPUs sit idle in gaming PCs every day
-- Developers face:
-  - high API costs
-  - infrastructure complexity
-  - limited access to scalable compute
+At the same time, households and friend groups are stacking subscriptions:
+- $20/month per seat on ChatGPT Plus across the whole household
+- Image generation behind another paywall (Midjourney, etc.)
+- Coding assistants behind another (Copilot, Cursor)
+
+Meanwhile **millions of high-end GPUs sit idle in gaming PCs every day**
+that could serve a whole friend group's everyday AI needs.
 
 ## The Solution
-A distributed AI compute marketplace.
+A contribute-to-use community network with an optional paid layer.
 
-We connect:
-- Idle GPUs (supply) → gamers, prosumers
-- AI workloads (demand) → developers, startups
+- **Contributors** (gamers, prosumers) plug their GPU into the network.
+  Their machine serves the network's shared queue when idle.
+- **Invitees** (their household, friends, family) get access without
+  needing their own hardware; the contributor sets each invitee's cap.
+- **Paid customers** (later, optional) — households without a gaming PC,
+  app developers, enterprises — pay for access. Most paid revenue flows
+  back to PRO/PLATINUM contributors who opt into serving paid jobs.
 
-Through a lightweight agent, users opt in to contribute compute when idle.
+The contributor's GPU is the only supply. The platform never extracts
+from contributor activity — only from paid activity, with a capped share
+that funds coordinator infrastructure.
 
 ## How it works
+
 ```
-Developer → API request → Coordinator
-                         ↓
-              Distributed GPU network
-                         ↓
-                   Response returned
+Contributor agent → idle GPU →┐
+                              │
+                              ▼
+              Coordinator (shared job queue)
+                              ▲
+                              │
+    Invitee / contributor / paid customer
+                              │
+                              ▼
+                        Response returned
 ```
 
-- Jobs are routed dynamically
-- Workers are paid per task
-- System scales organically with supply
+Three loops, layered:
+
+1. **Free access loop.** Contributor runs the agent → earns BRONZE →
+   PLATINUM tier → tier sets quota + invite slots → contributor and
+   their invitees consume the suite for free.
+2. **Anti-freeloading.** Tier maintenance requires both uptime AND
+   claimed-jobs-per-hour, so a contributor can't run a closed agent
+   that only serves their own friends. Modeled on BitTorrent ratios.
+3. **Paid revenue loop (Phase 3b+).** Paid customers buy access; their
+   jobs go to a priority queue served only by opt-in GOLD+ contributors.
+   80% of paid revenue → contributors who served the jobs; 20% → platform
+   (coordinator + future development).
 
 ## Why now
 Three trends converge:
 1. AI demand outpacing infrastructure
 2. Rising resistance to hyperscale data centers
 3. Huge untapped edge compute (gaming GPUs)
+4. **Household AI subscription fatigue** — paying for ChatGPT, Midjourney,
+   and Copilot per seat across a family adds up fast when one contributor's
+   gaming PC could serve them all.
 
 ## Business Model
-- Charge developers per token (e.g. $3–$8 / 1M tokens)
-- Pay workers ~60–70% of revenue
-- Platform keeps margin
+
+The economics are layered:
+
+**Layer 1 — Free contributor-tier access (MVP).** Tiers earned by
+contribution; no money changes hands. The contributor is the primary
+user, not a labor force.
+
+**Layer 2 — Paid customer tiers (Phase 3b+).**
+- CASUAL — households without a gaming PC, flat monthly fee
+- DEVELOPER — per-token API, between Haiku ($1.25/1M) and self-hosted
+- ENTERPRISE — volume + SLA + dedicated worker pools
+
+**Layer 3 — Bonus payouts.** 80% of paid revenue → opt-in PRO/PLATINUM
+contributors who actually served the paid jobs (per-token). 20% →
+platform for coordinator infra and future development.
+
+**Sustainability target:** at $1.50/1M tokens to DEVELOPER customers,
+two paying developers + one PLATINUM contributor in the paid pool covers
+the coordinator bill (~$50/mo at 1k users). Not a unicorn target — a
+year-one milestone that gets the founder off self-hosting at a loss.
 
 ## Target Customers
 
-**Phase 1**
-- indie developers
-- startups
-- cost-sensitive AI workloads
+**Foundation: contributors and their invitees**
+- gamer households
+- friend groups, D&D groups, college dorms, coworking spaces
+- small organizations where one person can host
 
-**Phase 2**
-- batch processing pipelines
-- document processing
-- embeddings at scale
+**Paid customer segments (Phase 3b+)**
+- **CASUAL** — households without a gaming PC (replacement for
+  per-seat ChatGPT Plus)
+- **DEVELOPER** — indie devs, startups, cost-sensitive AI workloads
+- **ENTERPRISE** — batch processing, document workflows, embeddings at
+  scale, regulated industries via the privacy tier
 
 ## Supported tools
 
@@ -99,49 +152,68 @@ routes each job to a worker advertising the matching capability.
 
 ## Competitive Positioning
 
-| Option | Cost | Setup | Power |
-| --- | --- | --- | --- |
-| Local models (e.g. Llama 3.2 1B) | low | medium | low |
-| OpenAI / Anthropic | high | low | very high |
-| Us | low | low | medium-high |
+| Option | Cost to user | Setup | Quality | Privacy |
+| --- | --- | --- | --- | --- |
+| Local-only (Ollama on your own machine) | Free, but power costs | High | Limited by your own hardware | Best |
+| OpenAI / Anthropic / etc. | High ($20/seat/mo) | None | Top tier | Worst (trains on prompts unless you pay extra) |
+| **Us** | **Free for contributors and their invitees; modest for paid customers** | **Run an agent, or get invited** | **8B–13B baseline today; pipeline to bigger models on the roadmap** | **Community network — no hyperscaler in the path** |
 
-We sit in the middle: more powerful than local, cheaper than cloud.
+We don't compete with OpenAI on quality at the frontier. We compete on
+*"my friend runs this for our group"* — and on the household-subscription
+fatigue that's compounding across every consumer AI category.
 
 ## The Bigger Vision
 We're not just a compute network. We're building:
 
-**Energy-aware AI infrastructure**
-- Jobs routed to where energy is cheapest or most available
+**Community-owned AI infrastructure**
+- Hyperscalers can't be your friend's GPU
 - Compute scales without building new data centers
-- Turns wasted energy + idle GPUs into useful work
+- Turns wasted energy + idle GPUs into household-scale AI
 
 **Distributed efficiency**
 - Heat stays in homes instead of data centers
 - No massive cooling infrastructure
 - No single point of failure
+- Energy-aware routing (Phase 4): jobs go where electricity is cheapest
+  or cleanest at that moment
 
 ## Strategic Advantage
 Hyperscalers scale by building bigger.
-We scale by connecting what already exists.
+We scale by **connecting people who already have idle GPUs to people who
+already trust them**. The community is the moat: incumbent providers
+can't be your D&D group's host, your family's host, your coworking
+space's host. We can.
 
 ## Roadmap
 
 **Phase 1 (done)**
 - Local MVP (Docker + workers)
-- Basic job routing + payouts
+- Basic job routing + payouts ledger
 
 **Phase 2 (now)**
-- Public single-VPS deploy (live at ai.dallinlayton.com — see `docs/devlog.md`)
-- Real GPU workers via the Windows agent
+- Public single-VPS deploy validated (real Llama-3.2:1b on CPU, then
+  Llama-3.1:8b on a real consumer GPU at ~50 tok/s — see `docs/devlog.md`)
+- Real GPU contributors via the Windows agent
 
 **Phase 3**
-- AI toolbox foundations: `job_type` + capability routing + web search +
-  image generation
-- Marketplace dynamics: per-tier pricing, reputation, payouts
+- 3a — AI toolbox foundations: `job_type` + capability routing + web
+  search + image generation
+- 3b.i — Membership and tier engine: invite flow, tier promotion engine,
+  per-tier quotas, Alice→Bob invitee mechanic, host admin UI
+- 3b.ii — Paid customer layer: paid-job priority queue, per-tier paid
+  pricing, Stripe Connect for contributor bonuses, opt-in pool for
+  GOLD+ contributors
+- 3b.iii — Trust & verification: dynamic pricing, reputation scoring,
+  challenge jobs, customer dashboards
 
 **Phase 4**
+- Big-model support (Petals → EXO) for frontier-class workloads
 - Energy-aware routing
 - Global scaling
+
+**Phase 5**
+- Privacy tiers, especially client-side embedding for sensitive prompts
+  and enterprise customers
 
 ## Risks (and why we still win)
 - **Latency** → Target async + batch workloads first
