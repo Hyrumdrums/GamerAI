@@ -5,6 +5,165 @@ entries on top. Skim for context before resuming work.
 
 ---
 
+## 2026-05-11 — Business plan: community-powered, tier-based, layered paid
+
+Second strategy pivot in three days. The 2026-05-09 entry reframed the
+*tools* (AI toolbox, not chat-only). This one reframes the *economics*:
+contribute-to-use with tier-based access for contributors and their
+invitees, optional paid customer layer in Phase 3b.ii to fund the
+network.
+
+### Trigger
+
+The Windows-worker throughput test landed at ~50 tok/s sustained on
+llama-3.1:8b — a ~7.7× uplift over the CPU-only VPS baseline (6.5 tok/s
+on llama-3.2:1b). Great capability demo. But the marketplace math
+implied by yesterday's $5/1M-tokens pricing gave a contributor ~$1.30/day
+of theoretical earnings — well below the marginal power cost of a
+saturated gaming GPU.
+
+The user pushed back: the payoff isn't a USD revenue split — **it's a
+community AI service powered by their friends and neighbors**. The
+revenue dance is the wrong axis to optimize against.
+
+### Three-layer model (canonical)
+
+1. **Foundation: contribute compute, earn tiered access (MVP).** Free
+   contributor tiers (BRONZE → PLATINUM) gated by uptime + capability
+   + claimed-jobs-per-hour. Tier sets quota and invite slots. Earning
+   higher tiers is the entire engagement loop — no money required to
+   participate.
+
+2. **Optional paid customer layer (Phase 3b.ii, not MVP launch).** Three
+   segments: CASUAL flat-fee households, DEVELOPER per-token API,
+   ENTERPRISE volume contracts. Paid jobs land in a separate priority
+   queue served only by opt-in GOLD+ contributors. Contributor-tier free
+   access is *never* degraded by paid demand.
+
+3. **Bonus payouts (Phase 3b.ii).** 80% of paid revenue flows to the
+   contributor who served the paid job. 20% to the platform for
+   coordinator infra + future development. The platform never extracts
+   from contributor activity — only from paid activity, capped.
+
+### Membership requirement — anti-freeloading
+
+Contributing to the **shared network pool** is non-negotiable. The
+agent serves the global queue anonymously, not just the contributor's
+own invitees. Without this rule, a closed friend group could run the
+agent only for their own circle and use the coordinator as a free
+fancy LAN service. Modeled on BitTorrent ratios, Tor relays, mesh
+Wi-Fi, Folding@home.
+
+Tier maintenance requires both uptime AND claimed-jobs-per-hour, so a
+fork that idles online without claiming jobs falls down the ladder.
+
+**Architectural implication: zero.** Workers already `BLPOP` from a
+global queue. Membership rule is a policy layered on top.
+
+### Alice → Bob (invitee mechanic)
+
+Contributors (Alice) invite non-contributors (Bob) by email. Alice
+sets Bob's cap (% of her remaining quota or absolute token count) and
+can adjust/revoke anytime via the host admin UI. Bob's prompts go
+into the shared queue and are served by whichever contributor's
+machine is idle — not specifically Alice's GPU.
+
+Side effect: GOLD/PLATINUM contributors get more invite headroom,
+which drives uptime competition organically. Status badge + invite
+slots are the carrot, not USD.
+
+### Power draw vs. uptime
+
+Important for the contributor pitch:
+
+| State | GPU draw (marginal) |
+|---|---:|
+| Online, no jobs (cold) | ~0 W |
+| Online, model warm (Ollama keep-alive) | ~30 W |
+| Active inference | ~250–400 W |
+
+Power scales with demand, not uptime. "Leave it on overnight" costs
+near-zero on a quiet network. Bursts of real power happen when there
+is real demand, which is precisely when GOLD+ contributors are earning
+paid-pool bonuses. Power bill and bonus are correlated, not decoupled.
+
+The Ollama keep-alive window is a tunable knob — long for paid-heavy
+workers (lower latency), short for casual contributors (lower idle
+draw).
+
+### Sustainability target
+
+The founder's stated constraint: "I'm not made of money and can't
+self-host the coordinator forever." Concrete answer:
+
+- Coordinator infra: ~€8/mo today, ~$50/mo at 1k users, ~$200/mo at 10k.
+- At $1.50/1M tokens to DEVELOPER paid customers (priced between Haiku
+  and self-hosted), $50/mo break-even = 33M tokens/mo paid usage.
+- At 50 tok/s saturated, that's ~6 hours/day of one PLATINUM
+  contributor opted into the paid pool.
+- **Two paying developer customers + one PLATINUM contributor covers
+  the coordinator bill indefinitely.**
+
+A year-one milestone, not a unicorn target.
+
+### Privacy framing — corrected
+
+Earlier drafts of this reframe said "your data stays in your trust
+circle." That overstates it under the membership rule: prompts traverse
+the contributor network, served by random members' GPUs (not
+necessarily your inviter's machine). Honest version: "prompts stay in
+the contributor network, not a hyperscaler — no training-on-prompts,
+no surveillance harvesting." For sensitive use cases, Phase 5
+**client-side embedding** is the answer — and now load-bearing for
+enterprise paid customers, not optional garnish.
+
+### What changed in the docs
+
+- README § 1 — "marketplace" replaced with "community-powered AI suite";
+  added membership-rule sentence + three-actor model
+  (Contributors / Invitees / Paid customers).
+- README § 5 (was "Business model") — renamed to "Economics," replaced
+  with three-layer breakdown (tier ladder + paid tiers + 80/20 bonus
+  split + sustainability math).
+- README § 6 — "Worker value proposition" → "Contributor value
+  proposition." Replaced "passive income" with status, access, invite
+  slots, opt-in paid-pool bonuses. Added power-draw table.
+- README § 7 — split into two audiences (contributors+invitees vs.
+  paid customers). Added the honest privacy framing note.
+- README § 14 Phase 3b — restructured into 3b.i (membership/tiers),
+  3b.ii (paid layer), 3b.iii (trust & verification).
+- README § 14 Phase 5 — added the community-network privacy context.
+- `business.md` — new "Core mechanic — contribute-to-use" section, new
+  3-loop "How it works" diagram, full Business Model rewrite, Target
+  Customers split, Roadmap matched to README Phase 3 restructure.
+- `docs/project-gaps.md` — "No customer identity" recast as "No
+  membership identity / tier accounting"; "No payout rails" scope
+  reframed to paid-revenue→bonus flow; "No pricing tier" expanded to
+  span both contributor and paid sides; "No customer signup flow"
+  replaced with "No invite / membership flow"; legal entry expanded
+  to community ToS + contributor agreement + paid commercial ToS;
+  30-day priority list reordered (membership/tiers/invites jump,
+  Stripe/marketing/SDK fall).
+- `windows-agent/README_addendum.md` — "How earnings work" rewritten
+  to two parallel ledgers (contribution + bonus); safety-notes section
+  on auth recast as the membership gate; power-draw table added to
+  "How it works."
+
+### Open implementation questions
+
+- Exact thresholds for tier promotion/demotion — what hours/day, what
+  jobs/hour ratio. Will need calibration once we have multiple real
+  contributors.
+- Ollama keep-alive policy per tier — should PLATINUM machines have
+  longer keep-alives (lower latency, higher idle draw) than BRONZE?
+- Contributor opt-in UX for the paid pool — a toggle in the agent? A
+  daily/monthly opt-in window? Should there be a "minimum payout
+  amount" the contributor can configure?
+- Whether the coordinator should expose a leaderboard / public tier
+  rankings, or keep tiers private.
+
+---
+
 ## 2026-05-09 — Strategy refresh: AI toolbox, not chat
 
 Reframing the product from "distributed chat API" to "distributed AI toolbox"
