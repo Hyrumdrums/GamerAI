@@ -1215,8 +1215,30 @@ def resolve_api_token(
     return entered
 
 
+def _print_greeting(once: bool, status: bool) -> None:
+    """First visible output. Runs before logging is wired up so a
+    freshly double-clicked agent.exe shows text immediately instead
+    of a blank console while PyInstaller finishes extracting itself.
+    Suppressed for --background (no console) and --status (the user
+    asked for a focused report)."""
+    if once or status:
+        return
+    try:
+        sys.stdout.write(
+            "\n"
+            "GamerAI agent: starting up...\n"
+            "Logs:    %APPDATA%\\GamerAI\\logs\\agent.log\n"
+            "\n"
+        )
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     args = parse_args(argv if argv is not None else sys.argv[1:])
+    if not args.background:
+        _print_greeting(args.once, args.status)
     cfg = Config.load(args.config if args.config.exists() else None)
     state = load_state()
     worker_id = resolve_worker_id(cfg.worker_id, state)
@@ -1255,6 +1277,18 @@ def main(argv: Optional[list[str]] = None) -> int:
     # Skipped if OLLAMA_URL is already set in the environment, so devs
     # pointing at a remote/test Ollama keep that override.
     if not os.getenv("OLLAMA_URL"):
+        if not args.background and cfg.bootstrap_enabled and IS_WINDOWS:
+            try:
+                sys.stdout.write(
+                    "First-run setup: ensuring Ollama and the default model "
+                    "are installed.\n"
+                    "On a fresh machine this can take several minutes "
+                    "(downloads ~2 GB). Subsequent launches are instant.\n"
+                    "\n"
+                )
+                sys.stdout.flush()
+            except Exception:
+                pass
         ready_url = bootstrap_inference(cfg, log)
         if ready_url:
             os.environ["OLLAMA_URL"] = ready_url

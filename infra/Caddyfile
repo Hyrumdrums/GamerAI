@@ -22,6 +22,14 @@
     # /srv/downloads. See infra/docker-compose.prod.yml.
     handle_path /download/* {
         root * /srv/downloads
+        # Standalone agent.exe lives at /download/agent.exe for
+        # backwards compatibility with the self-updater (which is
+        # hard-coded to that URL on every installed agent). The header
+        # below tells browsers to save it under a more descriptive
+        # filename so a recruit's Downloads folder doesn't end up
+        # with an anonymous "agent.exe."
+        @standalone path /agent.exe
+        header @standalone Content-Disposition "attachment; filename=\"GamerAI-Agent.exe\""
         file_server browse
     }
 
