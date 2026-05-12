@@ -1,0 +1,140 @@
+name: windows-agent build
+
+# Builds the GamerAI Windows agent (`agent.exe`) plus the bundled
+# Inno Setup installer (`GamerAI-Agent-Setup.exe`) on a windows-latest
+# runner, then SFTP-uploads both artifacts into /var/www/downloads on
+# the production VPS so they're served at
+# https://ai.dallinlayton.com/download/.
+#
+# Triggers:
+#   - push to main that touches windows-agent/** (the usual case)
+#   - manual workflow_dispatch (for re-publishing without code changes)
+#
+# Secrets required (already configured on the repo):
+#   VPS_SSH_KEY      private ed25519 key for the chroot-only SFTP user
+#                    `gamerai-uploads` on the VPS
+#   VPS_HOST         public IP / hostname of the VPS
+#   VPS_KNOWN_HOSTS  output of `ssh-keyscan -H <host>` — prevents the
+#                    first-connection trust-on-first-use prompt
+#
+# The CI SSH key cannot escape /var/www/downloads-chroot on the VPS;
+# AllowTcpForwarding/ForceCommand-internal-sftp/ChrootDirectory are
+# all enforced in sshd_config. See devlog 2026-05-11 "Windows exe
+# build + download surface" for the full setup.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - windows-agent/**
+      - .github/workflows/windows-agent-build.yml
+  workflow_dispatch:
+
+jobs:
+  build-and-publish:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python build dependencies
+        working-directory: windows-agent
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build agent.exe (PyInstaller)
+        working-directory: windows-agent
+        run: |
+          pyinstaller --onefile --name agent `
+            --add-data "config.json;." `
+            agent.py
+          if (-not (Test-Path "dist\agent.exe")) {
+            Write-Error "agent.exe was not produced"
+            exit 1
+          }
+          Get-Item dist\agent.exe | Select-Object Name, Length
+
+      - name: Install Inno Setup
+        # Inno Setup ships ISCC.exe (the compiler). Chocolatey ships
+        # innosetup as a pinned package on the windows-latest runner.
+        run: choco install innosetup --no-progress -y
+
+      - name: Compile installer.iss
+        working-directory: windows-agent
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            $iscc = "C:\Program Files\Inno Setup 6\ISCC.exe"
+          }
+          & "$iscc" installer.iss
+          if (-not (Test-Path "Output\GamerAI-Agent-Setup.exe")) {
+            Write-Error "GamerAI-Agent-Setup.exe was not produced"
+            exit 1
+          }
+          Get-Item Output\GamerAI-Agent-Setup.exe | Select-Object Name, Length
+
+      - name: Stage artifacts for upload
+        working-directory: windows-agent
+        run: |
+          New-Item -ItemType Directory -Force -Path upload | Out-Null
+          Copy-Item dist\agent.exe upload\agent.exe
+          Copy-Item Output\GamerAI-Agent-Setup.exe upload\GamerAI-Agent-Setup.exe
+          # A small index helps Caddy's browse view be self-explanatory.
+          $sha = "${{ github.sha }}".Substring(0, 7)
+          $now = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm 'UTC'")
+          @"
+          GamerAI Windows agent — build $sha — $now
+          Repo commit: ${{ github.sha }}
+          Files:
+            agent.exe                  standalone executable; pair with a config.json
+            GamerAI-Agent-Setup.exe    Inno Setup installer (Start Menu shortcuts, optional autostart)
+          "@ | Out-File -FilePath upload\BUILD.txt -Encoding utf8
+
+      - name: Configure SSH
+        run: |
+          New-Item -ItemType Directory -Force -Path $HOME\.ssh | Out-Null
+          $key = "${{ secrets.VPS_SSH_KEY }}"
+          [System.IO.File]::WriteAllText("$HOME\.ssh\id_ci", $key)
+          icacls "$HOME\.ssh\id_ci" /inheritance:r /grant:r "$($env:UserName):F" | Out-Null
+          $known = "${{ secrets.VPS_KNOWN_HOSTS }}"
+          [System.IO.File]::WriteAllText("$HOME\.ssh\known_hosts", $known)
+
+      - name: Upload artifacts via SFTP
+        working-directory: windows-agent
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+        run: |
+          # sftp batch file — uploads into the chroot's /uploads dir
+          @"
+          cd uploads
+          put upload/agent.exe agent.exe
+          put upload/GamerAI-Agent-Setup.exe GamerAI-Agent-Setup.exe
+          put upload/BUILD.txt BUILD.txt
+          bye
+          "@ | Out-File -FilePath sftp.batch -Encoding ascii
+
+          sftp -i $HOME\.ssh\id_ci `
+               -o UserKnownHostsFile=$HOME\.ssh\known_hosts `
+               -b sftp.batch `
+               gamerai-uploads@$env:VPS_HOST
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "SFTP upload failed with exit code $LASTEXITCODE"
+            exit $LASTEXITCODE
+          }
+
+      - name: Summary
+        run: |
+          Write-Host "Published artifacts:"
+          Write-Host "  https://ai.dallinlayton.com/download/agent.exe"
+          Write-Host "  https://ai.dallinlayton.com/download/GamerAI-Agent-Setup.exe"
+          Write-Host "  https://ai.dallinlayton.com/download/BUILD.txt"
