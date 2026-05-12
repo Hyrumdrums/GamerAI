@@ -330,6 +330,19 @@ DEFAULTS = {
         "enabled": True,
         "check_interval_hours": 6,
     },
+    "bootstrap": {
+        # First-run inference bootstrap (Windows). If enabled, the
+        # agent ensures Ollama + the default model are present before
+        # entering the main loop. Sources artifacts from
+        # {mirror_base_url}/download/* (defaults to coordinator_url),
+        # falling back to `ollama pull` when the mirror is missing a
+        # model. Best-effort: on failure the agent still runs and
+        # returns mock inference (preserves pre-bootstrap behavior).
+        "enabled": True,
+        "model": "llama3.2:1b",
+        "ollama_url": "http://localhost:11434",
+        "mirror_base_url": None,  # null = use coordinator_url
+    },
     "model": None,
     "worker_id": None,
     "api_token": None,
@@ -348,6 +361,10 @@ class Config:
     keep_awake_while_online: bool
     update_enabled: bool
     update_check_interval_hours: float
+    bootstrap_enabled: bool
+    bootstrap_model: str
+    bootstrap_ollama_url: str
+    bootstrap_mirror_base_url: Optional[str]
     model: Optional[str]
     worker_id: Optional[str]
     api_token: Optional[str]
@@ -362,6 +379,7 @@ class Config:
         idle = data["idle"]
         power = data.get("power", DEFAULTS["power"])
         update = data.get("update", DEFAULTS["update"])
+        bootstrap = data.get("bootstrap", DEFAULTS["bootstrap"])
         # env overrides config so a single API_TOKEN export works
         # for ad-hoc testing without touching config.json.
         token = (os.getenv("API_TOKEN") or data.get("api_token") or "").strip()
@@ -379,6 +397,16 @@ class Config:
             update_enabled=bool(update.get("enabled", True)),
             update_check_interval_hours=float(
                 update.get("check_interval_hours", 6)
+            ),
+            bootstrap_enabled=bool(bootstrap.get("enabled", True)),
+            bootstrap_model=str(bootstrap.get("model", "llama3.2:1b")),
+            bootstrap_ollama_url=str(
+                bootstrap.get("ollama_url", "http://localhost:11434")
+            ).rstrip("/"),
+            bootstrap_mirror_base_url=(
+                str(bootstrap["mirror_base_url"]).rstrip("/")
+                if bootstrap.get("mirror_base_url")
+                else None
             ),
             model=data.get("model"),
             worker_id=data.get("worker_id"),
@@ -516,10 +544,16 @@ class Coordinator:
             self.log.warning("coordinator GET %s failed: %s", path, e)
             return None
 
-    def register(self) -> bool:
+    def register(self, capabilities: Optional[dict] = None) -> bool:
+        body: dict = {"worker_id": self.worker_id}
+        if capabilities:
+            body["capabilities"] = capabilities
         for attempt in range(20):
-            if self._post("/register", {"worker_id": self.worker_id}) is not None:
-                self.log.info("registered with coordinator at %s", self.base)
+            if self._post("/register", body) is not None:
+                self.log.info(
+                    "registered with coordinator at %s (capabilities=%s)",
+                    self.base, capabilities or {},
+                )
                 return True
             time.sleep(min(2 * (attempt + 1), 15))
         self.log.error("could not register with coordinator")
@@ -551,6 +585,365 @@ class Coordinator:
 
     def remote_earnings(self) -> Optional[dict]:
         return self._get(f"/earnings/{self.worker_id}")
+
+
+# ---------------------------------------------------------------------------
+# Inference bootstrap (Windows-only): install Ollama + default model
+# ---------------------------------------------------------------------------
+# Default chain on first-run is:
+#   1. Probe ollama_url/api/tags — if it responds, Ollama is up.
+#   2. Else find ollama.exe at known paths and start it detached.
+#   3. Else download {mirror_base}/download/ollama-setup.exe and run /silent.
+#   4. Poll up to BOOTSTRAP_OLLAMA_WAIT_SECONDS for the HTTP API.
+#   5. Check /api/tags for the target model.
+#   6. Else try the mirror: GET {mirror_base}/download/models/{slug}.gguf +
+#      .Modelfile, then `ollama create <name> -f Modelfile`.
+#   7. Else fall back to POST {ollama_url}/api/pull (uses Ollama's CDN).
+#
+# Best-effort: any step failing leaves the agent running with mock
+# inference (the pre-bootstrap behavior). Idempotent — every step is a
+# fast no-op when its precondition is already met.
+
+BOOTSTRAP_OLLAMA_WAIT_SECONDS = 60.0
+BOOTSTRAP_MODEL_PULL_TIMEOUT_SECONDS = 1800.0  # 30 min; small models well under
+BOOTSTRAP_DOWNLOAD_CHUNK = 256 * 1024
+
+
+def _model_slug(model: str) -> str:
+    """`llama3.2:1b` -> `llama3.2-1b`. Used as the mirror filename stem."""
+    return model.replace(":", "-").replace("/", "-")
+
+
+def _ollama_responding(ollama_url: str, timeout: float = 2.0) -> bool:
+    try:
+        with httpx.Client(timeout=timeout) as c:
+            r = c.get(f"{ollama_url.rstrip('/')}/api/tags")
+            return r.status_code == 200
+    except Exception:
+        return False
+
+
+def _find_ollama_exe() -> Optional[Path]:
+    """Locate ollama.exe at the standard install paths. Returns None if
+    not installed."""
+    if not IS_WINDOWS:
+        return None
+    candidates = [
+        Path(os.getenv("LOCALAPPDATA") or "") / "Programs" / "Ollama" / "ollama.exe",
+        Path(os.getenv("ProgramFiles") or "C:/Program Files") / "Ollama" / "ollama.exe",
+        Path(os.getenv("ProgramFiles(x86)") or "C:/Program Files (x86)")
+            / "Ollama" / "ollama.exe",
+    ]
+    for p in candidates:
+        try:
+            if p.exists():
+                return p
+        except OSError:
+            continue
+    return None
+
+
+def _start_ollama_server(ollama_exe: Path, log: logging.Logger) -> bool:
+    """Launch `ollama serve` detached so the API comes up. Ollama's
+    installer normally drops a tray app that does this on login, but on
+    a freshly-silent-installed box the user hasn't logged out/in yet."""
+    if not IS_WINDOWS:
+        return False
+    try:
+        creationflags = (
+            subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+            | subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
+        )
+        subprocess.Popen(
+            [str(ollama_exe), "serve"],
+            close_fds=True,
+            creationflags=creationflags,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        log.info("bootstrap: launched ollama serve (%s)", ollama_exe)
+        return True
+    except Exception as e:
+        log.warning("bootstrap: could not launch ollama serve: %s", e)
+        return False
+
+
+def _download_to(url: str, dest: Path, log: logging.Logger, label: str) -> bool:
+    """Stream a URL to a temp file then rename atomically. Returns True
+    only on a complete, non-empty download."""
+    staged = dest.with_suffix(dest.suffix + ".part")
+    log.info("bootstrap: downloading %s -> %s", url, dest)
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with httpx.Client(timeout=600.0, follow_redirects=True) as c:
+            with c.stream("GET", url) as r:
+                r.raise_for_status()
+                bytes_written = 0
+                last_progress = time.time()
+                with open(staged, "wb") as f:
+                    for chunk in r.iter_bytes(chunk_size=BOOTSTRAP_DOWNLOAD_CHUNK):
+                        f.write(chunk)
+                        bytes_written += len(chunk)
+                        if time.time() - last_progress > 30:
+                            log.info(
+                                "bootstrap: %s download progress: %.1f MB",
+                                label, bytes_written / (1024 * 1024),
+                            )
+                            last_progress = time.time()
+    except Exception as e:
+        log.warning("bootstrap: download of %s failed: %s", url, e)
+        try:
+            staged.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+    try:
+        if staged.stat().st_size == 0:
+            staged.unlink(missing_ok=True)
+            log.warning("bootstrap: %s download was empty", label)
+            return False
+        staged.replace(dest)
+    except OSError as e:
+        log.warning("bootstrap: could not finalize %s: %s", label, e)
+        return False
+    return True
+
+
+def _install_ollama(mirror_base: str, log: logging.Logger) -> Optional[Path]:
+    """Download OllamaSetup.exe from our mirror and run it silently.
+    Returns the path to ollama.exe on success, else None."""
+    if not IS_WINDOWS:
+        return None
+    setup_url = f"{mirror_base.rstrip('/')}/download/ollama-setup.exe"
+    setup_dest = state_dir() / "ollama-setup.exe"
+    if not _download_to(setup_url, setup_dest, log, "ollama-setup.exe"):
+        return None
+    log.info("bootstrap: running ollama installer (silent)")
+    try:
+        # Squirrel-based installer; /S is the silent flag.
+        rc = subprocess.run(
+            [str(setup_dest), "/S"],
+            timeout=600,
+            check=False,
+        )
+        log.info("bootstrap: ollama installer exited rc=%s", rc.returncode)
+    except Exception as e:
+        log.warning("bootstrap: ollama installer failed to run: %s", e)
+        return None
+    # Installer can take a moment to populate %LOCALAPPDATA%\Programs\Ollama.
+    for _ in range(20):
+        exe = _find_ollama_exe()
+        if exe is not None:
+            return exe
+        time.sleep(1.0)
+    log.warning("bootstrap: ollama.exe not found after install")
+    return None
+
+
+def _wait_for_ollama(
+    ollama_url: str, log: logging.Logger,
+    timeout: float = BOOTSTRAP_OLLAMA_WAIT_SECONDS,
+) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _ollama_responding(ollama_url):
+            return True
+        time.sleep(2.0)
+    log.warning("bootstrap: ollama did not respond on %s within %.0fs",
+                ollama_url, timeout)
+    return False
+
+
+def _model_present(ollama_url: str, model: str, log: logging.Logger) -> bool:
+    """Check Ollama's /api/tags for an exact match of the model name.
+    Ollama lists models as `name:tag` (e.g. `llama3.2:1b`)."""
+    try:
+        with httpx.Client(timeout=10.0) as c:
+            r = c.get(f"{ollama_url.rstrip('/')}/api/tags")
+            r.raise_for_status()
+            data = r.json()
+    except Exception as e:
+        log.warning("bootstrap: /api/tags lookup failed: %s", e)
+        return False
+    for entry in data.get("models", []) or []:
+        if entry.get("name") == model:
+            return True
+    return False
+
+
+def _install_model_from_mirror(
+    ollama_exe: Optional[Path],
+    ollama_url: str,
+    model: str,
+    mirror_base: str,
+    log: logging.Logger,
+) -> bool:
+    """Pull the model .gguf + Modelfile from our mirror and run
+    `ollama create`. Returns True if the model is registered with
+    Ollama after this. Mirror-side files live at:
+        /download/models/<slug>.gguf
+        /download/models/<slug>.Modelfile
+    where slug = model with ':' -> '-'.
+    """
+    if ollama_exe is None:
+        log.warning("bootstrap: no ollama.exe — cannot run `ollama create`")
+        return False
+    slug = _model_slug(model)
+    base = mirror_base.rstrip("/")
+    gguf_url = f"{base}/download/models/{slug}.gguf"
+    modelfile_url = f"{base}/download/models/{slug}.Modelfile"
+
+    # HEAD the gguf first to decide whether the mirror has this model
+    # before we download a multi-GB blob that's actually a 404 HTML page.
+    try:
+        with httpx.Client(timeout=10.0, follow_redirects=True) as c:
+            head = c.head(gguf_url)
+        if head.status_code != 200:
+            log.info(
+                "bootstrap: mirror does not have %s (HTTP %d); will fall back to ollama pull",
+                slug, head.status_code,
+            )
+            return False
+    except Exception as e:
+        log.info("bootstrap: mirror HEAD failed (%s); will fall back to ollama pull", e)
+        return False
+
+    stage_dir = state_dir() / "bootstrap" / slug
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    gguf_path = stage_dir / f"{slug}.gguf"
+    modelfile_path = stage_dir / "Modelfile"
+
+    if not _download_to(gguf_url, gguf_path, log, f"{slug}.gguf"):
+        return False
+    if not _download_to(modelfile_url, modelfile_path, log, f"{slug}.Modelfile"):
+        return False
+
+    # Rewrite FROM line to absolute path so `ollama create` resolves
+    # the gguf regardless of cwd.
+    try:
+        original = modelfile_path.read_text(encoding="utf-8")
+        rewritten_lines = []
+        for line in original.splitlines():
+            if line.strip().lower().startswith("from "):
+                rewritten_lines.append(f"FROM {gguf_path}")
+            else:
+                rewritten_lines.append(line)
+        modelfile_path.write_text("\n".join(rewritten_lines) + "\n", encoding="utf-8")
+    except OSError as e:
+        log.warning("bootstrap: could not normalize Modelfile path: %s", e)
+        return False
+
+    log.info("bootstrap: registering %s with Ollama via `ollama create`", model)
+    try:
+        result = subprocess.run(
+            [str(ollama_exe), "create", model, "-f", str(modelfile_path)],
+            timeout=BOOTSTRAP_MODEL_PULL_TIMEOUT_SECONDS,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            log.warning(
+                "bootstrap: `ollama create` failed (rc=%d): %s",
+                result.returncode, (result.stderr or "").strip()[:500],
+            )
+            return False
+    except Exception as e:
+        log.warning("bootstrap: `ollama create` raised: %s", e)
+        return False
+    return _model_present(ollama_url, model, log)
+
+
+def _install_model_via_pull(
+    ollama_url: str, model: str, log: logging.Logger,
+) -> bool:
+    """Fall back to Ollama's own CDN via POST /api/pull. Streams JSON
+    progress lines; we just wait for the final 'success' status."""
+    log.info("bootstrap: pulling %s via ollama /api/pull (CDN fallback)", model)
+    try:
+        with httpx.Client(timeout=BOOTSTRAP_MODEL_PULL_TIMEOUT_SECONDS) as c:
+            with c.stream(
+                "POST",
+                f"{ollama_url.rstrip('/')}/api/pull",
+                json={"name": model, "stream": True},
+            ) as r:
+                r.raise_for_status()
+                last_log = time.time()
+                for line in r.iter_lines():
+                    if not line:
+                        continue
+                    try:
+                        evt = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    status = evt.get("status", "")
+                    if status == "success":
+                        log.info("bootstrap: ollama pull complete for %s", model)
+                        return True
+                    if "error" in evt:
+                        log.warning("bootstrap: ollama pull error: %s", evt["error"])
+                        return False
+                    if time.time() - last_log > 30 and status:
+                        log.info("bootstrap: pull progress — %s", status)
+                        last_log = time.time()
+    except Exception as e:
+        log.warning("bootstrap: ollama pull failed: %s", e)
+        return False
+    return _model_present(ollama_url, model, log)
+
+
+def bootstrap_inference(cfg: "Config", log: logging.Logger) -> Optional[str]:
+    """Make sure Ollama + the default model are ready. Returns the
+    working Ollama URL on success, or None on any failure (caller
+    keeps running and falls back to mock inference).
+
+    Skipped entirely on non-Windows and when bootstrap.enabled is
+    false in config.json.
+    """
+    if not cfg.bootstrap_enabled:
+        log.info("bootstrap: disabled in config — skipping")
+        return None
+    if not IS_WINDOWS:
+        log.info("bootstrap: not on Windows — skipping (dev mode)")
+        return None
+
+    ollama_url = cfg.bootstrap_ollama_url
+    mirror_base = cfg.bootstrap_mirror_base_url or cfg.coordinator_url
+    model = cfg.bootstrap_model
+
+    # Step 1-4: ensure Ollama is running.
+    if _ollama_responding(ollama_url):
+        log.info("bootstrap: ollama already running at %s", ollama_url)
+    else:
+        exe = _find_ollama_exe()
+        if exe is None:
+            exe = _install_ollama(mirror_base, log)
+        if exe is None:
+            log.warning("bootstrap: ollama not available — mock inference only")
+            return None
+        # Installer normally starts the tray-app server itself; if we got
+        # here from an already-installed-but-not-running state we have
+        # to kick it ourselves.
+        if not _ollama_responding(ollama_url):
+            _start_ollama_server(exe, log)
+        if not _wait_for_ollama(ollama_url, log):
+            return None
+
+    # Step 5-7: ensure the model is present.
+    if _model_present(ollama_url, model, log):
+        log.info("bootstrap: model %s already installed", model)
+        return ollama_url
+
+    exe = _find_ollama_exe()
+    if _install_model_from_mirror(exe, ollama_url, model, mirror_base, log):
+        log.info("bootstrap: model %s ready (mirror)", model)
+        return ollama_url
+    if _install_model_via_pull(ollama_url, model, log):
+        log.info("bootstrap: model %s ready (ollama CDN)", model)
+        return ollama_url
+
+    log.warning("bootstrap: could not install model %s — mock inference only", model)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -857,6 +1250,15 @@ def main(argv: Optional[list[str]] = None) -> int:
              cfg.min_input_idle_seconds, cfg.max_cpu_percent,
              "on" if cfg.api_token else "off")
 
+    # First-run bootstrap: install Ollama + default model. Best-effort;
+    # on failure we fall back to mock inference and keep running.
+    # Skipped if OLLAMA_URL is already set in the environment, so devs
+    # pointing at a remote/test Ollama keep that override.
+    if not os.getenv("OLLAMA_URL"):
+        ready_url = bootstrap_inference(cfg, log)
+        if ready_url:
+            os.environ["OLLAMA_URL"] = ready_url
+
     # Keep-awake is the "I've committed my machine" contract — only
     # enabled when the contributor opts into background mode (autostart
     # installer toggle) and the config knob is on. Foreground/--once
@@ -868,7 +1270,18 @@ def main(argv: Optional[list[str]] = None) -> int:
         log.info("keep-awake off (power.keep_awake_while_online=false)")
 
     coord = Coordinator(cfg.coordinator_url, worker_id, log, cfg.api_token)
-    if not coord.register():
+    # Advertise the model we can actually serve. The bootstrap above
+    # either confirmed the model is loaded into Ollama or fell back to
+    # mock — either way, the coordinator should know this worker is
+    # eligible for jobs targeting bootstrap_model. (Coordinator-side
+    # capability-aware routing is still on the deferred list; for now
+    # this is informational and surfaces in /workers.)
+    capabilities = (
+        {"models": [cfg.bootstrap_model]}
+        if cfg.bootstrap_enabled and os.getenv("OLLAMA_URL")
+        else None
+    )
+    if not coord.register(capabilities=capabilities):
         if keep_awake_active:
             keep_awake_end(log)
         return 1

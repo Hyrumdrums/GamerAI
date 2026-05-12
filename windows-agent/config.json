@@ -15,6 +15,12 @@
     "enabled": true,
     "check_interval_hours": 6
   },
+  "bootstrap": {
+    "enabled": true,
+    "model": "llama3.2:1b",
+    "ollama_url": "http://localhost:11434",
+    "mirror_base_url": null
+  },
   "model": null,
   "worker_id": null,
   "api_token": null
