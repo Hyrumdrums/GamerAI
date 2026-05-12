@@ -53,6 +53,25 @@ class JobCompleteRequest(BaseModel):
     error: Optional[str] = None
 
 
+class InviteCreateRequest(BaseModel):
+    """Contributor (or admin) creates an invite for an outside person.
+
+    All fields optional. ``daily_quota_tokens`` defaults to NULL =
+    unlimited; ``expires_hours`` defaults to no expiry.
+    """
+    daily_quota_tokens: Optional[int] = None
+    invitee_email: Optional[str] = None
+    expires_hours: Optional[float] = None
+    notes: Optional[str] = None
+
+
+class InviteAcceptRequest(BaseModel):
+    """Optional info the redeemer may attach when accepting.
+
+    The invite code itself is in the URL path, not this body."""
+    invitee_email: Optional[str] = None
+
+
 class JobRecord(BaseModel):
     job_id: str
     prompt: str

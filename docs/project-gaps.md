@@ -30,20 +30,49 @@ clients (worker, Windows agent, web UI, CLI) automatically include the
 header when the token is set. The bootstrap generates a random token at
 deploy time. See `infra/README.md` for the runbook.
 
-### 🔴 No membership identity / tier accounting
+### 🟢 No membership identity / tier accounting — identity + invites done
 
-There's no concept of "who submitted this job." The `API_TOKEN` above
-gates *network access*, not *which member submitted what*. Under the
-community-powered model (see README § 5 Economics), we need per-member
-identity to: (a) credit contributors for compute served, (b) enforce
-per-tier quotas on consumption, (c) attribute jobs through the
-Alice → Bob invitee chain, (d) eventually bill paid customers.
+Slices 1 & 2 (2026-05-11) shipped the identity + invite layers:
 
-**Fix:** member token issuance per identity (contributor, invitee, paid
-customer). Coordinator records the submitting member on every job row;
-the tier engine reads contribution + consumption rates from the ledger
-to promote/demote BRONZE → PLATINUM. Same plumbing later supports
-per-customer billing for the Phase 3b.ii paid layer.
+- `members` table with role / parent / token_hash / tier /
+  daily_quota_tokens.
+- `member_usage` daily rollup + **daily-quota enforcement** on
+  `/generate` (429 when over cap).
+- `jobs.submitted_by_member_id` attribution.
+- Per-token bearer auth (`coordinator/member_auth.py` + middleware in
+  `coordinator/main.py`).
+- `invites` table with atomic accept (single BEGIN IMMEDIATE that
+  validates + inserts the member + stamps the invite).
+- `POST /invites`, `GET /invites`, `GET /invites/<code>` (public),
+  `POST /invites/<code>/accept` (public), `POST /invites/<code>/revoke`
+  (admin).
+- `GET /admin/members` admin-only roster.
+- Admin CLI: `create-member`, `list-members`, `revoke`,
+  `create-invite`, `list-invites`, `revoke-invite`.
+- Public redemption page at `/invite/<code>` in `client/web.py` plus
+  `/admin/members` and `/admin/invites` admin browser views.
+- `GET /me` returns identity + today's usage.
+- Backwards compatible: existing `API_TOKEN` clients are auto-seeded
+  as the admin member.
+
+Severity downgraded 🔴 → 🟢. The system can distinguish callers,
+gate consumption per cap, and onboard new invitees via copy-paste URL
+without admin involvement. Remaining work is not blocking external
+membership testing — it's polish:
+
+- **Worker → member link.** A contributor's `worker_id` is still
+  unconnected to their `member_id`. Earnings credit lives on
+  `worker_id` only. Add `owner_member_id` on `/register` to
+  consolidate contributor earnings per person, not per GPU. ~½ day.
+- **Tier auto-promotion engine.** Everyone stays BRONZE unless
+  bumped by hand. Daily cron driven by uptime + claim rate. ~1 day.
+- **Per-member auth on the web UI itself.** `client/web.py` talks
+  to the coordinator as admin for every viewer; Alice would see
+  admin data. Add cookie-session login against member tokens.
+- **Caddy basic_auth on the web UI** — required before opening
+  the web UI beyond an SSH tunnel.
+- **SMTP-delivered invites** (Resend / Postmark) — copy-paste URL
+  is the slice-2 cut, deferred until first usability complaint.
 
 ### 🔴 No prompt safety / content controls
 
@@ -376,12 +405,14 @@ work them in. Highest leverage first.
    ✅ Done — capability-aware *routing* deferred to Phase 4.
 6. **Uptime Kuma (or equivalent) hitting `/health`.** **~½ day.**
 7. **SQLite nightly backup cron with weekly rotation.** **~½ day.**
-8. **Member identity + tier accounting** — per-member tokens, jobs
-   recorded against the submitter, daily tier evaluation. The
-   foundation for everything else under the community-powered model.
-   **~2 days.**
-9. **Invite / admin flow (Alice → Bob)** — contributor invites by email,
-   sets cap, host admin UI for tier + invitees. **~2–3 days.**
+8. ~~**Member identity + tier accounting**~~ — slice 1 done
+   (2026-05-11). Per-member tokens, jobs recorded against the
+   submitter, daily usage rollup. Tier auto-evaluation deferred to a
+   later slice. ✅ Done.
+9. ~~**Invite / admin flow (Alice → Bob)**~~ — slice 2 done
+   (2026-05-11). `invites` table, copy-paste invite URL, quota
+   enforcement on `/generate`, minimal admin web UI in `client/`.
+   ✅ Done.
 10. **Community ToS + contributor agreement** from a template. **~½ day.**
 11. **Recruit 3 real gamer contributors and run end-to-end.** The
     actual experiment. **~½ day, plus calendar time.**

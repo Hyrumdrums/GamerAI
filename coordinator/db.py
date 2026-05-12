@@ -3,6 +3,7 @@ import os
 import sqlite3
 import threading
 import time
+from datetime import datetime, timezone
 from typing import Optional
 
 from shared.config import DB_PATH
@@ -23,11 +24,13 @@ CREATE TABLE IF NOT EXISTS jobs (
     completed_at REAL,
     duration_seconds REAL,
     error TEXT,
-    attempts INTEGER DEFAULT 0
+    attempts INTEGER DEFAULT 0,
+    submitted_by_member_id TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_jobs_worker ON jobs(worker_id);
+CREATE INDEX IF NOT EXISTS idx_jobs_submitter ON jobs(submitted_by_member_id);
 
 CREATE TABLE IF NOT EXISTS workers (
     worker_id TEXT PRIMARY KEY,
@@ -43,7 +46,62 @@ CREATE TABLE IF NOT EXISTS earnings (
     total_usd REAL NOT NULL DEFAULT 0,
     updated_at REAL
 );
+
+-- Per-member identity. token_hash is sha256(raw_token); raw token is
+-- never stored. Admin members are seeded from the API_TOKEN env var
+-- on coordinator startup (see coordinator/main.py:ensure_admin_seed).
+CREATE TABLE IF NOT EXISTS members (
+    member_id TEXT PRIMARY KEY,
+    email TEXT,
+    role TEXT NOT NULL,
+    parent_member_id TEXT,
+    token_hash TEXT NOT NULL UNIQUE,
+    tier TEXT NOT NULL DEFAULT 'BRONZE',
+    daily_quota_tokens INTEGER,
+    revoked_at REAL,
+    created_at REAL NOT NULL,
+    last_active_at REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_members_token ON members(token_hash);
+CREATE INDEX IF NOT EXISTS idx_members_parent ON members(parent_member_id);
+
+-- Per-day consumption rollup, updated on /jobs/complete by submitter.
+-- Used for invitee quota enforcement (see /generate in main.py).
+CREATE TABLE IF NOT EXISTS member_usage (
+    member_id TEXT NOT NULL,
+    day TEXT NOT NULL,
+    tokens_in INTEGER NOT NULL DEFAULT 0,
+    tokens_out INTEGER NOT NULL DEFAULT 0,
+    jobs INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (member_id, day)
+);
+
+-- One row per outstanding or historical invite. The ``code`` is the
+-- redemption secret (carried in the invite URL). ``accepted_at`` and
+-- ``accepted_by_member_id`` are set atomically with the member-row
+-- insert when the invite is redeemed.
+CREATE TABLE IF NOT EXISTS invites (
+    invite_id TEXT PRIMARY KEY,
+    code TEXT NOT NULL UNIQUE,
+    contributor_member_id TEXT NOT NULL,
+    invitee_email TEXT,
+    daily_quota_tokens INTEGER,
+    expires_at REAL,
+    accepted_at REAL,
+    accepted_by_member_id TEXT,
+    revoked_at REAL,
+    notes TEXT,
+    created_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_invites_code ON invites(code);
+CREATE INDEX IF NOT EXISTS idx_invites_contributor ON invites(contributor_member_id);
 """
+
+
+def _utc_day(ts: float) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
 
 
 class DB:
@@ -56,14 +114,34 @@ class DB:
         self._lock = threading.Lock()
         with self._lock:
             self._conn.executescript(_SCHEMA)
+            self._migrate()
+
+    def _migrate(self) -> None:
+        """Best-effort additive column adds for DBs created before the
+        member-identity columns existed. Safe to call on every startup —
+        each ADD COLUMN is a no-op if the column is already present."""
+        try:
+            self._conn.execute(
+                "ALTER TABLE jobs ADD COLUMN submitted_by_member_id TEXT"
+            )
+        except sqlite3.OperationalError:
+            pass
 
     # ---------- jobs ----------
-    def insert_job(self, job_id: str, prompt: str, model: Optional[str], submitted_at: float) -> None:
+    def insert_job(
+        self,
+        job_id: str,
+        prompt: str,
+        model: Optional[str],
+        submitted_at: float,
+        submitted_by_member_id: Optional[str] = None,
+    ) -> None:
         with self._lock:
             self._conn.execute(
-                "INSERT OR REPLACE INTO jobs (job_id, prompt, model, status, submitted_at, attempts) "
-                "VALUES (?, ?, ?, 'pending', ?, 0)",
-                (job_id, prompt, model, submitted_at),
+                "INSERT OR REPLACE INTO jobs "
+                "(job_id, prompt, model, status, submitted_at, attempts, submitted_by_member_id) "
+                "VALUES (?, ?, ?, 'pending', ?, 0, ?)",
+                (job_id, prompt, model, submitted_at, submitted_by_member_id),
             )
 
     def mark_job_running(self, job_id: str, worker_id: str, started_at: float) -> None:
@@ -161,6 +239,235 @@ class DB:
         with self._lock:
             cur = self._conn.execute("SELECT * FROM earnings WHERE worker_id=?", (worker_id,))
             return cur.fetchone()
+
+    # ---------- members ----------
+    def create_member(
+        self,
+        member_id: str,
+        email: Optional[str],
+        role: str,
+        parent_member_id: Optional[str],
+        token_hash: str,
+        tier: str = "BRONZE",
+        daily_quota_tokens: Optional[int] = None,
+        created_at: Optional[float] = None,
+    ) -> None:
+        now = created_at if created_at is not None else time.time()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO members (member_id, email, role, parent_member_id, "
+                "token_hash, tier, daily_quota_tokens, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    member_id,
+                    email,
+                    role,
+                    parent_member_id,
+                    token_hash,
+                    tier,
+                    daily_quota_tokens,
+                    now,
+                ),
+            )
+
+    def get_member_by_token_hash(self, token_hash: str) -> Optional[sqlite3.Row]:
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM members WHERE token_hash=?", (token_hash,)
+            )
+            return cur.fetchone()
+
+    def get_member(self, member_id: str) -> Optional[sqlite3.Row]:
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM members WHERE member_id=?", (member_id,)
+            )
+            return cur.fetchone()
+
+    def list_members(self) -> list[sqlite3.Row]:
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM members ORDER BY created_at ASC"
+            )
+            return cur.fetchall()
+
+    def revoke_member_by_token_hash(self, token_hash: str, revoked_at: float) -> bool:
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE members SET revoked_at=? WHERE token_hash=? AND revoked_at IS NULL",
+                (revoked_at, token_hash),
+            )
+            return cur.rowcount > 0
+
+    def touch_member(self, member_id: str, when: float) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE members SET last_active_at=? WHERE member_id=?",
+                (when, member_id),
+            )
+
+    # ---------- member usage ----------
+    def add_member_usage(
+        self,
+        member_id: str,
+        when: float,
+        tokens_in: int,
+        tokens_out: int,
+    ) -> None:
+        day = _utc_day(when)
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO member_usage (member_id, day, tokens_in, tokens_out, jobs) "
+                "VALUES (?, ?, ?, ?, 1) "
+                "ON CONFLICT(member_id, day) DO UPDATE SET "
+                "tokens_in  = tokens_in  + excluded.tokens_in, "
+                "tokens_out = tokens_out + excluded.tokens_out, "
+                "jobs       = jobs       + 1",
+                (member_id, day, tokens_in, tokens_out),
+            )
+
+    def member_usage_today(self, member_id: str, now: Optional[float] = None) -> dict:
+        when = now if now is not None else time.time()
+        day = _utc_day(when)
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT tokens_in, tokens_out, jobs FROM member_usage "
+                "WHERE member_id=? AND day=?",
+                (member_id, day),
+            )
+            row = cur.fetchone()
+        if row is None:
+            return {"day": day, "tokens_in": 0, "tokens_out": 0, "jobs": 0}
+        return {
+            "day": day,
+            "tokens_in": int(row["tokens_in"]),
+            "tokens_out": int(row["tokens_out"]),
+            "jobs": int(row["jobs"]),
+        }
+
+    # ---------- invites ----------
+    def create_invite(
+        self,
+        invite_id: str,
+        code: str,
+        contributor_member_id: str,
+        daily_quota_tokens: Optional[int],
+        invitee_email: Optional[str] = None,
+        expires_at: Optional[float] = None,
+        notes: Optional[str] = None,
+        created_at: Optional[float] = None,
+    ) -> None:
+        now = created_at if created_at is not None else time.time()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO invites (invite_id, code, contributor_member_id, "
+                "invitee_email, daily_quota_tokens, expires_at, notes, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    invite_id,
+                    code,
+                    contributor_member_id,
+                    invitee_email,
+                    daily_quota_tokens,
+                    expires_at,
+                    notes,
+                    now,
+                ),
+            )
+
+    def get_invite_by_code(self, code: str) -> Optional[sqlite3.Row]:
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM invites WHERE code=?", (code,)
+            )
+            return cur.fetchone()
+
+    def list_invites_by_contributor(self, contributor_member_id: str) -> list[sqlite3.Row]:
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM invites WHERE contributor_member_id=? "
+                "ORDER BY created_at DESC",
+                (contributor_member_id,),
+            )
+            return cur.fetchall()
+
+    def list_all_invites(self) -> list[sqlite3.Row]:
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM invites ORDER BY created_at DESC"
+            )
+            return cur.fetchall()
+
+    def revoke_invite_by_code(self, code: str, revoked_at: float) -> bool:
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE invites SET revoked_at=? "
+                "WHERE code=? AND revoked_at IS NULL AND accepted_at IS NULL",
+                (revoked_at, code),
+            )
+            return cur.rowcount > 0
+
+    def accept_invite_atomic(
+        self,
+        code: str,
+        new_member_id: str,
+        new_token_hash: str,
+        invitee_email: Optional[str],
+        accepted_at: float,
+    ) -> Optional[sqlite3.Row]:
+        """Atomic: verify invite is redeemable, mark accepted, insert the
+        new invitee member. Returns the (updated) invite row on success,
+        or None if the invite was missing / expired / already accepted /
+        revoked. All writes happen under the same BEGIN/COMMIT so a
+        second concurrent accept of the same code cannot succeed."""
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = self._conn.execute(
+                    "SELECT * FROM invites WHERE code=?", (code,)
+                )
+                row = cur.fetchone()
+                if row is None:
+                    self._conn.execute("ROLLBACK")
+                    return None
+                if row["accepted_at"] is not None:
+                    self._conn.execute("ROLLBACK")
+                    return None
+                if row["revoked_at"] is not None:
+                    self._conn.execute("ROLLBACK")
+                    return None
+                if row["expires_at"] is not None and row["expires_at"] < accepted_at:
+                    self._conn.execute("ROLLBACK")
+                    return None
+
+                self._conn.execute(
+                    "INSERT INTO members (member_id, email, role, parent_member_id, "
+                    "token_hash, tier, daily_quota_tokens, created_at) "
+                    "VALUES (?, ?, 'invitee', ?, ?, 'BRONZE', ?, ?)",
+                    (
+                        new_member_id,
+                        invitee_email,
+                        row["contributor_member_id"],
+                        new_token_hash,
+                        row["daily_quota_tokens"],
+                        accepted_at,
+                    ),
+                )
+                self._conn.execute(
+                    "UPDATE invites SET accepted_at=?, accepted_by_member_id=?, "
+                    "invitee_email=COALESCE(?, invitee_email) "
+                    "WHERE code=?",
+                    (accepted_at, new_member_id, invitee_email, code),
+                )
+                cur = self._conn.execute(
+                    "SELECT * FROM invites WHERE code=?", (code,)
+                )
+                fresh = cur.fetchone()
+                self._conn.execute("COMMIT")
+                return fresh
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
 
     # ---------- metrics ----------
     def metrics(self) -> dict:

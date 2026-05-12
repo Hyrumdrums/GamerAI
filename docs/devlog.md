@@ -5,6 +5,208 @@ entries on top. Skim for context before resuming work.
 
 ---
 
+## 2026-05-11 — Invite flow + quota enforcement (slice 2 of 2)
+
+Slice 2 lands the invite UX and the daily-quota gate. Contributors can
+now invite outsiders without bothering the admin. Invitees redeem a
+copy-paste URL, get a bearer token, and start submitting prompts —
+gated by their daily quota.
+
+### What changed
+
+- **`invites` table** in `coordinator/db.py`: invite_id, code (unique),
+  contributor_member_id, invitee_email, daily_quota_tokens, expires_at,
+  accepted_at, accepted_by_member_id, revoked_at, notes, created_at.
+  Indexed on `code` and `contributor_member_id`.
+- **`accept_invite_atomic`** in `coordinator/db.py`: single
+  `BEGIN IMMEDIATE` transaction that validates the invite is open,
+  inserts the new member row, and stamps `accepted_at /
+  accepted_by_member_id` on the invite. Concurrent accepts of the
+  same code cannot both succeed.
+- **Invite endpoints in `coordinator/main.py`:**
+  - `POST /invites` — contributor or admin creates. Returns code.
+  - `GET /invites?all=true` — listing. Admin gets the full table;
+    contributors get their own.
+  - `GET /invites/<code>` — **public.** Returns inviter email +
+    cap so the redemption page can render before Bob has a token.
+  - `POST /invites/<code>/accept` — **public.** Mints the invitee
+    member, returns the bearer token exactly once.
+  - `POST /invites/<code>/revoke` — admin-only, unredeemed invites
+    only.
+- **Method-aware public-path matching** in the auth middleware
+  (`_is_public(method, path)`). Without it, `POST
+  /invites/<code>/revoke` was also being treated as public, which
+  defeated the admin gate. Lesson: when path prefixes overlap between
+  public and authenticated endpoints, the matcher needs path-shape +
+  method specificity, not just a `startswith`.
+- **Daily quota enforcement on `/generate`.** When the authenticated
+  member's `daily_quota_tokens` is non-null, the coordinator checks
+  today's `member_usage.tokens_out` against the cap and returns 429
+  if at/over. Pre-estimating completion size is out of scope —
+  the first prompt that crosses the cap can overshoot slightly. NULL
+  cap = unlimited (admin, tier-unlimited contributor).
+- **`/admin/members`** — admin-only roster endpoint. 403 for
+  non-admins. Returns no raw tokens (those aren't stored).
+- **CLI subcommands in `coordinator/admin.py`:** `create-invite`,
+  `list-invites`, `revoke-invite`. `create-invite` prints the
+  redemption URL using `PUBLIC_BASE_URL` (defaults to
+  `http://localhost:8080`; override at deploy time).
+- **Public redemption page in `client/web.py`:** `GET /invite/<code>`
+  renders an HTML landing page; `POST /invite/<code>` submits the
+  accept and shows the one-shot token. Uses a new `_public_client()`
+  helper that strips the admin auth headers — the invite code is the
+  credential, not the admin token.
+- **Admin web pages in `client/web.py`:** `/admin/members` and
+  `/admin/invites`. Plain HTML tables; relies on `client/web.py`
+  inheriting `API_TOKEN` (so it talks to the coordinator as admin).
+  Protected today by the localhost bind + SSH tunnel; layer Caddy
+  basic_auth before recruiting non-friends.
+
+### Tests
+
+86/86 pass (`python -m unittest discover -s tests`). New cases:
+- Invite create / public details / accept / one-shot / revoke / expiry.
+- Invitee role cannot create invites (403).
+- `/admin/members` requires admin role.
+- Quota under cap → 200, over cap → 429, admin unbounded.
+
+### What's still NOT in slice 2
+
+- **Worker → member link.** Contributor earnings live on `worker_id`;
+  consolidating per person is slice 3.
+- **Tier auto-promotion engine.** Everyone stays BRONZE unless bumped
+  by hand. Daily cron driven by uptime + claim rate is the next
+  build.
+- **Per-member auth on the web UI itself.** `client/web.py` still
+  talks to the coordinator as admin for every viewer. Alice would
+  see admin data if she visited. Real session/login flow against
+  member tokens is its own piece of work.
+- **SMTP-delivered invites.** Copy-paste URL is the slice-2 cut.
+  Plug in Resend / Postmark when first usability complaint lands.
+- **Caddy basic_auth on the web UI.** Required before the web UI is
+  reachable beyond the SSH tunnel.
+
+### How to run the new flow end-to-end (live VPS)
+
+```bash
+# 1. Create a contributor.
+docker exec -it gamerai-coordinator python -m coordinator.admin \\
+    create-member --role contributor --email alice@example.com
+# → token=gai_<...>
+
+# 2. Alice creates an invite for Bob.
+docker exec -it gamerai-coordinator python -m coordinator.admin \\
+    create-invite --contributor-token gai_<alice> \\
+    --daily-quota-tokens 5000 --email bob@example.com
+# → code=inv_<...>
+# → redemption_url=http://localhost:8080/invite/inv_<...>
+#   (set PUBLIC_BASE_URL=https://ai.dallinlayton.com in the coordinator
+#    env to print the public URL instead)
+
+# 3. Alice texts the URL to Bob; he clicks; redemption page mints his token.
+# 4. Bob's first /generate call uses his bearer; quota enforced from there.
+```
+
+---
+
+## 2026-05-11 — Member-identity layer (slice 1 of 2)
+
+The 50 tok/s Windows-agent test proved the **agent**, not the **network**.
+Every prompt so far has been the founder's own, served by the founder's
+GPU through the founder's coordinator. The next step that makes that
+statement false is "a second person's machine serves a stranger's
+prompt." Slice 1 is the smallest cohesive change toward that —
+per-member identity replacing the single shared `API_TOKEN`.
+
+### What changed
+
+- **New `members` table** in `coordinator/db.py`. Columns: `member_id`,
+  `email`, `role` (`admin`/`contributor`/`invitee`), `parent_member_id`
+  (the invite chain), `token_hash` (sha256), `tier` (default `BRONZE`),
+  `daily_quota_tokens` (nullable = unlimited), `revoked_at`,
+  `created_at`, `last_active_at`. Indexed on `token_hash` and
+  `parent_member_id`.
+- **`member_usage` per-day rollup** table. Updated on `/jobs/complete`
+  when the original submitter is known. Sets up slice-2 quota
+  enforcement without doing it yet.
+- **`jobs.submitted_by_member_id`** column added via additive
+  `ALTER TABLE` migration in `DB._migrate()`. Backfill is NULL —
+  pre-membership jobs simply don't have a submitter attribution.
+- **`coordinator/member_auth.py`** — server-side bearer lookup.
+  `gai_<64 hex>` token format, sha256 hashing, constant-time compare,
+  Member dataclass.
+- **Middleware swap in `coordinator/main.py`** — replaces the single
+  binary `check_authorization` with per-token member lookup. Attaches
+  `request.state.member` so downstream handlers know who's calling.
+- **Admin-seed-from-API_TOKEN.** On startup (or via direct
+  `ensure_admin_seed()` call), if `API_TOKEN` is set, a member with
+  role `admin` and tier `PLATINUM` is auto-created with that token's
+  hash. Every existing client that already sends
+  `Authorization: Bearer $API_TOKEN` is now logged in as that admin
+  member. **Zero client-side migration.**
+- **`coordinator/admin.py` CLI** — `create-member`, `list-members`,
+  `revoke`. The raw token is printed exactly once at create time and
+  never stored.
+- **`GET /me`** returns the caller's identity + quota + today's usage.
+  Cheap to add now, unblocks the slice-2 admin web UI.
+- **`/generate` records submitter** on the job row. `/jobs/complete`
+  attributes consumption to the member's daily usage.
+- **`/result/{job_id}`** now surfaces `submitted_by_member_id` so a
+  caller can tell whose job it was.
+
+### Tests
+
+73/73 pass (`python -m unittest discover -s tests`). New:
+`tests/test_members.py` (data layer, 18 cases) and
+`tests/test_member_auth_e2e.py` (HTTP layer with auth on, 12 cases).
+
+### Bootstrap gotcha (test infra)
+
+The existing `tests/test_coordinator_e2e.py` clears
+`shared.X`/`coordinator.X` submodule entries from `sys.modules` to pick
+up new env values on re-import. That's not enough: the **package
+modules themselves** (`coordinator`, `shared`) retain attribute
+references to first-loaded submodules, so a later `from coordinator
+import main` returns the stale module — auth-off — and every member
+test silently degraded to no-auth. Fixed in
+`tests/test_member_auth_e2e.py` by clearing the package keys too:
+
+```python
+for _mod in list(sys.modules):
+    if _mod.split(".", 1)[0] in ("shared", "coordinator"):
+        del sys.modules[_mod]
+```
+
+Symptom that pointed at this: `/me` returned `{"auth_disabled": true}`
+under `python -m unittest discover` but `{"role": "admin", ...}` when
+the file ran in isolation. Order-dependent → module-state leakage.
+
+### Backwards compatibility
+
+- Auth-off (no `API_TOKEN` env) preserves all current behavior. No
+  member rows are created; `submitted_by_member_id` stays NULL.
+- Auth-on with the existing `API_TOKEN`: clients that already send
+  `Authorization: Bearer $API_TOKEN` keep working — they're the admin
+  member. No worker/agent config change required.
+
+### Out of slice 1
+
+Slice 2 (next, ~2–3 days):
+
+- `invites` table.
+- `POST /invites` (contributor creates), `POST /invites/accept/<code>`
+  (invitee redeems → mints their own member token).
+- Copy-paste invite URL (no SMTP — same as Tailscale/Discord first cut).
+- Quota enforcement on `/generate` (reject when daily usage exceeds the
+  invitee's cap).
+- Minimal admin web UI in `client/` — list members, revoke, see invite
+  chains.
+
+Out of slice 1 and 2 both: tier auto-promotion engine, paid-pool /
+Stripe rails, SMTP email delivery.
+
+---
+
 ## 2026-05-11 — Business plan: community-powered, tier-based, layered paid
 
 Second strategy pivot in three days. The 2026-05-09 entry reframed the
