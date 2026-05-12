@@ -5,6 +5,222 @@ entries on top. Skim for context before resuming work.
 
 ---
 
+## 2026-05-12 — Windows agent build + public download surface
+
+Goal: a non-developer recruit clicks an invite URL, gets their bearer
+token, then downloads `GamerAI-Agent-Setup.exe` and clicks through.
+Today's session built that download surface end-to-end and fixed two
+prod bugs we hit along the way (Caddy didn't know about
+`/invite/<code>`; the GitHub deploy key wasn't registered after the
+prior VPS was retired).
+
+### What's now live
+
+- **`https://ai.dallinlayton.com/download/agent.exe`** — 10.4 MB
+  standalone PyInstaller `--onefile` build of `windows-agent/agent.py`,
+  with `config.json` bundled.
+- **`https://ai.dallinlayton.com/download/GamerAI-Agent-Setup.exe`** —
+  12.2 MB Inno Setup installer (Start Menu shortcuts, optional
+  run-on-startup tickbox, uninstaller).
+- **`https://ai.dallinlayton.com/download/BUILD.txt`** — manifest with
+  the source commit SHA + UTC build timestamp.
+- **`/download/` index** — Caddy `file_server browse` so a recruit
+  can land and see what's available without guessing filenames.
+
+### Pipeline shape
+
+```
+git push origin main (touches windows-agent/**)
+  ↓
+.github/workflows/windows-agent-build.yml on windows-latest
+  ↓
+pip install -r windows-agent/requirements.txt
+  ↓
+pyinstaller --onefile --name agent --add-data "config.json;." agent.py
+  → dist\agent.exe (~10 MB)
+  ↓
+choco install innosetup -y
+ISCC.exe installer.iss
+  → Output\GamerAI-Agent-Setup.exe (~12 MB)
+  ↓
+sftp gamerai-uploads@$VPS_HOST:uploads/  (chroot-only user; can ONLY
+                                          write into that one dir)
+  ↓
+Caddy file_server serves /var/www/downloads/* over TLS
+```
+
+End-to-end build is ~1m 13s on a `windows-latest` runner.
+
+### Caddy routing for the public surface
+
+`infra/Caddyfile` now has three handlers under `{$DOMAIN}`:
+
+```
+handle_path /download/*       → file_server (Caddy serves directly)
+handle /invite/*              → reverse_proxy client:8080  (web UI HTML)
+handle (everything else)      → reverse_proxy coordinator:8000  (API)
+```
+
+The `/download/*` block uses `handle_path` (strips the prefix) so
+`/download/agent.exe` resolves to `/srv/downloads/agent.exe` inside the
+Caddy container. `/srv/downloads` is bind-mounted from
+`/var/www/downloads` on the host (see `infra/docker-compose.prod.yml`),
+read-only inside the container. Caddy never writes.
+
+### Restricted SFTP-only user (`gamerai-uploads`)
+
+Per-host state on the VPS (not in the repo because it's not
+declarative):
+
+```bash
+# System user, no shell, no password.
+useradd -r -M -s /usr/sbin/nologin gamerai-uploads
+
+# Chroot directory MUST be root-owned with no group/other write,
+# otherwise sshd refuses to chroot into it.
+mkdir -p /var/www/downloads-chroot/uploads
+chown root:root /var/www/downloads-chroot
+chmod 755 /var/www/downloads-chroot
+chown gamerai-uploads:gamerai-uploads /var/www/downloads-chroot/uploads
+
+# Bind-mount the writable subdir into Caddy's serving path.
+# Persisted across reboot via /etc/fstab.
+echo "/var/www/downloads-chroot/uploads /var/www/downloads none bind 0 0" \
+  >> /etc/fstab
+mount /var/www/downloads
+
+# Authorized key OUTSIDE the chroot — sshd reads it before chrooting.
+mkdir -p /etc/ssh/auth
+echo "ssh-ed25519 AAAA... ci-upload" > /etc/ssh/auth/gamerai-uploads
+
+# sshd_config block (idempotent, appended once):
+cat >> /etc/ssh/sshd_config <<CFG
+Match User gamerai-uploads
+    ChrootDirectory /var/www/downloads-chroot
+    ForceCommand internal-sftp
+    AllowTcpForwarding no
+    X11Forwarding no
+    PasswordAuthentication no
+    AuthorizedKeysFile /etc/ssh/auth/%u
+CFG
+systemctl reload ssh
+```
+
+Blast radius if the CI key leaks: the attacker can read/write/delete
+files inside `/var/www/downloads-chroot/uploads`. They cannot run
+shell commands (`ForceCommand internal-sftp`), cannot escape the dir
+(`ChrootDirectory`), cannot forward ports
+(`AllowTcpForwarding no`), and cannot reach any other path. The
+worst case is "they put a malicious .exe at our download URL" —
+serious, but small surface and easy to detect/rotate.
+
+### Repo secrets (GitHub Actions)
+
+```
+VPS_SSH_KEY      private ed25519 key — gamerai-uploads@VPS
+VPS_HOST         5.161.235.139
+VPS_KNOWN_HOSTS  output of `ssh-keyscan -H 5.161.235.139`
+```
+
+Locally, the CI private key is at `~/.ssh/gamerai-ci-upload`.
+
+### Gotchas worth remembering
+
+**1. `caddy reload` reported success but did not apply the new route.**
+After committing the `/invite/<code>` → `client:8080` fix and running
+`docker exec gamerai-caddy caddy reload --config /etc/caddy/Caddyfile
+--adapter caddyfile`, the response continued to be the coordinator's
+JSON 401 instead of the redemption HTML. The reload command emitted:
+
+```
+"adapted config to JSON"
+"Caddyfile input is not formatted; run 'caddy fmt --overwrite' to fix"
+```
+
+…and *no* "config loaded" line. A full `docker restart gamerai-caddy`
+applied it cleanly. Lesson: don't trust the reload's exit code alone —
+verify with a request afterward, and fall back to a container restart
+if the route isn't taking.
+
+**2. GitHub deploy key for the private repo was missing on the new VPS.**
+Bootstrap failed at `git clone git@github.com:...` with
+`Permission denied (publickey)`. `gh api repos/Hyrumdrums/GamerAI/keys`
+returned `[]`. The previous VPS used this same `gamerai-github-deploy`
+key but GitHub or the user must have removed it when the prior server
+was destroyed (or it was never on this repo). Fix:
+
+```bash
+gh api repos/Hyrumdrums/GamerAI/keys -X POST \
+  -f title="gamerai-github-deploy" \
+  -f key="$(cat ~/.ssh/gamerai-github-deploy.pub)" \
+  -F read_only=true
+```
+
+Add to the rebuild-from-scratch runbook: **verify the deploy key is
+registered before running bootstrap**, since `bootstrap.sh` will hard-fail
+at the clone step otherwise. The bootstrap output already references
+this key path; the missing piece is the GitHub-side registration check.
+
+**3. Pushing `.github/workflows/*.yml` over HTTPS via the gh CLI's
+token requires the `workflow` OAuth scope.** First push of the new
+workflow file was rejected with:
+
+```
+refusing to allow an OAuth App to create or update workflow
+.github/workflows/windows-agent-build.yml without `workflow` scope
+```
+
+Fix: switched the remote URL from HTTPS to SSH
+(`git remote set-url origin git@github.com:...`), since `gh auth
+status` had already configured SSH for git operations. SSH push went
+through immediately. Alternative: `gh auth refresh -s workflow`.
+
+**4. Inno Setup isn't preinstalled on `windows-latest` runners.**
+Chocolatey is, so `choco install innosetup --no-progress -y` is the
+one-liner that gets `ISCC.exe` on PATH (well, at
+`C:\Program Files (x86)\Inno Setup 6\ISCC.exe`).
+
+**5. The `/admin/members` and `/admin/invites` HTML pages in
+`client/web.py` are not on the public domain.** The current Caddyfile
+only routes `/invite/*` to the web UI; everything else goes to the
+coordinator. So the admin pages still require an SSH tunnel
+(`ssh -L 8080:127.0.0.1:8080 root@VPS` → `http://localhost:8080/admin/...`).
+That's intentional for now (no basic_auth in place yet) but means
+"open the admin dashboard in your browser" is not yet a one-click
+operation.
+
+### What's not in this slice (yet)
+
+- **Signed binaries.** PyInstaller output is unsigned. Windows
+  SmartScreen will show "Unrecognized app" the first time. Real code
+  signing needs an EV certificate (~$300/yr); not worth it for the
+  3-friend recruitment phase. A note on the redemption page telling
+  Bob to "click More info → Run anyway" is the slice-3 polish.
+- **Redemption page → download link.** The invite-redemption HTML
+  currently shows Bob his token but doesn't link to the installer.
+  Hooking the two together so the page says "Step 2: download
+  `GamerAI-Agent-Setup.exe`, paste this token during install" is the
+  natural next polish.
+- **Auto-update for an installed agent.** A future fix-ship still
+  requires the user to re-download manually. Squirrel/NSIS
+  auto-updater is on the project-gaps list.
+
+### Bytes-on-disk + commits today
+
+```
+db55ebc  feat(membership): per-member identity, invite flow, daily quota gate
+e5c0858  test(web): smoke coverage for every web UI page
+3b1ae07  fix(caddy): route /invite/<code> to the web UI
+35d27b6  infra: serve /download/ from /var/www/downloads via Caddy
+a9f86d4  ci: windows-agent build + SFTP-publish to ai.* downloads
+```
+
+Five commits, 3 production fixes, 2 new public surfaces (redemption
+page + download index), 105 tests still passing, ~$0.06 of Hetzner
++ ~1.3 min of GHA `windows-latest` time spent.
+
+---
+
 ## 2026-05-11 — Invite flow + quota enforcement (slice 2 of 2)
 
 Slice 2 lands the invite UX and the daily-quota gate. Contributors can
