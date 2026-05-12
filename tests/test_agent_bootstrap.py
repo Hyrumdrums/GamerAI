@@ -30,6 +30,23 @@ class ModelSlugTests(unittest.TestCase):
         self.assertEqual(agent._model_slug("mistral"), "mistral")
 
 
+class FormatEtaTests(unittest.TestCase):
+    def test_sub_minute(self):
+        self.assertEqual(agent._format_eta(0), "0s")
+        self.assertEqual(agent._format_eta(45), "45s")
+
+    def test_minutes(self):
+        self.assertEqual(agent._format_eta(60), "1m 00s")
+        self.assertEqual(agent._format_eta(125), "2m 05s")
+
+    def test_hours(self):
+        self.assertEqual(agent._format_eta(3725), "1h 02m")
+
+    def test_negative_or_nan(self):
+        self.assertEqual(agent._format_eta(-1), "?")
+        self.assertEqual(agent._format_eta(float("nan")), "?")
+
+
 class ConfigBootstrapTests(unittest.TestCase):
     def test_defaults_present(self):
         cfg = agent.Config.load(None)

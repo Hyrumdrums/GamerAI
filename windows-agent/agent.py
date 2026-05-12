@@ -668,28 +668,78 @@ def _start_ollama_server(ollama_exe: Path, log: logging.Logger) -> bool:
         return False
 
 
+def _format_eta(seconds: float) -> str:
+    if seconds < 0 or seconds != seconds:  # NaN
+        return "?"
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m {s % 60:02d}s"
+    return f"{s // 3600}h {(s % 3600) // 60:02d}m"
+
+
 def _download_to(url: str, dest: Path, log: logging.Logger, label: str) -> bool:
     """Stream a URL to a temp file then rename atomically. Returns True
-    only on a complete, non-empty download."""
+    only on a complete, non-empty download. Logs progress as percent +
+    ETA when the server provides Content-Length (the usual case for a
+    static file). Falls back to byte counts when Content-Length is
+    absent (e.g. a chunked-encoded response)."""
     staged = dest.with_suffix(dest.suffix + ".part")
     log.info("bootstrap: downloading %s -> %s", url, dest)
     try:
         dest.parent.mkdir(parents=True, exist_ok=True)
+        started = time.time()
         with httpx.Client(timeout=600.0, follow_redirects=True) as c:
             with c.stream("GET", url) as r:
                 r.raise_for_status()
+                total = 0
+                try:
+                    total = int(r.headers.get("content-length") or 0)
+                except (TypeError, ValueError):
+                    total = 0
+                if total:
+                    log.info(
+                        "bootstrap: %s total size = %.1f MB",
+                        label, total / (1024 * 1024),
+                    )
                 bytes_written = 0
-                last_progress = time.time()
+                last_pct_bucket = 0
+                last_log_time = time.time()
                 with open(staged, "wb") as f:
                     for chunk in r.iter_bytes(chunk_size=BOOTSTRAP_DOWNLOAD_CHUNK):
                         f.write(chunk)
                         bytes_written += len(chunk)
-                        if time.time() - last_progress > 30:
-                            log.info(
-                                "bootstrap: %s download progress: %.1f MB",
-                                label, bytes_written / (1024 * 1024),
+                        now = time.time()
+                        elapsed = max(now - started, 0.001)
+                        rate = bytes_written / elapsed  # bytes/sec
+                        if total > 0:
+                            pct = bytes_written * 100.0 / total
+                            pct_bucket = int(pct // 5)
+                            should_log = (
+                                pct_bucket > last_pct_bucket
+                                or now - last_log_time >= 30
                             )
-                            last_progress = time.time()
+                            if should_log:
+                                remaining = max(total - bytes_written, 0)
+                                eta = remaining / rate if rate > 0 else 0
+                                log.info(
+                                    "bootstrap: %s %5.1f%% (%.0f / %.0f MB, %.1f MB/s) — ETA %s",
+                                    label, pct,
+                                    bytes_written / (1024 * 1024),
+                                    total / (1024 * 1024),
+                                    rate / (1024 * 1024),
+                                    _format_eta(eta),
+                                )
+                                last_pct_bucket = pct_bucket
+                                last_log_time = now
+                        elif now - last_log_time >= 30:
+                            log.info(
+                                "bootstrap: %s %.0f MB downloaded (size unknown, %.1f MB/s)",
+                                label, bytes_written / (1024 * 1024),
+                                rate / (1024 * 1024),
+                            )
+                            last_log_time = now
     except Exception as e:
         log.warning("bootstrap: download of %s failed: %s", url, e)
         try:
@@ -702,6 +752,12 @@ def _download_to(url: str, dest: Path, log: logging.Logger, label: str) -> bool:
             staged.unlink(missing_ok=True)
             log.warning("bootstrap: %s download was empty", label)
             return False
+        log.info(
+            "bootstrap: %s complete (%.0f MB in %s)",
+            label,
+            staged.stat().st_size / (1024 * 1024),
+            _format_eta(time.time() - started),
+        )
         staged.replace(dest)
     except OSError as e:
         log.warning("bootstrap: could not finalize %s: %s", label, e)
@@ -813,6 +869,16 @@ def _install_model_from_mirror(
     gguf_path = stage_dir / f"{slug}.gguf"
     modelfile_path = stage_dir / "Modelfile"
 
+    # Upfront warning so the user doesn't think the agent has hung
+    # mid-download. The .gguf is ~1 GB+ — at 10 Mbps that's ~15 min,
+    # at 1 Mbps it's ~2 hours. Progress lines below give percent + ETA.
+    log.info(
+        "bootstrap: about to download the model weights (%s). This is "
+        "the long step — typically 10-30 minutes on home internet, "
+        "potentially over an hour on a slow connection. Please leave "
+        "this window open; progress is logged below.",
+        slug,
+    )
     if not _download_to(gguf_url, gguf_path, log, f"{slug}.gguf"):
         return False
     if not _download_to(modelfile_url, modelfile_path, log, f"{slug}.Modelfile"):
@@ -858,8 +924,17 @@ def _install_model_via_pull(
     ollama_url: str, model: str, log: logging.Logger,
 ) -> bool:
     """Fall back to Ollama's own CDN via POST /api/pull. Streams JSON
-    progress lines; we just wait for the final 'success' status."""
+    progress lines; we use them to surface percent + ETA the same way
+    the mirror path does. Ollama's stream emits `total` and `completed`
+    on per-layer download events."""
     log.info("bootstrap: pulling %s via ollama /api/pull (CDN fallback)", model)
+    log.info(
+        "bootstrap: about to download the model weights from Ollama's CDN. "
+        "This is the long step — typically 10-30 minutes on home "
+        "internet, potentially over an hour on a slow connection. "
+        "Please leave this window open; progress is logged below.",
+    )
+    started = time.time()
     try:
         with httpx.Client(timeout=BOOTSTRAP_MODEL_PULL_TIMEOUT_SECONDS) as c:
             with c.stream(
@@ -868,7 +943,9 @@ def _install_model_via_pull(
                 json={"name": model, "stream": True},
             ) as r:
                 r.raise_for_status()
-                last_log = time.time()
+                last_log_time = time.time()
+                last_pct_bucket = -1
+                current_digest = ""
                 for line in r.iter_lines():
                     if not line:
                         continue
@@ -878,14 +955,46 @@ def _install_model_via_pull(
                         continue
                     status = evt.get("status", "")
                     if status == "success":
-                        log.info("bootstrap: ollama pull complete for %s", model)
+                        log.info(
+                            "bootstrap: ollama pull complete for %s (took %s)",
+                            model, _format_eta(time.time() - started),
+                        )
                         return True
                     if "error" in evt:
                         log.warning("bootstrap: ollama pull error: %s", evt["error"])
                         return False
-                    if time.time() - last_log > 30 and status:
-                        log.info("bootstrap: pull progress — %s", status)
-                        last_log = time.time()
+                    total = int(evt.get("total") or 0)
+                    completed = int(evt.get("completed") or 0)
+                    digest = evt.get("digest", "")
+                    now = time.time()
+                    if total > 0 and completed >= 0:
+                        pct = completed * 100.0 / total
+                        pct_bucket = int(pct // 5)
+                        digest_changed = digest != current_digest
+                        if digest_changed:
+                            current_digest = digest
+                            last_pct_bucket = -1
+                        should_log = (
+                            pct_bucket > last_pct_bucket
+                            or now - last_log_time >= 30
+                            or digest_changed
+                        )
+                        if should_log:
+                            elapsed = max(now - started, 0.001)
+                            rate = completed / elapsed if completed > 0 else 0
+                            eta = (total - completed) / rate if rate > 0 else 0
+                            log.info(
+                                "bootstrap: %s %5.1f%% (%.0f / %.0f MB) — ETA %s",
+                                status, pct,
+                                completed / (1024 * 1024),
+                                total / (1024 * 1024),
+                                _format_eta(eta),
+                            )
+                            last_pct_bucket = pct_bucket
+                            last_log_time = now
+                    elif status and now - last_log_time > 30:
+                        log.info("bootstrap: ollama pull — %s", status)
+                        last_log_time = now
     except Exception as e:
         log.warning("bootstrap: ollama pull failed: %s", e)
         return False
