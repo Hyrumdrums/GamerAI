@@ -5,6 +5,123 @@ entries on top. Skim for context before resuming work.
 
 ---
 
+## 2026-05-12 — Onboarding loop closure (redemption page → installer)
+
+Same date as the build-surface entry below. The previous slice put
+`agent.exe` and `GamerAI-Agent-Setup.exe` at
+`https://ai.dallinlayton.com/download/...`, but the redemption page
+just showed Bob his bearer token and said "paste it into the client
+config of your choice." For a non-developer recruit, that's exactly
+where the onboarding silently died. This slice closes the loop.
+
+### What the recruit sees now
+
+1. Clicks the invite URL → public redemption page (HTML from
+   `client/web.py`, routed by Caddy's `/invite/*` rule).
+2. Clicks **Accept** → post-accept page with three numbered steps:
+
+   - **Step 1: Save your bearer token.** The token is shown in a
+     yellow box with a one-click **Copy** button (uses the
+     `navigator.clipboard` API; falls back to text-selection on
+     older browsers).
+   - **Step 2: Install the Windows agent.** A prominent blue
+     **Download installer** button links straight to
+     `/download/GamerAI-Agent-Setup.exe`. A small note explains
+     the SmartScreen "More info → Run anyway" dance (binary is
+     unsigned for now; EV cert is a slice-4 cost).
+   - **Step 3: Paste your token on first run.** Explains that
+     `agent.exe` will prompt for the token the first time it
+     launches.
+
+   Power-user footer offers the standalone `/download/agent.exe`
+   and direct API usage against `https://ai.dallinlayton.com` with
+   `Authorization: Bearer <token>`.
+
+3. Bob runs the installer, launches the agent, gets:
+
+   ```
+   GamerAI agent first-run setup
+   -----------------------------
+   Paste the bearer token from your invite redemption page.
+   Looks like:  gai_<64 hex chars>
+
+   token:
+   ```
+
+   He pastes (Ctrl+V), the agent validates the shape (must start
+   with `gai_`), writes it to `%APPDATA%\GamerAI\state.json`, and
+   then registers + starts polling against
+   `https://ai.dallinlayton.com`.
+
+4. On every subsequent launch the agent reads the token from
+   `state.json` without prompting — including in `--background`
+   mode after the user ticks the "run on Windows startup"
+   installer option.
+
+### Code changes
+
+- **`client/web.py`** — `_REDEEM_DONE_PAGE` rewritten. New CSS for
+  the copy button + download CTA. New `<script>` block hooks the
+  Copy button to the clipboard API. Three numbered `<h2>` steps.
+- **`windows-agent/config.json`** — `coordinator_url` default
+  flipped from `http://localhost:8000` to `https://ai.dallinlayton.com`.
+  Bundled into both `agent.exe` (via PyInstaller `--add-data`) and
+  the installer (per `installer.iss`). Local devs running from
+  source override via `--config` or by editing their working copy.
+- **`windows-agent/agent.py`** — new `resolve_api_token()` function
+  with the chain: env `API_TOKEN` → `config.json` → `state.json` →
+  interactive prompt. Background mode without a token exits 2 with
+  a clear message pointing at `state.json`. The prompt enforces
+  the `gai_` prefix as a paste-accident guard.
+
+### Test additions
+
+- `tests/test_web_ui_smoke.py::test_invite_accept_page_links_to_installer`
+  asserts the post-accept page contains both download URLs and the
+  copy button. Without it a future refactor could silently strip
+  the install hook and the onboarding path would only break when
+  a real recruit hit it.
+
+### Subtle things worth remembering
+
+**1. The first-run prompt is the right home for the token, not
+config.json.** Initially I considered an installer-side dialog
+("paste your token now") to bake it into config.json at install
+time, but Inno Setup's `[Code]` dialog support adds a Pascal-script
+wart for one user-facing field. The agent's own first-run prompt is
+free (Python `input()`), survives uninstalling and reinstalling the
+binary (state.json lives in `%APPDATA%`), and decouples the
+"install" event from the "have a token" event. Same pattern as
+many CLI tools — first run is interactive, every subsequent run is
+automatic.
+
+**2. State is the right place to persist user secrets, not
+config.** `config.json` ships with the binary and gets blown away
+on reinstall. `state.json` lives in `%APPDATA%\GamerAI\` and
+survives the binary being replaced. Token belongs there, alongside
+`worker_id` and cumulative earnings.
+
+**3. The build pipeline rebuilds on every push that touches
+`windows-agent/**`.** That includes `config.json` and `agent.py`,
+so the new defaults shipped on the same `git push` that fixed the
+redemption page. Worth keeping the workflow's `paths:` filter
+honest — if we ever move agent-related Python out of `windows-agent/`,
+the build won't fire automatically.
+
+### Bytes-on-disk on /download/ after this slice
+
+```
+$ curl -s https://ai.dallinlayton.com/download/BUILD.txt
+GamerAI Windows agent — build 7d61d68 — 2026-05-12 01:38 UTC
+Repo commit: 7d61d6822fc9b8bb9d3a8eb2b5d08e7b573238b4
+```
+
+agent.exe: 10.4 MB (unchanged shape), installer: 12.8 MB (slight
+size bump from the new `coordinator_url` literal). Two PyInstaller
++ ISCC runs total today, both ~1m on `windows-latest`.
+
+---
+
 ## 2026-05-12 — Windows agent build + public download surface
 
 Goal: a non-developer recruit clicks an invite URL, gets their bearer
