@@ -247,27 +247,80 @@ _REDEEM_PAGE = """<!doctype html>
 _REDEEM_DONE_PAGE = """<!doctype html>
 <html><head><meta charset="utf-8"><title>Welcome to GamerAI</title>
 <style>
-  body{{font-family:-apple-system,system-ui,sans-serif;max-width:640px;margin:3rem auto;padding:0 1rem;color:#1a1a1a}}
+  body{{font-family:-apple-system,system-ui,sans-serif;max-width:680px;margin:2.5rem auto;padding:0 1rem;color:#1a1a1a}}
   h1{{margin-bottom:.25rem}}
+  h2{{margin-top:2rem;font-size:1.15rem}}
   .sub{{color:#666;margin-bottom:1.5rem}}
-  .token{{font-family:ui-monospace,Menlo,Consolas,monospace;background:#fff8c4;padding:.75rem;border-radius:4px;font-size:1.1rem;word-break:break-all;border:1px solid #ddc97a}}
-  .warn{{color:#b06000;font-weight:600;margin:1rem 0 .5rem}}
-  .small{{color:#666;font-size:.9rem;margin-top:1rem}}
+  .token-row{{display:flex;gap:.5rem;align-items:stretch;margin-bottom:.25rem}}
+  .token{{flex:1;font-family:ui-monospace,Menlo,Consolas,monospace;background:#fff8c4;padding:.75rem;border-radius:4px;font-size:1rem;word-break:break-all;border:1px solid #ddc97a;user-select:all}}
+  .copy-btn{{font-size:.9rem;padding:.4rem .8rem;cursor:pointer;background:#444;color:#fff;border:0;border-radius:4px}}
+  .copy-btn:hover{{background:#222}}
+  .copy-btn.ok{{background:#1f8a3a}}
+  .download-btn{{display:inline-block;font-size:1rem;padding:.7rem 1.4rem;cursor:pointer;background:#2d6cdf;color:#fff;border:0;border-radius:4px;text-decoration:none;font-weight:600}}
+  .download-btn:hover{{background:#1f55b8}}
+  .warn{{color:#b06000;font-weight:600;margin:1.25rem 0 .25rem}}
+  .small{{color:#666;font-size:.9rem;margin-top:.5rem}}
+  ol{{padding-left:1.25rem;line-height:1.55}}
+  ol li{{margin-bottom:.5rem}}
+  code{{background:#f3f3f3;padding:.1rem .35rem;border-radius:3px;font-size:.92em}}
+  .note{{background:#f5f8ff;border:1px solid #cfd9ee;border-radius:6px;padding:.7rem .9rem;font-size:.9rem;color:#33425a;margin:.75rem 0}}
 </style></head>
 <body>
 <h1>Welcome to GamerAI</h1>
-<div class="sub">Your invitee account is live. Save this token now — it cannot be recovered.</div>
+<div class="sub">Your invitee account is live. Two quick steps and you're up.</div>
 
-<div class="warn">Your bearer token</div>
-<div class="token">{token}</div>
+<div class="warn">1. Save your bearer token (it cannot be recovered)</div>
+<div class="token-row">
+  <div class="token" id="tok">{token}</div>
+  <button class="copy-btn" id="copy" type="button">Copy</button>
+</div>
+<div class="small">
+  member_id: <code>{member_id}</code> &nbsp;·&nbsp; daily_quota_tokens: <code>{cap}</code>
+</div>
+
+<h2>2. Install the Windows agent</h2>
+<p>The agent runs in the background on a Windows PC and only takes work when the machine is idle. Power scales with demand, not uptime.</p>
+
+<p><a class="download-btn" href="/download/GamerAI-Agent-Setup.exe">Download installer (Windows, ~12 MB)</a></p>
+
+<div class="note">
+  <strong>Windows SmartScreen note:</strong> the installer isn't code-signed yet,
+  so Windows will pop a "Windows protected your PC" dialog the first time you
+  run it. Click <em>More info</em> → <em>Run anyway</em>. The source is at
+  github.com/Hyrumdrums/GamerAI; the binary is built by GitHub Actions on
+  every push (see <code>/download/BUILD.txt</code> for the commit SHA).
+</div>
+
+<h2>3. Paste your token on first run</h2>
+<p>When you launch the agent for the first time, it will prompt for your bearer token. Paste the one above; the agent persists it locally and the network knows you're online.</p>
 
 <div class="small">
-  <strong>How to use it:</strong> add it as your <code>Authorization: Bearer &lt;token&gt;</code>
-  header when you call the GamerAI API, or paste it into the client config of your choice.
-  <br><br>
-  member_id: <code>{member_id}</code><br>
-  daily_quota_tokens: <code>{cap}</code>
+  Power user / not on Windows? You can also call the API directly with
+  <code>Authorization: Bearer &lt;token&gt;</code> against
+  <code>https://ai.dallinlayton.com</code>, or grab the standalone
+  <a href="/download/agent.exe">agent.exe</a> and pair it with a custom
+  <code>config.json</code>.
 </div>
+
+<script>
+const btn = document.getElementById('copy');
+const tok = document.getElementById('tok');
+btn.addEventListener('click', async () => {{
+  try {{
+    await navigator.clipboard.writeText(tok.textContent.trim());
+    btn.textContent = 'Copied ✓';
+    btn.classList.add('ok');
+    setTimeout(() => {{ btn.textContent = 'Copy'; btn.classList.remove('ok'); }}, 2000);
+  }} catch (e) {{
+    // Fallback: select the text so the user can copy with their keyboard.
+    const r = document.createRange();
+    r.selectNode(tok);
+    window.getSelection().removeAllRanges();
+    window.getSelection().addRange(r);
+    btn.textContent = 'Selected — Ctrl+C';
+  }}
+}});
+</script>
 </body></html>
 """
 

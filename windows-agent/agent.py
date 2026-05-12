@@ -153,7 +153,13 @@ def load_state() -> dict:
             return json.loads(STATE_PATH.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             pass
-    return {"worker_id": None, "jobs": 0, "tokens": 0, "earnings_usd": 0.0}
+    return {
+        "worker_id": None,
+        "api_token": None,
+        "jobs": 0,
+        "tokens": 0,
+        "earnings_usd": 0.0,
+    }
 
 
 def save_state(state: dict) -> None:
@@ -437,6 +443,56 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
+def resolve_api_token(
+    cfg_token: Optional[str],
+    state: dict,
+    background: bool,
+) -> Optional[str]:
+    """Token-resolution chain for first-run onboarding:
+
+      env API_TOKEN   ← already merged into cfg.api_token by Config.load
+        →  config.json["api_token"]
+        →  state.json["api_token"]      (persisted from a prior first-run prompt)
+        →  interactive prompt (foreground only)
+
+    Returns the resolved token, or None when running in --background and
+    no token is available (caller should error out — we can't prompt
+    when there's no console).
+    """
+    if cfg_token:
+        return cfg_token
+    state_token = state.get("api_token")
+    if state_token:
+        return state_token
+    if background:
+        return None
+    # First-run prompt. Most recruits land here exactly once.
+    sys.stdout.write(
+        "\n"
+        "GamerAI agent first-run setup\n"
+        "-----------------------------\n"
+        "Paste the bearer token from your invite redemption page.\n"
+        "Looks like:  gai_<64 hex chars>\n"
+        "\n"
+    )
+    sys.stdout.flush()
+    try:
+        entered = input("token: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        sys.stderr.write("\naborted — no token entered.\n")
+        return None
+    if not entered.startswith("gai_"):
+        sys.stderr.write(
+            "that doesn't look like a GamerAI token (expected gai_<...>).\n"
+            "edit %APPDATA%\\GamerAI\\state.json manually if you need to.\n"
+        )
+        return None
+    state["api_token"] = entered
+    save_state(state)
+    sys.stdout.write(f"token saved to {STATE_PATH}\n\n")
+    return entered
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     args = parse_args(argv if argv is not None else sys.argv[1:])
     cfg = Config.load(args.config if args.config.exists() else None)
@@ -450,6 +506,20 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"tokens:    {state.get('tokens', 0)}")
         print(f"earnings:  ${float(state.get('earnings_usd', 0.0)):.6f}")
         return 0
+
+    token = resolve_api_token(cfg.api_token, state, args.background)
+    if not token:
+        msg = (
+            "no api_token configured. "
+            "edit %APPDATA%\\GamerAI\\state.json and set \"api_token\", "
+            "or run the agent in the foreground once and paste your token."
+            if IS_WINDOWS else
+            "no api_token configured. Set $API_TOKEN or edit ~/.gamerai/state.json"
+        )
+        log.error(msg)
+        sys.stderr.write(msg + "\n")
+        return 2
+    cfg.api_token = token
 
     log.info("agent starting on %s — worker_id=%s", platform.platform(), worker_id)
     log.info("coordinator=%s polling=%ss idle threshold=%ss cpu<%s%% auth=%s",

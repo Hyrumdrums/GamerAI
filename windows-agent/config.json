@@ -1,5 +1,5 @@
 {
-  "coordinator_url": "http://localhost:8000",
+  "coordinator_url": "https://ai.dallinlayton.com",
   "polling_interval_seconds": 5,
   "earnings_print_minutes": 10,
   "idle": {

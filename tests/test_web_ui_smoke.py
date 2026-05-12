@@ -160,6 +160,20 @@ class WebUISmokeTests(unittest.TestCase):
         self.assertIn("gai_", body)  # the new bearer token
         self.assertIn("member_id", body)
 
+    def test_invite_accept_page_links_to_installer(self):
+        """Regression guard: the post-accept page must show the
+        Windows-agent installer download link, otherwise the onboarding
+        path silently degrades to 'go figure out where to download it'."""
+        _, code = self._make_contributor_and_invite()
+        resp = self.web.post(f"/invite/{code}", data={})
+        self.assertEqual(resp.status_code, 200)
+        body = resp.text
+        self.assertIn("/download/GamerAI-Agent-Setup.exe", body)
+        self.assertIn("/download/agent.exe", body)
+        # The copy-token button must be present so non-developer recruits
+        # don't have to fight a triple-click select.
+        self.assertIn('id="copy"', body)
+
     def test_invite_accept_410_after_one_shot(self):
         _, code = self._make_contributor_and_invite()
         first = self.web.post(f"/invite/{code}", data={})
