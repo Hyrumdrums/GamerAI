@@ -5,6 +5,113 @@ entries on top. Skim for context before resuming work.
 
 ---
 
+## 2026-05-12 — First real-machine onboarding run + sleep behavior
+
+First end-to-end recruitment test on a real Windows host (not the
+founder's earlier local dev test). Worked end-to-end. One real-world
+quirk worth recording before we recruit a stranger.
+
+### What ran
+
+- Admin minted a contributor token for `hyrumdrums@gmail.com` via
+  the CLI (`python -m coordinator.admin create-member --role
+  contributor --email …`).
+- Token pasted into the installed `agent.exe`'s first-run prompt
+  on a Windows host reached over Chrome Remote Desktop. Persisted
+  to `%APPDATA%\GamerAI\state.json`.
+- Worker registered with the production coordinator with
+  `worker_id=win-Home-PC-d4f76ae1`. Heartbeats every ~5s.
+- Status flipped correctly between `idle` (no kbd/mouse for 60s,
+  CPU < 30%) and `offline` (user touching the keyboard) — the
+  gamer-friendly contract held without intervention.
+- Admin submitted a `/generate` prompt from a separate Linux box.
+  The first job was served by the in-VPS mock worker (`worker-fa…`)
+  in 7.5s — its 2.5s polling interval beat the Windows agent's 5s
+  poll plus 60s idle gate.
+- Stopped the in-VPS mock worker (`docker stop gamerai-worker-1`)
+  to force the next job onto the Windows machine. Job submitted.
+
+### The quirk: Windows sleep ends the contributor's session
+
+About 4 minutes after Chrome Remote Desktop disconnected from the
+Windows host, the agent stopped heartbeating
+(`hb_age=235s`). Likely cause: Windows modern-standby /
+S0-low-power kicked in after the RDP session ended, suspending
+user-session processes including `agent.exe`. Job sat in the queue
+with `status: pending`, `queue_depth: 1`, `active_workers: 0`.
+
+Implications for the recruitment pitch:
+
+- **The model is fine when the contributor's machine is left
+  awake.** Most gaming PCs are configured "never sleep" by their
+  owners; for them the agent runs through the night and serves
+  whenever idle. The whole "leave it on overnight" pitch in
+  README_addendum already assumes this.
+- **But for non-gamer Windows boxes with default power settings**,
+  the contributor disappears from the network whenever they walk
+  away. The agent has no power-management awareness today —
+  no `SetThreadExecutionState(ES_SYSTEM_REQUIRED)`, no
+  PowerCfg / wake-timer integration.
+
+### Why we won't fix this in the agent today
+
+Two reasons:
+
+1. **It's a configuration question, not a code question, for the
+   target user.** Real gaming PCs override the default sleep
+   timer to never; that's the population we care about for the
+   tier ladder + paid pool. Adding `SetThreadExecutionState` to
+   the agent would *prevent* sleep on every host, which is
+   pushy and breaks the "your machine, your rules" framing in
+   `README_addendum.md`'s safety notes.
+
+2. **Graceful pending-state is the right failure mode.** When a
+   contributor's machine sleeps, jobs they would have served sit
+   in the queue until another worker picks them up — or the
+   reaper requeues them after `JOB_TIMEOUT_SECONDS` if they
+   were claimed. No data loss, no error path, no spam to the
+   contributor's logs. The cost is latency, which is exactly
+   what we accept by saying "yes, latency-tolerant
+   workloads."
+
+What we *should* do is be honest about this in the README
+addendum's "How it works" section, and add a one-line note to the
+redemption page on Step 3 (something like "the agent only takes
+work while your PC is awake — leave it running overnight to
+contribute more"). Both are docs work, not code.
+
+### Adjacent observation: long polling vs short polling
+
+The in-VPS mock worker's 2.5s poll beat the Windows agent's 5s
+poll consistently. That's not surprising — the VPS worker is in the
+same docker network with negligible round-trip — but it suggests
+that **when we have multiple contributors in different locations,
+the one with the lowest end-to-end coordinator round-trip will
+serve any given job**, all else equal. Could matter for the
+geographic contributor recruiting motion (project_network_economics
+memory). Not a fix today, just a note.
+
+### Today's seven commits + this finding
+
+```
+db55ebc  feat(membership): per-member identity, invite flow, daily quota gate
+e5c0858  test(web): smoke coverage for every web UI page
+3b1ae07  fix(caddy): route /invite/<code> to the web UI
+35d27b6  infra: serve /download/ from /var/www/downloads via Caddy
+a9f86d4  ci: windows-agent build + SFTP-publish to ai.* downloads
+37b6fc1  docs(devlog): record windows agent build + gotchas
+7d61d68  feat(onboarding): redemption page → installer + first-run token prompt
+6aedafb  docs(devlog): record onboarding loop closure
+```
+
+Plus this finding. Membership + invite + download + install +
+first-run token + register + heartbeat + idle gating ALL worked
+on a real Windows machine on the first try. Sleep behavior is
+the only thing that broke flow, and only in the
+remote-managed Windows case.
+
+---
+
 ## 2026-05-12 — Onboarding loop closure (redemption page → installer)
 
 Same date as the build-surface entry below. The previous slice put
