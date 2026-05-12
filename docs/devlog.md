@@ -5,6 +5,180 @@ entries on top. Skim for context before resuming work.
 
 ---
 
+## 2026-05-12 — Inference bootstrap (Ollama + default model on first run)
+
+The previous slices delivered an installer, an invite flow, a token
+prompt, keep-awake, drain visibility, and self-update — every layer of
+the contributor experience *except* the part that actually matters:
+real inference. Until today a fresh-install contributor's machine
+would register, claim jobs, and return **mock output**, because the
+agent only calls Ollama when `OLLAMA_URL` is set — and a non-developer
+recruit never sets that. This slice closes the gap: the agent installs
+Ollama and the default model on first run, from a mirror we control.
+
+### What ships
+
+```
+fresh Windows box                            ai.dallinlayton.com
+─────────────────                            ───────────────────
+agent.exe first launch                       /download/ollama-setup.exe
+  ↓                                          /download/models/llama3.2-1b.gguf
+probe localhost:11434 → 404                  /download/models/llama3.2-1b.Modelfile
+  ↓
+find ollama.exe → none
+  ↓
+download ollama-setup.exe ◄──────────────────
+  ↓
+run /S (silent install)
+  ↓
+wait for 11434 (up to 60s)
+  ↓
+GET /api/tags → no llama3.2:1b
+  ↓
+HEAD mirror gguf → 200
+  ↓
+download .gguf + Modelfile  ◄────────────────
+  ↓
+rewrite FROM to absolute path
+  ↓
+ollama create llama3.2:1b -f Modelfile
+  ↓
+set OLLAMA_URL=http://localhost:11434
+  ↓
+register({"models": ["llama3.2:1b"]})
+  ↓
+main_loop runs REAL inference
+```
+
+Best-effort throughout: any step failing leaves the agent running with
+mock inference (same as before this slice). Idempotent: every step is
+a fast no-op when its precondition is already met, so subsequent
+launches probe → "ollama already running" → "model already installed"
+→ done in <500ms.
+
+### Mirror-first, ollama-pull fallback
+
+The user pushed back when I waved my hand at "just `ollama pull`":
+the whole point of building infrastructure is that we control the
+supply chain. So the agent tries our mirror first:
+
+1. `HEAD {mirror}/download/models/{slug}.gguf` — if 200, download both
+   the `.gguf` and a sibling `.Modelfile`, rewrite the relative `FROM`
+   to an absolute path, run `ollama create`.
+2. If the mirror returns anything other than 200, fall back to
+   `POST {ollama_url}/api/pull` (streams from Ollama's CDN).
+
+This way the mirror is authoritative when populated; Ollama's CDN is
+the dependable fallback so a contributor whose model isn't on our
+mirror yet still gets a working agent. When we eventually publish a
+fine-tuned model or pin a quantization, dropping a new `.gguf` +
+`.Modelfile` on the VPS is the only step required.
+
+### What needs to be on the VPS
+
+A new script, `infra/setup-mirror.sh`, populates the mirror:
+
+- `https://ai.dallinlayton.com/download/ollama-setup.exe` —
+  mirrored from `https://ollama.com/download/OllamaSetup.exe`
+  (~700 MB Squirrel installer; runs with `/S` for silent).
+- `https://ai.dallinlayton.com/download/models/llama3.2-1b.gguf` —
+  Q8_0 quantization to match Ollama's default for that tag
+  (~1.3 GB; pulled from a HuggingFace mirror of
+  `meta-llama/Llama-3.2-1B-Instruct`).
+- `https://ai.dallinlayton.com/download/models/llama3.2-1b.Modelfile`
+  — written inline by the script; the `FROM` line is a placeholder
+  the agent rewrites to an absolute path before invoking
+  `ollama create`.
+
+Disk on VPS: ~2 GB additional. Bandwidth out: 2 GB per new
+contributor's first install (one-time). Hetzner CPX21 has 80 GB disk
+and 20 TB/mo bandwidth, so 10 contributors/mo costs 20 GB of egress
+— a rounding error.
+
+```bash
+ssh -i ~/.ssh/id_ed25519_gamerai root@5.161.235.139
+sudo bash /opt/gamerai/infra/setup-mirror.sh
+```
+
+Runs idempotently; re-run after `git pull` is harmless.
+
+### Why install Ollama unelevated
+
+Ollama's Windows installer is a Squirrel-based exe that installs into
+`%LOCALAPPDATA%\Programs\Ollama` and does *not* require admin
+elevation. Since our own installer is `PrivilegesRequired=lowest` and
+the agent runs unelevated, this works out — no UAC prompt mid-install,
+no elevation friction. The tradeoff: per-user install means each
+Windows account on a shared machine needs its own Ollama. Fine for
+single-user gamer rigs; will revisit if a real contributor reports
+multi-account hosts.
+
+### Model capability advertised on /register
+
+`/register` now sends `capabilities: {"models": ["llama3.2:1b"]}` when
+bootstrap succeeds (i.e., when `OLLAMA_URL` is set after bootstrap
+returns). `/workers` already surfaces this; the only thing still
+missing is *routing*: today every job goes into the global queue, so
+a job targeting `llama3.1:8b` could still land on a contributor that
+only has `llama3.2:1b`. That worker would call Ollama, get a 404
+model-not-found, and fall through to the mock-fallback path —
+correct behavior, but wasteful. Capability-aware routing is the
+deferred Phase 4 piece.
+
+### What's still NOT in this slice
+
+- **Per-tier model bundles.** Today every contributor installs the
+  same `llama3.2:1b`. A BRONZE 6GB GPU should probably still get
+  the 1B; a PLATINUM 24GB GPU should get a 13B-class model
+  automatically. Needs (a) coordinator-side advertisement of "what
+  this tier should run" and (b) capability-aware routing. Out of
+  scope until tier auto-promotion ships.
+- **Disk-space pre-check.** A contributor with <5 GB free will fail
+  mid-download. We log the failure but don't catch it upfront.
+- **Resume on partial download.** A flaky network on a 1.3 GB pull
+  starts over from scratch. httpx supports Range, but the failure
+  rate of small-model downloads in practice is low enough this isn't
+  worth the complexity yet.
+- **Signed Ollama installer mirror.** We're rehosting an unsigned
+  bag of bytes. If our SFTP key leaks, an attacker could swap in a
+  malicious "OllamaSetup.exe" and we'd serve it. Same trust chain
+  as the agent self-update; signed binaries are the eventual EV-cert
+  fix (still Phase 4).
+- **Background-mode bootstrap progress UX.** The bootstrap can take
+  3–5 minutes the first time. In `--background` mode there's no
+  console; the contributor sees nothing happen for several minutes
+  unless they tail `%APPDATA%\GamerAI\logs\agent.log`. A
+  status-shows-up-in-system-tray UI would help, but it's beyond
+  this slice.
+
+### Test scoreboard
+
+- 118/118 tests pass (108 + 10 new in `tests/test_agent_bootstrap.py`:
+  config defaults, user overrides, slug shape, disabled/non-Windows
+  short-circuit, `/api/tags` parsing).
+- Existing tests untouched; bootstrap is gated on `IS_WINDOWS` so the
+  Linux dev/CI path is a no-op.
+- Real-machine verification still pending the next CI rebuild + a
+  manual run on the founder's Windows box.
+
+### File layout changes
+
+```
+windows-agent/agent.py            <- bootstrap_inference() + helpers,
+                                     Coordinator.register(capabilities=...),
+                                     bootstrap_* fields on Config
+windows-agent/config.json         <- "bootstrap" section
+                                     (enabled, model, ollama_url,
+                                      mirror_base_url)
+infra/setup-mirror.sh             <- one-time VPS-side script to
+                                     populate /download/{ollama-setup.exe,
+                                     models/llama3.2-1b.gguf,
+                                     models/llama3.2-1b.Modelfile}
+tests/test_agent_bootstrap.py     <- new
+```
+
+---
+
 ## 2026-05-12 — Background self-update for the Windows agent
 
 Without an update path, every installed agent gets stuck at the
