@@ -64,6 +64,46 @@ def cpu_percent(sample_seconds: float) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Power management (Windows-only)
+# ---------------------------------------------------------------------------
+# SetThreadExecutionState flags from winnt.h. ES_CONTINUOUS keeps the request
+# active until we explicitly clear it; ES_SYSTEM_REQUIRED tells Windows the
+# system is needed (resets the idle timer that triggers sleep).
+_ES_CONTINUOUS = 0x80000000
+_ES_SYSTEM_REQUIRED = 0x00000001
+
+
+def keep_awake_begin(log: logging.Logger) -> bool:
+    """Ask Windows not to sleep while the agent is running. Returns True on
+    success. No-op on non-Windows so the same code runs in dev."""
+    if not IS_WINDOWS:
+        return False
+    try:
+        rc = ctypes.windll.kernel32.SetThreadExecutionState(
+            _ES_CONTINUOUS | _ES_SYSTEM_REQUIRED
+        )
+        if rc == 0:
+            log.warning("SetThreadExecutionState failed; sleep may still occur")
+            return False
+        log.info("keep-awake on (preventing system sleep while online)")
+        return True
+    except Exception as e:
+        log.warning("keep-awake setup failed: %s", e)
+        return False
+
+
+def keep_awake_end(log: logging.Logger) -> None:
+    """Release the keep-awake request. Safe to call even if begin failed."""
+    if not IS_WINDOWS:
+        return
+    try:
+        ctypes.windll.kernel32.SetThreadExecutionState(_ES_CONTINUOUS)
+        log.info("keep-awake released")
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 DEFAULTS = {
@@ -74,6 +114,20 @@ DEFAULTS = {
         "min_input_idle_seconds": 60,
         "max_cpu_percent": 30,
         "cpu_sample_seconds": 2,
+        # When true, if the user becomes active between job-claim and
+        # inference-start the agent calls /jobs/abandon and forfeits
+        # any pending earnings. Off by default: the existing behavior
+        # is to drain (finish the in-flight job, *then* go offline).
+        "override_drain": False,
+    },
+    "power": {
+        # When true and running in --background mode, ask Windows not
+        # to sleep while the agent is online. This is the "I've opted
+        # my machine into the network" contract — autostart shortcuts
+        # set --background, so this only fires for explicit
+        # background-contributor mode. Foreground / --once never
+        # touches power state.
+        "keep_awake_while_online": True,
     },
     "model": None,
     "worker_id": None,
@@ -89,6 +143,8 @@ class Config:
     min_input_idle_seconds: float
     max_cpu_percent: float
     cpu_sample_seconds: float
+    override_drain: bool
+    keep_awake_while_online: bool
     model: Optional[str]
     worker_id: Optional[str]
     api_token: Optional[str]
@@ -101,6 +157,7 @@ class Config:
                 user = json.load(f)
             _deep_merge(data, user)
         idle = data["idle"]
+        power = data.get("power", DEFAULTS["power"])
         # env overrides config so a single API_TOKEN export works
         # for ad-hoc testing without touching config.json.
         token = (os.getenv("API_TOKEN") or data.get("api_token") or "").strip()
@@ -111,6 +168,10 @@ class Config:
             min_input_idle_seconds=float(idle["min_input_idle_seconds"]),
             max_cpu_percent=float(idle["max_cpu_percent"]),
             cpu_sample_seconds=float(idle["cpu_sample_seconds"]),
+            override_drain=bool(idle.get("override_drain", False)),
+            keep_awake_while_online=bool(
+                power.get("keep_awake_while_online", True)
+            ),
             model=data.get("model"),
             worker_id=data.get("worker_id"),
             api_token=token or None,
@@ -269,6 +330,17 @@ class Coordinator:
     def complete(self, payload: dict) -> Optional[dict]:
         return self._post("/jobs/complete", payload, timeout=30)
 
+    def abandon(self, job_id: str) -> bool:
+        """Voluntarily return a claimed job to the queue. Used in
+        override-drain mode when the user becomes active between
+        claim and inference. Coordinator requeues; another worker
+        picks it up. Earnings are forfeited."""
+        out = self._post(
+            "/jobs/abandon",
+            {"worker_id": self.worker_id, "job_id": job_id},
+        )
+        return bool((out or {}).get("ok"))
+
     def remote_earnings(self) -> Optional[dict]:
         return self._get(f"/earnings/{self.worker_id}")
 
@@ -335,16 +407,87 @@ def is_system_idle(cfg: Config) -> tuple[bool, str]:
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
-def process_one(cfg: Config, coord: Coordinator, state: dict, log: logging.Logger) -> bool:
+def print_earnings(state: dict, log: logging.Logger) -> None:
+    log.info(
+        "Jobs completed: %d | Earnings: $%.6f",
+        int(state.get("jobs", 0)),
+        float(state.get("earnings_usd", 0.0)),
+    )
+
+
+def main_loop(cfg: Config, coord: Coordinator, state: dict, log: logging.Logger, once: bool) -> None:
+    last_heartbeat = 0.0
+    last_earnings_print = time.time()
+    # Tracks whether the last main-loop iteration completed a real job.
+    # Used to differentiate a plain "user became active" message from
+    # "user became active right after a job completed" — the latter is
+    # the graceful-drain case the README addendum advertises, and
+    # surfacing it gives the contributor confidence that their last
+    # work landed before the machine went offline.
+    just_drained_job_id: Optional[str] = None
+
+    while True:
+        now = time.time()
+        if now - last_heartbeat > 5:
+            coord.heartbeat("idle")
+            last_heartbeat = now
+
+        if now - last_earnings_print > cfg.earnings_print_seconds:
+            print_earnings(state, log)
+            last_earnings_print = now
+
+        idle, reason = is_system_idle(cfg)
+        if not idle:
+            if just_drained_job_id is not None:
+                log.info(
+                    "user activity detected (%s) — last job %s complete, agent offline",
+                    reason, just_drained_job_id,
+                )
+                just_drained_job_id = None
+            coord.heartbeat("offline")
+            last_heartbeat = time.time()
+            time.sleep(cfg.polling_interval)
+            continue
+
+        # Idle. If we just came off a job we'd previously logged the
+        # drain message, clear the breadcrumb so the next user-active
+        # transition doesn't reference a stale job_id.
+        just_drained_job_id = None
+
+        did_work, processed_job_id = process_one(cfg, coord, state, log)
+        if did_work:
+            just_drained_job_id = processed_job_id
+        if once and did_work:
+            return
+        if not did_work:
+            time.sleep(cfg.polling_interval)
+
+
+def process_one(
+    cfg: Config, coord: Coordinator, state: dict, log: logging.Logger,
+) -> tuple[bool, Optional[str]]:
+    """Pop, claim, run, complete one job. Returns (did_work, job_id).
+    The job_id is captured so the main loop can reference it in the
+    next iteration's drain-visibility log line."""
     job = coord.next_job()
     if not job:
-        return False
-
+        return False, None
     job_id = job.get("job_id")
     prompt = job.get("prompt", "")
     log.info("job %s started", job_id)
     coord.claim(job_id)
     coord.heartbeat("busy")
+
+    if cfg.override_drain:
+        idle_now, reason = is_system_idle(cfg)
+        if not idle_now:
+            log.info(
+                "override-drain: %s — abandoning job %s (earnings forfeited)",
+                reason, job_id,
+            )
+            coord.abandon(job_id)
+            coord.heartbeat("offline")
+            return False, None
 
     started = time.time()
     try:
@@ -388,43 +531,7 @@ def process_one(cfg: Config, coord: Coordinator, state: dict, log: logging.Logge
         )
     finally:
         coord.heartbeat("idle")
-    return True
-
-
-def print_earnings(state: dict, log: logging.Logger) -> None:
-    log.info(
-        "Jobs completed: %d | Earnings: $%.6f",
-        int(state.get("jobs", 0)),
-        float(state.get("earnings_usd", 0.0)),
-    )
-
-
-def main_loop(cfg: Config, coord: Coordinator, state: dict, log: logging.Logger, once: bool) -> None:
-    last_heartbeat = 0.0
-    last_earnings_print = time.time()
-
-    while True:
-        now = time.time()
-        if now - last_heartbeat > 5:
-            coord.heartbeat("idle")
-            last_heartbeat = now
-
-        if now - last_earnings_print > cfg.earnings_print_seconds:
-            print_earnings(state, log)
-            last_earnings_print = now
-
-        idle, reason = is_system_idle(cfg)
-        if not idle:
-            coord.heartbeat("offline")
-            last_heartbeat = time.time()
-            time.sleep(cfg.polling_interval)
-            continue
-
-        did_work = process_one(cfg, coord, state, log)
-        if once and did_work:
-            return
-        if not did_work:
-            time.sleep(cfg.polling_interval)
+    return True, job_id
 
 
 # ---------------------------------------------------------------------------
@@ -527,8 +634,20 @@ def main(argv: Optional[list[str]] = None) -> int:
              cfg.min_input_idle_seconds, cfg.max_cpu_percent,
              "on" if cfg.api_token else "off")
 
+    # Keep-awake is the "I've committed my machine" contract — only
+    # enabled when the contributor opts into background mode (autostart
+    # installer toggle) and the config knob is on. Foreground/--once
+    # runs never touch power state.
+    keep_awake_active = False
+    if args.background and cfg.keep_awake_while_online:
+        keep_awake_active = keep_awake_begin(log)
+    elif args.background and not cfg.keep_awake_while_online:
+        log.info("keep-awake off (power.keep_awake_while_online=false)")
+
     coord = Coordinator(cfg.coordinator_url, worker_id, log, cfg.api_token)
     if not coord.register():
+        if keep_awake_active:
+            keep_awake_end(log)
         return 1
 
     try:
@@ -540,6 +659,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             coord.heartbeat("offline")
         except Exception:
             pass
+        if keep_awake_active:
+            keep_awake_end(log)
         print_earnings(state, log)
     return 0
 

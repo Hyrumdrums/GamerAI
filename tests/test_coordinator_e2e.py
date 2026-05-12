@@ -206,6 +206,46 @@ class CoordinatorE2ETests(unittest.TestCase):
         self.assertIsNone(rec["capabilities"])
 
     # ------------------------------------------------------------------
+    # abandon (voluntary requeue when contributor's user becomes active)
+    # ------------------------------------------------------------------
+    def test_abandon_returns_job_to_queue(self):
+        # Submit + claim by worker A, then have A abandon mid-flight.
+        job_id = self.client.post(
+            "/generate", json={"prompt": "drain me"}
+        ).json()["job_id"]
+        worker_id = "wkr-abandoning"
+        self.client.post("/register", json={"worker_id": worker_id})
+        self.r.lpop("job_queue")  # mimic worker pop
+        self.client.post(
+            "/jobs/claim", json={"worker_id": worker_id, "job_id": job_id}
+        )
+
+        # Sanity: job is in-flight, queue is empty.
+        self.assertEqual(self.r.llen("job_queue"), 0)
+        self.assertEqual(self.r.hlen("job_processing"), 1)
+
+        resp = self.client.post(
+            "/jobs/abandon", json={"worker_id": worker_id, "job_id": job_id}
+        )
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertTrue(body["ok"])
+        self.assertTrue(body["requeued"])
+
+        # Job back on the queue, out of in-flight, SQLite row reset to pending.
+        self.assertEqual(self.r.llen("job_queue"), 1)
+        self.assertEqual(self.r.hlen("job_processing"), 0)
+        row = self.client.get(f"/result/{job_id}").json()
+        self.assertEqual(row["status"], "pending")
+
+    def test_abandon_unknown_job_is_noop(self):
+        resp = self.client.post(
+            "/jobs/abandon", json={"worker_id": "wkr-x", "job_id": "no-such"}
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertFalse(resp.json()["requeued"])
+
+    # ------------------------------------------------------------------
     # reaper
     # ------------------------------------------------------------------
     def test_reaper_requeues_jobs_with_expired_deadlines(self):

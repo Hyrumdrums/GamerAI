@@ -387,6 +387,55 @@ def claim(req: JobClaimRequest):
     return {"ok": True, "deadline": deadline}
 
 
+@app.post("/jobs/abandon")
+def abandon(req: JobClaimRequest):
+    """Worker voluntarily gives a claimed job back to the queue.
+
+    Used when the contributor's machine sees user activity and the
+    agent is configured with ``idle.override_drain: true`` (the
+    "throw out the money" path — paid contributors who'd rather
+    forfeit earnings than make the user wait).
+
+    Idempotent: a missing job_id is a no-op. We requeue the job from
+    the processing-hash record so the next worker picks up the same
+    prompt + model. Earnings are zeroed because no work was reported.
+    """
+    raw = r.hget(JOB_PROCESSING, req.job_id)
+    if raw is None:
+        return {"ok": True, "requeued": False, "reason": "not in flight"}
+    try:
+        meta = json.loads(raw)
+    except json.JSONDecodeError:
+        meta = {}
+    original = meta.get("job")
+    if original is None:
+        row = db.get_job(req.job_id)
+        if row is not None:
+            original = {
+                "job_id": row["job_id"],
+                "prompt": row["prompt"],
+                "model": row["model"],
+                "submitted_at": row["submitted_at"],
+                "submitted_by_member_id": row["submitted_by_member_id"]
+                if "submitted_by_member_id" in row.keys()
+                else None,
+            }
+    if original is not None:
+        r.rpush(JOB_QUEUE, json.dumps(original))
+    r.hdel(JOB_PROCESSING, req.job_id)
+    r.hset(WORKER_STATUS, req.worker_id, "idle")
+    db.requeue_job(req.job_id)
+    log.info(
+        "job abandoned",
+        extra={
+            "event": "job_abandoned",
+            "job_id": req.job_id,
+            "worker_id": req.worker_id,
+        },
+    )
+    return {"ok": True, "requeued": True}
+
+
 @app.post("/jobs/complete")
 def complete(req: JobCompleteRequest):
     """Worker submits result. Coordinator writes Redis result, earnings, SQLite row."""

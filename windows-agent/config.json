@@ -5,7 +5,11 @@
   "idle": {
     "min_input_idle_seconds": 60,
     "max_cpu_percent": 30,
-    "cpu_sample_seconds": 2
+    "cpu_sample_seconds": 2,
+    "override_drain": false
+  },
+  "power": {
+    "keep_awake_while_online": true
   },
   "model": null,
   "worker_id": null,
