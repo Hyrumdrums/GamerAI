@@ -48,6 +48,10 @@ services:
       - ./infra/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
+      # CI uploads the Windows agent installer here via SFTP (see
+      # .github/workflows/windows-agent-build.yml). The dir is host-managed
+      # and exposed read-only inside the container.
+      - /var/www/downloads:/srv/downloads:ro
 
 volumes:
   caddy_data:

@@ -16,6 +16,15 @@
     tls {$EMAIL}
     encode zstd gzip
 
+    # Public download surface for the Windows agent installer +
+    # standalone exe. Files are uploaded by CI into /var/www/downloads
+    # on the host, which is bind-mounted into the Caddy container at
+    # /srv/downloads. See infra/docker-compose.prod.yml.
+    handle_path /download/* {
+        root * /srv/downloads
+        file_server browse
+    }
+
     @public_invite path /invite/*
     handle @public_invite {
         reverse_proxy client:8080
