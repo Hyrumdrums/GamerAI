@@ -1,0 +1,301 @@
+"""Web UI smoke tests. Exercises the public invite-redemption pages and
+the admin browser views by routing the web UI's outbound httpx calls
+through an ASGI transport against the in-process coordinator app — no
+network, no separate worker process.
+
+The goal is dead-route / template / proxy-shape coverage, not pixel
+exactness. Run with ``python -m unittest tests.test_web_ui_smoke``.
+"""
+from __future__ import annotations
+
+import os
+import sys
+import tempfile
+import unittest
+
+# 1. Env BEFORE imports — auth on, fresh DB, no rate limit.
+_TMPDIR = tempfile.mkdtemp(prefix="gamerai-test-webui-")
+os.environ["DB_PATH"] = os.path.join(_TMPDIR, "test.db")
+os.environ["API_TOKEN"] = "admin-seed-token-for-webui-tests"
+os.environ.pop("RATE_LIMIT_PER_MIN", None)
+os.environ.pop("STRICT_MODELS", None)
+
+# 2. Drop cached modules (including the ``client`` package).
+for _mod in list(sys.modules):
+    if _mod.split(".", 1)[0] in ("shared", "coordinator", "client"):
+        del sys.modules[_mod]
+
+# 3. Patch the coordinator's Redis factory before main imports.
+import fakeredis  # noqa: E402
+
+import coordinator.redis_client  # noqa: E402
+
+_FAKE = fakeredis.FakeStrictRedis(decode_responses=True)
+coordinator.redis_client.get_client = lambda: _FAKE  # type: ignore[assignment]
+
+# 4. Import the coordinator + web UI.
+import httpx  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
+
+from client import web as client_web  # noqa: E402
+from coordinator import main as coordinator_main  # noqa: E402
+from coordinator import member_auth  # noqa: E402
+
+ADMIN_TOKEN = os.environ["API_TOKEN"]
+
+
+def _patched_admin_client() -> httpx.AsyncClient:
+    """Drop-in for ``client.web._client`` — routes admin-authed outbound
+    calls through ASGITransport at the coordinator app, no network."""
+    return httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=coordinator_main.app),
+        base_url="http://coordinator",
+        headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+    )
+
+
+def _patched_public_client() -> httpx.AsyncClient:
+    """Drop-in for ``client.web._public_client`` — no auth header."""
+    return httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=coordinator_main.app),
+        base_url="http://coordinator",
+    )
+
+
+client_web._client = _patched_admin_client  # type: ignore[assignment]
+client_web._public_client = _patched_public_client  # type: ignore[assignment]
+
+
+class WebUISmokeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # follow_redirects=False so we can assert the /admin redirect target
+        # without TestClient auto-following it.
+        cls.web = TestClient(client_web.app, follow_redirects=False)
+        cls.coord = TestClient(coordinator_main.app)
+        cls.db = coordinator_main.db
+        cls.r = _FAKE
+        coordinator_main.ensure_admin_seed()
+
+    def setUp(self):
+        self.r.flushall()
+        self.db._conn.executescript(
+            "DELETE FROM jobs; "
+            "DELETE FROM workers; "
+            "DELETE FROM earnings; "
+            "DELETE FROM member_usage; "
+            "DELETE FROM invites; "
+            "DELETE FROM members WHERE role <> 'admin';"
+        )
+
+    # ------------------------------------------------------------------
+    # helpers — bootstrap a contributor + invite via the coordinator
+    # ------------------------------------------------------------------
+    def _make_contributor_and_invite(self, **invite_kwargs) -> tuple[str, str]:
+        """Returns (contributor_token, invite_code). Both built via the
+        coordinator's HTTP surface so this test file has no direct DB
+        dependencies beyond table truncation."""
+        admin_headers = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
+        # Mint a contributor by direct DB write — the only path that does
+        # this today is the CLI, which we don't want to exec here.
+        token = member_auth.generate_token()
+        member_id = "mem_webui_contrib"
+        self.db.create_member(
+            member_id=member_id,
+            email="alice@example.com",
+            role="contributor",
+            parent_member_id=None,
+            token_hash=member_auth.hash_token(token),
+        )
+        body = {"daily_quota_tokens": 200}
+        body.update(invite_kwargs)
+        resp = self.coord.post(
+            "/invites",
+            json=body,
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        return token, resp.json()["code"]
+
+    # ------------------------------------------------------------------
+    # public redemption flow
+    # ------------------------------------------------------------------
+    def test_invite_landing_renders_inviter_info(self):
+        _, code = self._make_contributor_and_invite()
+        resp = self.web.get(f"/invite/{code}")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.text
+        self.assertIn("You've been invited", body)
+        self.assertIn("alice@example.com", body)
+        self.assertIn("200 tokens/day", body)
+        # The form posts back to the same URL.
+        self.assertIn(f'<form method="POST"', body)
+
+    def test_invite_landing_404_for_unknown_code(self):
+        resp = self.web.get("/invite/inv_doesnotexist")
+        self.assertEqual(resp.status_code, 404)
+        self.assertIn("was not found", resp.text)
+
+    def test_invite_landing_410_for_revoked(self):
+        _, code = self._make_contributor_and_invite()
+        # Revoke via admin endpoint.
+        rev = self.coord.post(
+            f"/invites/{code}/revoke",
+            headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+        )
+        self.assertEqual(rev.status_code, 200)
+        resp = self.web.get(f"/invite/{code}")
+        self.assertEqual(resp.status_code, 410)
+        self.assertIn("revoked", resp.text)
+
+    def test_invite_accept_renders_token(self):
+        _, code = self._make_contributor_and_invite()
+        resp = self.web.post(
+            f"/invite/{code}",
+            data={"invitee_email": "bob@example.com"},
+        )
+        self.assertEqual(resp.status_code, 200)
+        body = resp.text
+        self.assertIn("Welcome to GamerAI", body)
+        self.assertIn("gai_", body)  # the new bearer token
+        self.assertIn("member_id", body)
+
+    def test_invite_accept_410_after_one_shot(self):
+        _, code = self._make_contributor_and_invite()
+        first = self.web.post(f"/invite/{code}", data={})
+        self.assertEqual(first.status_code, 200)
+        second = self.web.post(f"/invite/{code}", data={})
+        self.assertEqual(second.status_code, 410)
+        self.assertIn("accepted", second.text)
+
+    def test_invite_accept_without_email_works(self):
+        # Bob is allowed to redeem without filling in his email.
+        _, code = self._make_contributor_and_invite()
+        resp = self.web.post(f"/invite/{code}", data={"invitee_email": ""})
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("gai_", resp.text)
+
+    # ------------------------------------------------------------------
+    # admin browser views
+    # ------------------------------------------------------------------
+    def test_admin_members_page_renders(self):
+        contributor_token, _ = self._make_contributor_and_invite()
+        del contributor_token  # we only want the side effect of the row insert
+        resp = self.web.get("/admin/members")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.text
+        self.assertIn("Members", body)
+        self.assertIn("admin", body)         # the admin seed row
+        self.assertIn("alice@example.com", body)  # the contributor row
+        self.assertIn("contributor", body)
+
+    def test_admin_invites_page_renders(self):
+        _, code = self._make_contributor_and_invite()
+        resp = self.web.get("/admin/invites")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.text
+        self.assertIn("Invites", body)
+        self.assertIn(code, body)
+        self.assertIn("open", body)
+
+    def test_admin_invites_shows_accepted_state(self):
+        _, code = self._make_contributor_and_invite()
+        # Bob accepts.
+        self.web.post(f"/invite/{code}", data={"invitee_email": "bob@example.com"})
+        resp = self.web.get("/admin/invites")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.text
+        self.assertIn(code, body)
+        self.assertIn("accepted", body)
+
+    # ------------------------------------------------------------------
+    # static / chrome pages
+    # ------------------------------------------------------------------
+    def test_index_page_renders(self):
+        resp = self.web.get("/")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.text
+        self.assertIn("GamerAI", body)
+        # The prompt form must be present — that's the page's only job.
+        self.assertIn('id="prompt"', body)
+        self.assertIn('id="f"', body)
+
+    def test_admin_redirects_to_dashboard(self):
+        resp = self.web.get("/admin")
+        self.assertIn(resp.status_code, (302, 307))
+        self.assertEqual(resp.headers["location"], "/dashboard")
+
+    def test_dashboard_renders_on_empty_state(self):
+        """Regression guard — the dashboard does division/sum across the
+        workers/earnings lists. An empty network must not 500."""
+        resp = self.web.get("/dashboard")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.text
+        self.assertIn("Admin Dashboard", body)
+        self.assertIn("Total Workers", body)
+
+    def test_dashboard_renders_with_a_worker(self):
+        # Make the dashboard exercise both the metrics and the workers loops.
+        admin_headers = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
+        self.coord.post(
+            "/register",
+            json={
+                "worker_id": "wkr-dashtest",
+                "capabilities": {"vram_gb": 24.0, "gpu_model": "RTX 4090"},
+            },
+            headers=admin_headers,
+        )
+        resp = self.web.get("/dashboard")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("wkr-dashtest"[-12:], resp.text)
+
+    # ------------------------------------------------------------------
+    # /api/* proxy endpoints — exercise each one through the web UI so we
+    # know the proxy adapter (auth headers, base URL, error translation)
+    # works for every backend endpoint that the browser-side JS hits.
+    # ------------------------------------------------------------------
+    def test_api_generate_proxy_round_trips(self):
+        resp = self.web.post("/api/generate", json={"prompt": "hello"})
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertIn("job_id", body)
+        # The job is queued on the coordinator's Redis.
+        self.assertEqual(self.r.llen("job_queue"), 1)
+
+    def test_api_result_proxy_returns_pending_for_known_job(self):
+        # Submit so we have a job_id that exists.
+        jid = self.web.post(
+            "/api/generate", json={"prompt": "p"}
+        ).json()["job_id"]
+        resp = self.web.get(f"/api/result/{jid}")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["status"], "pending")
+
+    def test_api_result_proxy_returns_404_for_unknown_job(self):
+        resp = self.web.get("/api/result/no-such-job")
+        self.assertEqual(resp.status_code, 404)
+
+    def test_api_workers_proxy_returns_list(self):
+        resp = self.web.get("/api/workers")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("workers", resp.json())
+        self.assertIsInstance(resp.json()["workers"], list)
+
+    def test_api_earnings_proxy_returns_aggregate(self):
+        resp = self.web.get("/api/earnings")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertIn("workers", body)
+        self.assertIn("total_usd", body)
+
+    def test_api_metrics_proxy_returns_dict(self):
+        resp = self.web.get("/api/metrics")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        # Keys defined by coordinator.db.DB.metrics().
+        self.assertIn("total_jobs", body)
+        self.assertIn("queue_depth", body)
+
+
+if __name__ == "__main__":
+    unittest.main()
