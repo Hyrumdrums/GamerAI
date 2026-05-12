@@ -5,6 +5,134 @@ entries on top. Skim for context before resuming work.
 
 ---
 
+## 2026-05-12 — Agent reliability: keep-awake, drain visibility, abandon path
+
+Yesterday's first real-machine run surfaced two contributor-side
+gaps: the agent went silent after Chrome Remote Desktop disconnect
+(Windows modern-standby), and the "agent finishes current job
+before going offline" behavior advertised in README_addendum was
+real but completely invisible to the contributor (no log line, no
+console output). Today's slice fixes both, and adds an opt-in
+override path for the future paid-contributor case.
+
+### What shipped
+
+**1. Keep-awake (Windows `SetThreadExecutionState`).** When the
+agent is launched with `--background` (the installer-autostart
+path) and `power.keep_awake_while_online` is true (default), the
+agent calls `SetThreadExecutionState(ES_CONTINUOUS |
+ES_SYSTEM_REQUIRED)` at startup. The flag stays active for the
+lifetime of the agent process; released on exit. Windows treats
+this as "something needs the system" and skips the idle-timer →
+sleep path. Foreground / `--once` runs never touch power state —
+they're dev/test workflows.
+
+Yesterday's argument against this was "real gaming PCs configure
+sleep to never; SetThreadExecutionState is pushy and redundant for
+them." Counter-argument that landed: gaming PCs are a minority of
+the recruit pool, and even gamers lock screens / use Remote
+Desktop. The opt-in framing (autostart toggle + config knob)
+preserves "your machine, your rules": foreground users see no
+behavior change; autostart users get the silent uptime promise
+they thought they were signing up for.
+
+**2. Drain-visibility logging.** `main_loop` now remembers the
+last-processed `job_id` across iterations. The transition
+"finished a job → user just became active" emits a distinct line:
+
+```
+user activity detected (user active (0s since last input)) —
+last job 3b160373-... complete, agent offline
+```
+
+Plain idle-to-offline transitions (no job in flight) keep the
+silent heartbeat-only path; only the drain case logs. The
+rotating file at `%APPDATA%\GamerAI\logs\agent.log` now tells
+the story the README addendum promised.
+
+**3. Override-drain (`idle.override_drain`, default false).** A
+new opt-in config knob for the "paid contributor who'd rather
+forfeit earnings than make the user wait" case. When true, the
+agent re-checks system idle between *claim* and
+*inference-start*; if the user became active in that window,
+the agent calls a new `POST /jobs/abandon` and bails out.
+Coordinator requeues the job via the existing
+`db.requeue_job` + Redis processing-hash unwind path the reaper
+already used.
+
+What this does *not* do today is interrupt mid-inference. Real
+mid-inference cancel needs streaming inference + a cancellation
+token, which is a larger surface (httpx streaming + signal
+handling). Documented in the agent comment. Hooked up for the
+small pre-inference window so the override knob is real even if
+it's only catching a sub-second activity window for mock
+inference.
+
+### Coordinator changes
+
+- **`POST /jobs/abandon`** in `coordinator/main.py`. Body:
+  `{worker_id, job_id}`. Returns `{ok, requeued, reason?}`.
+  Idempotent — a missing/unknown `job_id` is a no-op
+  (`requeued: false`). Reuses the same Redis + SQLite unwind
+  the reaper uses for timeout requeues, so a job comes back
+  to the queue in exactly the state any other worker can
+  pick up.
+- Two new tests in `tests/test_coordinator_e2e.py`:
+  `test_abandon_returns_job_to_queue` (happy path with full
+  state-machine assertion) and `test_abandon_unknown_job_is_noop`.
+
+### Why we shipped #3 even though paid contributors are months
+away
+
+Three reasons it was worth landing now rather than punting until
+Phase 3b.ii:
+
+- The coordinator endpoint is generally useful — same shape
+  as the reaper-requeue path, no new concept, ~50 lines.
+- The agent-side check between claim and inference is a single
+  if-block; cheap to add now, free to leave dormant
+  (`override_drain: false` is the default).
+- It surfaces the design constraint clearly *before* we have a
+  real paid contributor whose expectations need managing. When
+  the time comes, "we already have an abandon API and an
+  opt-in agent knob; we just need streaming inference to make
+  it interrupt mid-job" is a much smaller conversation than
+  "we need to design this from scratch."
+
+### What's still NOT in this slice
+
+- **Mid-inference cancel.** Today abandon only catches activity in
+  the claim→inference-start window (<1s). The honest answer is
+  "your override only saves time if your inference is slow to
+  start, not if it's slow to finish." For the current network
+  (sub-10s mocks, sub-30s small-model inference) this is fine; for
+  paid-quality 13B-class inference where a single job can take
+  many seconds, mid-inference cancel becomes meaningful and the
+  architectural cost (streaming + cancellation tokens) becomes
+  worth paying.
+- **Windows service mode.** Still not in. Yesterday's argument
+  stands — Session 0 GPU access is sketchy and shipping a service
+  install adds elevation friction to the recruitment flow. The
+  keep-awake feature above is the cheap intermediate fix. If
+  future contributors actually complain that "I had to log in
+  for the agent to start," we revisit and probably ship service
+  mode as an optional advanced install path.
+- **Foreground-mode keep-awake.** Deliberately off. Foreground
+  is "I'm watching the agent" and the user's power preferences
+  should rule. Only the autostart-as-background-contributor mode
+  opts into keep-awake.
+
+### Test scoreboard
+
+- `coordinator/main.py` + `coordinator/db.py` unchanged surface,
+  one new endpoint.
+- 108/108 tests pass.
+- CI rebuild of the Windows agent kicked off on commit `0d09e59`;
+  fresh `agent.exe` + `GamerAI-Agent-Setup.exe` should land at
+  `https://ai.dallinlayton.com/download/` within ~1m.
+
+---
+
 ## 2026-05-12 — First real-machine onboarding run + sleep behavior
 
 First end-to-end recruitment test on a real Windows host (not the
