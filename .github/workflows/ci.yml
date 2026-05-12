@@ -19,10 +19,18 @@ jobs:
           cache: pip
 
       - name: Install dependencies
+        # Tests import code from every component (the web smoke suite
+        # touches client/web.py and needs python-multipart for Form();
+        # the agent bootstrap suite imports windows-agent/agent.py and
+        # needs psutil). Install every component's runtime deps so
+        # discovery succeeds. pywin32 in windows-agent is
+        # sys_platform-gated and silently skipped on Linux.
         run: |
           python -m pip install --upgrade pip
           pip install -r coordinator/requirements.txt \
                       -r worker/requirements.txt \
+                      -r client/requirements.txt \
+                      -r windows-agent/requirements.txt \
                       -r requirements-dev.txt
 
       - name: Run unit tests
