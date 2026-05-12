@@ -12,3 +12,13 @@ __pycache__/
 data/
 ollama-models/
 .env.prod
+
+# windows-agent build outputs — produced by CI (and locally if you run
+# build.bat). version.txt is generated at build time and bundled into
+# agent.exe by PyInstaller; never committed.
+windows-agent/version.txt
+windows-agent/dist/
+windows-agent/build/
+windows-agent/Output/
+windows-agent/*.spec
+windows-agent/upload/

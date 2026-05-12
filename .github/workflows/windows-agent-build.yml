@@ -52,11 +52,26 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Write version.txt for the build
+        # The agent reads this file at startup (bundled via PyInstaller
+        # --add-data) and the self-updater compares it against the
+        # version.txt that this workflow also publishes to /download/.
+        # Format: a single line "<short-sha> <iso-utc>" so a contributor
+        # can eyeball mismatches in the log without parsing JSON.
+        working-directory: windows-agent
+        run: |
+          $sha = "${{ github.sha }}".Substring(0, 7)
+          $now = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+          "$sha $now" | Out-File -FilePath version.txt -Encoding ascii -NoNewline
+          Get-Content version.txt
+          Write-Host ""
+
       - name: Build agent.exe (PyInstaller)
         working-directory: windows-agent
         run: |
           pyinstaller --onefile --name agent `
             --add-data "config.json;." `
+            --add-data "version.txt;." `
             agent.py
           if (-not (Test-Path "dist\agent.exe")) {
             Write-Error "agent.exe was not produced"
@@ -89,6 +104,9 @@ jobs:
           New-Item -ItemType Directory -Force -Path upload | Out-Null
           Copy-Item dist\agent.exe upload\agent.exe
           Copy-Item Output\GamerAI-Agent-Setup.exe upload\GamerAI-Agent-Setup.exe
+          # version.txt is the latest-published-version file the
+          # installed agents poll for self-update.
+          Copy-Item version.txt upload\version.txt
           # A small index helps Caddy's browse view be self-explanatory.
           $sha = "${{ github.sha }}".Substring(0, 7)
           $now = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm 'UTC'")
@@ -119,6 +137,7 @@ jobs:
           cd uploads
           put upload/agent.exe agent.exe
           put upload/GamerAI-Agent-Setup.exe GamerAI-Agent-Setup.exe
+          put upload/version.txt version.txt
           put upload/BUILD.txt BUILD.txt
           bye
           "@ | Out-File -FilePath sftp.batch -Encoding ascii

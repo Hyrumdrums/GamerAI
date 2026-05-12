@@ -11,6 +11,10 @@
   "power": {
     "keep_awake_while_online": true
   },
+  "update": {
+    "enabled": true,
+    "check_interval_hours": 6
+  },
   "model": null,
   "worker_id": null,
   "api_token": null
