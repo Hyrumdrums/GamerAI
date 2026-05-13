@@ -212,7 +212,7 @@ a{{color:#2d6cdf;text-decoration:none}}
 _REDEEM_PAGE = """<!doctype html>
 <html><head><meta charset="utf-8"><title>You've been invited — GamerAI</title>
 <style>
-  body{{font-family:-apple-system,system-ui,sans-serif;max-width:560px;margin:3rem auto;padding:0 1rem;color:#1a1a1a}}
+  body{{font-family:-apple-system,system-ui,sans-serif;max-width:580px;margin:3rem auto;padding:0 1rem;color:#1a1a1a;line-height:1.5}}
   h1{{margin-bottom:.25rem}}
   .sub{{color:#666;margin-bottom:1.5rem}}
   .card{{background:#fafafa;border:1px solid #e5e5e5;border-radius:8px;padding:1.25rem;margin-bottom:1.25rem}}
@@ -223,6 +223,13 @@ _REDEEM_PAGE = """<!doctype html>
   button:hover{{background:#1f55b8}}
   button[disabled]{{background:#999;cursor:not-allowed}}
   .err{{color:#b00020}}
+  .tos{{background:#fff8e8;border:1px solid #f0d57b;border-radius:8px;padding:1rem 1.1rem;margin-bottom:1rem;font-size:.92rem}}
+  .tos h2{{margin:0 0 .5rem;font-size:1.05rem}}
+  .tos ul{{margin:.25rem 0 .5rem 0;padding-left:1.25rem}}
+  .tos li{{margin-bottom:.25rem}}
+  .tos a{{color:#2d6cdf}}
+  .accept-row{{display:flex;align-items:flex-start;gap:.5rem;margin:.75rem 0 1rem}}
+  .accept-row input{{margin-top:.25rem}}
 </style></head>
 <body>
 <h1>You've been invited</h1>
@@ -236,11 +243,33 @@ _REDEEM_PAGE = """<!doctype html>
   {expiry_block}
 </div>
 
+<div class="tos">
+  <h2>Community terms (TL;DR)</h2>
+  <ul>
+    <li><strong>Prompts are visible</strong> to whichever contributor's GPU serves them. Don't paste passwords, API keys, or anything sensitive.</li>
+    <li><strong>Best-effort service.</strong> Things can break, timeouts happen, and answers can be wrong. Don't use this for anything that costs money or harms people if it fails.</li>
+    <li><strong>Be a good neighbor.</strong> No abuse, no scraping, no illegal content. We'll remove members who break trust.</li>
+  </ul>
+  <a href="/tos" target="_blank">Read the full terms</a>
+</div>
+
 <form method="POST">
   <label for="email" class="label">Your email (optional, helps the inviter recognize you)</label>
   <input id="email" name="invitee_email" type="email" placeholder="you@example.com" />
-  <button type="submit">Accept and get my token</button>
+
+  <div class="accept-row">
+    <input id="tos_accepted" name="tos_accepted" type="checkbox" required />
+    <label for="tos_accepted">I've read and accept the <a href="/tos" target="_blank">community terms</a>.</label>
+  </div>
+
+  <button id="submit" type="submit" disabled>Accept and get my token</button>
 </form>
+
+<script>
+  const cb = document.getElementById('tos_accepted');
+  const btn = document.getElementById('submit');
+  cb.addEventListener('change', () => {{ btn.disabled = !cb.checked; }});
+</script>
 </body></html>
 """
 
@@ -390,9 +419,30 @@ async def invite_landing(code: str):
 
 
 @app.post("/invite/{code}", response_class=HTMLResponse)
-async def invite_accept(code: str, invitee_email: str = Form(default="")):
-    """Bob hits Accept. Mint a member token through the coordinator."""
-    body = {"invitee_email": invitee_email.strip() or None}
+async def invite_accept(
+    code: str,
+    invitee_email: str = Form(default=""),
+    tos_accepted: str = Form(default=""),
+):
+    """Bob hits Accept. Mint a member token through the coordinator.
+    The ToS checkbox is required client-side (HTML5 ``required``) AND
+    server-side (coordinator rejects requests without ``tos_accepted``).
+    Belt-and-suspenders: a savvy user could remove the ``required``
+    attribute via devtools, but the coordinator still refuses."""
+    if tos_accepted != "on":
+        return HTMLResponse(
+            _REDEEM_ERROR_PAGE.format(
+                detail=(
+                    "The community terms must be accepted to redeem this "
+                    "invite. Go back, check the box, and try again."
+                ),
+            ),
+            status_code=400,
+        )
+    body = {
+        "invitee_email": invitee_email.strip() or None,
+        "tos_accepted": True,
+    }
     async with _public_client() as c:
         r = await c.post(f"/invites/{code}/accept", json=body, timeout=5)
     if r.status_code == 404:

@@ -293,7 +293,7 @@ class MemberAuthE2ETests(unittest.TestCase):
         _, contributor_token = self._make_contributor()
         code = self._create_invite(contributor_token)
         accept = self.client.post(
-            f"/invites/{code}/accept", json={}
+            f"/invites/{code}/accept", json={"tos_accepted": True}
         ).json()
         invitee_token = accept["token"]
         resp = self.client.post(
@@ -322,7 +322,8 @@ class MemberAuthE2ETests(unittest.TestCase):
         code = self._create_invite(contributor_token)
         # Public — no auth header.
         resp = self.client.post(
-            f"/invites/{code}/accept", json={"invitee_email": "bob@example.com"}
+            f"/invites/{code}/accept",
+            json={"invitee_email": "bob@example.com", "tos_accepted": True},
         )
         self.assertEqual(resp.status_code, 200)
         body = resp.json()
@@ -341,9 +342,9 @@ class MemberAuthE2ETests(unittest.TestCase):
     def test_accept_is_one_shot(self):
         _, contributor_token = self._make_contributor()
         code = self._create_invite(contributor_token)
-        first = self.client.post(f"/invites/{code}/accept", json={})
+        first = self.client.post(f"/invites/{code}/accept", json={"tos_accepted": True})
         self.assertEqual(first.status_code, 200)
-        second = self.client.post(f"/invites/{code}/accept", json={})
+        second = self.client.post(f"/invites/{code}/accept", json={"tos_accepted": True})
         self.assertEqual(second.status_code, 410)
         self.assertIn("accepted", second.json()["detail"])
 
@@ -354,7 +355,7 @@ class MemberAuthE2ETests(unittest.TestCase):
             f"/invites/{code}/revoke", headers=self._admin_headers()
         )
         self.assertEqual(rev.status_code, 200)
-        resp = self.client.post(f"/invites/{code}/accept", json={})
+        resp = self.client.post(f"/invites/{code}/accept", json={"tos_accepted": True})
         self.assertEqual(resp.status_code, 410)
 
     def test_accept_after_expiry_is_rejected(self):
@@ -371,7 +372,7 @@ class MemberAuthE2ETests(unittest.TestCase):
             daily_quota_tokens=100,
             expires_at=time.time() - 3600,
         )
-        resp = self.client.post(f"/invites/{code}/accept", json={})
+        resp = self.client.post(f"/invites/{code}/accept", json={"tos_accepted": True})
         self.assertEqual(resp.status_code, 410)
         self.assertIn("expired", resp.json()["detail"])
 
@@ -409,7 +410,7 @@ class MemberAuthE2ETests(unittest.TestCase):
         _, contributor_token = self._make_contributor()
         code = self._create_invite(contributor_token, daily_quota_tokens=20)
         token = self.client.post(
-            f"/invites/{code}/accept", json={}
+            f"/invites/{code}/accept", json={"tos_accepted": True}
         ).json()["token"]
         resp = self.client.post(
             "/generate",
@@ -422,7 +423,7 @@ class MemberAuthE2ETests(unittest.TestCase):
         _, contributor_token = self._make_contributor()
         code = self._create_invite(contributor_token, daily_quota_tokens=5)
         accept = self.client.post(
-            f"/invites/{code}/accept", json={}
+            f"/invites/{code}/accept", json={"tos_accepted": True}
         ).json()
         invitee_token = accept["token"]
         invitee_member = member_auth.lookup_member_by_token(

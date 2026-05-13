@@ -1,14 +1,19 @@
 """Coordinator: REST API + Redis queue + SQLite write-through + reaper."""
 import json
 import logging
+import os
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
+from coordinator import canaries as canary_lib
 from coordinator import member_auth, model_registry
+from coordinator.canaries import CanaryInjector
 from coordinator.db import DB
 from coordinator.idempotency import IdempotencyStore
 from coordinator.rate_limit import RateLimiter
@@ -16,6 +21,9 @@ from coordinator.redis_client import get_client
 from coordinator.scheduler import Reaper
 from shared.auth import API_TOKEN, AUTH_ENABLED, is_public_path
 from shared.config import (
+    CANARY_INTERVAL_SECONDS,
+    CANARY_PENDING,
+    CANARY_SCORE_WINDOW,
     IDEMPOTENCY_TTL_SECONDS,
     JOB_PROCESSING,
     JOB_QUEUE,
@@ -72,6 +80,7 @@ db = DB()
 idem = IdempotencyStore(r, IDEMPOTENCY_TTL_SECONDS)
 rate_limiter = RateLimiter(r, RATE_LIMIT_PER_MIN)
 _reaper: Reaper | None = None
+_canary_injector: CanaryInjector | None = None
 
 
 def ensure_admin_seed() -> None:
@@ -96,6 +105,11 @@ def ensure_admin_seed() -> None:
         token_hash=token_hash,
         tier="PLATINUM",
         daily_quota_tokens=None,
+        # The admin operates the coordinator; bringing the system up
+        # is implicit acceptance of these terms. Stamping the version
+        # so the admin row matches the same shape as invitee rows.
+        tos_accepted_at=time.time(),
+        tos_version=TOS_VERSION,
     )
     log.info(
         "seeded admin member from API_TOKEN",
@@ -105,16 +119,21 @@ def ensure_admin_seed() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _reaper
+    global _reaper, _canary_injector
     ensure_admin_seed()
     _reaper = Reaper(r, db)
     _reaper.start()
+    if CANARY_INTERVAL_SECONDS > 0:
+        _canary_injector = CanaryInjector(r, db, interval=CANARY_INTERVAL_SECONDS)
+        _canary_injector.start()
     log.info("coordinator ready", extra={"event": "startup"})
     try:
         yield
     finally:
         if _reaper:
             _reaper.stop()
+        if _canary_injector:
+            _canary_injector.stop()
 
 
 app = FastAPI(title="GamerAI Coordinator", version="0.3.0", lifespan=lifespan)
@@ -124,9 +143,11 @@ def _is_public(method: str, path: str) -> bool:
     """Path+method auth exemption. ``/health`` is fully open. The
     invite-redemption flow needs exactly two endpoints reachable
     without auth: ``GET /invites/<code>`` and ``POST /invites/<code>/accept``.
-    Everything else under ``/invites`` (create, list, revoke) requires
-    a valid bearer."""
+    The community ToS is public (``/tos`` and ``/tos/raw``). Everything
+    else under ``/invites`` (create, list, revoke) requires a valid bearer."""
     if is_public_path(path):
+        return True
+    if method == "GET" and path in ("/tos", "/tos/raw"):
         return True
     parts = path.strip("/").split("/")
     if method == "GET" and len(parts) == 2 and parts[0] == "invites":
@@ -139,6 +160,26 @@ def _is_public(method: str, path: str) -> bool:
     ):
         return True
     return False
+
+
+# ---------- community ToS ----------
+# Version string is checked against the file every startup and stamped
+# into each new member row when they accept. Bumping this manually
+# (after a substantive change to docs/community-tos.md) will cause
+# existing members to be flagged as "needs re-accept" by the per-
+# member ToS check.
+TOS_VERSION = "2026-05-12"
+_TOS_PATH = Path(__file__).resolve().parent.parent / "docs" / "community-tos.md"
+
+
+def _load_tos_text() -> str:
+    try:
+        return _TOS_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return (
+            "# GamerAI Community Terms of Service\n\n"
+            "Terms document not bundled with this deploy.\n"
+        )
 
 
 # ---------- auth (no-op when API_TOKEN env is unset) ----------
@@ -206,6 +247,45 @@ def health():
         return {"status": "ok"}
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"redis unavailable: {e}")
+
+
+_TOS_HTML_TEMPLATE = """<!doctype html>
+<html><head><meta charset="utf-8"><title>GamerAI — Community ToS</title>
+<style>
+  body{{font-family:-apple-system,system-ui,sans-serif;max-width:760px;margin:2.5rem auto;padding:0 1.25rem;color:#1a1a1a;line-height:1.55}}
+  .meta{{color:#666;font-size:.9rem;margin-bottom:1.5rem}}
+  pre{{white-space:pre-wrap;word-wrap:break-word;font-family:-apple-system,system-ui,sans-serif;font-size:1rem;line-height:1.55;background:transparent;border:0;padding:0}}
+  a{{color:#2d6cdf}}
+</style></head>
+<body>
+<div class="meta">
+  Version <strong>{version}</strong> · <a href="/tos/raw">view raw</a>
+</div>
+<pre>{body}</pre>
+</body></html>
+"""
+
+
+@app.get("/tos", response_class=HTMLResponse)
+def tos_html():
+    """Public ToS page. Used both as the destination of the redemption-
+    page link and as a stable URL contributors can revisit any time."""
+    import html as html_lib
+    text = _load_tos_text()
+    return HTMLResponse(_TOS_HTML_TEMPLATE.format(
+        version=html_lib.escape(TOS_VERSION),
+        body=html_lib.escape(text),
+    ))
+
+
+@app.get("/tos/raw", response_class=PlainTextResponse)
+def tos_raw():
+    """Raw markdown for clients that prefer it (or for grep-friendly
+    diffs between versions)."""
+    return PlainTextResponse(
+        _load_tos_text(),
+        headers={"X-Tos-Version": TOS_VERSION},
+    )
 
 
 @app.post("/generate", response_model=GenerateResponse)
@@ -441,6 +521,56 @@ def complete(req: JobCompleteRequest):
     """Worker submits result. Coordinator writes Redis result, earnings, SQLite row."""
     now = time.time()
     tokens = int(req.completion_tokens or 0)
+
+    # Canary check: if this job_id was injected as a canary, divert to
+    # the verification path and skip earnings + usage rollup. The worker
+    # is told "ok" the same way as a real job — we don't surface canary
+    # status, because doing so would let a malicious worker special-case
+    # canary handling and pass every check.
+    canary_id = r.hget(CANARY_PENDING, req.job_id)
+    if canary_id:
+        canary_row = db.get_canary(canary_id)
+        matched = (
+            req.status == "complete"
+            and canary_row is not None
+            and canary_lib.verify_response(canary_row, req.text or "")
+        )
+        snippet = (req.text or "")[:500]
+        db.record_canary_result(
+            result_id="cr_" + uuid.uuid4().hex[:12],
+            canary_id=canary_id,
+            worker_id=req.worker_id,
+            job_id=req.job_id,
+            response_text_snippet=snippet,
+            matched=matched,
+        )
+        db.mark_job_complete(
+            job_id=req.job_id,
+            worker_id=req.worker_id,
+            model=req.model,
+            text=req.text,
+            prompt_tokens=req.prompt_tokens,
+            completion_tokens=tokens,
+            earnings=0.0,
+            duration_seconds=req.duration_seconds,
+            completed_at=now,
+            status="canary_complete" if matched else "canary_failed",
+            error=req.error,
+        )
+        r.hdel(CANARY_PENDING, req.job_id)
+        r.hdel(JOB_PROCESSING, req.job_id)
+        r.hset(WORKER_STATUS, req.worker_id, "idle")
+        log.info(
+            "canary verified" if matched else "canary failed",
+            extra={
+                "event": "canary_matched" if matched else "canary_mismatch",
+                "job_id": req.job_id,
+                "worker_id": req.worker_id,
+                "canary_id": canary_id,
+            },
+        )
+        return {"ok": True, "earnings": 0.0}
+
     earnings = round(tokens * RATE_PER_TOKEN * WORKER_SHARE, 10) if req.status == "complete" else 0.0
 
     payload = {
@@ -545,6 +675,7 @@ def workers():
                 "total_jobs": int(e["total_jobs"]) if e else 0,
                 "total_usd": round(float(e["total_usd"]), 8) if e else 0.0,
                 "capabilities": _load_capabilities(wid),
+                "canary_score": db.canary_score_for_worker(wid, limit=CANARY_SCORE_WINDOW),
             }
         )
     return {"workers": out}
@@ -568,6 +699,12 @@ def me(request: Request):
         "tier": member.tier,
         "daily_quota_tokens": member.daily_quota_tokens,
         "usage_today": usage,
+        "tos": {
+            "accepted_at": member.tos_accepted_at,
+            "version": member.tos_version,
+            "current_version": TOS_VERSION,
+            "needs_reaccept": member.tos_version != TOS_VERSION,
+        },
     }
 
 
@@ -691,7 +828,20 @@ def invite_details(code: str):
 @app.post("/invites/{code}/accept")
 def accept_invite(code: str, req: InviteAcceptRequest):
     """Public: Bob redeems his invite. One-shot — the same code cannot
-    be accepted twice. Returns the new bearer token exactly once."""
+    be accepted twice. Returns the new bearer token exactly once.
+
+    The redemption page collects an explicit ToS-accepted checkbox;
+    the field is required here so a programmatic redeemer cannot
+    bypass the click-through. The accepted ToS version is stamped
+    onto the new member row."""
+    if not req.tos_accepted:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Community ToS must be accepted to redeem an invite "
+                "(see /tos)."
+            ),
+        )
     now = time.time()
     new_member_id = "mem_" + uuid.uuid4().hex[:12]
     raw_token = member_auth.generate_token()
@@ -703,6 +853,7 @@ def accept_invite(code: str, req: InviteAcceptRequest):
         new_token_hash=token_hash,
         invitee_email=req.invitee_email,
         accepted_at=now,
+        tos_version=TOS_VERSION,
     )
     if invite_row is None:
         # Distinguish missing vs unredeemable for the redemption page.
@@ -722,6 +873,7 @@ def accept_invite(code: str, req: InviteAcceptRequest):
         "role": "invitee",
         "parent_member_id": invite_row["contributor_member_id"],
         "daily_quota_tokens": invite_row["daily_quota_tokens"],
+        "tos_version": TOS_VERSION,
     }
 
 
@@ -763,6 +915,8 @@ def admin_list_members(request: Request):
                 "revoked_at": r["revoked_at"],
                 "created_at": r["created_at"],
                 "last_active_at": r["last_active_at"],
+                "tos_accepted_at": r["tos_accepted_at"] if "tos_accepted_at" in r.keys() else None,
+                "tos_version": r["tos_version"] if "tos_version" in r.keys() else None,
             }
             for r in rows
         ]

@@ -97,6 +97,41 @@ CREATE TABLE IF NOT EXISTS invites (
 
 CREATE INDEX IF NOT EXISTS idx_invites_code ON invites(code);
 CREATE INDEX IF NOT EXISTS idx_invites_contributor ON invites(contributor_member_id);
+
+-- Canary prompts. The coordinator periodically injects one of these
+-- into the queue (looking identical to a real prompt from the
+-- worker's perspective) and verifies the worker's response contains
+-- the required_tokens. Used to detect contributors who have swapped
+-- in a different model or are tampering with outputs.
+--
+-- required_tokens is a JSON list of substrings; the response must
+-- contain ALL of them (case-insensitive) to pass. Pick prompts with
+-- stable factual answers and minimal phrasing variance.
+CREATE TABLE IF NOT EXISTS canaries (
+    canary_id TEXT PRIMARY KEY,
+    prompt TEXT NOT NULL,
+    required_tokens TEXT NOT NULL,  -- JSON-encoded list of strings
+    model TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at REAL NOT NULL
+);
+
+-- One row per completed canary check. ``matched`` is the verdict;
+-- response_text_snippet stores the first ~500 chars of the worker's
+-- response for forensics. ``worker_id`` may be NULL if no worker
+-- claimed the canary before it timed out.
+CREATE TABLE IF NOT EXISTS canary_results (
+    result_id TEXT PRIMARY KEY,
+    canary_id TEXT NOT NULL,
+    worker_id TEXT,
+    job_id TEXT NOT NULL,
+    response_text_snippet TEXT,
+    matched INTEGER NOT NULL,
+    created_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_canary_results_worker ON canary_results(worker_id);
+CREATE INDEX IF NOT EXISTS idx_canary_results_canary ON canary_results(canary_id);
 """
 
 
@@ -126,6 +161,15 @@ class DB:
             )
         except sqlite3.OperationalError:
             pass
+        # ToS acceptance — added with the first community-trust slice.
+        for col, ddl in (
+            ("tos_accepted_at", "ALTER TABLE members ADD COLUMN tos_accepted_at REAL"),
+            ("tos_version", "ALTER TABLE members ADD COLUMN tos_version TEXT"),
+        ):
+            try:
+                self._conn.execute(ddl)
+            except sqlite3.OperationalError:
+                pass
 
     # ---------- jobs ----------
     def insert_job(
@@ -251,13 +295,16 @@ class DB:
         tier: str = "BRONZE",
         daily_quota_tokens: Optional[int] = None,
         created_at: Optional[float] = None,
+        tos_accepted_at: Optional[float] = None,
+        tos_version: Optional[str] = None,
     ) -> None:
         now = created_at if created_at is not None else time.time()
         with self._lock:
             self._conn.execute(
                 "INSERT INTO members (member_id, email, role, parent_member_id, "
-                "token_hash, tier, daily_quota_tokens, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "token_hash, tier, daily_quota_tokens, created_at, "
+                "tos_accepted_at, tos_version) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     member_id,
                     email,
@@ -267,6 +314,8 @@ class DB:
                     tier,
                     daily_quota_tokens,
                     now,
+                    tos_accepted_at,
+                    tos_version,
                 ),
             )
 
@@ -414,12 +463,19 @@ class DB:
         new_token_hash: str,
         invitee_email: Optional[str],
         accepted_at: float,
+        tos_version: Optional[str] = None,
     ) -> Optional[sqlite3.Row]:
         """Atomic: verify invite is redeemable, mark accepted, insert the
         new invitee member. Returns the (updated) invite row on success,
         or None if the invite was missing / expired / already accepted /
         revoked. All writes happen under the same BEGIN/COMMIT so a
-        second concurrent accept of the same code cannot succeed."""
+        second concurrent accept of the same code cannot succeed.
+
+        ``tos_version`` is recorded on the new member row so we can
+        track which terms version each invitee accepted. ``None`` is
+        permitted for backwards compatibility but the caller should
+        always pass the current version when invoked via the public
+        redemption flow."""
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -442,8 +498,9 @@ class DB:
 
                 self._conn.execute(
                     "INSERT INTO members (member_id, email, role, parent_member_id, "
-                    "token_hash, tier, daily_quota_tokens, created_at) "
-                    "VALUES (?, ?, 'invitee', ?, ?, 'BRONZE', ?, ?)",
+                    "token_hash, tier, daily_quota_tokens, created_at, "
+                    "tos_accepted_at, tos_version) "
+                    "VALUES (?, ?, 'invitee', ?, ?, 'BRONZE', ?, ?, ?, ?)",
                     (
                         new_member_id,
                         invitee_email,
@@ -451,6 +508,8 @@ class DB:
                         new_token_hash,
                         row["daily_quota_tokens"],
                         accepted_at,
+                        accepted_at,  # tos_accepted_at — checkbox was required at submit
+                        tos_version,
                     ),
                 )
                 self._conn.execute(
@@ -468,6 +527,81 @@ class DB:
             except Exception:
                 self._conn.execute("ROLLBACK")
                 raise
+
+    # ---------- canaries ----------
+    def create_canary(
+        self,
+        canary_id: str,
+        prompt: str,
+        required_tokens_json: str,
+        model: str,
+        active: bool = True,
+        created_at: Optional[float] = None,
+    ) -> None:
+        now = created_at if created_at is not None else time.time()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO canaries "
+                "(canary_id, prompt, required_tokens, model, active, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (canary_id, prompt, required_tokens_json, model, 1 if active else 0, now),
+            )
+
+    def list_active_canaries(self) -> list[sqlite3.Row]:
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM canaries WHERE active=1 ORDER BY created_at"
+            )
+            return cur.fetchall()
+
+    def get_canary(self, canary_id: str) -> Optional[sqlite3.Row]:
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM canaries WHERE canary_id=?", (canary_id,)
+            )
+            return cur.fetchone()
+
+    def record_canary_result(
+        self,
+        result_id: str,
+        canary_id: str,
+        worker_id: Optional[str],
+        job_id: str,
+        response_text_snippet: Optional[str],
+        matched: bool,
+        created_at: Optional[float] = None,
+    ) -> None:
+        now = created_at if created_at is not None else time.time()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO canary_results "
+                "(result_id, canary_id, worker_id, job_id, "
+                "response_text_snippet, matched, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (result_id, canary_id, worker_id, job_id,
+                 response_text_snippet, 1 if matched else 0, now),
+            )
+
+    def canary_score_for_worker(
+        self,
+        worker_id: str,
+        limit: int = 50,
+    ) -> dict:
+        """Per-worker canary pass rate over the last ``limit`` checks.
+        Returns ``{passed, total, score}`` where score is 0.0-1.0, or
+        None when the worker has no canary history yet."""
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT matched FROM canary_results WHERE worker_id=? "
+                "ORDER BY created_at DESC LIMIT ?",
+                (worker_id, limit),
+            )
+            rows = cur.fetchall()
+        if not rows:
+            return {"passed": 0, "total": 0, "score": None}
+        passed = sum(1 for r in rows if r["matched"])
+        total = len(rows)
+        return {"passed": passed, "total": total, "score": passed / total}
 
     # ---------- metrics ----------
     def metrics(self) -> dict:

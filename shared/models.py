@@ -68,8 +68,15 @@ class InviteCreateRequest(BaseModel):
 class InviteAcceptRequest(BaseModel):
     """Optional info the redeemer may attach when accepting.
 
-    The invite code itself is in the URL path, not this body."""
+    The invite code itself is in the URL path, not this body.
+
+    ``tos_accepted`` must be true for the redemption to succeed —
+    the redemption page submits it as part of the form. The flag is
+    here (not coerced server-side) so a programmatic redeemer cannot
+    bypass the click-through accidentally.
+    """
     invitee_email: Optional[str] = None
+    tos_accepted: bool = False
 
 
 class JobRecord(BaseModel):

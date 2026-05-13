@@ -16,6 +16,7 @@ There is no recovery — losing it means revoke + reissue.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -190,6 +191,59 @@ def cmd_revoke_invite(args: argparse.Namespace) -> None:
     print("revoked")
 
 
+# --------------------------- canaries -------------------------------
+
+# Seed list. Pick prompts with stable, narrowly-phrased factual answers
+# so honest models will reliably produce the required tokens regardless
+# of sampling temperature. Avoid prompts where a correct answer could
+# legitimately omit any required token (e.g. "What planet do we live
+# on?" might be answered "we live here" without naming Earth).
+DEFAULT_CANARIES = [
+    {
+        "prompt": "Reply with the single word that names our planet: ",
+        "required_tokens": ["earth"],
+    },
+    {
+        "prompt": "What is two plus three? Reply with only the digit.",
+        "required_tokens": ["5"],
+    },
+    {
+        "prompt": "Name the largest ocean on Earth in one word.",
+        "required_tokens": ["pacific"],
+    },
+    {
+        "prompt": "In what year did humans first land on the Moon? Reply with the year only.",
+        "required_tokens": ["1969"],
+    },
+    {
+        "prompt": "What is the chemical symbol for water? Reply with the symbol only.",
+        "required_tokens": ["h2o"],
+    },
+]
+
+
+def cmd_seed_canaries(args: argparse.Namespace) -> None:
+    db = DB()
+    model = args.model
+    existing = {row["prompt"]: row for row in db.list_active_canaries()}
+    seeded = 0
+    skipped = 0
+    for entry in DEFAULT_CANARIES:
+        prompt = entry["prompt"]
+        if prompt in existing:
+            skipped += 1
+            continue
+        db.create_canary(
+            canary_id="can_" + uuid.uuid4().hex[:12],
+            prompt=prompt,
+            required_tokens_json=json.dumps(entry["required_tokens"]),
+            model=model,
+            active=True,
+        )
+        seeded += 1
+    print(f"seeded={seeded} skipped={skipped} model={model}")
+
+
 def _build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="python -m coordinator.admin")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -251,6 +305,17 @@ def _build_parser() -> argparse.ArgumentParser:
     p_ri = sub.add_parser("revoke-invite", help="revoke an unredeemed invite")
     p_ri.add_argument("--code", required=True)
     p_ri.set_defaults(fn=cmd_revoke_invite)
+
+    p_sc = sub.add_parser(
+        "seed-canaries",
+        help="install the default factual-answer canary prompts",
+    )
+    p_sc.add_argument(
+        "--model",
+        default="llama3.2:1b",
+        help="model name to target; should match what most contributors run",
+    )
+    p_sc.set_defaults(fn=cmd_seed_canaries)
 
     return ap
 

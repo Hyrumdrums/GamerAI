@@ -69,6 +69,14 @@ RATE_LIMIT_PER_MIN = _int("RATE_LIMIT_PER_MIN", 0)
 # --- model registry (off by default = legacy "any model name accepted") ---
 STRICT_MODELS = _bool("STRICT_MODELS", False)
 
+# --- canaries (community-trust monitoring) ---
+# Background task injects one canary every CANARY_INTERVAL_SECONDS, but
+# only if there's at least one live worker AND at least one active
+# canary seeded. Set to 0 to disable injection entirely.
+CANARY_INTERVAL_SECONDS = _int("CANARY_INTERVAL_SECONDS", 600)  # 10 min
+# Recent-window depth used to compute per-worker canary scores.
+CANARY_SCORE_WINDOW = _int("CANARY_SCORE_WINDOW", 50)
+
 
 # --- redis keys ---
 JOB_QUEUE = "job_queue"
@@ -79,3 +87,7 @@ WORKER_HEARTBEATS = "worker_heartbeats"
 WORKER_STATUS = "worker_status"
 WORKER_EARNINGS = "worker_earnings"
 WORKER_CAPABILITIES = "worker_capabilities"
+# Redis hash mapping job_id -> canary_id for jobs currently in flight
+# as canaries. Coordinator consults this on /jobs/complete to recognize
+# canary results; workers never see this key.
+CANARY_PENDING = "canary_pending"

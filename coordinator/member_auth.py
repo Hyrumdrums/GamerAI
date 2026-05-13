@@ -57,9 +57,14 @@ class Member:
     daily_quota_tokens: Optional[int]
     revoked_at: Optional[float]
     created_at: float
+    tos_accepted_at: Optional[float] = None
+    tos_version: Optional[str] = None
 
 
 def _row_to_member(row) -> Member:
+    keys = row.keys()
+    tos_accepted = row["tos_accepted_at"] if "tos_accepted_at" in keys else None
+    tos_version = row["tos_version"] if "tos_version" in keys else None
     return Member(
         member_id=row["member_id"],
         email=row["email"],
@@ -73,6 +78,8 @@ def _row_to_member(row) -> Member:
         ),
         revoked_at=float(row["revoked_at"]) if row["revoked_at"] is not None else None,
         created_at=float(row["created_at"]),
+        tos_accepted_at=float(tos_accepted) if tos_accepted is not None else None,
+        tos_version=tos_version,
     )
 
 

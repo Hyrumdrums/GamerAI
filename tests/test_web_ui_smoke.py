@@ -152,7 +152,7 @@ class WebUISmokeTests(unittest.TestCase):
         _, code = self._make_contributor_and_invite()
         resp = self.web.post(
             f"/invite/{code}",
-            data={"invitee_email": "bob@example.com"},
+            data={"invitee_email": "bob@example.com", "tos_accepted": "on"},
         )
         self.assertEqual(resp.status_code, 200)
         body = resp.text
@@ -165,7 +165,7 @@ class WebUISmokeTests(unittest.TestCase):
         Windows-agent installer download link, otherwise the onboarding
         path silently degrades to 'go figure out where to download it'."""
         _, code = self._make_contributor_and_invite()
-        resp = self.web.post(f"/invite/{code}", data={})
+        resp = self.web.post(f"/invite/{code}", data={"tos_accepted": "on"})
         self.assertEqual(resp.status_code, 200)
         body = resp.text
         self.assertIn("/download/GamerAI-Agent-Setup.exe", body)
@@ -176,18 +176,33 @@ class WebUISmokeTests(unittest.TestCase):
 
     def test_invite_accept_410_after_one_shot(self):
         _, code = self._make_contributor_and_invite()
-        first = self.web.post(f"/invite/{code}", data={})
+        first = self.web.post(f"/invite/{code}", data={"tos_accepted": "on"})
         self.assertEqual(first.status_code, 200)
-        second = self.web.post(f"/invite/{code}", data={})
+        second = self.web.post(f"/invite/{code}", data={"tos_accepted": "on"})
         self.assertEqual(second.status_code, 410)
         self.assertIn("accepted", second.text)
 
     def test_invite_accept_without_email_works(self):
         # Bob is allowed to redeem without filling in his email.
         _, code = self._make_contributor_and_invite()
-        resp = self.web.post(f"/invite/{code}", data={"invitee_email": ""})
+        resp = self.web.post(
+            f"/invite/{code}",
+            data={"invitee_email": "", "tos_accepted": "on"},
+        )
         self.assertEqual(resp.status_code, 200)
         self.assertIn("gai_", resp.text)
+
+    def test_invite_accept_without_tos_checkbox_is_rejected(self):
+        """If a user posts without checking the box (e.g. via devtools
+        manipulation), the web layer should bounce them back rather
+        than silently submitting tos_accepted=false to the coordinator."""
+        _, code = self._make_contributor_and_invite()
+        resp = self.web.post(
+            f"/invite/{code}",
+            data={"invitee_email": "bob@example.com"},  # no tos_accepted
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("terms must be accepted", resp.text)
 
     # ------------------------------------------------------------------
     # admin browser views
@@ -215,7 +230,10 @@ class WebUISmokeTests(unittest.TestCase):
     def test_admin_invites_shows_accepted_state(self):
         _, code = self._make_contributor_and_invite()
         # Bob accepts.
-        self.web.post(f"/invite/{code}", data={"invitee_email": "bob@example.com"})
+        self.web.post(
+            f"/invite/{code}",
+            data={"invitee_email": "bob@example.com", "tos_accepted": "on"},
+        )
         resp = self.web.get("/admin/invites")
         self.assertEqual(resp.status_code, 200)
         body = resp.text
