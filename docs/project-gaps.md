@@ -119,6 +119,51 @@ Local-only today. Once we have remote workers, the Caddy+coordinator
 hop is TLS but the worker→Redis path is not. Worth fixing once Redis
 is no longer co-resident with the coordinator (Phase 2b ElastiCache).
 
+### 🟡 Stored prompt history is plaintext at rest (Phase 3b.iii)
+
+`jobs.prompt` (and `jobs.result`) in the SQLite ledger are stored as
+plaintext today. A user's full conversation history is recoverable by
+anyone who can read the DB file: a coordinator-host compromise, a
+backup leak, or an admin doing curiosity reads. The truncation
+alternative would break the ChatGPT-style "see your past
+conversations" feature, which is load-bearing for a chat suite.
+
+**Fix:** encrypt prompts + responses at rest with a key derived from
+the user's bearer token, never stored.
+
+```
+On submit:
+  k = HKDF(bearer_token, salt="prompt-encryption-v1")
+  ciphertext, iv = AES-GCM-encrypt(k, prompt)
+  → jobs.prompt_ciphertext + jobs.prompt_iv,  jobs.prompt = NULL
+
+On read:
+  bearer = Authorization header (already required)
+  k = HKDF(bearer, ...)
+  plaintext = AES-GCM-decrypt(k, ciphertext, iv)
+```
+
+A DB dump reveals AES-GCM ciphertext, not prompts. Same pattern
+Bitwarden / 1Password use for vaults. **Three known costs:**
+
+- **The worker still sees plaintext during inference** (it has to —
+  the model can't run on ciphertext). This protects stored history,
+  not in-flight prompts. Real in-flight confidentiality is the
+  Phase 5 client-side embedding tier.
+- **Bearer rotation breaks history.** Mitigation: store a wrapped
+  per-user vault key that is itself AES-encrypted under HKDF(bearer);
+  on rotation, re-wrap with the new bearer. One small extra table.
+- **Admin can't grep prompts** even for moderation. That's a feature
+  under the ToS framing — admins should not be able to read prompts —
+  but it means abuse triage needs user-reported flags that include
+  the decrypted copy.
+
+Scope estimate: ~2–3 days. Slotted into **Phase 3b.iii (trust &
+verification)** alongside the canary system and (eventually) k-of-n
+consensus. Not blocking near-term recruitment because the founder is
+the only admin and the trust circle is friends-only; lands before
+opening the network to strangers at scale.
+
 ---
 
 ## 2. Reliability & Ops
