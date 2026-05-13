@@ -5,6 +5,225 @@ entries on top. Skim for context before resuming work.
 
 ---
 
+## 2026-05-12 — First real prompt served by a real contributor's GPU
+
+The 2026-05-11 invite slice closed the recruitment loop on paper.
+Earlier today the bootstrap slice closed it on a real machine. This
+afternoon we ran the actual experiment the project has been chasing
+since the very first commit: **prompt submitted from a different
+machine, queued by the coordinator, claimed and served by a real
+contributor's GPU, response returned to the original submitter.**
+
+### What the test looked like
+
+```bash
+ssh root@5.161.235.139 'docker stop gamerai-worker-1'   # silence in-VPS mock
+
+curl -X POST https://ai.dallinlayton.com/generate \\
+  -H "Authorization: Bearer $API_TOKEN" \\
+  -H "Content-Type: application/json" \\
+  -d '{"prompt": "In one sentence, why is the sky blue?"}'
+# → {"job_id": "84653df9-..."}
+
+# poll /result/<id>...
+# → status: complete after ~7s
+```
+
+### The result row that mattered
+
+```json
+{
+    "job_id": "84653df9-f12f-401a-aa2d-acd3d0baa21f",
+    "status": "complete",
+    "worker_id": "win-Home-PC-d4f76ae1",
+    "model": "llama3.2:1b",
+    "text": "The sky appears blue because of a phenomenon called
+             Rayleigh scattering, in which shorter (blue) wavelengths
+             of light are scattered more than longer (red) wavelengths
+             by the tiny molecules of gases in the Earth's atmosphere.",
+    "prompt_tokens": 35,
+    "completion_tokens": 44,
+    "earnings": 0.000154,
+    "duration_seconds": 6.934
+}
+```
+
+`worker_id: win-Home-PC-d4f76ae1` is the founder's Windows box.
+`model: llama3.2:1b` is the bundled default. `text` is a coherent
+non-mock answer. 6.9s end-to-end includes ~2s of polling overhead,
+so raw inference was probably ~3s on the Windows GPU.
+
+VPS mock worker restarted after the test; the network is back to
+its multi-worker steady state.
+
+### Why this matters
+
+Every prior `/generate` on the public coordinator was served by the
+in-VPS mock worker. Every contributor demo before today was the
+founder's own box talking to the founder's own coordinator. This is
+the first time the request and the GPU were on different machines
+under the production routing path — same loop a stranger's request
+would take through a stranger's machine.
+
+The platform is now structurally ready to serve a real community.
+What it doesn't have yet — and what blocks recruiting beyond the
+founder's circle — is the trust + safety layer for when "the
+contributor isn't you." That's the next slice (see entry below).
+
+---
+
+## 2026-05-12 — Community trust: ToS + canary integrity monitoring
+
+The 2026-05-11 invite slice and today's first-real-prompt result make
+the network real on paper. They don't make it safe to recruit
+strangers. Two missing pieces blocked that:
+
+1. **No social contract.** No written ToS for contributors or invitees
+   to agree to. No place to set expectations like "prompts are
+   visible to the GPU that serves them — don't paste secrets" or
+   "run unmodified models."
+2. **No detection layer.** A malicious contributor could swap in a
+   finetuned/backdoored model and the coordinator would have no
+   way to notice. Outputs would look plausible but be subtly wrong
+   (or poisoned).
+
+This slice ships both:
+
+### ToS
+
+- `docs/community-tos.md` — plain-English terms covering: prompt
+  visibility, no-secrets warning, contributor honesty (run the model
+  you said you'd run), monitoring disclosure (canaries + agreement
+  scoring exist and aren't surveillance), best-effort service / no
+  warranty, jurisdiction.
+- Coordinator endpoints:
+  - `GET /tos` — public HTML, version-stamped at the top.
+  - `GET /tos/raw` — public markdown + `X-Tos-Version` header.
+- Redemption page rewritten: TL;DR box, "Read full terms" link,
+  required checkbox, "Accept" button disabled until checked.
+- Belt and suspenders: server-side check too. `POST /invites/<code>/accept`
+  returns 400 if `tos_accepted` isn't `true`, so a savvy user who
+  pops devtools to remove the HTML5 `required` attribute still gets
+  bounced.
+- The accepted version is stamped onto the member row
+  (`members.tos_accepted_at`, `members.tos_version`). `/me` exposes
+  `needs_reaccept` so a future ToS bump can prompt existing members
+  to re-accept.
+
+### Canaries
+
+- New tables: `canaries` (prompt + required_tokens + model) and
+  `canary_results` (per-completion pass/fail audit).
+- Admin CLI: `python -m coordinator.admin seed-canaries` installs the
+  default factual-answer list (Earth / 1969 / Pacific / H2O / 2+3).
+- Coordinator background thread `CanaryInjector` wakes every
+  `CANARY_INTERVAL_SECONDS` (default 600s = 10 min) and pushes one
+  canary into the job queue. **The worker sees nothing distinguishing
+  it from a real prompt** — that mapping (job_id → canary_id) lives
+  in Redis only, on the coordinator side.
+- `/jobs/complete` recognizes canary completions: it verifies the
+  response contains every required token (case-insensitive substring),
+  records the result, and intentionally skips both earnings credit
+  and member-usage rollup. The worker is told `{"ok": true,
+  "earnings": 0.0}` either way, so a worker that special-cased the
+  zero-earnings reply to detect canaries would also reveal itself
+  by handling that case at all.
+
+### Agreement scoring (first cut)
+
+- `canary_score_for_worker(worker_id, limit=50)` returns
+  `{passed, total, score}` over the most recent window. Surfaced on
+  `GET /workers` as `canary_score`.
+- This is the v1 of "agreement" — agreement-with-known-good-answer,
+  not agreement-with-other-workers. Worker-vs-worker k-of-n consensus
+  on real prompts is the next layer (requires fan-out routing +
+  output comparison + payout queuing). Deferred until the network has
+  enough workers to make consensus meaningful.
+
+### Why canaries before consensus
+
+Cost vs. value:
+- Canary infra is small (one background thread + a check in /jobs/complete
+  + a score query). Catches the biggest class of attack (substituted
+  model returning systematically different answers).
+- Consensus infra is large (dispatch picks 2+ workers, both responses
+  collected, similarity threshold, payout held until verified) and
+  only adds value when we have many contributors to compare.
+- At 3 contributors, canaries are sufficient. Past 10–20, consensus
+  becomes worthwhile.
+
+### What we deliberately did NOT do
+
+- **Prompt encryption / TEE / FHE.** Out-of-scope for community-tier
+  contributors. The ToS is honest about prompt visibility; users who
+  need confidentiality should wait for the Phase 5 client-side
+  embedding tier.
+- **Signed Ollama installer or attestable model hash.** A malicious
+  contributor could still run a modified Ollama; the canary system
+  detects them behaviorally rather than cryptographically. Real
+  attestation requires hardware that excludes most of the contributor
+  pool.
+- **Auto-quarantine of failing workers.** A worker that fails 5/5
+  canaries gets a score of 0.0 in `/workers`, but they keep
+  receiving jobs. Manual admin review for now; auto-suspension can
+  ship once the score has been calibrated in production.
+- **Per-tier ToS bumps.** A bumped `TOS_VERSION` will surface as
+  `needs_reaccept: true` on `/me`, but nothing yet blocks an
+  existing member from continuing to use the network. That's a
+  policy decision (do we hard-block? soft-nudge?) we'll make when
+  we actually have a substantive ToS change.
+
+### Test scoreboard
+
+- 137/137 passing (123 prior + 14 new in
+  `tests/test_tos_and_canaries.py`: ToS endpoint coverage, invite
+  accept enforcement, canary verify function, end-to-end
+  inject→complete→score path).
+- Existing invite tests updated to send `tos_accepted=true`.
+
+### File layout changes
+
+```
+docs/community-tos.md          <- new; the canonical terms doc
+coordinator/canaries.py        <- new; CanaryInjector + verify_response
+coordinator/db.py              <- canaries + canary_results tables,
+                                  tos_accepted_at + tos_version
+                                  columns on members, canary CRUD,
+                                  canary_score_for_worker()
+coordinator/main.py            <- /tos + /tos/raw endpoints,
+                                  ToS enforcement on /invites/<>/accept,
+                                  canary detection in /jobs/complete,
+                                  canary_score on /workers,
+                                  CanaryInjector wired into lifespan
+coordinator/admin.py           <- seed-canaries CLI subcommand
+coordinator/member_auth.py     <- Member dataclass gets tos fields
+shared/config.py               <- CANARY_INTERVAL_SECONDS, CANARY_PENDING
+shared/models.py               <- InviteAcceptRequest.tos_accepted
+client/web.py                  <- redemption page TL;DR + checkbox
+tests/test_tos_and_canaries.py <- new
+tests/test_web_ui_smoke.py     <- updated for tos_accepted contract
+tests/test_member_auth_e2e.py  <- updated for tos_accepted contract
+```
+
+### Deploy steps for the VPS
+
+```bash
+ssh -i ~/.ssh/id_ed25519_gamerai root@5.161.235.139
+cd /opt/gamerai
+git pull
+sudo /opt/gamerai/infra/deploy.sh
+docker restart gamerai-caddy        # picks up the filename header from earlier slice
+docker exec -it gamerai-coordinator python -m coordinator.admin seed-canaries
+```
+
+After that, the first canary will hit the queue within 10 minutes
+(plus the random initial-delay stagger). If a contributor is online
+and idle, they'll claim it and the coordinator will tick their
+score. `curl https://ai.dallinlayton.com/workers -H "Authorization:
+Bearer $API_TOKEN"` shows the new `canary_score` field per worker.
+
+---
+
 ## 2026-05-12 — Inference bootstrap (Ollama + default model on first run)
 
 The previous slices delivered an installer, an invite flow, a token
