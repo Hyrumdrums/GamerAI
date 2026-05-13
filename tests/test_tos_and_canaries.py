@@ -269,5 +269,192 @@ class CanaryEndToEndTests(_BaseE2E):
         self.assertEqual(found["canary_score"]["score"], 1.0)
 
 
+class WorkerOwnershipTests(_BaseE2E):
+    """Worker→member binding (2026-05-13 security slice). A
+    non-admin member cannot act on a worker_id owned by someone else.
+    """
+
+    def _post(self, path: str, token: str, json_body: dict | None = None):
+        return self.client.post(
+            path,
+            json=json_body or {},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    def test_register_stamps_owner(self):
+        _, t = self._make_contributor(email="reg-owner@x.com")
+        wid = f"wkr-own-{uuid.uuid4().hex[:6]}"
+        resp = self._post("/register", t, {"worker_id": wid})
+        self.assertEqual(resp.status_code, 200, resp.text)
+        # DB now records this member as the owner.
+        owner = self.db.worker_owner(wid)
+        self.assertIsNotNone(owner)
+        # Resolve their member_id via the token to compare.
+        from coordinator import member_auth
+        their_id = member_auth.lookup_member_by_token(self.db, t).member_id
+        self.assertEqual(owner, their_id)
+
+    def test_register_rejects_when_owned_by_different_member(self):
+        _, alice = self._make_contributor(email="alice-own@x.com")
+        _, bob = self._make_contributor(email="bob-own@x.com")
+        wid = f"wkr-conflict-{uuid.uuid4().hex[:6]}"
+        self.assertEqual(self._post("/register", alice, {"worker_id": wid}).status_code, 200)
+        # Bob tries to register the same worker_id — should be rejected.
+        resp = self._post("/register", bob, {"worker_id": wid})
+        self.assertEqual(resp.status_code, 403)
+        self.assertIn("different member", resp.json()["detail"])
+
+    def test_re_register_by_same_owner_succeeds(self):
+        _, t = self._make_contributor(email="re-reg@x.com")
+        wid = f"wkr-re-{uuid.uuid4().hex[:6]}"
+        self.assertEqual(self._post("/register", t, {"worker_id": wid}).status_code, 200)
+        self.assertEqual(self._post("/register", t, {"worker_id": wid}).status_code, 200)
+
+    def test_legacy_unowned_worker_is_adopted_by_first_caller(self):
+        # Simulate a pre-migration row: worker exists but owner is NULL.
+        wid = f"wkr-legacy-{uuid.uuid4().hex[:6]}"
+        self.db.upsert_worker(wid, "idle", time.time())
+        self.assertIsNone(self.db.worker_owner(wid))
+        _, t = self._make_contributor(email="adopt@x.com")
+        resp = self._post("/register", t, {"worker_id": wid})
+        self.assertEqual(resp.status_code, 200)
+        from coordinator import member_auth
+        their_id = member_auth.lookup_member_by_token(self.db, t).member_id
+        self.assertEqual(self.db.worker_owner(wid), their_id)
+
+    def test_jobs_complete_rejects_non_owner(self):
+        _, alice = self._make_contributor(email="alice-jobs@x.com")
+        _, bob = self._make_contributor(email="bob-jobs@x.com")
+        # Alice registers her worker.
+        wid = f"wkr-spoof-{uuid.uuid4().hex[:6]}"
+        self.assertEqual(self._post("/register", alice, {"worker_id": wid}).status_code, 200)
+        # Bob tries to complete a job AS Alice's worker.
+        resp = self.client.post(
+            "/jobs/complete",
+            json={
+                "worker_id": wid,
+                "job_id": "fakejob",
+                "text": "spoofed",
+                "model": "llama3.2:1b",
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "duration_seconds": 0.0,
+                "status": "complete",
+            },
+            headers={"Authorization": f"Bearer {bob}"},
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertIn("not your worker", resp.json()["detail"])
+
+    def test_admin_can_act_on_any_worker(self):
+        # Admin operational override — admins can complete jobs on
+        # any worker for incident response.
+        _, alice = self._make_contributor(email="alice-adminbypass@x.com")
+        wid = f"wkr-admin-{uuid.uuid4().hex[:6]}"
+        self.assertEqual(self._post("/register", alice, {"worker_id": wid}).status_code, 200)
+        # Admin completes a "job" with Alice's worker_id — should pass
+        # the ownership gate (admin bypass), and fall through to the
+        # normal complete logic.
+        resp = self.client.post(
+            "/heartbeat",
+            json={"worker_id": wid, "status": "idle"},
+            headers=self._admin_headers(),
+        )
+        self.assertEqual(resp.status_code, 200)
+
+    def test_jobs_complete_by_owner_works(self):
+        _, t = self._make_contributor(email="happy@x.com")
+        wid = f"wkr-happy-{uuid.uuid4().hex[:6]}"
+        self.assertEqual(self._post("/register", t, {"worker_id": wid}).status_code, 200)
+        # Submit a job (as admin, since members have quota; admin doesn't).
+        sub = self.client.post(
+            "/generate", json={"prompt": "hi"}, headers=self._admin_headers(),
+        )
+        jid = sub.json()["job_id"]
+        # Complete it as the worker's owner.
+        resp = self.client.post(
+            "/jobs/complete",
+            json={
+                "worker_id": wid,
+                "job_id": jid,
+                "text": "hello",
+                "model": "llama3.2:1b",
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "duration_seconds": 0.0,
+                "status": "complete",
+            },
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+
+
+class CanaryEnvelopeLeakTests(_BaseE2E):
+    """Regression guard: the worker-facing job envelope must NOT
+    contain submitted_by_member_id. Including it lets a malicious
+    worker recognize canaries (submitted_by_member_id is NULL for
+    canaries; non-null for real prompts) and selectively cheat."""
+
+    def test_generated_job_envelope_omits_submitter(self):
+        # Submit a real prompt (has a submitter — the admin).
+        resp = self.client.post(
+            "/generate",
+            json={"prompt": "hello"},
+            headers=self._admin_headers(),
+        )
+        self.assertEqual(resp.status_code, 200)
+        # Pop the queue and inspect the envelope a worker would see.
+        raw = self.r.lpop("job_queue")
+        self.assertIsNotNone(raw)
+        envelope = json.loads(raw)
+        self.assertNotIn(
+            "submitted_by_member_id", envelope,
+            "submitter leaked into worker envelope — canary detection vuln",
+        )
+        # Sanity: the fields the worker DOES need are present.
+        self.assertIn("job_id", envelope)
+        self.assertIn("prompt", envelope)
+
+    def test_canary_envelope_indistinguishable_from_real_envelope(self):
+        # Seed and inject a canary. Real prompt right after.
+        canary_id = "can_" + uuid.uuid4().hex[:12]
+        self.db.create_canary(
+            canary_id=canary_id,
+            prompt="planet?",
+            required_tokens_json=json.dumps(["earth"]),
+            model="llama3.2:1b",
+            active=True,
+        )
+        from shared.config import CANARY_PENDING
+        cjid = str(uuid.uuid4())
+        self.r.hset(CANARY_PENDING, cjid, canary_id)
+        self.db.insert_job(
+            job_id=cjid, prompt="planet?", model="llama3.2:1b",
+            submitted_at=time.time(), submitted_by_member_id=None,
+        )
+        # Use the actual production injector so the test exercises
+        # the real envelope shape (not a hand-built one).
+        from coordinator.canaries import CanaryInjector
+        CanaryInjector(self.r, self.db)._inject(self.db.get_canary(canary_id))
+        # Submit a real prompt to compare envelope shape.
+        self.client.post("/generate", json={"prompt": "real"}, headers=self._admin_headers())
+        # Both queue entries should have the SAME set of keys; if the
+        # canary envelope has a missing key the real envelope has
+        # (or vice versa) the worker can distinguish them.
+        envelopes = []
+        while True:
+            raw = self.r.lpop("job_queue")
+            if not raw:
+                break
+            envelopes.append(json.loads(raw))
+        self.assertEqual(len(envelopes), 2)
+        keys_a = set(envelopes[0].keys())
+        keys_b = set(envelopes[1].keys())
+        self.assertEqual(
+            keys_a, keys_b,
+            "canary vs real envelopes have different keys — worker can fingerprint",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

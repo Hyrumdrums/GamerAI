@@ -50,6 +50,11 @@
     @web_ui_api path /api/*
     @web_ui_dashboard path /dashboard
     @web_ui_admin path /admin/*
+    # Vendored JS (marked + DOMPurify) — referenced by both the chat
+    # UI (client:8080) and the ToS page (served by coordinator:8000,
+    # which has its own copy). We route to the client since both
+    # containers serve identical bytes.
+    @web_ui_static path /static/*
     handle @web_ui {
         reverse_proxy client:8080
     }
@@ -66,6 +71,9 @@
         reverse_proxy client:8080
     }
     handle @web_ui_admin {
+        reverse_proxy client:8080
+    }
+    handle @web_ui_static {
         reverse_proxy client:8080
     }
 

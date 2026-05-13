@@ -1,11 +1,13 @@
 """Tiny FastAPI web UI for GamerAI. Submit prompts, browse workers/earnings/metrics."""
 import html as html_lib
 import os
+from pathlib import Path
 from typing import Optional
 
 import httpx
 from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 
 from shared.auth import auth_headers
 
@@ -23,6 +25,15 @@ SESSION_MAX_AGE = 60 * 60 * 24 * 30  # 30 days
 COOKIE_SECURE = (os.getenv("PUBLIC_BASE_URL", "http://").startswith("https://"))
 
 app = FastAPI(title="GamerAI Web UI")
+
+# Vendored JS lives in client/static/ alongside this module. Serving
+# our own copies of marked.js + DOMPurify removes the jsDelivr
+# supply-chain dependency the chat UI used to have — a CDN compromise
+# would otherwise let an attacker inject arbitrary JS into every
+# authenticated page. Same logic as the Ollama-installer mirror.
+_STATIC_DIR = Path(__file__).resolve().parent / "static"
+if _STATIC_DIR.is_dir():
+    app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 
 
 def _client(bearer: Optional[str] = None) -> httpx.AsyncClient:
@@ -173,7 +184,8 @@ INDEX_HTML = """<!doctype html>
   </main>
 </div>
 
-<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js" integrity="sha384-r93nUxgK4UnyZc3qmoCKKqZpsR1tNvHohKVPK16BzMc1+kgwY3RyP8+ZIyx8RGy/" crossorigin="anonymous"></script>
+<script src="/static/marked.min.js"></script>
+<script src="/static/purify.min.js"></script>
 <script>
 // ---- state ------------------------------------------------------------
 let me = null;
@@ -280,9 +292,19 @@ function messageEl(role, text) {
   const b = document.createElement('div');
   b.className = 'bubble';
   // Render assistant messages as markdown; user messages stay literal
-  // to avoid surprising rendering of pasted code.
-  if (role === 'assistant' && window.marked) {
-    b.innerHTML = window.marked.parse(text || '');
+  // to avoid surprising rendering of pasted code. We pipe marked
+  // output through DOMPurify because a malicious model could emit
+  // raw HTML like <img onerror=...> and marked's default behavior
+  // passes HTML through. Canaries detect tampering behaviorally but
+  // can't guarantee absence of HTML — sanitizing is the belt to the
+  // canary suspenders.
+  if (role === 'assistant' && window.marked && window.DOMPurify) {
+    const rendered = window.marked.parse(text || '');
+    b.innerHTML = window.DOMPurify.sanitize(rendered);
+  } else if (role === 'assistant' && window.marked) {
+    // DOMPurify missing — fall back to literal text rather than
+    // risk raw HTML execution.
+    b.textContent = text;
   } else {
     b.textContent = text;
   }

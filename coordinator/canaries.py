@@ -100,10 +100,17 @@ class CanaryInjector(threading.Thread):
 
     def _inject(self, canary) -> None:
         job_id = str(uuid.uuid4())
+        # The envelope shape MUST match what /generate pushes for real
+        # prompts — same keys, same types. If a canary envelope has a
+        # different shape from a real one (e.g. missing submitted_at),
+        # a malicious worker can fingerprint canaries and selectively
+        # cheat. Keep these aligned with the /generate path.
+        now = time.time()
         envelope = {
             "job_id": job_id,
             "prompt": canary["prompt"],
             "model": canary["model"],
+            "submitted_at": now,
         }
         # Record canary mapping FIRST, then push to queue. If push fails
         # we leave a dangling entry (harmless — it just never gets
@@ -116,7 +123,7 @@ class CanaryInjector(threading.Thread):
             job_id=job_id,
             prompt=canary["prompt"],
             model=canary["model"],
-            submitted_at=time.time(),
+            submitted_at=now,
             submitted_by_member_id=None,
         )
         self.r.rpush(JOB_QUEUE, json.dumps(envelope))

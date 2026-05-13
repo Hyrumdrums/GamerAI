@@ -93,6 +93,61 @@ A malicious worker could return garbage and earn money for it.
 **Fix:** Phase 3 roadmap item; quickest win is k-of-n consensus on a
 random sample of jobs (run 5% of jobs on two workers, compare).
 
+### 🔴 Open security findings (2026-05-13 review) — next up
+
+A focused security pass surfaced three real, exploitable issues plus
+three high-severity items worth fixing this week. Listed here so we
+don't lose track; the **🔴 critical** items are the immediate next
+slice.
+
+**🔴 1. Canary detection leak.** `/jobs/next` and the queue-pushed
+job envelope include `submitted_by_member_id`. Canaries have this
+`null` (no human submitter). A worker can read its own incoming
+jobs, spot the null submitter, recognize it's a canary, pass that
+one cleanly, and cheat on real prompts. Defeats the integrity
+slice we just shipped. **Fix:** drop the field from the
+worker-facing payload. ~15 min.
+
+**🔴 2. Worker→member link missing.** `/jobs/complete`,
+`/jobs/claim`, `/jobs/abandon`, `/heartbeat` accept any `worker_id`
+in the request body. Any authenticated member can spoof completions
+against another worker's `worker_id`, attributing earnings to
+someone else or returning bogus responses to other members'
+prompts. **Fix:** stamp `owner_member_id` on the `workers` table at
+`/register` time; reject calls where the authenticated member
+doesn't own the `worker_id` they reference. ~½ day. (Already noted
+elsewhere in this doc as polish; review elevated it to immediate.)
+
+**🔴 3. Markdown XSS surface in the chat UI.** Assistant responses
+go through `marked.parse()` with raw HTML passthrough. A contributor
+running a tampered model could emit `<img src=x onerror=...>` and
+execute arbitrary JS in the user's browser. Canaries don't catch
+this (they check required tokens are present, not that HTML is
+absent). **Fix:** sanitize the marked output (DOMPurify, or
+escape-HTML option). ~30 min.
+
+**🟡 4. CDN scripts without Subresource Integrity.**
+`<script src="https://cdn.jsdelivr.net/.../marked.min.js">` has no
+`integrity=` attribute on the chat UI or the ToS page. CDN compromise
+→ arbitrary JS injected into authenticated pages. **Fix:** pin a
+version + add SRI hash, or self-host `marked.min.js` from
+`/static/`. ~30 min.
+
+**🟡 5. No prompt length cap on `/generate`.** A single request can
+submit an unboundedly large prompt; gets stored in SQLite and
+shoveled to a worker. Cheap DoS. **Fix:** `MAX_PROMPT_BYTES` env
+guard. ~15 min.
+
+**🟡 6. No rate limit on `/login`.** 256-bit tokens make brute force
+infeasible in practice, but the principle is wrong and a real
+pentest will flag it. **Fix:** enable `RATE_LIMIT_PER_MIN` in
+production, or hook `/login` specifically. ~30 min.
+
+Plus the medium items from the review (cookie value IS the bearer,
+agent state.json plaintext, no admin audit log, no token rotation
+policy) — flagged but accepted for now, see devlog for the full
+review.
+
 ### ~~🟡 Web UI dashboard has no auth~~ — done
 
 Resolved by the 2026-05-12 browser-auth slice. `client/web.py` now

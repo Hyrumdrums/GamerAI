@@ -11,6 +11,7 @@ from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.staticfiles import StaticFiles
 
 from coordinator import canaries as canary_lib
 from coordinator import member_auth, model_registry
@@ -139,6 +140,18 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="GamerAI Coordinator", version="0.3.0", lifespan=lifespan)
+
+# Vendored JS for the public ToS page (marked + DOMPurify). Same
+# supply-chain logic as the client/web.py mount: avoids depending on
+# any third-party CDN. Mount is conditional so test environments
+# without the directory don't fail to import.
+_COORD_STATIC_DIR = Path(__file__).resolve().parent / "static"
+if _COORD_STATIC_DIR.is_dir():
+    app.mount(
+        "/static",
+        StaticFiles(directory=str(_COORD_STATIC_DIR)),
+        name="static",
+    )
 
 
 def _is_public(method: str, path: str) -> bool:
@@ -275,10 +288,13 @@ _TOS_HTML_TEMPLATE = """<!doctype html>
   Version <strong>{version}</strong> · <a href="/tos/raw">view raw</a>
 </div>
 <div id="content"><span id="loading">Loading terms…</span></div>
-<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script src="/static/marked.min.js"></script>
+<script src="/static/purify.min.js"></script>
 <script>
 fetch('/tos/raw').then(r => r.text()).then(md => {{
-  document.getElementById('content').innerHTML = window.marked.parse(md);
+  const html = window.marked.parse(md);
+  document.getElementById('content').innerHTML =
+    window.DOMPurify ? window.DOMPurify.sanitize(html) : html;
 }}).catch(() => {{
   document.getElementById('content').innerHTML =
     '<p>Could not load terms. <a href="/tos/raw">View raw markdown</a>.</p>';
@@ -385,12 +401,17 @@ def generate(req: GenerateRequest, request: Request):
 
     job_id = str(uuid.uuid4())
     submitted_at = time.time()
+    # IMPORTANT: do NOT include submitted_by_member_id in the worker-
+    # facing envelope. The worker has no need for it, and including
+    # it lets a malicious worker recognize canaries (null submitter)
+    # and selectively cheat on real prompts. Attribution lives on
+    # the jobs DB row instead, which the coordinator reads directly
+    # when crediting earnings / member_usage on /jobs/complete.
     job = {
         "job_id": job_id,
         "prompt": worker_prompt,
         "model": req_model,
         "submitted_at": submitted_at,
-        "submitted_by_member_id": submitted_by,
     }
     # Store the ORIGINAL user message (not the prepended worker-prompt)
     # so /jobs/complete can replay only the new turn into the
@@ -468,9 +489,55 @@ def result(job_id: str):
 
 
 # ---------- worker lifecycle ----------
+def _require_worker_owner(request: Request, worker_id: str) -> None:
+    """Reject when the authenticated member doesn't own the worker_id.
+    Admin bypasses for operational override (incident response). When
+    AUTH is disabled, ownership is unenforced (dev/test mode).
+
+    An unowned legacy worker_id (owner_member_id NULL) also rejects —
+    the caller should hit /register first to stamp ownership."""
+    if not AUTH_ENABLED:
+        return
+    member = getattr(request.state, "member", None)
+    if member is None:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    if member.role == "admin":
+        return
+    owner = db.worker_owner(worker_id)
+    if owner is None:
+        raise HTTPException(
+            status_code=403,
+            detail="worker_id has no registered owner — call /register first",
+        )
+    if owner != member.member_id:
+        raise HTTPException(status_code=403, detail="not your worker")
+
+
 @app.post("/register")
-def register(req: WorkerIdent):
+def register(req: WorkerIdent, request: Request):
     now = time.time()
+    member = getattr(request.state, "member", None)
+    member_id = member.member_id if member is not None else None
+
+    # Ownership claim — atomic so concurrent registers can't race.
+    # When AUTH is off (dev mode), member_id is None and the
+    # ownership check inside claim_worker_ownership is permissive.
+    ok, existing_owner = db.claim_worker_ownership(
+        req.worker_id, member_id, "idle", now,
+    )
+    if not ok:
+        log.warning(
+            "worker registration rejected",
+            extra={
+                "event": "worker_owner_mismatch",
+                "worker_id": req.worker_id,
+            },
+        )
+        raise HTTPException(
+            status_code=403,
+            detail="worker_id is owned by a different member",
+        )
+
     r.sadd(WORKER_REGISTRY, req.worker_id)
     r.hset(WORKER_HEARTBEATS, req.worker_id, now)
     r.hset(WORKER_STATUS, req.worker_id, "idle")
@@ -480,7 +547,6 @@ def register(req: WorkerIdent):
             req.worker_id,
             req.capabilities.model_dump_json(),
         )
-    db.upsert_worker(req.worker_id, "idle", now)
     log.info(
         "worker registered",
         extra={"event": "worker_registered", "worker_id": req.worker_id},
@@ -489,7 +555,8 @@ def register(req: WorkerIdent):
 
 
 @app.post("/heartbeat")
-def heartbeat(req: HeartbeatRequest):
+def heartbeat(req: HeartbeatRequest, request: Request):
+    _require_worker_owner(request, req.worker_id)
     now = time.time()
     r.hset(WORKER_HEARTBEATS, req.worker_id, now)
     r.hset(WORKER_STATUS, req.worker_id, req.status)
@@ -498,10 +565,11 @@ def heartbeat(req: HeartbeatRequest):
 
 
 @app.post("/jobs/next")
-def next_job(req: WorkerIdent):
+def next_job(req: WorkerIdent, request: Request):
     """HTTP-only job pickup for remote agents (e.g. the Windows gamer install).
     Pops one job from the queue and returns it; the agent should immediately
     POST /jobs/claim with the returned job_id."""
+    _require_worker_owner(request, req.worker_id)
     raw = r.lpop(JOB_QUEUE)
     if not raw:
         return {"job": None}
@@ -521,8 +589,9 @@ def next_job(req: WorkerIdent):
 
 
 @app.post("/jobs/claim")
-def claim(req: JobClaimRequest):
+def claim(req: JobClaimRequest, request: Request):
     """Worker reports it has claimed a job. Coordinator records processing entry + DB row."""
+    _require_worker_owner(request, req.worker_id)
     now = time.time()
     deadline = now + JOB_TIMEOUT_SECONDS
 
@@ -554,7 +623,7 @@ def claim(req: JobClaimRequest):
 
 
 @app.post("/jobs/abandon")
-def abandon(req: JobClaimRequest):
+def abandon(req: JobClaimRequest, request: Request):
     """Worker voluntarily gives a claimed job back to the queue.
 
     Used when the contributor's machine sees user activity and the
@@ -566,6 +635,7 @@ def abandon(req: JobClaimRequest):
     the processing-hash record so the next worker picks up the same
     prompt + model. Earnings are zeroed because no work was reported.
     """
+    _require_worker_owner(request, req.worker_id)
     raw = r.hget(JOB_PROCESSING, req.job_id)
     if raw is None:
         return {"ok": True, "requeued": False, "reason": "not in flight"}
@@ -577,14 +647,14 @@ def abandon(req: JobClaimRequest):
     if original is None:
         row = db.get_job(req.job_id)
         if row is not None:
+            # Reconstructed envelope must match the worker-facing shape
+            # we push from /generate — no submitted_by_member_id (see
+            # the comment there explaining the canary-detection issue).
             original = {
                 "job_id": row["job_id"],
                 "prompt": row["prompt"],
                 "model": row["model"],
                 "submitted_at": row["submitted_at"],
-                "submitted_by_member_id": row["submitted_by_member_id"]
-                if "submitted_by_member_id" in row.keys()
-                else None,
             }
     if original is not None:
         r.rpush(JOB_QUEUE, json.dumps(original))
@@ -603,8 +673,9 @@ def abandon(req: JobClaimRequest):
 
 
 @app.post("/jobs/complete")
-def complete(req: JobCompleteRequest):
+def complete(req: JobCompleteRequest, request: Request):
     """Worker submits result. Coordinator writes Redis result, earnings, SQLite row."""
+    _require_worker_owner(request, req.worker_id)
     now = time.time()
     tokens = int(req.completion_tokens or 0)
 

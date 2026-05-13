@@ -213,6 +213,16 @@ class DB:
             )
         except sqlite3.OperationalError:
             pass
+        # Worker→member binding — added with the 2026-05-13 security
+        # slice. Without it any authenticated member can /jobs/complete
+        # with any worker_id (fraudulent earnings + ability to inject
+        # bogus responses into other members' prompts).
+        try:
+            self._conn.execute(
+                "ALTER TABLE workers ADD COLUMN owner_member_id TEXT"
+            )
+        except sqlite3.OperationalError:
+            pass
 
     # ---------- jobs ----------
     def insert_job(
@@ -293,6 +303,11 @@ class DB:
 
     # ---------- workers ----------
     def upsert_worker(self, worker_id: str, status: str, last_seen: float) -> None:
+        """Legacy upsert — preserves the pre-ownership signature for
+        callers that don't have a member context (heartbeat path,
+        in-process tests, etc.). Does NOT touch owner_member_id, so
+        ownership state is preserved across status / heartbeat
+        updates."""
         with self._lock:
             self._conn.execute(
                 "INSERT INTO workers (worker_id, status, last_seen, registered_at) "
@@ -301,6 +316,74 @@ class DB:
                 "last_seen=excluded.last_seen",
                 (worker_id, status, last_seen, last_seen),
             )
+
+    def claim_worker_ownership(
+        self,
+        worker_id: str,
+        member_id: Optional[str],
+        status: str,
+        last_seen: float,
+    ) -> tuple[bool, Optional[str]]:
+        """Atomic ownership claim for /register. Returns
+        (ok, current_owner).
+
+        - If the worker_id is new, inserts with member_id as owner.
+        - If the worker_id exists with owner_member_id NULL (legacy),
+          the calling member adopts ownership.
+        - If the worker_id exists with the same owner, refresh status.
+        - If owned by a different member, returns (False, existing_owner)
+          so the caller can 403.
+        """
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = self._conn.execute(
+                    "SELECT owner_member_id FROM workers WHERE worker_id=?",
+                    (worker_id,),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    self._conn.execute(
+                        "INSERT INTO workers "
+                        "(worker_id, status, last_seen, registered_at, owner_member_id) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (worker_id, status, last_seen, last_seen, member_id),
+                    )
+                    self._conn.execute("COMMIT")
+                    return True, member_id
+                existing = row["owner_member_id"]
+                if (
+                    existing is not None
+                    and member_id is not None
+                    and existing != member_id
+                ):
+                    self._conn.execute("ROLLBACK")
+                    return False, existing
+                # Same owner OR adopting a legacy unowned worker.
+                self._conn.execute(
+                    "UPDATE workers SET status=?, last_seen=?, "
+                    "owner_member_id=COALESCE(owner_member_id, ?) "
+                    "WHERE worker_id=?",
+                    (status, last_seen, member_id, worker_id),
+                )
+                self._conn.execute("COMMIT")
+                return True, member_id if existing is None else existing
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+
+    def worker_owner(self, worker_id: str) -> Optional[str]:
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT owner_member_id FROM workers WHERE worker_id=?",
+                (worker_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            if "owner_member_id" not in row.keys():
+                return None  # legacy DB before migration
+            return row["owner_member_id"]
 
     def list_workers(self) -> list[sqlite3.Row]:
         with self._lock:

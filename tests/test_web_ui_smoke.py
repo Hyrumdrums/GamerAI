@@ -372,6 +372,31 @@ class WebUISmokeTests(unittest.TestCase):
         # The job is queued on the coordinator's Redis.
         self.assertEqual(self.r.llen("job_queue"), 1)
 
+    def test_chat_ui_uses_vendored_js_not_cdn(self):
+        """Regression guard for the supply-chain finding: the chat UI
+        must not pull marked / DOMPurify from a third-party CDN. A
+        CDN compromise would inject arbitrary JS into authenticated
+        pages and exfiltrate every prompt the user types."""
+        resp = self.web.get("/")
+        body = resp.text
+        self.assertIn("/static/marked.min.js", body)
+        self.assertIn("/static/purify.min.js", body)
+        self.assertNotIn("cdn.jsdelivr.net", body)
+
+    def test_vendored_static_files_are_served(self):
+        for path in ("/static/marked.min.js", "/static/purify.min.js"):
+            resp = self.web.get(path)
+            self.assertEqual(resp.status_code, 200, f"{path} not served")
+            self.assertGreater(len(resp.content), 1024, f"{path} is suspiciously small")
+
+    def test_chat_ui_sanitizes_assistant_markdown(self):
+        """Belt-and-suspenders to the canary system: marked.parse
+        output for assistant messages must be piped through DOMPurify
+        so a malicious model can't XSS the user via raw HTML in its
+        response."""
+        body = self.web.get("/").text
+        self.assertIn("DOMPurify.sanitize", body)
+
     def test_api_conversations_round_trip(self):
         """The new chat UI calls POST /api/conversations on the first
         prompt of a new chat, then GETs the list, then GETs the
