@@ -17,6 +17,22 @@ class GenerateRequest(BaseModel):
 
 class GenerateResponse(BaseModel):
     job_id: str
+    # When the request carries a conversation_id, the coordinator
+    # persists a placeholder assistant message at enqueue time so a
+    # client that disconnects mid-stream can find and resume it on
+    # reload. The id is returned here so the active client can also
+    # track the in-progress bubble without re-fetching the conversation.
+    assistant_message_id: Optional[str] = None
+
+
+class JobPartialRequest(BaseModel):
+    """Worker push during streaming. ``text`` is the full accumulated
+    output so far (not a delta), so the coordinator can do a simple
+    replacement write. A retried worker's first partial therefore
+    correctly overwrites any leftover text from the original attempt."""
+    worker_id: str
+    job_id: str
+    text: str
 
 
 class WorkerCapabilities(BaseModel):

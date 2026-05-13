@@ -30,7 +30,9 @@ CREATE TABLE IF NOT EXISTS jobs (
 
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_jobs_worker ON jobs(worker_id);
-CREATE INDEX IF NOT EXISTS idx_jobs_submitter ON jobs(submitted_by_member_id);
+-- idx_jobs_submitter is created in _migrate() after the
+-- submitted_by_member_id column is added, so legacy DBs that pre-date
+-- that column don't fail to start.
 
 CREATE TABLE IF NOT EXISTS workers (
     worker_id TEXT PRIMARY KEY,
@@ -152,12 +154,18 @@ CREATE INDEX IF NOT EXISTS idx_conversations_owner ON conversations(owner_member
 -- One row per turn. `role` is 'user' or 'assistant'. Assistant rows
 -- link back to the jobs row that produced them via `job_id` so an
 -- admin debugging a bad answer can see worker_id / duration / etc.
+-- `status` is the lifecycle state — 'pending' while a worker is
+-- streaming partial tokens, 'complete' once /jobs/complete lands,
+-- 'error' if the job failed or timed out. The text column is the
+-- accumulated partial during streaming and the final answer once
+-- complete; for status='error' it holds a short user-facing reason.
 CREATE TABLE IF NOT EXISTS messages (
     message_id TEXT PRIMARY KEY,
     conversation_id TEXT NOT NULL,
     seq INTEGER NOT NULL,
     role TEXT NOT NULL,
     text TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'complete',
     job_id TEXT,
     model TEXT,
     prompt_tokens INTEGER,
@@ -195,6 +203,16 @@ class DB:
             )
         except sqlite3.OperationalError:
             pass
+        # Index on the migration-added column. Created here (not in
+        # _SCHEMA) so a legacy DB whose jobs table predates the column
+        # finishes the ALTER before SQLite parses the CREATE INDEX.
+        try:
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_jobs_submitter "
+                "ON jobs(submitted_by_member_id)"
+            )
+        except sqlite3.OperationalError:
+            pass
         # ToS acceptance — added with the first community-trust slice.
         for col, ddl in (
             ("tos_accepted_at", "ALTER TABLE members ADD COLUMN tos_accepted_at REAL"),
@@ -220,6 +238,18 @@ class DB:
         try:
             self._conn.execute(
                 "ALTER TABLE workers ADD COLUMN owner_member_id TEXT"
+            )
+        except sqlite3.OperationalError:
+            pass
+        # Streaming lifecycle — added when assistant messages started
+        # getting persisted at enqueue time and updated incrementally
+        # as the worker streams tokens. Backfills existing rows to
+        # 'complete' since pre-streaming all persisted messages were
+        # final.
+        try:
+            self._conn.execute(
+                "ALTER TABLE messages ADD COLUMN status TEXT "
+                "NOT NULL DEFAULT 'complete'"
             )
         except sqlite3.OperationalError:
             pass
@@ -685,6 +715,26 @@ class DB:
             )
             return cur.fetchone()
 
+    def list_unowned_conversations(
+        self, include_archived: bool = False,
+    ) -> list[sqlite3.Row]:
+        """Conversations created without an owner_member_id — i.e. in
+        auth-off dev mode. Excluded from list_conversations_for_member
+        because that filters on a specific owner."""
+        with self._lock:
+            if include_archived:
+                cur = self._conn.execute(
+                    "SELECT * FROM conversations WHERE owner_member_id IS NULL "
+                    "ORDER BY updated_at DESC",
+                )
+            else:
+                cur = self._conn.execute(
+                    "SELECT * FROM conversations WHERE owner_member_id IS NULL "
+                    "AND archived_at IS NULL "
+                    "ORDER BY updated_at DESC",
+                )
+            return cur.fetchall()
+
     def list_conversations_for_member(
         self, owner_member_id: str, include_archived: bool = False,
     ) -> list[sqlite3.Row]:
@@ -766,19 +816,91 @@ class DB:
         prompt_tokens: Optional[int] = None,
         completion_tokens: Optional[int] = None,
         created_at: Optional[float] = None,
+        status: str = "complete",
     ) -> None:
         now = created_at if created_at is not None else time.time()
         with self._lock:
             self._conn.execute(
                 "INSERT INTO messages "
-                "(message_id, conversation_id, seq, role, text, job_id, "
-                "model, prompt_tokens, completion_tokens, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "(message_id, conversation_id, seq, role, text, status, "
+                "job_id, model, prompt_tokens, completion_tokens, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    message_id, conversation_id, seq, role, text, job_id,
-                    model, prompt_tokens, completion_tokens, now,
+                    message_id, conversation_id, seq, role, text, status,
+                    job_id, model, prompt_tokens, completion_tokens, now,
                 ),
             )
+
+    def update_message_partial(self, message_id: str, text: str) -> None:
+        """Overwrite a pending message's text with the latest accumulated
+        stream. Only touches rows still in status='pending' so a late
+        partial from an abandoned worker can't clobber a row that already
+        moved to 'complete' or 'error'."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE messages SET text=? "
+                "WHERE message_id=? AND status='pending'",
+                (text, message_id),
+            )
+
+    def finalize_message(
+        self,
+        message_id: str,
+        text: str,
+        status: str,
+        prompt_tokens: Optional[int] = None,
+        completion_tokens: Optional[int] = None,
+        model: Optional[str] = None,
+    ) -> None:
+        """Move a pending message to its terminal state ('complete' or
+        'error'). Status guard prevents double-finalization if both a
+        retry and the original worker race."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE messages SET text=?, status=?, "
+                "prompt_tokens=COALESCE(?, prompt_tokens), "
+                "completion_tokens=COALESCE(?, completion_tokens), "
+                "model=COALESCE(?, model) "
+                "WHERE message_id=? AND status='pending'",
+                (text, status, prompt_tokens, completion_tokens, model, message_id),
+            )
+
+    def get_message(self, message_id: str) -> Optional[sqlite3.Row]:
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM messages WHERE message_id=?", (message_id,),
+            )
+            return cur.fetchone()
+
+    def reset_message_for_retry(
+        self,
+        message_id: str,
+        new_job_id: str,
+    ) -> bool:
+        """Move a status='error' assistant message back to 'pending' so
+        a fresh worker job can stream into it. Only succeeds when the
+        row is currently 'error' — if the user has already kicked off
+        a successful retry from another tab, this is a no-op."""
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE messages SET text='', status='pending', "
+                "job_id=?, prompt_tokens=NULL, completion_tokens=NULL "
+                "WHERE message_id=? AND status='error'",
+                (new_job_id, message_id),
+            )
+            return cur.rowcount > 0
+
+    def get_message_by_job(self, job_id: str) -> Optional[sqlite3.Row]:
+        """Look up the assistant message produced by a given job. Returns
+        None if no message row references this job_id (e.g. legacy jobs
+        that pre-date enqueue-time persistence)."""
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM messages WHERE job_id=? AND role='assistant' "
+                "ORDER BY seq DESC LIMIT 1",
+                (job_id,),
+            )
+            return cur.fetchone()
 
     # ---------- canaries ----------
     def create_canary(

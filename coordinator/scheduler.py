@@ -5,6 +5,7 @@ import threading
 import time
 
 from shared.config import (
+    JOB_PARTIALS,
     JOB_PROCESSING,
     JOB_QUEUE,
     REAPER_INTERVAL_SECONDS,
@@ -64,4 +65,7 @@ class Reaper(threading.Thread):
         )
         self.r.rpush(JOB_QUEUE, json.dumps(original))
         self.r.hdel(JOB_PROCESSING, job_id)
+        # Drop any partial text from the dead worker so the retry
+        # worker's fresh output replaces it cleanly.
+        self.r.hdel(JOB_PARTIALS, job_id)
         self.db.requeue_job(job_id)

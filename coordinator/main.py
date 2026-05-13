@@ -27,6 +27,7 @@ from shared.config import (
     CANARY_PENDING,
     CANARY_SCORE_WINDOW,
     IDEMPOTENCY_TTL_SECONDS,
+    JOB_PARTIALS,
     JOB_PROCESSING,
     JOB_QUEUE,
     JOB_RESULTS,
@@ -51,6 +52,7 @@ from shared.models import (
     InviteCreateRequest,
     JobClaimRequest,
     JobCompleteRequest,
+    JobPartialRequest,
     WorkerIdent,
 )
 
@@ -346,7 +348,13 @@ def generate(req: GenerateRequest, request: Request):
             "idempotent retry",
             extra={"event": "idempotent_hit", "job_id": existing},
         )
-        return GenerateResponse(job_id=existing)
+        existing_msg = db.get_message_by_job(existing)
+        return GenerateResponse(
+            job_id=existing,
+            assistant_message_id=(
+                existing_msg["message_id"] if existing_msg is not None else None
+            ),
+        )
 
     member = getattr(request.state, "member", None)
     submitted_by = member.member_id if member is not None else None
@@ -388,6 +396,17 @@ def generate(req: GenerateRequest, request: Request):
                 status_code=410, detail="conversation is archived"
             )
         prior = db.list_messages(conversation_id)
+        # Don't let a caller queue a new turn while a previous one is
+        # still streaming — the conversation history would then contain
+        # an empty/partial assistant turn wedged between two user turns,
+        # which makes a mess of the worker-facing prompt and the UI.
+        # The client UI also disables submit while pending, but the
+        # server check is what makes the rule load-bearing.
+        if prior and prior[-1]["status"] == "pending":
+            raise HTTPException(
+                status_code=409,
+                detail="previous turn is still streaming",
+            )
         if prior:
             worker_prompt = _format_chat_prompt(prior, req.prompt)
         # Conversation may pin a default model; honor it when the call
@@ -424,6 +443,43 @@ def generate(req: GenerateRequest, request: Request):
         submitted_by,
         conversation_id=conversation_id,
     )
+    # Persist the user turn and an empty pending assistant turn now,
+    # not at /jobs/complete time. This means: (a) a client that
+    # disconnects mid-stream can reload /conversations and see its
+    # message + the partial answer so far; (b) if the job fails, the
+    # user's message stays visible with an error bubble in its place
+    # (vs. the old behavior of erasing the user's prompt on failure).
+    assistant_message_id: Optional[str] = None
+    if conversation_id:
+        base_seq = db.next_message_seq(conversation_id)
+        user_msg_id = "msg_" + uuid.uuid4().hex[:12]
+        assistant_message_id = "msg_" + uuid.uuid4().hex[:12]
+        db.append_message(
+            message_id=user_msg_id,
+            conversation_id=conversation_id,
+            seq=base_seq,
+            role="user",
+            text=req.prompt,
+            model=req_model,
+            created_at=submitted_at,
+            status="complete",
+        )
+        db.append_message(
+            message_id=assistant_message_id,
+            conversation_id=conversation_id,
+            seq=base_seq + 1,
+            role="assistant",
+            text="",
+            job_id=job_id,
+            model=req_model,
+            created_at=submitted_at,
+            status="pending",
+        )
+        db.touch_conversation(conversation_id, submitted_at)
+        # First-prompt-becomes-the-title behavior is idempotent (set only
+        # when title is NULL/empty) so it's safe to call here even
+        # though the message is now persisted earlier than before.
+        db.set_conversation_title(conversation_id, req.prompt[:80].strip())
     r.rpush(JOB_QUEUE, json.dumps(job))
     idem.remember(idem_key, job_id)
     log.info(
@@ -433,7 +489,9 @@ def generate(req: GenerateRequest, request: Request):
             "job_id": job_id,
         },
     )
-    return GenerateResponse(job_id=job_id)
+    return GenerateResponse(
+        job_id=job_id, assistant_message_id=assistant_message_id,
+    )
 
 
 def _format_chat_prompt(prior_messages, new_user_text: str) -> str:
@@ -463,6 +521,7 @@ def result(job_id: str):
     if raw:
         data = json.loads(raw)
         data.setdefault("status", "complete")
+        data["done"] = data.get("status") in ("complete", "error")
         return data
     row = db.get_job(job_id)
     if row is None:
@@ -472,12 +531,17 @@ def result(job_id: str):
         if "submitted_by_member_id" in row.keys()
         else None
     )
+    # Mid-stream: if the worker has been pushing partials, surface the
+    # latest accumulated text so the polling client can render it.
+    # status stays 'pending'/'running' so the client keeps polling.
+    partial_text = r.hget(JOB_PARTIALS, job_id)
+    status = row["status"]
     return {
         "job_id": row["job_id"],
-        "status": row["status"],
+        "status": status,
         "worker_id": row["worker_id"],
         "model": row["model"],
-        "text": row["result"],
+        "text": partial_text if partial_text is not None else row["result"],
         "prompt_tokens": row["prompt_tokens"],
         "completion_tokens": row["completion_tokens"],
         "earnings": row["earnings"],
@@ -485,6 +549,7 @@ def result(job_id: str):
         "attempts": row["attempts"],
         "error": row["error"],
         "submitted_by_member_id": submitted_by,
+        "done": status in ("complete", "error"),
     }
 
 
@@ -659,6 +724,7 @@ def abandon(req: JobClaimRequest, request: Request):
     if original is not None:
         r.rpush(JOB_QUEUE, json.dumps(original))
     r.hdel(JOB_PROCESSING, req.job_id)
+    r.hdel(JOB_PARTIALS, req.job_id)
     r.hset(WORKER_STATUS, req.worker_id, "idle")
     db.requeue_job(req.job_id)
     log.info(
@@ -670,6 +736,45 @@ def abandon(req: JobClaimRequest, request: Request):
         },
     )
     return {"ok": True, "requeued": True}
+
+
+@app.post("/jobs/partial")
+def partial(req: JobPartialRequest, request: Request):
+    """Streaming push from the worker mid-generation.
+
+    ``text`` is the full accumulated output so far (not a delta). We
+    write to Redis JOB_PARTIALS for the polling read path and UPDATE
+    the pending assistant message row so a client that reloads the
+    conversation mid-stream sees the partial answer immediately,
+    without needing to wait for the next poll. Late partials that
+    arrive after /jobs/complete are silently dropped — the message
+    has moved past 'pending' and update_message_partial's WHERE clause
+    filters them out.
+    """
+    _require_worker_owner(request, req.worker_id)
+    # Verify this worker actually holds the claim — same gating as
+    # /jobs/complete, prevents one worker from clobbering another's
+    # in-flight job's text.
+    raw = r.hget(JOB_PROCESSING, req.job_id)
+    if raw is None:
+        # Job already completed or never claimed by anyone — accept
+        # silently rather than 404, since this is a fire-and-forget
+        # path and the worker may be a few ms behind a finalize.
+        return {"ok": True, "stale": True}
+    try:
+        meta = json.loads(raw)
+    except json.JSONDecodeError:
+        meta = {}
+    if meta.get("worker_id") != req.worker_id:
+        raise HTTPException(
+            status_code=403, detail="not the current claimant",
+        )
+    text = req.text or ""
+    r.hset(JOB_PARTIALS, req.job_id, text)
+    msg = db.get_message_by_job(req.job_id)
+    if msg is not None:
+        db.update_message_partial(msg["message_id"], text)
+    return {"ok": True}
 
 
 @app.post("/jobs/complete")
@@ -744,6 +849,7 @@ def complete(req: JobCompleteRequest, request: Request):
     }
     r.hset(JOB_RESULTS, req.job_id, json.dumps(payload))
     r.hdel(JOB_PROCESSING, req.job_id)
+    r.hdel(JOB_PARTIALS, req.job_id)
     r.hset(WORKER_STATUS, req.worker_id, "idle")
     db.mark_job_complete(
         job_id=req.job_id,
@@ -758,9 +864,41 @@ def complete(req: JobCompleteRequest, request: Request):
         status=req.status,
         error=req.error,
     )
+    job_row = db.get_job(req.job_id)
+    conv_id = (
+        job_row["conversation_id"]
+        if job_row is not None and "conversation_id" in job_row.keys()
+        else None
+    )
+    # Finalize the pending assistant message that was created at
+    # enqueue time. On success we write the final text + tokens; on
+    # error we write a short user-facing reason as the bubble text
+    # and flip status to 'error' so the client can render a retry
+    # button. The user turn is already in the table from enqueue, so
+    # we never insert it here.
+    if conv_id:
+        existing_msg = db.get_message_by_job(req.job_id)
+        if existing_msg is not None:
+            if req.status == "complete":
+                db.finalize_message(
+                    message_id=existing_msg["message_id"],
+                    text=req.text or "",
+                    status="complete",
+                    prompt_tokens=int(req.prompt_tokens or 0),
+                    completion_tokens=tokens,
+                    model=req.model,
+                )
+            else:
+                db.finalize_message(
+                    message_id=existing_msg["message_id"],
+                    text=(req.error or "Generation failed.")[:500],
+                    status="error",
+                    model=req.model,
+                )
+        db.touch_conversation(conv_id, now)
+
     if req.status == "complete" and tokens > 0:
         db.add_earnings(req.worker_id, tokens, earnings)
-        job_row = db.get_job(req.job_id)
         submitter = (
             job_row["submitted_by_member_id"]
             if job_row is not None and "submitted_by_member_id" in job_row.keys()
@@ -773,43 +911,6 @@ def complete(req: JobCompleteRequest, request: Request):
                 tokens_in=int(req.prompt_tokens or 0),
                 tokens_out=tokens,
             )
-        # Multi-turn: if the job was tied to a conversation, append the
-        # user message (the original prompt, NOT the worker-facing
-        # concatenation) and the assistant response as two new turns.
-        conv_id = (
-            job_row["conversation_id"]
-            if job_row is not None and "conversation_id" in job_row.keys()
-            else None
-        )
-        if conv_id:
-            user_text = job_row["prompt"] or ""
-            assistant_text = req.text or ""
-            base_seq = db.next_message_seq(conv_id)
-            db.append_message(
-                message_id="msg_" + uuid.uuid4().hex[:12],
-                conversation_id=conv_id,
-                seq=base_seq,
-                role="user",
-                text=user_text,
-                model=req.model,
-                prompt_tokens=int(req.prompt_tokens or 0),
-                created_at=now,
-            )
-            db.append_message(
-                message_id="msg_" + uuid.uuid4().hex[:12],
-                conversation_id=conv_id,
-                seq=base_seq + 1,
-                role="assistant",
-                text=assistant_text,
-                job_id=req.job_id,
-                model=req.model,
-                completion_tokens=tokens,
-                created_at=now,
-            )
-            db.touch_conversation(conv_id, now)
-            # First-prompt-becomes-the-title behavior. Title is set
-            # only if currently NULL/empty (idempotent for later turns).
-            db.set_conversation_title(conv_id, user_text[:80].strip())
         # mirror to redis hash for backwards compat
         existing = r.hget(WORKER_EARNINGS, req.worker_id)
         if existing:
@@ -916,11 +1017,13 @@ def _conv_row_to_summary(row) -> dict:
 
 
 def _message_row_to_dict(row) -> dict:
+    keys = row.keys()
     return {
         "message_id": row["message_id"],
         "seq": row["seq"],
         "role": row["role"],
         "text": row["text"],
+        "status": row["status"] if "status" in keys else "complete",
         "job_id": row["job_id"],
         "model": row["model"],
         "prompt_tokens": row["prompt_tokens"],
@@ -977,6 +1080,14 @@ def list_conversations(request: Request, include_archived: bool = False):
         raise HTTPException(status_code=401, detail="unauthorized")
     owner_id = member.member_id if member is not None else None
     if owner_id is None:
+        # Auth-off dev mode: conversations get owner_member_id=NULL when
+        # there's no authenticated caller, so a member-id filter would
+        # always miss. Surface those rows so the sidebar isn't empty.
+        if not AUTH_ENABLED:
+            rows = db.list_unowned_conversations(
+                include_archived=include_archived,
+            )
+            return {"conversations": [_conv_row_to_summary(r) for r in rows]}
         return {"conversations": []}
     rows = db.list_conversations_for_member(
         owner_id, include_archived=include_archived,
@@ -994,6 +1105,120 @@ def get_conversation(conversation_id: str, request: Request):
     return {
         **_conv_row_to_summary(row),
         "messages": [_message_row_to_dict(m) for m in messages],
+    }
+
+
+# Minimum seconds between retry button presses for the same message.
+# Enforced via Redis with a per-message TTL key so a client that
+# bypasses the disabled button still gets rejected.
+RETRY_COOLDOWN_SECONDS = 10
+
+
+@app.post("/messages/{message_id}/retry")
+def retry_message(message_id: str, request: Request):
+    """Re-enqueue a failed assistant message. Caller must own the
+    conversation. Cooldown is server-enforced — the client UI disables
+    its retry button for the same window but a hand-crafted request
+    will still 429."""
+    msg = db.get_message(message_id)
+    if msg is None:
+        raise HTTPException(status_code=404, detail="message not found")
+    if msg["role"] != "assistant":
+        raise HTTPException(status_code=400, detail="not an assistant message")
+    conv_row = db.get_conversation(msg["conversation_id"])
+    if conv_row is None:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    _require_conversation_owner(request, conv_row)
+
+    # Cooldown gate runs BEFORE the state check so a rapid double-click
+    # gets 429'd (the spam signal) rather than 409'd (the "already
+    # retrying" signal). SET NX EX is the atomic primitive here — only
+    # the first caller in the window gets the OK, everyone else sees
+    # the remaining TTL and gets 429'd.
+    cd_key = f"retry_cd:{message_id}"
+    if not r.set(cd_key, "1", nx=True, ex=RETRY_COOLDOWN_SECONDS):
+        remaining = r.ttl(cd_key)
+        retry_after = max(1, int(remaining)) if remaining is not None else RETRY_COOLDOWN_SECONDS
+        raise HTTPException(
+            status_code=429,
+            detail=f"retry cooldown active; try again in {retry_after}s",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    if msg["status"] != "error":
+        # Release the cooldown we just claimed since we're not actually
+        # going to do work — otherwise an accidental click on a
+        # complete/pending message would lock out a legitimate retry
+        # on the same id later.
+        r.delete(cd_key)
+        raise HTTPException(
+            status_code=409,
+            detail=f"message is not in error state (status={msg['status']})",
+        )
+
+    # Rebuild the worker-facing prompt from prior turns. The user
+    # message that produced this failure is at seq - 1; everything
+    # before it is conversation context. We also pin the conversation
+    # owner as the submitter for usage/quota accounting on retry.
+    all_messages = db.list_messages(msg["conversation_id"])
+    user_msg = None
+    prior: list = []
+    for m in all_messages:
+        if m["message_id"] == message_id:
+            break
+        if m["seq"] == msg["seq"] - 1 and m["role"] == "user":
+            user_msg = m
+        else:
+            prior.append(m)
+    if user_msg is None:
+        raise HTTPException(
+            status_code=500,
+            detail="cannot find the user message that produced this failure",
+        )
+    worker_prompt = _format_chat_prompt(prior, user_msg["text"] or "")
+
+    # Pick a model: explicit conversation default → original message
+    # model → coordinator default at job-fetch time. Keeping the same
+    # model on retry avoids a surprise model swap mid-conversation.
+    use_model = conv_row["model"] or msg["model"]
+    new_job_id = str(uuid.uuid4())
+    submitted_at = time.time()
+    member = getattr(request.state, "member", None)
+    submitted_by = member.member_id if member is not None else None
+    db.insert_job(
+        new_job_id,
+        user_msg["text"] or "",
+        use_model,
+        submitted_at,
+        submitted_by,
+        conversation_id=msg["conversation_id"],
+    )
+    if not db.reset_message_for_retry(message_id, new_job_id):
+        # Someone else flipped status between get_message and now —
+        # rare but possible. Release the cooldown and surface a 409.
+        r.delete(cd_key)
+        raise HTTPException(status_code=409, detail="message no longer in error state")
+    db.touch_conversation(msg["conversation_id"], submitted_at)
+    job = {
+        "job_id": new_job_id,
+        "prompt": worker_prompt,
+        "model": use_model,
+        "submitted_at": submitted_at,
+    }
+    r.rpush(JOB_QUEUE, json.dumps(job))
+    log.info(
+        "retry queued",
+        extra={
+            "event": "retry_queued",
+            "job_id": new_job_id,
+            "message_id": message_id,
+        },
+    )
+    return {
+        "ok": True,
+        "job_id": new_job_id,
+        "message_id": message_id,
+        "cooldown_seconds": RETRY_COOLDOWN_SECONDS,
     }
 
 

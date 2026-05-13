@@ -121,10 +121,54 @@ def estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4) if text else 0
 
 
-def run_inference(prompt: str, model: Optional[str], http: httpx.Client) -> dict:
+# Minimum wall-clock between /jobs/partial pushes for real Ollama
+# streams. Tight enough that tokens feel live, loose enough that we
+# don't hammer the coordinator with one POST per token. The mock
+# branch overrides this and flushes per character so a dev watching
+# the UI sees a visible type-in effect even when the underlying
+# response is tiny.
+PARTIAL_FLUSH_INTERVAL = 0.25
+
+# A fixed lorem-ipsum-flavored body the mock streams back regardless
+# of the input prompt. Deliberately NOT an echo of the prompt — that
+# was confusing in multi-turn dev tests where the prepended chat
+# history looked like the model was leaking it back. This is long
+# enough that a 200ms client poll captures several visible chunks.
+_MOCK_RESPONSE = (
+    "Streaming demo response: lorem ipsum dolor sit amet, consectetur "
+    "adipiscing elit. Sed do eiusmod tempor incididunt ut labore et "
+    "dolore magna aliqua. Ut enim ad minim veniam, quis nostrud "
+    "exercitation ullamco laboris nisi ut aliquip ex ea commodo "
+    "consequat. Duis aute irure dolor in reprehenderit in voluptate "
+    "velit esse cillum dolore eu fugiat nulla pariatur."
+)
+# Per-character wall-clock during the mock stream. 2.5ms ⇒ the full
+# response above takes about a second — fast enough that it doesn't
+# stall the demo, slow enough that the client poll loop sees multiple
+# intermediate states and renders a real type-in effect.
+_MOCK_CHAR_DELAY = 0.0025
+
+
+def run_inference(
+    prompt: str,
+    model: Optional[str],
+    http: httpx.Client,
+    on_partial=None,
+) -> dict:
+    """Generate a response, streaming intermediate text via ``on_partial``
+    (called with the FULL accumulated text, not a delta). The final
+    return is the same shape as before so /jobs/complete callers don't
+    need to change."""
     if MOCK_INFERENCE:
-        time.sleep(0.5)
-        text = f"[mock-{WORKER_ID}] echo: {prompt[:200]}"
+        # Push every character — no throttle. The mock is a UX demo,
+        # not a load test, and flushing per char makes the streaming
+        # animation visible regardless of how the client paces polls.
+        text = ""
+        for ch in _MOCK_RESPONSE:
+            text += ch
+            time.sleep(_MOCK_CHAR_DELAY)
+            if on_partial:
+                on_partial(text)
         return {
             "text": text,
             "prompt_tokens": estimate_tokens(prompt),
@@ -132,18 +176,41 @@ def run_inference(prompt: str, model: Optional[str], http: httpx.Client) -> dict
             "model": "mock",
         }
     use_model = model or MODEL
-    resp = http.post(
+    text = ""
+    prompt_tokens: Optional[int] = None
+    completion_tokens: Optional[int] = None
+    last_flush = 0.0
+    with http.stream(
+        "POST",
         f"{OLLAMA_URL}/api/generate",
-        json={"model": use_model, "prompt": prompt, "stream": False},
+        json={"model": use_model, "prompt": prompt, "stream": True},
         timeout=600,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    text = data.get("response", "")
+    ) as resp:
+        resp.raise_for_status()
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            try:
+                chunk = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            token = chunk.get("response", "")
+            if token:
+                text += token
+            if chunk.get("done"):
+                prompt_tokens = chunk.get("prompt_eval_count")
+                completion_tokens = chunk.get("eval_count")
+                break
+            now = time.time()
+            if on_partial and (now - last_flush) >= PARTIAL_FLUSH_INTERVAL:
+                on_partial(text)
+                last_flush = now
+    if on_partial:
+        on_partial(text)
     return {
         "text": text,
-        "prompt_tokens": int(data.get("prompt_eval_count") or estimate_tokens(prompt)),
-        "completion_tokens": int(data.get("eval_count") or estimate_tokens(text)),
+        "prompt_tokens": int(prompt_tokens or estimate_tokens(prompt)),
+        "completion_tokens": int(completion_tokens or estimate_tokens(text)),
         "model": use_model,
     }
 
@@ -169,10 +236,23 @@ def process_job(r: redis.Redis, http: httpx.Client, job: dict, last_job_finished
     log.info("claimed", extra={"event": "claimed", "job_id": job_id})
     post(http, "/jobs/claim", {"worker_id": WORKER_ID, "job_id": job_id})
 
+    def push_partial(text: str) -> None:
+        # Fire-and-forget: a dropped partial isn't worth retrying since
+        # the next one carries the full text anyway, and the final
+        # /jobs/complete is the source of truth.
+        post(
+            http,
+            "/jobs/partial",
+            {"worker_id": WORKER_ID, "job_id": job_id, "text": text},
+            timeout=3,
+        )
+
     try:
         maybe_simulate_cold_start(last_job_finished)
         simulate_network_delay()
-        result = run_inference(job["prompt"], job.get("model"), http)
+        result = run_inference(
+            job["prompt"], job.get("model"), http, on_partial=push_partial,
+        )
         duration = round(time.time() - started, 3)
         post(
             http,

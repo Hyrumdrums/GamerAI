@@ -82,6 +82,11 @@ CANARY_SCORE_WINDOW = _int("CANARY_SCORE_WINDOW", 50)
 JOB_QUEUE = "job_queue"
 JOB_RESULTS = "job_results"
 JOB_PROCESSING = "job_processing"
+# Accumulated streaming text per in-flight job, keyed by job_id. Worker
+# pushes the full running text on each /jobs/partial; the polling path
+# reads from here while the job is mid-stream and falls back to
+# JOB_RESULTS once it completes.
+JOB_PARTIALS = "job_partials"
 WORKER_REGISTRY = "worker_registry"
 WORKER_HEARTBEATS = "worker_heartbeats"
 WORKER_STATUS = "worker_status"
