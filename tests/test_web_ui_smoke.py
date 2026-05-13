@@ -44,13 +44,17 @@ from coordinator import member_auth  # noqa: E402
 ADMIN_TOKEN = os.environ["API_TOKEN"]
 
 
-def _patched_admin_client() -> httpx.AsyncClient:
-    """Drop-in for ``client.web._client`` — routes admin-authed outbound
-    calls through ASGITransport at the coordinator app, no network."""
+def _patched_admin_client(bearer: str | None = None) -> httpx.AsyncClient:
+    """Drop-in for ``client.web._client`` — routes outbound calls
+    through ASGITransport at the coordinator app, no network. When a
+    per-session ``bearer`` is supplied (new browser-auth slice), that
+    bearer goes on the wire; otherwise we use the admin token, which
+    matches the pre-slice behavior."""
+    token = bearer or ADMIN_TOKEN
     return httpx.AsyncClient(
         transport=httpx.ASGITransport(app=coordinator_main.app),
         base_url="http://coordinator",
-        headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+        headers={"Authorization": f"Bearer {token}"},
     )
 
 
@@ -76,6 +80,11 @@ class WebUISmokeTests(unittest.TestCase):
         cls.db = coordinator_main.db
         cls.r = _FAKE
         coordinator_main.ensure_admin_seed()
+        # Browser-auth slice: the web UI gates non-public pages on the
+        # session cookie. For tests we stamp it as the admin so existing
+        # smoke coverage of /, /dashboard, /admin/* keeps working. The
+        # /invite/<code> public path is unaffected (no cookie required).
+        cls.web.cookies.set(client_web.SESSION_COOKIE, ADMIN_TOKEN)
 
     def setUp(self):
         self.r.flushall()
@@ -239,6 +248,73 @@ class WebUISmokeTests(unittest.TestCase):
         body = resp.text
         self.assertIn(code, body)
         self.assertIn("accepted", body)
+
+    # ------------------------------------------------------------------
+    # session-cookie auth (browser-auth slice)
+    # ------------------------------------------------------------------
+    def test_index_redirects_to_login_without_session(self):
+        """A visitor without a session cookie cannot see the chat UI."""
+        anon = TestClient(client_web.app, follow_redirects=False)
+        resp = anon.get("/")
+        self.assertIn(resp.status_code, (302, 303, 307))
+        self.assertIn("/login", resp.headers["location"])
+
+    def test_login_page_renders(self):
+        anon = TestClient(client_web.app, follow_redirects=False)
+        resp = anon.get("/login")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("Sign in", resp.text)
+        self.assertIn('name="token"', resp.text)
+
+    def test_login_with_valid_token_sets_cookie_and_redirects(self):
+        anon = TestClient(client_web.app, follow_redirects=False)
+        resp = anon.post(
+            "/login",
+            data={"token": ADMIN_TOKEN, "next": "/"},
+        )
+        self.assertEqual(resp.status_code, 303)
+        self.assertEqual(resp.headers["location"], "/")
+        # Cookie is set on the response.
+        set_cookie = resp.headers.get("set-cookie", "")
+        self.assertIn(client_web.SESSION_COOKIE, set_cookie)
+        self.assertIn("HttpOnly", set_cookie)
+
+    def test_login_with_invalid_token_re_renders_form_401(self):
+        anon = TestClient(client_web.app, follow_redirects=False)
+        resp = anon.post(
+            "/login",
+            data={"token": "gai_definitely-not-valid", "next": "/"},
+        )
+        self.assertEqual(resp.status_code, 401)
+        self.assertIn("rejected", resp.text)
+
+    def test_logout_clears_cookie(self):
+        # Use the class-level client which has a cookie set.
+        resp = self.web.get("/logout")
+        self.assertEqual(resp.status_code, 303)
+        self.assertEqual(resp.headers["location"], "/login")
+        # The Set-Cookie header should clear gai_session.
+        set_cookie = resp.headers.get("set-cookie", "")
+        self.assertIn(client_web.SESSION_COOKIE, set_cookie)
+        # FastAPI's delete_cookie uses an expired Max-Age and/or empty value.
+        self.assertTrue(
+            'Max-Age=0' in set_cookie or 'expires=' in set_cookie.lower(),
+            f"expected an expiry-stamped cookie, got: {set_cookie}",
+        )
+
+    def test_api_generate_without_session_returns_401(self):
+        anon = TestClient(client_web.app, follow_redirects=False)
+        resp = anon.post("/api/generate", json={"prompt": "hi"})
+        self.assertEqual(resp.status_code, 401)
+
+    def test_invite_redemption_remains_public(self):
+        """/invite/<code> must NOT require a session — the whole point is
+        Bob hits it without an account yet."""
+        _, code = self._make_contributor_and_invite()
+        anon = TestClient(client_web.app, follow_redirects=False)
+        resp = anon.get(f"/invite/{code}")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("invited", resp.text.lower())
 
     # ------------------------------------------------------------------
     # static / chrome pages

@@ -1,6 +1,7 @@
 """Tiny FastAPI web UI for GamerAI. Submit prompts, browse workers/earnings/metrics."""
 import html as html_lib
 import os
+from typing import Optional
 
 import httpx
 from fastapi import FastAPI, Form, HTTPException, Request
@@ -10,12 +11,34 @@ from shared.auth import auth_headers
 
 COORDINATOR_URL = os.getenv("COORDINATOR_URL", "http://coordinator:8000")
 
+# Session cookie name + lifetime. The cookie value is literally the
+# user's bearer token. HttpOnly prevents JavaScript from reading it,
+# Secure keeps it off plaintext HTTP. SameSite=Lax stops a third-party
+# site from triggering authenticated requests on our user's behalf.
+SESSION_COOKIE = "gai_session"
+SESSION_MAX_AGE = 60 * 60 * 24 * 30  # 30 days
+# In dev (no HTTPS) the Secure flag would prevent the cookie from
+# being set at all. The PUBLIC_BASE_URL env is set to the public
+# https://... URL on the VPS; we use that as the signal.
+COOKIE_SECURE = (os.getenv("PUBLIC_BASE_URL", "http://").startswith("https://"))
+
 app = FastAPI(title="GamerAI Web UI")
 
 
-def _client() -> httpx.AsyncClient:
-    """httpx client preconfigured with the coordinator base URL and any
-    bearer-token auth headers (no-op when API_TOKEN is unset)."""
+def _client(bearer: Optional[str] = None) -> httpx.AsyncClient:
+    """httpx client for the coordinator.
+
+    When ``bearer`` is provided, sends ``Authorization: Bearer <bearer>``
+    (the per-session user's token). When omitted, falls back to the
+    admin token from the env (legacy path used by admin browser
+    views). Both forms talk to the same coordinator API — the only
+    difference is which member they authenticate as.
+    """
+    if bearer:
+        return httpx.AsyncClient(
+            base_url=COORDINATOR_URL,
+            headers={"Authorization": f"Bearer {bearer}"},
+        )
     return httpx.AsyncClient(base_url=COORDINATOR_URL, headers=auth_headers())
 
 
@@ -24,12 +47,62 @@ def _public_client() -> httpx.AsyncClient:
     Authorization header — the invite code itself is the credential."""
     return httpx.AsyncClient(base_url=COORDINATOR_URL)
 
+
+# ---------- session helpers ----------
+def _session_bearer(request: Request) -> Optional[str]:
+    """Extract the user's bearer token from the session cookie.
+    None when not logged in."""
+    return request.cookies.get(SESSION_COOKIE) or None
+
+
+async def _identify(bearer: str) -> Optional[dict]:
+    """Resolve a bearer to the /me payload, or None if invalid.
+    Caches nothing — every request re-checks so revoked tokens stop
+    working immediately."""
+    if not bearer:
+        return None
+    try:
+        async with _client(bearer=bearer) as c:
+            r = await c.get("/me", timeout=5)
+        if r.status_code != 200:
+            return None
+        body = r.json()
+        if body.get("auth_disabled"):
+            # Auth is off coordinator-side; treat anyone as a logged-in
+            # admin so dev/test loops don't have to plumb env.
+            return {"member_id": "dev", "role": "admin", "email": None}
+        return body
+    except httpx.HTTPError:
+        return None
+
+
+def _set_session_cookie(response, bearer: str) -> None:
+    response.set_cookie(
+        SESSION_COOKIE, bearer,
+        max_age=SESSION_MAX_AGE,
+        httponly=True,
+        secure=COOKIE_SECURE,
+        samesite="lax",
+        path="/",
+    )
+
+
+def _clear_session_cookie(response) -> None:
+    response.delete_cookie(SESSION_COOKIE, path="/")
+
+
+def _login_redirect(next_path: str = "/") -> RedirectResponse:
+    target = f"/login?next={next_path}" if next_path != "/" else "/login"
+    return RedirectResponse(target, status_code=303)
+
 INDEX_HTML = """<!doctype html>
 <html><head><meta charset="utf-8"><title>GamerAI</title>
 <style>
   body{font-family:-apple-system,system-ui,sans-serif;max-width:780px;margin:2rem auto;padding:0 1rem;color:#1a1a1a}
   h1{margin-bottom:.25rem}
-  .sub{color:#666;margin-bottom:2rem}
+  .sub{color:#666;margin-bottom:1rem}
+  .userbar{display:flex;justify-content:space-between;align-items:center;font-size:.85rem;color:#666;margin-bottom:1.5rem;padding-bottom:.5rem;border-bottom:1px solid #eee}
+  .userbar a{color:#2d6cdf;text-decoration:none;margin-left:1rem}
   textarea{width:100%;min-height:6rem;font-size:1rem;padding:.6rem;box-sizing:border-box}
   button{font-size:1rem;padding:.5rem 1.2rem;cursor:pointer;background:#2d6cdf;color:#fff;border:0;border-radius:4px}
   button:hover{background:#1f55b8}
@@ -37,11 +110,16 @@ INDEX_HTML = """<!doctype html>
   .row{display:flex;gap:.5rem;margin-top:.5rem;flex-wrap:wrap}
   .row a{font-size:.9rem;color:#2d6cdf;text-decoration:none}
   .meta{color:#666;font-size:.85rem;margin-top:.5rem}
-  table{width:100%;border-collapse:collapse;margin-top:1rem;font-size:.9rem}
-  th,td{padding:.4rem .6rem;border-bottom:1px solid #eee;text-align:left}
-  th{background:#fafafa}
 </style></head>
 <body>
+<div class="userbar">
+  <span id="who">signing in…</span>
+  <span>
+    <a href="/tos" target="_blank">terms</a>
+    <a id="adminlink" href="/dashboard" hidden>admin</a>
+    <a href="/logout">sign out</a>
+  </span>
+</div>
 <h1>GamerAI</h1>
 <div class="sub">Distributed inference, paid per token.</div>
 
@@ -49,10 +127,6 @@ INDEX_HTML = """<!doctype html>
   <textarea id="prompt" placeholder="Ask anything..."></textarea>
   <div class="row">
     <button type="submit">Submit</button>
-    <a href="/dashboard">dashboard</a>
-    <a href="/api/workers" target="_blank">/workers</a>
-    <a href="/api/earnings" target="_blank">/earnings</a>
-    <a href="/api/metrics" target="_blank">/metrics</a>
   </div>
 </form>
 
@@ -60,6 +134,23 @@ INDEX_HTML = """<!doctype html>
 <pre id="out" hidden></pre>
 
 <script>
+async function loadMe() {
+  try {
+    const r = await fetch('/api/me');
+    if (!r.ok) { location.href = '/login'; return; }
+    const me = await r.json();
+    const who = document.getElementById('who');
+    const label = me.email || me.member_id || 'signed in';
+    who.textContent = `${label} · ${me.role || 'member'}`;
+    if (me.role === 'admin') {
+      document.getElementById('adminlink').hidden = false;
+    }
+  } catch (e) {
+    location.href = '/login';
+  }
+}
+loadMe();
+
 const f = document.getElementById('f');
 const out = document.getElementById('out');
 const status = document.getElementById('status');
@@ -74,6 +165,11 @@ f.onsubmit = async (e) => {
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify({prompt})
   });
+  if (r.status === 401) { location.href = '/login'; return; }
+  if (!r.ok) {
+    status.textContent = 'error: ' + r.status + ' ' + (await r.text());
+    return;
+  }
   const {job_id} = await r.json();
   status.textContent = 'job '+job_id+' — running...';
   const start = Date.now();
@@ -84,7 +180,7 @@ f.onsubmit = async (e) => {
       out.hidden = false;
       out.textContent = res.text || res.error || JSON.stringify(res, null, 2);
       const dt = ((Date.now()-start)/1000).toFixed(1);
-      status.textContent = `done in ${dt}s — worker ${res.worker_id} — ${res.completion_tokens} tokens — $${res.earnings}`;
+      status.textContent = `done in ${dt}s — ${res.completion_tokens||0} tokens`;
       return;
     }
   }
@@ -94,9 +190,84 @@ f.onsubmit = async (e) => {
 """
 
 
+_LOGIN_PAGE = """<!doctype html>
+<html><head><meta charset="utf-8"><title>Sign in — GamerAI</title>
+<style>
+  body{{font-family:-apple-system,system-ui,sans-serif;max-width:480px;margin:4rem auto;padding:0 1rem;color:#1a1a1a}}
+  h1{{margin-bottom:.25rem}}
+  .sub{{color:#666;margin-bottom:1.5rem}}
+  input[type=password]{{width:100%;padding:.6rem;font-size:1rem;font-family:ui-monospace,Menlo,Consolas,monospace;box-sizing:border-box;margin-bottom:.75rem}}
+  button{{font-size:1rem;padding:.6rem 1.2rem;cursor:pointer;background:#2d6cdf;color:#fff;border:0;border-radius:4px;width:100%}}
+  button:hover{{background:#1f55b8}}
+  .err{{background:#fde0e0;border:1px solid #f5b0b0;color:#900;padding:.6rem .9rem;border-radius:6px;margin-bottom:1rem}}
+  .hint{{color:#666;font-size:.85rem;margin-top:1rem}}
+  a{{color:#2d6cdf}}
+</style></head>
+<body>
+<h1>GamerAI</h1>
+<div class="sub">Sign in with your bearer token to start a session.</div>
+
+{error_block}
+
+<form method="POST" action="/login">
+  <input type="hidden" name="next" value="{next_path}">
+  <input type="password" name="token" placeholder="gai_<your token>" autocomplete="off" autofocus required>
+  <button type="submit">Sign in</button>
+</form>
+
+<div class="hint">
+  No token? Ask the contributor who invited you for a fresh invite link,
+  or read the <a href="/tos">community terms</a>.
+</div>
+</body></html>
+"""
+
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_page(request: Request, next: str = "/"):
+    # If already logged in, bounce to the destination.
+    bearer = _session_bearer(request)
+    if bearer and await _identify(bearer):
+        return RedirectResponse(next or "/", status_code=303)
+    return HTMLResponse(_LOGIN_PAGE.format(
+        next_path=html_lib.escape(next or "/"),
+        error_block="",
+    ))
+
+
+@app.post("/login", response_class=HTMLResponse)
+async def login_submit(
+    request: Request,
+    token: str = Form(...),
+    next: str = Form("/"),
+):
+    bearer = token.strip()
+    me = await _identify(bearer)
+    if me is None:
+        # Invalid or revoked token — re-show the form with an error.
+        return HTMLResponse(_LOGIN_PAGE.format(
+            next_path=html_lib.escape(next or "/"),
+            error_block='<div class="err">That token was rejected by the coordinator. Double-check it and try again.</div>',
+        ), status_code=401)
+    safe_next = next if next.startswith("/") else "/"
+    response = RedirectResponse(safe_next, status_code=303)
+    _set_session_cookie(response, bearer)
+    return response
+
+
+@app.get("/logout")
+def logout():
+    response = RedirectResponse("/login", status_code=303)
+    _clear_session_cookie(response)
+    return response
+
+
 @app.get("/", response_class=HTMLResponse)
-def index():
-    return INDEX_HTML
+async def index(request: Request):
+    bearer = _session_bearer(request)
+    if not bearer or not await _identify(bearer):
+        return _login_redirect("/")
+    return HTMLResponse(INDEX_HTML)
 
 
 @app.get("/admin")
@@ -105,8 +276,18 @@ def admin_redirect():
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard():
-    async with _client() as c:
+async def dashboard(request: Request):
+    bearer = _session_bearer(request)
+    me = await _identify(bearer) if bearer else None
+    if me is None:
+        return _login_redirect("/dashboard")
+    if me.get("role") != "admin":
+        return HTMLResponse(
+            "<h1>403 — admin only</h1><p>Dashboard requires the admin role.</p>"
+            '<p><a href="/">Back to chat</a></p>',
+            status_code=403,
+        )
+    async with _client(bearer=bearer) as c:
         m = (await c.get("/metrics", timeout=5)).json()
         w = (await c.get("/workers", timeout=5)).json()
         e = (await c.get("/earnings", timeout=5)).json()
@@ -478,12 +659,32 @@ async def invite_accept(
 
 
 # ---------- admin pages ----------
+async def _require_admin_session(request: Request):
+    """Used by the admin HTML pages. Returns the session bearer when
+    the caller is an authenticated admin; redirects to /login when no
+    session; returns a 403 HTML page otherwise."""
+    bearer = _session_bearer(request)
+    me = await _identify(bearer) if bearer else None
+    if me is None:
+        return None, _login_redirect(str(request.url.path))
+    if me.get("role") != "admin":
+        return None, HTMLResponse(
+            "<h1>403 — admin only</h1>"
+            '<p><a href="/">Back to chat</a></p>',
+            status_code=403,
+        )
+    return bearer, None
+
+
 @app.get("/admin/members", response_class=HTMLResponse)
-async def admin_members():
-    """Admin-only table of every member. The web UI talks to the
-    coordinator as the admin (it inherits API_TOKEN); restrict access
-    to this page via Caddy basic_auth or an SSH tunnel for now."""
-    async with _client() as c:
+async def admin_members(request: Request):
+    """Admin-only table of every member. Session cookie gate added in
+    the browser-auth slice; previously this page used the admin API
+    token and was kept off the public domain via Caddy."""
+    bearer, fail = await _require_admin_session(request)
+    if fail is not None:
+        return fail
+    async with _client(bearer=bearer) as c:
         r = await c.get("/admin/members", timeout=5)
     if r.status_code >= 400:
         raise HTTPException(status_code=r.status_code, detail=r.text)
@@ -523,9 +724,12 @@ async def admin_members():
 
 
 @app.get("/admin/invites", response_class=HTMLResponse)
-async def admin_invites():
+async def admin_invites(request: Request):
     """Admin view of every invite in the system, redeemed or not."""
-    async with _client() as c:
+    bearer, fail = await _require_admin_session(request)
+    if fail is not None:
+        return fail
+    async with _client(bearer=bearer) as c:
         r = await c.get("/invites?all=true", timeout=5)
     if r.status_code >= 400:
         raise HTTPException(status_code=r.status_code, detail=r.text)
@@ -564,9 +768,21 @@ async def admin_invites():
 
 
 # ---------- proxy endpoints (avoids CORS for browser) ----------
+# All /api/* proxies use the caller's session-cookie bearer so the
+# coordinator authenticates the prompt as the logged-in member. A
+# request with no session is rejected 401 — the JS in INDEX_HTML
+# will see that and redirect.
+def _require_session_bearer(request: Request) -> str:
+    bearer = _session_bearer(request)
+    if not bearer:
+        raise HTTPException(status_code=401, detail="not signed in")
+    return bearer
+
+
 @app.post("/api/generate")
-async def proxy_generate(payload: dict):
-    async with _client() as c:
+async def proxy_generate(payload: dict, request: Request):
+    bearer = _require_session_bearer(request)
+    async with _client(bearer=bearer) as c:
         r = await c.post("/generate", json=payload, timeout=10)
     if r.status_code >= 400:
         raise HTTPException(status_code=r.status_code, detail=r.text)
@@ -574,28 +790,74 @@ async def proxy_generate(payload: dict):
 
 
 @app.get("/api/result/{job_id}")
-async def proxy_result(job_id: str):
-    async with _client() as c:
+async def proxy_result(job_id: str, request: Request):
+    bearer = _require_session_bearer(request)
+    async with _client(bearer=bearer) as c:
         r = await c.get(f"/result/{job_id}", timeout=10)
     return JSONResponse(r.json(), status_code=r.status_code)
 
 
+@app.get("/api/me")
+async def proxy_me(request: Request):
+    bearer = _require_session_bearer(request)
+    async with _client(bearer=bearer) as c:
+        r = await c.get("/me", timeout=5)
+    return JSONResponse(r.json(), status_code=r.status_code)
+
+
+# Workers / earnings / metrics are operational data — admin only.
+async def _admin_only_proxy(request: Request, path: str):
+    bearer = _require_session_bearer(request)
+    me = await _identify(bearer)
+    if me is None or me.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="admin only")
+    async with _client(bearer=bearer) as c:
+        r = await c.get(path, timeout=10)
+    return JSONResponse(r.json(), status_code=r.status_code)
+
+
 @app.get("/api/workers")
-async def proxy_workers():
-    async with _client() as c:
-        r = await c.get("/workers", timeout=10)
-    return JSONResponse(r.json())
+async def proxy_workers(request: Request):
+    return await _admin_only_proxy(request, "/workers")
 
 
 @app.get("/api/earnings")
-async def proxy_earnings():
-    async with _client() as c:
-        r = await c.get("/earnings", timeout=10)
-    return JSONResponse(r.json())
+async def proxy_earnings(request: Request):
+    return await _admin_only_proxy(request, "/earnings")
 
 
 @app.get("/api/metrics")
-async def proxy_metrics():
-    async with _client() as c:
-        r = await c.get("/metrics", timeout=10)
-    return JSONResponse(r.json())
+async def proxy_metrics(request: Request):
+    return await _admin_only_proxy(request, "/metrics")
+
+
+@app.get("/api/conversations")
+async def proxy_list_conversations(request: Request):
+    bearer = _require_session_bearer(request)
+    async with _client(bearer=bearer) as c:
+        r = await c.get("/conversations", timeout=10)
+    return JSONResponse(r.json(), status_code=r.status_code)
+
+
+@app.post("/api/conversations")
+async def proxy_create_conversation(payload: dict, request: Request):
+    bearer = _require_session_bearer(request)
+    async with _client(bearer=bearer) as c:
+        r = await c.post("/conversations", json=payload, timeout=10)
+    return JSONResponse(r.json(), status_code=r.status_code)
+
+
+@app.get("/api/conversations/{conversation_id}")
+async def proxy_get_conversation(conversation_id: str, request: Request):
+    bearer = _require_session_bearer(request)
+    async with _client(bearer=bearer) as c:
+        r = await c.get(f"/conversations/{conversation_id}", timeout=10)
+    return JSONResponse(r.json(), status_code=r.status_code)
+
+
+@app.delete("/api/conversations/{conversation_id}")
+async def proxy_archive_conversation(conversation_id: str, request: Request):
+    bearer = _require_session_bearer(request)
+    async with _client(bearer=bearer) as c:
+        r = await c.delete(f"/conversations/{conversation_id}", timeout=10)
+    return JSONResponse(r.json(), status_code=r.status_code)

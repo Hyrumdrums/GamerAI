@@ -31,6 +31,12 @@ services:
     restart: unless-stopped
     ports: !override
       - "127.0.0.1:8080:8080"
+    environment:
+      # PUBLIC_BASE_URL tells the web UI whether to set the Secure flag
+      # on session cookies (Secure stops them from being sent over
+      # plain HTTP). When DOMAIN is set, we're behind Caddy + TLS, so
+      # cookies should be Secure. Falls back to http:// in local dev.
+      PUBLIC_BASE_URL: "https://${DOMAIN}"
 
   caddy:
     image: caddy:2-alpine

@@ -38,6 +38,37 @@
         reverse_proxy client:8080
     }
 
+    # Chat UI surface. Session-cookie auth gates these on the client
+    # side (no admin token leakage, see client/web.py). The chat box,
+    # login, logout, and /api/* proxies all live on client:8080.
+    # Admin HTML pages (/admin/members, /admin/invites, /dashboard)
+    # are gated to role=admin inside the client and therefore safe to
+    # expose on the public domain.
+    @web_ui path /
+    @web_ui_login path /login
+    @web_ui_logout path /logout
+    @web_ui_api path /api/*
+    @web_ui_dashboard path /dashboard
+    @web_ui_admin path /admin/*
+    handle @web_ui {
+        reverse_proxy client:8080
+    }
+    handle @web_ui_login {
+        reverse_proxy client:8080
+    }
+    handle @web_ui_logout {
+        reverse_proxy client:8080
+    }
+    handle @web_ui_api {
+        reverse_proxy client:8080
+    }
+    handle @web_ui_dashboard {
+        reverse_proxy client:8080
+    }
+    handle @web_ui_admin {
+        reverse_proxy client:8080
+    }
+
     handle {
         reverse_proxy coordinator:8000
     }
