@@ -170,7 +170,7 @@ def _is_public(method: str, path: str) -> bool:
 # (after a substantive change to docs/community-tos.md) will cause
 # existing members to be flagged as "needs re-accept" by the per-
 # member ToS check.
-TOS_VERSION = "2026-05-12"
+TOS_VERSION = "2026-05-13"
 _TOS_PATH = Path(__file__).resolve().parent.parent / "docs" / "community-tos.md"
 
 
@@ -254,16 +254,36 @@ def health():
 _TOS_HTML_TEMPLATE = """<!doctype html>
 <html><head><meta charset="utf-8"><title>GamerAI — Community ToS</title>
 <style>
-  body{{font-family:-apple-system,system-ui,sans-serif;max-width:760px;margin:2.5rem auto;padding:0 1.25rem;color:#1a1a1a;line-height:1.55}}
-  .meta{{color:#666;font-size:.9rem;margin-bottom:1.5rem}}
-  pre{{white-space:pre-wrap;word-wrap:break-word;font-family:-apple-system,system-ui,sans-serif;font-size:1rem;line-height:1.55;background:transparent;border:0;padding:0}}
-  a{{color:#2d6cdf}}
+  body{{font-family:-apple-system,system-ui,sans-serif;max-width:760px;margin:2.5rem auto;padding:0 1.25rem;color:#1a1a1a;line-height:1.6}}
+  .meta{{color:#666;font-size:.9rem;margin-bottom:1.5rem;padding-bottom:.75rem;border-bottom:1px solid #eee}}
+  .meta a{{color:#2d6cdf;text-decoration:none}}
+  #content h1{{margin-top:0}}
+  #content h2{{margin-top:2rem;font-size:1.25rem;color:#1a1a1a}}
+  #content h3{{margin-top:1.5rem;font-size:1.05rem;color:#333}}
+  #content p{{margin:.75rem 0}}
+  #content ul,#content ol{{padding-left:1.25rem;margin:.5rem 0 .75rem 0}}
+  #content li{{margin-bottom:.25rem}}
+  #content em{{color:#666}}
+  #content strong{{color:#1a1a1a}}
+  #content code{{background:#f3f3f3;padding:.05rem .3rem;border-radius:3px;font-size:.9em;font-family:ui-monospace,Menlo,Consolas,monospace}}
+  #content hr{{border:0;border-top:1px solid #e5e5e5;margin:1.75rem 0}}
+  #content a{{color:#2d6cdf}}
+  #loading{{color:#888}}
 </style></head>
 <body>
 <div class="meta">
   Version <strong>{version}</strong> · <a href="/tos/raw">view raw</a>
 </div>
-<pre>{body}</pre>
+<div id="content"><span id="loading">Loading terms…</span></div>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script>
+fetch('/tos/raw').then(r => r.text()).then(md => {{
+  document.getElementById('content').innerHTML = window.marked.parse(md);
+}}).catch(() => {{
+  document.getElementById('content').innerHTML =
+    '<p>Could not load terms. <a href="/tos/raw">View raw markdown</a>.</p>';
+}});
+</script>
 </body></html>
 """
 
@@ -271,12 +291,13 @@ _TOS_HTML_TEMPLATE = """<!doctype html>
 @app.get("/tos", response_class=HTMLResponse)
 def tos_html():
     """Public ToS page. Used both as the destination of the redemption-
-    page link and as a stable URL contributors can revisit any time."""
+    page link and as a stable URL contributors can revisit any time.
+    The markdown body is fetched client-side from /tos/raw and rendered
+    via marked.js so headings, lists, and emphasis come through as a
+    real document, not preformatted ASCII in a <pre> block."""
     import html as html_lib
-    text = _load_tos_text()
     return HTMLResponse(_TOS_HTML_TEMPLATE.format(
         version=html_lib.escape(TOS_VERSION),
-        body=html_lib.escape(text),
     ))
 
 

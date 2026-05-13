@@ -100,8 +100,13 @@ class TosEndpointTests(_BaseE2E):
     def test_tos_html_is_public(self):
         resp = self.client.get("/tos")
         self.assertEqual(resp.status_code, 200)
-        self.assertIn("Community Terms", resp.text)
+        # Markdown body is fetched client-side from /tos/raw and
+        # rendered with marked.js; the static HTML shell carries the
+        # title + version stamp.
+        self.assertIn("Community ToS", resp.text)
         self.assertIn("Version", resp.text)
+        self.assertIn("/tos/raw", resp.text)
+        self.assertIn("marked", resp.text)
 
     def test_tos_raw_returns_markdown_with_version_header(self):
         resp = self.client.get("/tos/raw")
