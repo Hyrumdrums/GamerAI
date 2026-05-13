@@ -646,9 +646,19 @@ def _find_ollama_exe() -> Optional[Path]:
 def _start_ollama_server(ollama_exe: Path, log: logging.Logger) -> bool:
     """Launch `ollama serve` detached so the API comes up. Ollama's
     installer normally drops a tray app that does this on login, but on
-    a freshly-silent-installed box the user hasn't logged out/in yet."""
+    a freshly-silent-installed box the user hasn't logged out/in yet.
+
+    Ollama's default logging does NOT include prompts at INFO level, but
+    setting OLLAMA_DEBUG=1 makes it dump prompt + response. We pin
+    OLLAMA_DEBUG=0 explicitly when we spawn the server so the Ollama
+    instance the agent installs cannot leak prompts to contributor-side
+    logs even if the contributor has the env var set globally. This is
+    a defense in depth on top of the community-tos.md clause forbidding
+    contributor-side prompt logging — it costs us nothing and means
+    fresh installs are safe by default."""
     if not IS_WINDOWS:
         return False
+    safe_env = {**os.environ, "OLLAMA_DEBUG": "0"}
     try:
         creationflags = (
             subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
@@ -660,8 +670,12 @@ def _start_ollama_server(ollama_exe: Path, log: logging.Logger) -> bool:
             creationflags=creationflags,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            env=safe_env,
         )
-        log.info("bootstrap: launched ollama serve (%s)", ollama_exe)
+        log.info(
+            "bootstrap: launched ollama serve (%s) with OLLAMA_DEBUG=0",
+            ollama_exe,
+        )
         return True
     except Exception as e:
         log.warning("bootstrap: could not launch ollama serve: %s", e)
@@ -1380,6 +1394,18 @@ def main(argv: Optional[list[str]] = None) -> int:
              cfg.coordinator_url, cfg.polling_interval,
              cfg.min_input_idle_seconds, cfg.max_cpu_percent,
              "on" if cfg.api_token else "off")
+
+    # Visibility-only check. If the contributor has OLLAMA_DEBUG=1 set
+    # in the agent's environment they likely also have it set for the
+    # Ollama process, which would log prompts. We can't strictly verify
+    # Ollama's state without changing its API, so we log a warning here.
+    # The community ToS forbids debug logging; this surfaces a concrete
+    # signal for the admin during incident review.
+    if (os.getenv("OLLAMA_DEBUG") or "0").strip() not in ("", "0", "false", "False"):
+        log.warning(
+            "OLLAMA_DEBUG is set in this agent's environment — Ollama may "
+            "log prompts. This violates the community ToS; please unset it."
+        )
 
     # First-run bootstrap: install Ollama + default model. Best-effort;
     # on failure we fall back to mock inference and keep running.

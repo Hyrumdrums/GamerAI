@@ -30,6 +30,13 @@ or operating the coordinator means you agree to these terms.
   a stranger's diary you stumbled across. Do not log them outside the
   agent's own files, do not share them, do not search them. The agent
   rotates its log file automatically; you can delete it any time.
+- **Do not enable inference-engine debug logging.** Specifically, do
+  not run Ollama with ``OLLAMA_DEBUG=1`` (or any equivalent verbose
+  flag) while your agent is serving the community queue. The agent
+  itself does not log prompt text, but Ollama's debug mode does — and
+  that is the most plausible way prompts could leak from your machine.
+  The agent spawns Ollama with debug off by default, but a contributor
+  who launches Ollama themselves controls its environment.
 - **Don't game the network.** Don't run multiple agents on the same
   machine for inflated tier counts. Don't claim work you don't intend
   to serve. Don't intentionally fail jobs.
