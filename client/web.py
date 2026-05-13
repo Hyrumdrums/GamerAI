@@ -179,6 +179,13 @@ INDEX_HTML = """<!doctype html>
 let me = null;
 let conversations = [];   // [{conversation_id, title, updated_at, ...}]
 let currentId = null;     // active conversation_id, or null = brand-new
+// In-memory message cache so switching between already-opened
+// conversations is instant. Keyed by conversation_id; value is the
+// full messages[] array. Cleared on page refresh — not a substitute
+// for offline persistence (see project-gaps.md). Each completed
+// turn appends to the cache directly so we don't refetch on every
+// new message.
+const msgCache = new Map();
 
 // ---- bootstrap --------------------------------------------------------
 async function init() {
@@ -232,10 +239,23 @@ async function openConversation(id) {
   document.querySelectorAll('.conv-item').forEach((el, i) => {
     el.classList.toggle('active', conversations[i] && conversations[i].conversation_id === id);
   });
+  // Cache hit: render immediately, no network. We still kick off a
+  // background fetch to pick up turns added from another tab/device.
+  if (msgCache.has(id)) {
+    renderMessages(msgCache.get(id));
+    refreshConversation(id);  // background; will re-render if it changed
+    return;
+  }
+  await refreshConversation(id, {render: true});
+}
+
+async function refreshConversation(id, {render = false} = {}) {
   const r = await fetch('/api/conversations/' + id);
   if (!r.ok) return;
   const body = await r.json();
-  renderMessages(body.messages || []);
+  const messages = body.messages || [];
+  msgCache.set(id, messages);
+  if (render || currentId === id) renderMessages(messages);
 }
 
 function renderMessages(messages) {
@@ -349,6 +369,11 @@ document.getElementById('composer').onsubmit = async (e) => {
         `done in ${dt}s · ${res.completion_tokens || 0} tokens · ${res.worker_id || 'unknown worker'}`;
       submitBtn.disabled = false; textarea.disabled = false;
       textarea.focus();
+      // Invalidate this conversation's cache; next openConversation
+      // will pull fresh from the server with authoritative seq +
+      // message_ids. The DOM already has the optimistic render so
+      // there's nothing to update visually right now.
+      msgCache.delete(currentId);
       // Refresh the sidebar so the title (set from the first prompt
       // on the coordinator) shows up.
       await refreshSidebar();

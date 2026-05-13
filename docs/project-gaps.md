@@ -131,6 +131,44 @@ Local-only today. Once we have remote workers, the Caddy+coordinator
 hop is TLS but the worker→Redis path is not. Worth fixing once Redis
 is no longer co-resident with the coordinator (Phase 2b ElastiCache).
 
+### 🟢 No persistent client-side cache (offline / reload-resilience)
+
+The chat UI keeps an in-memory `Map` of loaded conversation messages
+so switching back and forth between threads in the same tab is
+instant. **Page refresh wipes it** — every new tab pays one
+`/api/conversations` + one `/api/conversations/<id>` round trip
+before any text appears. Two things this *doesn't* give us:
+
+- **Reload-resilience.** If the coordinator is slow or briefly
+  unreachable, the user sees a blank UI even though their history
+  exists on disk in their browser nowhere.
+- **Offline read.** A user on a flaky train connection can't review
+  a past conversation while the network is dropping.
+
+**Fix candidates (in order of cost):**
+
+1. `localStorage` (per-conversation cache, plaintext). ~½ day. Cheap
+   and easy. Major issue: it stores prompts + responses in plaintext
+   in the user's browser. That's *fine* against the threats the
+   user already knows about ("admins might read my DB"), but it
+   **breaks the symmetry** with the Phase 3b.iii encrypted-history
+   plan: we'd be claiming server-side encryption while the same
+   data sits unencrypted on disk a few clicks away. Skip until
+   we've decided we don't care, or until #2 ships.
+2. IndexedDB + client-side decryption pairing with Phase 3b.iii.
+   When the encryption work derives a key from the bearer for
+   server-side ciphertext, the same key works for IndexedDB write.
+   The user's bearer is the cryptographic gate everywhere. ~2 days
+   on top of the encryption work.
+3. PWA shell (service worker, offline cache, install-to-home-screen).
+   ~3–5 days. Real offline mode. Only worth it after we have real
+   users complaining.
+
+Recommend: bundle #1 and #2 together, ship neither until Phase
+3b.iii lands so the privacy story stays consistent. Decision
+captured here so the next time someone asks "why don't we cache?"
+we don't accidentally invent the wrong shortcut.
+
 ### 🟡 Stored prompt history is plaintext at rest (Phase 3b.iii)
 
 `jobs.prompt` (and `jobs.result`) in the SQLite ledger are stored as
