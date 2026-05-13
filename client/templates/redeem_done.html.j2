@@ -1,0 +1,54 @@
+{% extends "base.html.j2" %}
+{% block title %}Welcome to GamerAI{% endblock %}
+{% block extra_css %}
+<link rel="stylesheet" href="/static/css/redeem_done.css">
+{% endblock %}
+
+{% block content %}
+<div class="page">
+  <h1>Welcome to GamerAI</h1>
+  <div class="muted" style="margin-bottom:1.5rem">
+    Your invitee account is live. Two quick steps and you're up.
+  </div>
+
+  <div class="warn">1. Save your bearer token (it cannot be recovered)</div>
+  <div class="token-row">
+    <div class="token" id="tok">{{ token }}</div>
+    <button class="copy-btn" id="copy" type="button">Copy</button>
+  </div>
+  <div class="small">
+    member_id: <code>{{ member_id }}</code>
+    &nbsp;·&nbsp; daily_quota_tokens: <code>{{ cap }}</code>
+  </div>
+
+  <h2>2. Install the Windows agent</h2>
+  <p>The agent runs in the background on a Windows PC and only takes work
+     when the machine is idle. Power scales with demand, not uptime.</p>
+  <p><a class="btn" href="/download/GamerAI-Agent-Setup.exe">
+    Download installer (Windows, ~12 MB)</a></p>
+
+  <div class="note">
+    <strong>Windows SmartScreen note:</strong> the installer isn't
+    code-signed yet, so Windows will pop a "Windows protected your PC"
+    dialog the first time you run it. Click <em>More info</em> →
+    <em>Run anyway</em>. The source is at github.com/Hyrumdrums/GamerAI;
+    the binary is built by GitHub Actions on every push (see
+    <code>/download/BUILD.txt</code> for the commit SHA).
+  </div>
+
+  <h2>3. Paste your token on first run</h2>
+  <p>When you launch the agent for the first time, it will prompt for
+     your bearer token. Paste the one above; the agent persists it locally
+     and the network knows you're online.</p>
+
+  <div class="small">Power user / not on Windows? You can also call
+    the API directly with <code>Authorization: Bearer &lt;token&gt;</code>
+    against <code>https://ai.dallinlayton.com</code>, or grab the
+    standalone <a href="/download/agent.exe">agent.exe</a> and pair it
+    with a custom <code>config.json</code>.</div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script src="/static/js/redeem_done.js"></script>
+{% endblock %}

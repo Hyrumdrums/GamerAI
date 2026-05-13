@@ -1,0 +1,13 @@
+{% extends "base.html.j2" %}
+{% block title %}Invite unavailable — GamerAI{% endblock %}
+{% block extra_css %}
+<link rel="stylesheet" href="/static/css/redeem_error.css">
+{% endblock %}
+
+{% block content %}
+<div class="page">
+  <h1>This invite isn't available</h1>
+  <p>{{ detail }}</p>
+  <p>Ask the person who sent the invite for a fresh link.</p>
+</div>
+{% endblock %}

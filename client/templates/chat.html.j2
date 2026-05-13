@@ -1,0 +1,54 @@
+{% extends "base.html.j2" %}
+{% block title %}GamerAI{% endblock %}
+{% block extra_css %}
+<link rel="stylesheet" href="/static/css/chat.css">
+{% endblock %}
+
+{% block topbar %}
+<div class="topbar">
+  <div style="display:flex;align-items:center;gap:.4rem">
+    <button class="hamburger" id="hamburger" type="button" aria-label="Toggle conversations">☰</button>
+    <div class="brand">GamerAI</div>
+  </div>
+  <div class="topbar-actions">
+    <span id="who" class="muted hide-mobile">signing in…</span>
+    <a href="/tos" target="_blank" class="hide-mobile">terms</a>
+    <a id="adminlink" href="/dashboard" hidden>admin</a>
+    <a href="/logout">sign out</a>
+  </div>
+</div>
+{% endblock %}
+
+{% block content %}
+<div class="layout">
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-head">
+      <button id="new-chat">+ New chat</button>
+    </div>
+    <div class="conv-list" id="conv-list"></div>
+  </aside>
+
+  <main class="main">
+    <div class="chat-pane" id="chat-pane">
+      <div class="empty" id="empty-state">
+        <h2>What's on your mind?</h2>
+        <div>Start a new conversation by typing below.</div>
+      </div>
+    </div>
+
+    <form class="composer" id="composer">
+      <div class="composer-inner">
+        <textarea id="prompt" placeholder="Message GamerAI..." rows="1"></textarea>
+        <button type="submit" id="submit">Send</button>
+      </div>
+      <div class="status" id="status"></div>
+    </form>
+  </main>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script src="/static/marked.min.js"></script>
+<script src="/static/purify.min.js"></script>
+<script src="/static/js/chat.js"></script>
+{% endblock %}

@@ -1,0 +1,83 @@
+{% extends "base.html.j2" %}
+{% block title %}GamerAI Admin Dashboard{% endblock %}
+{% block extra_css %}
+<link rel="stylesheet" href="/static/css/dashboard.css">
+{% endblock %}
+
+{% block topbar %}
+<div class="topbar">
+  <div class="brand">GamerAI · admin</div>
+  <div class="topbar-actions">
+    <button onclick="location.reload()" class="btn-quiet" style="width:auto">Refresh</button>
+    <a href="/">← chat</a>
+  </div>
+</div>
+{% endblock %}
+
+{% block content %}
+<div class="page">
+  <div class="stats">
+    <div class="stat-card">
+      <div class="stat-value">{{ workers|length }}</div>
+      <div class="stat-label">Total Workers</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-value">{{ active_workers_count }}</div>
+      <div class="stat-label">Online Workers</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-value">{{ metrics.get('total_jobs', 0) }}</div>
+      <div class="stat-label">Jobs Processed</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-value">${{ "%.4f"|format(total_earnings) }}</div>
+      <div class="stat-label">Total Earnings</div>
+    </div>
+  </div>
+
+  <div class="row-2">
+    <div class="section">
+      <h2>System Metrics</h2>
+      <table>
+        <tr><th>Metric</th><th>Value</th></tr>
+        {% for k, v in metrics.items() %}
+        <tr><td>{{ k }}</td><td>{{ v }}</td></tr>
+        {% endfor %}
+      </table>
+    </div>
+    <div class="section">
+      <h2>Top Earners</h2>
+      <table>
+        <tr><th>Worker</th><th>Jobs</th><th>Tokens</th><th>Earnings</th></tr>
+        {% for w in top_earners %}
+        <tr>
+          <td>{{ w.worker_id[-12:] }}</td>
+          <td>{{ w.total_jobs }}</td>
+          <td>{{ w.total_tokens }}</td>
+          <td>${{ "%.6f"|format(w.total_usd) }}</td>
+        </tr>
+        {% endfor %}
+      </table>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>All Workers</h2>
+    <table>
+      <tr><th>Worker ID</th><th>Status</th><th>Jobs</th><th>Tokens</th><th>Earnings</th></tr>
+      {% for x in workers %}
+      <tr>
+        <td>
+          <span style="color:{% if x.status == 'online' %}#4CAF50{% else %}#FF5722{% endif %};">●</span>
+          {{ x.worker_id[-12:] }}
+        </td>
+        <td>{{ x.status }}</td>
+        <td>{{ x.total_jobs }}</td>
+        <td>{{ x.total_tokens }}</td>
+        <td>${{ "%.6f"|format(x.total_usd) }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+  </div>
+</div>
+{% endblock %}

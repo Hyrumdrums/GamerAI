@@ -1,0 +1,3 @@
+.page { max-width: 420px; }
+input[type=password] { font-family: var(--mono); margin-bottom: .75rem; }
+.hint { color: var(--muted); font-size: .9rem; margin-top: 1rem; }

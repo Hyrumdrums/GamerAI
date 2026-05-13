@@ -38,6 +38,7 @@ import httpx  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from client import web as client_web  # noqa: E402
+from client.services import coordinator_client as _coord_client  # noqa: E402
 from coordinator import main as coordinator_main  # noqa: E402
 from coordinator import member_auth  # noqa: E402
 
@@ -45,7 +46,7 @@ ADMIN_TOKEN = os.environ["API_TOKEN"]
 
 
 def _patched_admin_client(bearer: str | None = None) -> httpx.AsyncClient:
-    """Drop-in for ``client.web._client`` — routes outbound calls
+    """Drop-in for ``coordinator_client._client`` — routes outbound calls
     through ASGITransport at the coordinator app, no network. When a
     per-session ``bearer`` is supplied (new browser-auth slice), that
     bearer goes on the wire; otherwise we use the admin token, which
@@ -59,15 +60,19 @@ def _patched_admin_client(bearer: str | None = None) -> httpx.AsyncClient:
 
 
 def _patched_public_client() -> httpx.AsyncClient:
-    """Drop-in for ``client.web._public_client`` — no auth header."""
+    """Drop-in for ``coordinator_client._public_client`` — no auth header."""
     return httpx.AsyncClient(
         transport=httpx.ASGITransport(app=coordinator_main.app),
         base_url="http://coordinator",
     )
 
 
-client_web._client = _patched_admin_client  # type: ignore[assignment]
-client_web._public_client = _patched_public_client  # type: ignore[assignment]
+# Patch where the routes actually look up the factories. The legacy
+# ``client.web`` module re-exports these names for back-compat, but the
+# route handlers import the ``coordinator_client`` module directly — so
+# rebinding the shim doesn't affect them.
+_coord_client._client = _patched_admin_client  # type: ignore[assignment]
+_coord_client._public_client = _patched_public_client  # type: ignore[assignment]
 
 
 class WebUISmokeTests(unittest.TestCase):
@@ -393,9 +398,12 @@ class WebUISmokeTests(unittest.TestCase):
         """Belt-and-suspenders to the canary system: marked.parse
         output for assistant messages must be piped through DOMPurify
         so a malicious model can't XSS the user via raw HTML in its
-        response."""
+        response. The chat JS lives in /static/js/chat.js; the page
+        body just references it via <script src>."""
         body = self.web.get("/").text
-        self.assertIn("DOMPurify.sanitize", body)
+        self.assertIn("/static/js/chat.js", body)
+        chat_js = self.web.get("/static/js/chat.js").text
+        self.assertIn("DOMPurify.sanitize", chat_js)
 
     def test_api_conversations_round_trip(self):
         """The new chat UI calls POST /api/conversations on the first

@@ -1,0 +1,54 @@
+{% extends "base.html.j2" %}
+{% block title %}You've been invited — GamerAI{% endblock %}
+{% block extra_css %}
+<link rel="stylesheet" href="/static/css/redeem.css">
+{% endblock %}
+
+{% block content %}
+<div class="page">
+  <h1>You've been invited</h1>
+  <div class="muted" style="margin-bottom:1.25rem">
+    Someone with a GamerAI contributor account wants to share their network with you.
+  </div>
+
+  <div class="card">
+    <div class="label">Invited by</div>
+    <div class="value">{{ contributor }}</div>
+    <div class="label">Daily prompt cap</div>
+    <div class="value">{{ cap }}</div>
+    {% if expires_at_text %}
+    <div class="label">Expires</div>
+    <div class="value">{{ expires_at_text }}</div>
+    {% endif %}
+  </div>
+
+  <div class="tos">
+    <h2>Community terms (TL;DR)</h2>
+    <ul>
+      <li><strong>Prompts are visible</strong> to whichever contributor's GPU
+        serves them. Don't paste passwords, API keys, or anything sensitive.</li>
+      <li><strong>Best-effort service.</strong> Things can break, timeouts
+        happen, and answers can be wrong. Don't use this for anything that costs
+        money or harms people if it fails.</li>
+      <li><strong>Be a good neighbor.</strong> No abuse, no scraping, no
+        illegal content. We'll remove members who break trust.</li>
+    </ul>
+    <a href="/tos" target="_blank">Read the full terms</a>
+  </div>
+
+  <form method="POST">
+    <label for="email" class="label">Your email (optional, helps the inviter recognize you)</label>
+    <input id="email" name="invitee_email" type="email" placeholder="you@example.com">
+    <div class="accept-row">
+      <input id="tos_accepted" name="tos_accepted" type="checkbox" required>
+      <label for="tos_accepted">I've read and accept the
+        <a href="/tos" target="_blank">community terms</a>.</label>
+    </div>
+    <button id="submit" type="submit" disabled>Accept and get my token</button>
+  </form>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script src="/static/js/redeem.js"></script>
+{% endblock %}

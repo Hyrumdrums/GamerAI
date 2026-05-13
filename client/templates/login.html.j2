@@ -1,0 +1,27 @@
+{% extends "base.html.j2" %}
+{% block title %}Sign in — GamerAI{% endblock %}
+{% block extra_css %}
+<link rel="stylesheet" href="/static/css/login.css">
+{% endblock %}
+
+{% block content %}
+<div class="page">
+  <h1>GamerAI</h1>
+  <div class="muted" style="margin-bottom:1.5rem">
+    Sign in with your bearer token to start a session.
+  </div>
+  {% if error %}
+  <div class="alert-err">{{ error }}</div>
+  {% endif %}
+  <form method="POST" action="/login">
+    <input type="hidden" name="next" value="{{ next_path }}">
+    <input type="password" name="token" placeholder="gai_&lt;your token&gt;"
+           autocomplete="off" autofocus required>
+    <button type="submit">Sign in</button>
+  </form>
+  <div class="hint">
+    No token? Ask the contributor who invited you for a fresh invite link,
+    or read the <a href="/tos">community terms</a>.
+  </div>
+</div>
+{% endblock %}

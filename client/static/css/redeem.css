@@ -1,0 +1,13 @@
+.page { max-width: 580px; }
+.label { color: var(--muted); font-size: .85rem; }
+.value { font-weight: 600; margin-bottom: .5rem; }
+.tos {
+  background: #fff8e8; border: 1px solid #f0d57b;
+  border-radius: var(--radius); padding: 1rem 1.1rem; margin-bottom: 1rem;
+  font-size: .92rem;
+}
+.tos h2 { margin: 0 0 .5rem; font-size: 1.05rem; }
+.tos ul { margin: .25rem 0 .5rem; padding-left: 1.25rem; }
+.tos li { margin-bottom: .25rem; }
+.accept-row { display: flex; align-items: flex-start; gap: .5rem; margin: .75rem 0 1rem; }
+.accept-row input { margin-top: .25rem; flex: 0 0 auto; width: auto; }

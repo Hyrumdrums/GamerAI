@@ -1,0 +1,31 @@
+{% extends "base.html.j2" %}
+{% block title %}GamerAI — invites{% endblock %}
+{% block extra_css %}
+<link rel="stylesheet" href="/static/css/admin.css">
+{% endblock %}
+
+{% block content %}
+<div class="page">
+  <h1>Invites ({{ invites|length }})</h1>
+  <p class="muted">
+    <a href="/admin/members">→ members</a> ·
+    <a href="/dashboard">← dashboard</a>
+  </p>
+  <table>
+    <tr>
+      <th>code</th><th>state</th><th>contributor</th><th>invitee email</th>
+      <th>quota/day</th><th>accepted by</th>
+    </tr>
+    {% for i in invites %}
+    <tr>
+      <td><code>{{ i.code }}</code></td>
+      <td>{{ i.get('state', '?') }}</td>
+      <td><code>{{ i.contributor_member_id }}</code></td>
+      <td>{{ i.invitee_email or '-' }}</td>
+      <td>{% if i.daily_quota_tokens is not none %}{{ i.daily_quota_tokens }}{% else %}∞{% endif %}</td>
+      <td><code>{{ i.accepted_by_member_id or '-' }}</code></td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+{% endblock %}

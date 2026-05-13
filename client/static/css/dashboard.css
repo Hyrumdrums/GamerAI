@@ -1,0 +1,13 @@
+.page { max-width: 1100px; }
+.stats { display: grid; grid-template-columns: 1fr 1fr; gap: .75rem; margin-bottom: 1rem; }
+.stat-card { padding: 1rem; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); text-align: center; }
+.stat-value { font-size: 1.5rem; font-weight: 600; color: var(--brand); }
+.stat-label { color: var(--muted); font-size: .85rem; margin-top: .25rem; }
+.section { background: var(--surface); border: 1px solid var(--border); margin-bottom: 1rem; padding: 1rem; border-radius: var(--radius); }
+.section h2 { margin-top: 0; }
+.row-2 { display: grid; grid-template-columns: 1fr; gap: 1rem; }
+@media (min-width: 640px) {
+  .stats { grid-template-columns: repeat(4, 1fr); }
+  .row-2 { grid-template-columns: 1fr 1fr; }
+  .stat-value { font-size: 2rem; }
+}

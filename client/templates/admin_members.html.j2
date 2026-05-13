@@ -1,0 +1,32 @@
+{% extends "base.html.j2" %}
+{% block title %}GamerAI — members{% endblock %}
+{% block extra_css %}
+<link rel="stylesheet" href="/static/css/admin.css">
+{% endblock %}
+
+{% block content %}
+<div class="page">
+  <h1>Members ({{ members|length }})</h1>
+  <p class="muted">
+    <a href="/admin/invites">→ invites</a> ·
+    <a href="/dashboard">← dashboard</a>
+  </p>
+  <table>
+    <tr>
+      <th>member_id</th><th>role</th><th>tier</th><th>email</th>
+      <th>parent</th><th>quota/day</th><th>revoked</th>
+    </tr>
+    {% for m in members %}
+    <tr>
+      <td><code>{{ m.member_id }}</code></td>
+      <td>{{ m.role }}</td>
+      <td>{{ m.tier }}</td>
+      <td>{{ m.email or '-' }}</td>
+      <td><code>{{ m.parent_member_id or '-' }}</code></td>
+      <td>{% if m.daily_quota_tokens is not none %}{{ m.daily_quota_tokens }}{% else %}∞{% endif %}</td>
+      <td>{% if m.revoked_at %}yes{% else %}no{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+{% endblock %}
