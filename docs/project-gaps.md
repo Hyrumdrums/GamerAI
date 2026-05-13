@@ -93,14 +93,26 @@ A malicious worker could return garbage and earn money for it.
 **Fix:** Phase 3 roadmap item; quickest win is k-of-n consensus on a
 random sample of jobs (run 5% of jobs on two workers, compare).
 
-### 🟡 Web UI dashboard has no auth
+### ~~🟡 Web UI dashboard has no auth~~ — done
 
-Even bound to localhost (current default), once we expose it through
-Caddy on a subdomain it leaks worker IDs, earnings, and job prompts to
-anyone who guesses the URL.
+Resolved by the 2026-05-12 browser-auth slice. `client/web.py` now
+gates `/`, `/dashboard`, `/admin/*`, and `/api/*` on a session
+cookie (`gai_session`) seeded by `/login`. Admin pages additionally
+require `role=admin` from the session's bearer. Public surface
+(`/invite/<code>`, `/tos`) stays open. Caddy now forwards all of the
+above to the web UI on the public domain — the dashboard is no
+longer SSH-tunnel-only.
 
-**Fix:** Caddy `basic_auth` is one line and good enough until we have
-real customer accounts.
+### ~~🟡 No customer chat UI / persistent conversations~~ — done
+
+Resolved by the 2026-05-12 chat-UI rewrite. `INDEX_HTML` is now a
+two-column layout (sidebar of past conversations, message pane,
+auto-growing composer). Multi-turn context handled via the
+`conversation_id` on `/generate`; coordinator concatenates prior
+turns server-side and auto-appends new turns to the conversation on
+`/jobs/complete`. Markdown rendering for assistant messages via
+`marked.js`. Remaining ChatGPT-style polish (streaming, stop button,
+mobile responsive, multi-model picker) is on the followups list.
 
 ### 🟡 Workers can read every job
 

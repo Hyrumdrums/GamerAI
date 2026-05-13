@@ -98,89 +98,264 @@ def _login_redirect(next_path: str = "/") -> RedirectResponse:
 INDEX_HTML = """<!doctype html>
 <html><head><meta charset="utf-8"><title>GamerAI</title>
 <style>
-  body{font-family:-apple-system,system-ui,sans-serif;max-width:780px;margin:2rem auto;padding:0 1rem;color:#1a1a1a}
-  h1{margin-bottom:.25rem}
-  .sub{color:#666;margin-bottom:1rem}
-  .userbar{display:flex;justify-content:space-between;align-items:center;font-size:.85rem;color:#666;margin-bottom:1.5rem;padding-bottom:.5rem;border-bottom:1px solid #eee}
-  .userbar a{color:#2d6cdf;text-decoration:none;margin-left:1rem}
-  textarea{width:100%;min-height:6rem;font-size:1rem;padding:.6rem;box-sizing:border-box}
-  button{font-size:1rem;padding:.5rem 1.2rem;cursor:pointer;background:#2d6cdf;color:#fff;border:0;border-radius:4px}
-  button:hover{background:#1f55b8}
-  pre{background:#f5f5f5;padding:1rem;white-space:pre-wrap;word-break:break-word;border-radius:4px}
-  .row{display:flex;gap:.5rem;margin-top:.5rem;flex-wrap:wrap}
-  .row a{font-size:.9rem;color:#2d6cdf;text-decoration:none}
-  .meta{color:#666;font-size:.85rem;margin-top:.5rem}
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{font-family:-apple-system,system-ui,sans-serif;color:#1a1a1a;background:#f7f7f8;display:flex;flex-direction:column}
+  .topbar{display:flex;justify-content:space-between;align-items:center;padding:.5rem 1rem;background:#fff;border-bottom:1px solid #e5e5e5;font-size:.9rem}
+  .topbar a{color:#2d6cdf;text-decoration:none;margin-left:1rem}
+  .topbar .brand{font-weight:600;color:#1a1a1a}
+  .layout{display:flex;flex:1;min-height:0}
+  .sidebar{width:260px;background:#fff;border-right:1px solid #e5e5e5;display:flex;flex-direction:column}
+  .sidebar-head{padding:.75rem 1rem;border-bottom:1px solid #f0f0f0;display:flex;gap:.5rem}
+  .sidebar-head button{flex:1;padding:.5rem;font-size:.9rem;background:#2d6cdf;color:#fff;border:0;border-radius:4px;cursor:pointer}
+  .sidebar-head button:hover{background:#1f55b8}
+  .conv-list{flex:1;overflow-y:auto;padding:.25rem 0}
+  .conv-item{padding:.6rem 1rem;cursor:pointer;border-left:3px solid transparent;font-size:.9rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#333}
+  .conv-item:hover{background:#f5f5f5}
+  .conv-item.active{background:#eef3fb;border-left-color:#2d6cdf;color:#1a1a1a;font-weight:500}
+  .main{flex:1;display:flex;flex-direction:column;min-width:0;background:#fff}
+  .chat-pane{flex:1;overflow-y:auto;padding:1.5rem;display:flex;flex-direction:column;gap:1rem}
+  .msg{max-width:46rem;width:100%;align-self:center;display:flex;gap:.75rem}
+  .msg .bubble{flex:1;padding:.6rem .9rem;border-radius:6px;line-height:1.55;font-size:.95rem;word-wrap:break-word}
+  .msg.user .bubble{background:#eef3fb;color:#1a1a1a}
+  .msg.assistant .bubble{background:#fafafa;color:#1a1a1a;border:1px solid #efefef}
+  .msg .role{font-size:.75rem;color:#666;flex:0 0 4rem;text-transform:uppercase;padding-top:.4rem}
+  .msg .bubble pre{background:#f3f3f3;padding:.5rem;border-radius:4px;overflow-x:auto;font-size:.85em;margin:.4rem 0}
+  .msg .bubble code{background:#f3f3f3;padding:.05rem .25rem;border-radius:3px;font-size:.9em}
+  .msg .bubble pre code{background:transparent;padding:0}
+  .msg .bubble p:first-child{margin-top:0}
+  .msg .bubble p:last-child{margin-bottom:0}
+  .empty{align-self:center;color:#888;margin-top:4rem;font-size:.9rem;text-align:center}
+  .empty h2{color:#444;font-weight:500;margin-bottom:.5rem}
+  .composer{border-top:1px solid #e5e5e5;padding:1rem 1.5rem;background:#fff}
+  .composer-inner{max-width:48rem;margin:0 auto;display:flex;gap:.5rem;align-items:flex-end}
+  textarea{flex:1;min-height:2.5rem;max-height:12rem;font-size:1rem;padding:.6rem;border:1px solid #ccc;border-radius:6px;resize:none;font-family:inherit;line-height:1.4}
+  textarea:focus{outline:0;border-color:#2d6cdf}
+  .composer button{padding:.55rem 1rem;font-size:1rem;background:#2d6cdf;color:#fff;border:0;border-radius:4px;cursor:pointer}
+  .composer button:disabled{background:#aaa;cursor:not-allowed}
+  .status{max-width:48rem;margin:.5rem auto 0;color:#666;font-size:.8rem;text-align:center;min-height:1em}
+  .typing{display:inline-block;color:#666;font-style:italic}
 </style></head>
 <body>
-<div class="userbar">
-  <span id="who">signing in…</span>
-  <span>
+<div class="topbar">
+  <div class="brand">GamerAI</div>
+  <div>
+    <span id="who">signing in…</span>
     <a href="/tos" target="_blank">terms</a>
     <a id="adminlink" href="/dashboard" hidden>admin</a>
     <a href="/logout">sign out</a>
-  </span>
-</div>
-<h1>GamerAI</h1>
-<div class="sub">Distributed inference, paid per token.</div>
-
-<form id="f">
-  <textarea id="prompt" placeholder="Ask anything..."></textarea>
-  <div class="row">
-    <button type="submit">Submit</button>
   </div>
-</form>
+</div>
 
-<div id="status" class="meta"></div>
-<pre id="out" hidden></pre>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-head">
+      <button id="new-chat">+ New chat</button>
+    </div>
+    <div class="conv-list" id="conv-list"></div>
+  </aside>
 
+  <main class="main">
+    <div class="chat-pane" id="chat-pane">
+      <div class="empty" id="empty-state">
+        <h2>What's on your mind?</h2>
+        <div>Start a new conversation by typing below.</div>
+      </div>
+    </div>
+
+    <form class="composer" id="composer">
+      <div class="composer-inner">
+        <textarea id="prompt" placeholder="Message GamerAI..." rows="1"></textarea>
+        <button type="submit" id="submit">Send</button>
+      </div>
+      <div class="status" id="status"></div>
+    </form>
+  </main>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js" integrity="sha384-r93nUxgK4UnyZc3qmoCKKqZpsR1tNvHohKVPK16BzMc1+kgwY3RyP8+ZIyx8RGy/" crossorigin="anonymous"></script>
 <script>
-async function loadMe() {
+// ---- state ------------------------------------------------------------
+let me = null;
+let conversations = [];   // [{conversation_id, title, updated_at, ...}]
+let currentId = null;     // active conversation_id, or null = brand-new
+
+// ---- bootstrap --------------------------------------------------------
+async function init() {
   try {
     const r = await fetch('/api/me');
     if (!r.ok) { location.href = '/login'; return; }
-    const me = await r.json();
-    const who = document.getElementById('who');
-    const label = me.email || me.member_id || 'signed in';
-    who.textContent = `${label} · ${me.role || 'member'}`;
+    me = await r.json();
+    document.getElementById('who').textContent =
+      `${me.email || me.member_id || 'signed in'} · ${me.role || 'member'}`;
     if (me.role === 'admin') {
       document.getElementById('adminlink').hidden = false;
     }
-  } catch (e) {
-    location.href = '/login';
+  } catch { location.href = '/login'; return; }
+  await refreshSidebar();
+  if (conversations.length > 0) {
+    openConversation(conversations[0].conversation_id);
   }
 }
-loadMe();
+init();
 
-const f = document.getElementById('f');
-const out = document.getElementById('out');
-const status = document.getElementById('status');
-f.onsubmit = async (e) => {
-  e.preventDefault();
-  const prompt = document.getElementById('prompt').value.trim();
-  if (!prompt) return;
-  out.hidden = true; out.textContent = '';
-  status.textContent = 'submitting...';
-  const r = await fetch('/api/generate', {
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({prompt})
+// ---- sidebar ----------------------------------------------------------
+async function refreshSidebar() {
+  const r = await fetch('/api/conversations');
+  if (!r.ok) return;
+  const body = await r.json();
+  conversations = body.conversations || [];
+  const list = document.getElementById('conv-list');
+  list.innerHTML = '';
+  for (const c of conversations) {
+    const div = document.createElement('div');
+    div.className = 'conv-item' + (c.conversation_id === currentId ? ' active' : '');
+    div.textContent = c.title || '(untitled)';
+    div.title = c.title || c.conversation_id;
+    div.onclick = () => openConversation(c.conversation_id);
+    list.appendChild(div);
+  }
+}
+
+document.getElementById('new-chat').onclick = () => {
+  currentId = null;
+  document.getElementById('chat-pane').innerHTML =
+    '<div class="empty"><h2>What\\'s on your mind?</h2><div>Start a new conversation by typing below.</div></div>';
+  document.querySelectorAll('.conv-item').forEach(el => el.classList.remove('active'));
+  document.getElementById('prompt').focus();
+};
+
+// ---- conversation rendering ------------------------------------------
+async function openConversation(id) {
+  currentId = id;
+  // Highlight the right sidebar entry.
+  document.querySelectorAll('.conv-item').forEach((el, i) => {
+    el.classList.toggle('active', conversations[i] && conversations[i].conversation_id === id);
   });
-  if (r.status === 401) { location.href = '/login'; return; }
-  if (!r.ok) {
-    status.textContent = 'error: ' + r.status + ' ' + (await r.text());
+  const r = await fetch('/api/conversations/' + id);
+  if (!r.ok) return;
+  const body = await r.json();
+  renderMessages(body.messages || []);
+}
+
+function renderMessages(messages) {
+  const pane = document.getElementById('chat-pane');
+  pane.innerHTML = '';
+  if (messages.length === 0) {
+    pane.innerHTML = '<div class="empty"><h2>(empty)</h2></div>';
     return;
   }
-  const {job_id} = await r.json();
-  status.textContent = 'job '+job_id+' — running...';
+  for (const m of messages) {
+    pane.appendChild(messageEl(m.role, m.text));
+  }
+  pane.scrollTop = pane.scrollHeight;
+}
+
+function messageEl(role, text) {
+  const wrap = document.createElement('div');
+  wrap.className = 'msg ' + role;
+  const r = document.createElement('div');
+  r.className = 'role';
+  r.textContent = role;
+  const b = document.createElement('div');
+  b.className = 'bubble';
+  // Render assistant messages as markdown; user messages stay literal
+  // to avoid surprising rendering of pasted code.
+  if (role === 'assistant' && window.marked) {
+    b.innerHTML = window.marked.parse(text || '');
+  } else {
+    b.textContent = text;
+  }
+  wrap.appendChild(r);
+  wrap.appendChild(b);
+  return wrap;
+}
+
+// ---- composer ---------------------------------------------------------
+const textarea = document.getElementById('prompt');
+textarea.addEventListener('input', () => {
+  textarea.style.height = 'auto';
+  textarea.style.height = Math.min(textarea.scrollHeight, 12 * 16) + 'px';
+});
+textarea.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    document.getElementById('composer').requestSubmit();
+  }
+});
+
+document.getElementById('composer').onsubmit = async (e) => {
+  e.preventDefault();
+  const prompt = textarea.value.trim();
+  if (!prompt) return;
+  const submitBtn = document.getElementById('submit');
+  const statusEl = document.getElementById('status');
+  submitBtn.disabled = true;
+  textarea.disabled = true;
+
+  // If this is a brand-new chat (no currentId), create one first.
+  if (!currentId) {
+    const cr = await fetch('/api/conversations', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({}),
+    });
+    if (!cr.ok) {
+      statusEl.textContent = 'failed to create conversation';
+      submitBtn.disabled = false; textarea.disabled = false;
+      return;
+    }
+    currentId = (await cr.json()).conversation_id;
+  }
+
+  // Append the user message optimistically so it shows up right away.
+  const pane = document.getElementById('chat-pane');
+  const empty = document.getElementById('empty-state');
+  if (empty) empty.remove();
+  pane.appendChild(messageEl('user', prompt));
+  const typing = messageEl('assistant', '');
+  typing.querySelector('.bubble').innerHTML = '<span class="typing">thinking…</span>';
+  pane.appendChild(typing);
+  pane.scrollTop = pane.scrollHeight;
+  textarea.value = '';
+  textarea.style.height = 'auto';
+
+  // Submit + poll.
+  statusEl.textContent = 'submitting…';
   const start = Date.now();
+  const gr = await fetch('/api/generate', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({prompt, conversation_id: currentId}),
+  });
+  if (gr.status === 401) { location.href = '/login'; return; }
+  if (!gr.ok) {
+    typing.remove();
+    statusEl.textContent = 'error: ' + gr.status + ' ' + (await gr.text());
+    submitBtn.disabled = false; textarea.disabled = false;
+    return;
+  }
+  const {job_id} = await gr.json();
   while (true) {
     await new Promise(r => setTimeout(r, 1000));
-    const res = await fetch('/api/result/'+job_id).then(r=>r.json());
+    const res = await fetch('/api/result/' + job_id).then(r => r.json());
     if (res.status === 'complete' || res.status === 'error') {
-      out.hidden = false;
-      out.textContent = res.text || res.error || JSON.stringify(res, null, 2);
-      const dt = ((Date.now()-start)/1000).toFixed(1);
-      status.textContent = `done in ${dt}s — ${res.completion_tokens||0} tokens`;
+      typing.remove();
+      const txt = res.text || res.error || '(empty)';
+      pane.appendChild(messageEl('assistant', txt));
+      pane.scrollTop = pane.scrollHeight;
+      const dt = ((Date.now() - start) / 1000).toFixed(1);
+      statusEl.textContent =
+        `done in ${dt}s · ${res.completion_tokens || 0} tokens · ${res.worker_id || 'unknown worker'}`;
+      submitBtn.disabled = false; textarea.disabled = false;
+      textarea.focus();
+      // Refresh the sidebar so the title (set from the first prompt
+      // on the coordinator) shows up.
+      await refreshSidebar();
+      // Re-highlight current.
+      document.querySelectorAll('.conv-item').forEach((el, i) => {
+        el.classList.toggle('active', conversations[i] && conversations[i].conversation_id === currentId);
+      });
       return;
     }
   }

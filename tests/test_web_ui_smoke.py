@@ -324,9 +324,11 @@ class WebUISmokeTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         body = resp.text
         self.assertIn("GamerAI", body)
-        # The prompt form must be present — that's the page's only job.
+        # Conversation-aware shell — sidebar list, prompt input, send button.
         self.assertIn('id="prompt"', body)
-        self.assertIn('id="f"', body)
+        self.assertIn('id="composer"', body)
+        self.assertIn('id="conv-list"', body)
+        self.assertIn('id="new-chat"', body)
 
     def test_admin_redirects_to_dashboard(self):
         resp = self.web.get("/admin")
@@ -369,6 +371,19 @@ class WebUISmokeTests(unittest.TestCase):
         self.assertIn("job_id", body)
         # The job is queued on the coordinator's Redis.
         self.assertEqual(self.r.llen("job_queue"), 1)
+
+    def test_api_conversations_round_trip(self):
+        """The new chat UI calls POST /api/conversations on the first
+        prompt of a new chat, then GETs the list, then GETs the
+        single conversation as the user clicks back into it."""
+        create = self.web.post("/api/conversations", json={})
+        self.assertEqual(create.status_code, 200, create.text)
+        cid = create.json()["conversation_id"]
+        listed = self.web.get("/api/conversations").json()["conversations"]
+        self.assertTrue(any(c["conversation_id"] == cid for c in listed))
+        single = self.web.get(f"/api/conversations/{cid}").json()
+        self.assertEqual(single["conversation_id"], cid)
+        self.assertEqual(single.get("messages", []), [])
 
     def test_api_result_proxy_returns_pending_for_known_job(self):
         # Submit so we have a job_id that exists.

@@ -5,6 +5,195 @@ entries on top. Skim for context before resuming work.
 
 ---
 
+## 2026-05-12 — ChatGPT-shaped UI: conversations, browser auth, chat rewrite
+
+Three connected slices that turn the single-prompt-and-result form
+into something a stranger could land on and actually use. Each was
+independently shippable; bundling them in one devlog entry because
+they only make sense together.
+
+### 1. Multi-turn conversation API (coordinator)
+
+The data layer for threads:
+
+- New tables: `conversations` (id, owner_member_id, title, model,
+  created_at, updated_at, archived_at) and `messages` (id,
+  conversation_id, seq, role, text, job_id, model, tokens). Messages
+  stack via `seq`; assistant rows link back to the originating
+  `jobs.job_id` for forensics.
+- Additive migration: `jobs.conversation_id`.
+- Endpoints:
+  - `POST /conversations` — create
+  - `GET /conversations` — caller's threads, most-recently-updated
+    first; archived hidden unless `?include_archived=true`
+  - `GET /conversations/<id>` — thread with all messages
+  - `DELETE /conversations/<id>` — soft archive
+
+- `/generate` now accepts `conversation_id`. When set, the coordinator
+  loads prior turns, concatenates them with `User:`/`Assistant:`
+  prefixes into the worker-facing prompt, then stamps the
+  conversation_id onto the jobs row. The original (un-prepended)
+  user prompt is stored separately so `/jobs/complete` can replay
+  *only the new turn* into the conversation history. Result: the
+  worker contract is unchanged; multi-turn lives entirely on the
+  coordinator side.
+- `/jobs/complete` auto-appends two rows on completion when the job
+  was tied to a conversation: the user message (the original prompt)
+  and the assistant response. Sets the conversation title from the
+  first user message (idempotent — only when title is still NULL).
+- Ownership enforced everywhere: a member can only read/write their
+  own conversations. Admin can read any (for moderation). 404 on
+  cross-member access — deliberately the same as missing, to avoid
+  leaking existence.
+
+13 new tests in `tests/test_conversations.py`.
+
+### 2. Browser auth on the web UI
+
+The chat UI was previously submitting every prompt as the *admin* —
+`client/web.py`'s `_client()` used the API_TOKEN env var for every
+coordinator call. That meant the chat box couldn't safely go public
+because anyone hitting it would inherit admin permissions. This slice
+fixes that:
+
+- `_client(bearer=...)` accepts an optional per-request bearer; falls
+  back to admin only on legacy paths (admin browser views).
+- New session cookie: `gai_session`. The cookie value IS the user's
+  bearer token. `HttpOnly` prevents JS read, `Secure` keeps it off
+  plain HTTP, `SameSite=lax` handles CSRF. 30-day Max-Age.
+- `/login` (GET) shows a paste-your-token form. POST validates the
+  token by calling `/me` against the coordinator; on success the
+  cookie is set and the user is redirected. Invalid token re-renders
+  the form with an error (401).
+- `/logout` clears the cookie.
+- Every `/api/*` proxy now reads the session cookie's bearer and
+  forwards it as `Authorization: Bearer …`. Workers/earnings/metrics
+  proxies are admin-gated (403 non-admin). Generate/result/me/
+  conversations are open to any authenticated member.
+- Admin HTML pages (`/dashboard`, `/admin/members`, `/admin/invites`)
+  now require role=admin from the session, not just inside-the-SSH-
+  tunnel.
+- Caddy: `/`, `/login`, `/logout`, `/api/*`, `/dashboard`,
+  `/admin/*` now forward to the web UI publicly. Session-cookie auth
+  is the gate. Invite redemption stays untouched-public.
+
+7 new tests in `tests/test_web_ui_smoke.py`.
+
+### 3. Conversation-aware chat UI
+
+`INDEX_HTML` rewritten from a single-prompt form to a real chat
+shape:
+
+- Two-column layout: left sidebar lists conversations (titles auto-
+  derived from each thread's first user message); main pane shows
+  message bubbles for the active conversation. Sidebar entries
+  highlight on click; "+ New chat" button starts a fresh thread.
+- Composer auto-grows up to 12 rows, submits on Enter (Shift+Enter
+  for newline), disables Send while in-flight.
+- Optimistic UI: as soon as the user submits, the user message
+  bubble appears immediately followed by a "thinking…" placeholder.
+  The placeholder is replaced by the assistant response when the
+  job completes.
+- First submit on a brand-new chat auto-creates the conversation,
+  then submits with `conversation_id` set.
+- Markdown rendering for assistant messages via `marked.min.js` from
+  the jsDelivr CDN. User messages render literal (don't surprise the
+  user with markdown rendering of code they pasted).
+- Sidebar refreshes after each completion so the title (set from the
+  first prompt by the coordinator) shows up without a manual reload.
+- Status line under the composer shows job duration + token count
+  per turn.
+
+One new test (`/api/conversations` round-trip via the web UI proxy);
+existing index-page test updated to assert the new shell elements.
+
+### What you'll see at https://ai.dallinlayton.com/
+
+```
+┌─────────────┬────────────────────────────────────┐
+│ + New chat  │ GamerAI         hyrumdrums  terms… │
+├─────────────┼────────────────────────────────────┤
+│ ▎ Why is    │  USER     Why is the sky blue?     │
+│   the sky.. │                                    │
+│             │  ASSIST   The sky appears blue     │
+│   What's    │           because of Rayleigh      │
+│   the cap.. │           scattering...            │
+│             │                                    │
+│             ├────────────────────────────────────┤
+│             │ [ Message GamerAI… ]  [Send]       │
+│             │ done in 6.9s · 44 tokens           │
+└─────────────┴────────────────────────────────────┘
+```
+
+Click into "Why is the sky blue", paste a follow-up like "And why
+not green?" — the coordinator prepends the prior turn, the worker
+serves a context-aware response, both turns persist.
+
+### Test scoreboard
+
+- 158/158 passing (137 → 150 with conversations slice → 157 with
+  browser-auth slice → 158 with chat-UI slice).
+
+### What's deliberately NOT in this push
+
+- **Streaming.** Responses still arrive all-at-once after polling
+  every 1s. Token-streaming via SSE on the coordinator + an Ollama
+  `/api/chat`-style streaming worker contract is its own slice.
+- **Conversation history search.** No "find a chat about Python
+  decorators." Defer until per-user volume justifies an index. The
+  Phase 3b.iii encrypted-history-at-rest design also constrains
+  what server-side search can do.
+- **Conversation rename / delete buttons in the UI.** The API
+  supports archive via `DELETE /conversations/<id>` but there's no
+  UI affordance yet.
+- **Stop generation button.** Today, once you submit, you wait. A
+  user-cancel button would require coordinator-side abandon
+  routing for partially-completed jobs.
+- **Multi-model picker.** Every prompt still goes to `llama3.2:1b`
+  (the only model anyone has). Will become useful once we have
+  multiple worker model classes.
+- **Mobile responsiveness.** Two-column desktop layout. Sidebar will
+  break on narrow screens. Defer.
+
+### File layout changes
+
+```
+coordinator/db.py              <- conversations + messages tables,
+                                  jobs.conversation_id migration,
+                                  CRUD + append/touch + title helper
+coordinator/main.py            <- /conversations endpoints,
+                                  conversation-aware /generate,
+                                  auto-append in /jobs/complete,
+                                  _format_chat_prompt helper
+shared/models.py               <- GenerateRequest.conversation_id,
+                                  new ConversationCreateRequest
+client/web.py                  <- session cookie helpers, /login,
+                                  /logout, INDEX_HTML rewrite,
+                                  per-session /api/* proxies,
+                                  admin-gated /api/workers/earnings/metrics
+infra/Caddyfile                <- /, /login, /logout, /api/*,
+                                  /dashboard, /admin/* exposed publicly
+infra/docker-compose.prod.yml  <- PUBLIC_BASE_URL on client container
+                                  for Secure-cookie detection
+tests/test_conversations.py    <- new (13 tests)
+tests/test_web_ui_smoke.py     <- +8 tests for login/session/conv-proxy
+```
+
+### Deploy steps for the VPS
+
+```bash
+ssh -i ~/.ssh/id_ed25519_gamerai root@5.161.235.139
+cd /opt/gamerai
+git pull
+sudo /opt/gamerai/infra/deploy.sh
+docker restart gamerai-caddy   # for the new /login etc. routes
+```
+
+After that, `https://ai.dallinlayton.com/` is the public chat. Paste
+your bearer at `/login` and start.
+
+---
+
 ## 2026-05-12 — First real prompt served by a real contributor's GPU
 
 The 2026-05-11 invite slice closed the recruitment loop on paper.
