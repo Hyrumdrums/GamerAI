@@ -266,44 +266,47 @@ def health():
         raise HTTPException(status_code=503, detail=f"redis unavailable: {e}")
 
 
-_TOS_HTML_TEMPLATE = """<!doctype html>
-<html><head><meta charset="utf-8"><title>GamerAI — Community ToS</title>
-<style>
-  body{{font-family:-apple-system,system-ui,sans-serif;max-width:760px;margin:2.5rem auto;padding:0 1.25rem;color:#1a1a1a;line-height:1.6}}
-  .meta{{color:#666;font-size:.9rem;margin-bottom:1.5rem;padding-bottom:.75rem;border-bottom:1px solid #eee}}
-  .meta a{{color:#2d6cdf;text-decoration:none}}
-  #content h1{{margin-top:0}}
-  #content h2{{margin-top:2rem;font-size:1.25rem;color:#1a1a1a}}
-  #content h3{{margin-top:1.5rem;font-size:1.05rem;color:#333}}
-  #content p{{margin:.75rem 0}}
-  #content ul,#content ol{{padding-left:1.25rem;margin:.5rem 0 .75rem 0}}
-  #content li{{margin-bottom:.25rem}}
-  #content em{{color:#666}}
-  #content strong{{color:#1a1a1a}}
-  #content code{{background:#f3f3f3;padding:.05rem .3rem;border-radius:3px;font-size:.9em;font-family:ui-monospace,Menlo,Consolas,monospace}}
-  #content hr{{border:0;border-top:1px solid #e5e5e5;margin:1.75rem 0}}
-  #content a{{color:#2d6cdf}}
-  #loading{{color:#888}}
-</style></head>
-<body>
-<div class="meta">
-  Version <strong>{version}</strong> · <a href="/tos/raw">view raw</a>
-</div>
-<div id="content"><span id="loading">Loading terms…</span></div>
-<script src="/static/marked.min.js"></script>
-<script src="/static/purify.min.js"></script>
-<script>
-fetch('/tos/raw').then(r => r.text()).then(md => {{
-  const html = window.marked.parse(md);
-  document.getElementById('content').innerHTML =
-    window.DOMPurify ? window.DOMPurify.sanitize(html) : html;
-}}).catch(() => {{
-  document.getElementById('content').innerHTML =
-    '<p>Could not load terms. <a href="/tos/raw">View raw markdown</a>.</p>';
-}});
-</script>
-</body></html>
+from string import Template as _Template
+
+from shared.ui import BASE_CSS as _BASE_CSS, VIEWPORT_META as _VIEWPORT_META
+
+_TOS_CSS = """
+.page { max-width: 760px; line-height: 1.6; }
+.meta { color: var(--muted); font-size: .9rem; margin-bottom: 1.5rem; padding-bottom: .75rem; border-bottom: 1px solid var(--border-soft); }
+#content h1 { margin-top: 0; }
+#content h2 { margin-top: 2rem; font-size: 1.25rem; }
+#content h3 { margin-top: 1.5rem; font-size: 1.05rem; color: #333; }
+#content p { margin: .75rem 0; }
+#content ul, #content ol { padding-left: 1.25rem; margin: .5rem 0 .75rem; }
+#content li { margin-bottom: .25rem; }
+#content em { color: var(--muted); }
+#content hr { border: 0; border-top: 1px solid var(--border); margin: 1.75rem 0; }
+#loading { color: var(--muted); }
 """
+
+_TOS_HTML_TEMPLATE = _Template(
+    '<!doctype html><html><head><meta charset="utf-8">'
+    + _VIEWPORT_META
+    + "<title>GamerAI — Community ToS</title>"
+    + "<style>" + _BASE_CSS + _TOS_CSS + "</style></head>"
+    + '<body><div class="page">'
+    + '<div class="meta">Version <strong>$version</strong> · '
+      '<a href="/tos/raw">view raw</a></div>'
+    + '<div id="content"><span id="loading">Loading terms…</span></div>'
+    + '<script src="/static/marked.min.js"></script>'
+    + '<script src="/static/purify.min.js"></script>'
+    + "<script>"
+      "fetch('/tos/raw').then(r => r.text()).then(md => {"
+      "  const html = window.marked.parse(md);"
+      "  document.getElementById('content').innerHTML ="
+      "    window.DOMPurify ? window.DOMPurify.sanitize(html) : html;"
+      "}).catch(() => {"
+      "  document.getElementById('content').innerHTML ="
+      "    '<p>Could not load terms. <a href=\"/tos/raw\">View raw markdown</a>.</p>';"
+      "});"
+      "</script>"
+    + "</div></body></html>"
+)
 
 
 @app.get("/tos", response_class=HTMLResponse)
@@ -314,7 +317,7 @@ def tos_html():
     via marked.js so headings, lists, and emphasis come through as a
     real document, not preformatted ASCII in a <pre> block."""
     import html as html_lib
-    return HTMLResponse(_TOS_HTML_TEMPLATE.format(
+    return HTMLResponse(_TOS_HTML_TEMPLATE.substitute(
         version=html_lib.escape(TOS_VERSION),
     ))
 

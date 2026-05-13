@@ -2,6 +2,7 @@
 import html as html_lib
 import os
 from pathlib import Path
+from string import Template
 from typing import Optional
 
 import httpx
@@ -10,6 +11,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from shared.auth import auth_headers
+from shared.ui import BASE_CSS, VIEWPORT_META
 
 COORDINATOR_URL = os.getenv("COORDINATOR_URL", "http://coordinator:8000")
 
@@ -106,65 +108,131 @@ def _login_redirect(next_path: str = "/") -> RedirectResponse:
     target = f"/login?next={next_path}" if next_path != "/" else "/login"
     return RedirectResponse(target, status_code=303)
 
+_CHAT_CSS = """
+/* Page is full-height so the chat pane scrolls inside the viewport,
+   not the whole document. */
+html, body { height: 100%; }
+body { display: flex; flex-direction: column; }
+
+/* Mobile-first defaults: single column. The sidebar slides over the
+   chat as a drawer; the hamburger in the topbar opens it. Tapping a
+   conversation closes it again (handled in JS). */
+.layout { flex: 1; min-height: 0; position: relative; display: flex; }
+.sidebar {
+  position: fixed; top: 0; left: 0; bottom: 0;
+  width: 84vw; max-width: 320px;
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  display: flex; flex-direction: column;
+  transform: translateX(-100%);
+  transition: transform .2s ease;
+  z-index: 30;
+}
+.sidebar.open { transform: translateX(0); box-shadow: 0 0 24px rgba(0,0,0,.18); }
+.sidebar-head { padding: .65rem .9rem; border-bottom: 1px solid var(--border-soft); }
+.sidebar-head button { width: 100%; padding: .55rem; font-size: .95rem; }
+.conv-list { flex: 1; overflow-y: auto; padding: .25rem 0; }
+.conv-item {
+  padding: .65rem .9rem; cursor: pointer; font-size: .92rem;
+  color: #333; border-left: 3px solid transparent;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.conv-item:hover { background: #f5f5f5; }
+.conv-item.active {
+  background: #eef3fb; color: var(--text); font-weight: 500;
+  border-left-color: var(--brand);
+}
+.hamburger {
+  background: transparent; color: var(--text); border: 0;
+  padding: .2rem .55rem; font-size: 1.4rem; line-height: 1;
+  cursor: pointer;
+}
+.hamburger:hover { background: #f5f5f5; }
+
+.main { flex: 1; display: flex; flex-direction: column; min-width: 0; background: var(--surface); }
+.chat-pane {
+  flex: 1; overflow-y: auto; padding: 1rem .9rem;
+  display: flex; flex-direction: column; gap: .9rem;
+}
+/* Bubble defaults: role label stacks above the bubble on mobile to
+   reclaim horizontal room. Desktop swaps to a side-by-side layout. */
+.msg { width: 100%; display: flex; flex-direction: column; gap: .2rem; }
+.msg .role {
+  font-size: .7rem; color: var(--muted); text-transform: uppercase;
+  letter-spacing: .03em;
+}
+.msg .bubble {
+  padding: .55rem .8rem; border-radius: var(--radius);
+  line-height: 1.55; font-size: .95rem; word-wrap: break-word;
+}
+.msg.user .bubble { background: #eef3fb; }
+.msg.assistant .bubble { background: #fafafa; border: 1px solid #efefef; }
+.msg.assistant .bubble.error {
+  background: #fff5f5; border-color: #f3c7c7; color: #7a1f1f;
+}
+.msg.assistant .bubble.error::before { content: "⚠ "; color: #b53232; font-weight: 600; }
+.msg .bubble pre {
+  background: var(--code-bg); padding: .5rem; border-radius: 4px;
+  overflow-x: auto; font-size: .85em; margin: .4rem 0;
+}
+.msg .bubble code { background: var(--code-bg); padding: .05rem .25rem; border-radius: 3px; font-size: .9em; }
+.msg .bubble pre code { background: transparent; padding: 0; }
+.msg .bubble p:first-child { margin-top: 0; }
+.msg .bubble p:last-child { margin-bottom: 0; }
+.empty { color: var(--muted); margin-top: 3rem; text-align: center; align-self: center; }
+.empty h2 { color: #444; font-weight: 500; margin-bottom: .25rem; }
+.typing { display: inline-block; color: var(--muted); font-style: italic; }
+
+.composer { border-top: 1px solid var(--border); padding: .65rem .9rem; background: var(--surface); }
+.composer-inner { display: flex; gap: .5rem; align-items: flex-end; }
+.composer textarea {
+  flex: 1; min-height: 2.5rem; max-height: 10rem; resize: none;
+}
+.composer button { width: auto; }
+.status { color: var(--muted); font-size: .8rem; text-align: center; min-height: 1em; margin-top: .35rem; }
+
+.retry-btn {
+  margin-top: .5rem; padding: .35rem .7rem; font-size: .85rem;
+  background: var(--surface); color: #b53232; border: 1px solid #d99;
+  border-radius: var(--radius); cursor: pointer; width: auto;
+}
+.retry-btn:hover:not(:disabled) { background: #fdecec; }
+.retry-btn:disabled { cursor: not-allowed; color: #999; border-color: #ddd; background: var(--surface); }
+
+@media (min-width: 640px) {
+  .sidebar {
+    position: static; transform: none; box-shadow: none;
+    width: 260px; max-width: 260px;
+  }
+  .hamburger { display: none; }
+  .chat-pane { padding: 1.5rem; gap: 1rem; }
+  .msg { flex-direction: row; gap: .75rem; max-width: 46rem; align-self: center; }
+  .msg .role { flex: 0 0 4rem; padding-top: .35rem; }
+  .msg .bubble { flex: 1; }
+  .composer { padding: 1rem 1.5rem; }
+  .composer-inner { max-width: 48rem; margin: 0 auto; }
+}
+"""
+
 INDEX_HTML = """<!doctype html>
-<html><head><meta charset="utf-8"><title>GamerAI</title>
-<style>
-  *{box-sizing:border-box}
-  html,body{height:100%;margin:0}
-  body{font-family:-apple-system,system-ui,sans-serif;color:#1a1a1a;background:#f7f7f8;display:flex;flex-direction:column}
-  .topbar{display:flex;justify-content:space-between;align-items:center;padding:.5rem 1rem;background:#fff;border-bottom:1px solid #e5e5e5;font-size:.9rem}
-  .topbar a{color:#2d6cdf;text-decoration:none;margin-left:1rem}
-  .topbar .brand{font-weight:600;color:#1a1a1a}
-  .layout{display:flex;flex:1;min-height:0}
-  .sidebar{width:260px;background:#fff;border-right:1px solid #e5e5e5;display:flex;flex-direction:column}
-  .sidebar-head{padding:.75rem 1rem;border-bottom:1px solid #f0f0f0;display:flex;gap:.5rem}
-  .sidebar-head button{flex:1;padding:.5rem;font-size:.9rem;background:#2d6cdf;color:#fff;border:0;border-radius:4px;cursor:pointer}
-  .sidebar-head button:hover{background:#1f55b8}
-  .conv-list{flex:1;overflow-y:auto;padding:.25rem 0}
-  .conv-item{padding:.6rem 1rem;cursor:pointer;border-left:3px solid transparent;font-size:.9rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#333}
-  .conv-item:hover{background:#f5f5f5}
-  .conv-item.active{background:#eef3fb;border-left-color:#2d6cdf;color:#1a1a1a;font-weight:500}
-  .main{flex:1;display:flex;flex-direction:column;min-width:0;background:#fff}
-  .chat-pane{flex:1;overflow-y:auto;padding:1.5rem;display:flex;flex-direction:column;gap:1rem}
-  .msg{max-width:46rem;width:100%;align-self:center;display:flex;gap:.75rem}
-  .msg .bubble{flex:1;padding:.6rem .9rem;border-radius:6px;line-height:1.55;font-size:.95rem;word-wrap:break-word}
-  .msg.user .bubble{background:#eef3fb;color:#1a1a1a}
-  .msg.assistant .bubble{background:#fafafa;color:#1a1a1a;border:1px solid #efefef}
-  .msg .role{font-size:.75rem;color:#666;flex:0 0 4rem;text-transform:uppercase;padding-top:.4rem}
-  .msg .bubble pre{background:#f3f3f3;padding:.5rem;border-radius:4px;overflow-x:auto;font-size:.85em;margin:.4rem 0}
-  .msg .bubble code{background:#f3f3f3;padding:.05rem .25rem;border-radius:3px;font-size:.9em}
-  .msg .bubble pre code{background:transparent;padding:0}
-  .msg .bubble p:first-child{margin-top:0}
-  .msg .bubble p:last-child{margin-bottom:0}
-  .empty{align-self:center;color:#888;margin-top:4rem;font-size:.9rem;text-align:center}
-  .empty h2{color:#444;font-weight:500;margin-bottom:.5rem}
-  .composer{border-top:1px solid #e5e5e5;padding:1rem 1.5rem;background:#fff}
-  .composer-inner{max-width:48rem;margin:0 auto;display:flex;gap:.5rem;align-items:flex-end}
-  textarea{flex:1;min-height:2.5rem;max-height:12rem;font-size:1rem;padding:.6rem;border:1px solid #ccc;border-radius:6px;resize:none;font-family:inherit;line-height:1.4}
-  textarea:focus{outline:0;border-color:#2d6cdf}
-  .composer button{padding:.55rem 1rem;font-size:1rem;background:#2d6cdf;color:#fff;border:0;border-radius:4px;cursor:pointer}
-  .composer button:disabled{background:#aaa;cursor:not-allowed}
-  .status{max-width:48rem;margin:.5rem auto 0;color:#666;font-size:.8rem;text-align:center;min-height:1em}
-  .typing{display:inline-block;color:#666;font-style:italic}
-  .msg.assistant .bubble.error{background:#fff5f5;border-color:#f3c7c7;color:#7a1f1f}
-  .msg.assistant .bubble.error::before{content:"⚠ ";color:#b53232;font-weight:600}
-  .retry-btn{margin-top:.5rem;padding:.3rem .65rem;font-size:.8rem;background:#fff;color:#b53232;border:1px solid #d99;border-radius:4px;cursor:pointer}
-  .retry-btn:hover:not(:disabled){background:#fdecec}
-  .retry-btn:disabled{cursor:not-allowed;color:#999;border-color:#ddd}
-</style></head>
+<html><head><meta charset="utf-8">""" + VIEWPORT_META + """<title>GamerAI</title>
+<style>""" + BASE_CSS + _CHAT_CSS + """</style></head>
 <body>
 <div class="topbar">
-  <div class="brand">GamerAI</div>
-  <div>
-    <span id="who">signing in…</span>
-    <a href="/tos" target="_blank">terms</a>
+  <div style="display:flex;align-items:center;gap:.4rem">
+    <button class="hamburger" id="hamburger" type="button" aria-label="Toggle conversations">☰</button>
+    <div class="brand">GamerAI</div>
+  </div>
+  <div class="topbar-actions">
+    <span id="who" class="muted hide-mobile">signing in…</span>
+    <a href="/tos" target="_blank" class="hide-mobile">terms</a>
     <a id="adminlink" href="/dashboard" hidden>admin</a>
     <a href="/logout">sign out</a>
   </div>
 </div>
 
 <div class="layout">
-  <aside class="sidebar">
+  <aside class="sidebar" id="sidebar">
     <div class="sidebar-head">
       <button id="new-chat">+ New chat</button>
     </div>
@@ -250,7 +318,14 @@ document.getElementById('new-chat').onclick = () => {
   document.getElementById('chat-pane').innerHTML =
     '<div class="empty"><h2>What\\'s on your mind?</h2><div>Start a new conversation by typing below.</div></div>';
   document.querySelectorAll('.conv-item').forEach(el => el.classList.remove('active'));
+  document.getElementById('sidebar').classList.remove('open');
   document.getElementById('prompt').focus();
+};
+
+// Hamburger toggle for the mobile drawer. On desktop the hamburger is
+// hidden via CSS so this handler is effectively unreachable there.
+document.getElementById('hamburger').onclick = () => {
+  document.getElementById('sidebar').classList.toggle('open');
 };
 
 // ---- conversation rendering ------------------------------------------
@@ -262,6 +337,9 @@ async function openConversation(id) {
   activeStream = null;
   document.getElementById('submit').disabled = false;
   document.getElementById('prompt').disabled = false;
+  // On mobile, close the drawer once a conversation is picked. CSS
+  // makes this a no-op on desktop where the sidebar is persistent.
+  document.getElementById('sidebar').classList.remove('open');
   // Highlight the right sidebar entry.
   document.querySelectorAll('.conv-item').forEach((el, i) => {
     el.classList.toggle('active', conversations[i] && conversations[i].conversation_id === id);
@@ -573,37 +651,32 @@ document.getElementById('composer').onsubmit = async (e) => {
 """
 
 
-_LOGIN_PAGE = """<!doctype html>
-<html><head><meta charset="utf-8"><title>Sign in — GamerAI</title>
-<style>
-  body{{font-family:-apple-system,system-ui,sans-serif;max-width:480px;margin:4rem auto;padding:0 1rem;color:#1a1a1a}}
-  h1{{margin-bottom:.25rem}}
-  .sub{{color:#666;margin-bottom:1.5rem}}
-  input[type=password]{{width:100%;padding:.6rem;font-size:1rem;font-family:ui-monospace,Menlo,Consolas,monospace;box-sizing:border-box;margin-bottom:.75rem}}
-  button{{font-size:1rem;padding:.6rem 1.2rem;cursor:pointer;background:#2d6cdf;color:#fff;border:0;border-radius:4px;width:100%}}
-  button:hover{{background:#1f55b8}}
-  .err{{background:#fde0e0;border:1px solid #f5b0b0;color:#900;padding:.6rem .9rem;border-radius:6px;margin-bottom:1rem}}
-  .hint{{color:#666;font-size:.85rem;margin-top:1rem}}
-  a{{color:#2d6cdf}}
-</style></head>
-<body>
-<h1>GamerAI</h1>
-<div class="sub">Sign in with your bearer token to start a session.</div>
-
-{error_block}
-
-<form method="POST" action="/login">
-  <input type="hidden" name="next" value="{next_path}">
-  <input type="password" name="token" placeholder="gai_<your token>" autocomplete="off" autofocus required>
-  <button type="submit">Sign in</button>
-</form>
-
-<div class="hint">
-  No token? Ask the contributor who invited you for a fresh invite link,
-  or read the <a href="/tos">community terms</a>.
-</div>
-</body></html>
+_LOGIN_CSS = """
+.page { max-width: 420px; }
+input[type=password] { font-family: var(--mono); margin-bottom: .75rem; }
+.hint { color: var(--muted); font-size: .9rem; margin-top: 1rem; }
 """
+
+_LOGIN_PAGE = Template(
+    "<!doctype html><html><head><meta charset=\"utf-8\">"
+    + VIEWPORT_META
+    + "<title>Sign in — GamerAI</title><style>"
+    + BASE_CSS + _LOGIN_CSS
+    + "</style></head><body><div class=\"page\">"
+    + "<h1>GamerAI</h1>"
+    + "<div class=\"muted\" style=\"margin-bottom:1.5rem\">"
+    + "Sign in with your bearer token to start a session.</div>"
+    + "$error_block"
+    + '<form method="POST" action="/login">'
+    + '<input type="hidden" name="next" value="$next_path">'
+    + '<input type="password" name="token" placeholder="gai_&lt;your token&gt;" '
+      'autocomplete="off" autofocus required>'
+    + '<button type="submit">Sign in</button>'
+    + "</form>"
+    + '<div class="hint">No token? Ask the contributor who invited you for a '
+      'fresh invite link, or read the <a href="/tos">community terms</a>.</div>'
+    + "</div></body></html>"
+)
 
 
 @app.get("/login", response_class=HTMLResponse)
@@ -612,7 +685,7 @@ async def login_page(request: Request, next: str = "/"):
     bearer = _session_bearer(request)
     if bearer and await _identify(bearer):
         return RedirectResponse(next or "/", status_code=303)
-    return HTMLResponse(_LOGIN_PAGE.format(
+    return HTMLResponse(_LOGIN_PAGE.substitute(
         next_path=html_lib.escape(next or "/"),
         error_block="",
     ))
@@ -628,9 +701,12 @@ async def login_submit(
     me = await _identify(bearer)
     if me is None:
         # Invalid or revoked token — re-show the form with an error.
-        return HTMLResponse(_LOGIN_PAGE.format(
+        return HTMLResponse(_LOGIN_PAGE.substitute(
             next_path=html_lib.escape(next or "/"),
-            error_block='<div class="err">That token was rejected by the coordinator. Double-check it and try again.</div>',
+            error_block=(
+                '<div class="alert-err">That token was rejected by the '
+                'coordinator. Double-check it and try again.</div>'
+            ),
         ), status_code=401)
     safe_next = next if next.startswith("/") else "/"
     response = RedirectResponse(safe_next, status_code=303)
@@ -699,236 +775,203 @@ async def dashboard(request: Request):
             for w in sorted(e["workers"], key=lambda x: x["total_usd"], reverse=True)[:5]
         )
     
-    html = f"""<!doctype html><html><head><meta charset="utf-8">
-<title>🎮 GamerAI Admin Dashboard</title>
-<style>
-body{{font-family:system-ui;max-width:1200px;margin:2rem auto;padding:0 1rem;background:#f8f9fa}}
-.header{{display:flex;justify-content:space-between;align-items:center;margin-bottom:2rem;padding:1rem;background:white;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1)}}
-.stats{{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:1rem;margin-bottom:2rem}}
-.stat-card{{padding:1.5rem;background:white;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1);text-align:center}}
-.stat-value{{font-size:2rem;font-weight:bold;color:#2d6cdf}}
-.stat-label{{color:#666;font-size:0.9rem;margin-top:0.5rem}}
-.section{{background:white;margin-bottom:2rem;padding:1.5rem;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1)}}
-h1{{margin:0;color:#333}}h2{{margin:0 0 1rem 0;color:#555;font-size:1.3rem}}
-table{{width:100%;border-collapse:collapse;font-size:.9rem}}
-th,td{{padding:.6rem;border-bottom:1px solid #eee;text-align:left}}
-th{{background:#f8f9fa;font-weight:600}}
-a{{color:#2d6cdf;text-decoration:none}}
-.refresh-btn{{padding:0.5rem 1rem;background:#2d6cdf;color:white;border:none;border-radius:4px;cursor:pointer}}
-</style>
-</head>
-<body>
-<div class="header">
-  <div>
-    <h1>🎮 GamerAI Admin Dashboard</h1>
-    <div style="color:#666">Distributed AI Inference Marketplace</div>
-  </div>
-  <div>
-    <button class="refresh-btn" onclick="location.reload()">🔄 Refresh</button>
-    <a href="/" style="margin-left:1rem">← Back to Client</a>
-  </div>
-</div>
-
-<div class="stats">
-  <div class="stat-card">
-    <div class="stat-value">{len(workers)}</div>
-    <div class="stat-label">Total Workers</div>
-  </div>
-  <div class="stat-card">
-    <div class="stat-value">{len(active_workers)}</div>
-    <div class="stat-label">Online Workers</div>
-  </div>
-  <div class="stat-card">
-    <div class="stat-value">{m.get('total_jobs', 0)}</div>
-    <div class="stat-label">Jobs Processed</div>
-  </div>
-  <div class="stat-card">
-    <div class="stat-value">${total_earnings:.4f}</div>
-    <div class="stat-label">Total Earnings</div>
-  </div>
-</div>
-
-<div style="display:grid;grid-template-columns:1fr 1fr;gap:2rem">
-  <div class="section">
-    <h2>⚡ System Metrics</h2>
-    <table><tr><th>Metric</th><th>Value</th></tr>{metrics_html}</table>
-  </div>
-  
-  <div class="section">
-    <h2>🏆 Top Earners</h2>
-    <table><tr><th>Worker</th><th>Jobs</th><th>Tokens</th><th>Earnings</th></tr>{recent_earnings}</table>
-  </div>
-</div>
-
-<div class="section">
-  <h2>👥 All Workers</h2>
-  <table>
-    <tr><th>Worker ID</th><th>Status</th><th>Jobs</th><th>Tokens</th><th>Earnings</th></tr>
-    {worker_rows}
-  </table>
-</div>
-
-</body></html>"""
+    dashboard_css = """
+.page { max-width: 1100px; }
+.stats { display: grid; grid-template-columns: 1fr 1fr; gap: .75rem; margin-bottom: 1rem; }
+.stat-card { padding: 1rem; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); text-align: center; }
+.stat-value { font-size: 1.5rem; font-weight: 600; color: var(--brand); }
+.stat-label { color: var(--muted); font-size: .85rem; margin-top: .25rem; }
+.section { background: var(--surface); border: 1px solid var(--border); margin-bottom: 1rem; padding: 1rem; border-radius: var(--radius); }
+.section h2 { margin-top: 0; }
+.row-2 { display: grid; grid-template-columns: 1fr; gap: 1rem; }
+@media (min-width: 640px) {
+  .stats { grid-template-columns: repeat(4, 1fr); }
+  .row-2 { grid-template-columns: 1fr 1fr; }
+  .stat-value { font-size: 2rem; }
+}
+"""
+    html = (
+        '<!doctype html><html><head><meta charset="utf-8">'
+        + VIEWPORT_META
+        + "<title>GamerAI Admin Dashboard</title>"
+        + "<style>" + BASE_CSS + dashboard_css + "</style>"
+        + "</head><body>"
+        + '<div class="topbar"><div class="brand">GamerAI · admin</div>'
+        + '<div class="topbar-actions">'
+        + '<button onclick="location.reload()" class="btn-quiet" style="width:auto">Refresh</button>'
+        + '<a href="/">← chat</a></div></div>'
+        + '<div class="page">'
+        + f'<div class="stats">'
+        f'<div class="stat-card"><div class="stat-value">{len(workers)}</div><div class="stat-label">Total Workers</div></div>'
+        f'<div class="stat-card"><div class="stat-value">{len(active_workers)}</div><div class="stat-label">Online Workers</div></div>'
+        f'<div class="stat-card"><div class="stat-value">{m.get("total_jobs", 0)}</div><div class="stat-label">Jobs Processed</div></div>'
+        f'<div class="stat-card"><div class="stat-value">${total_earnings:.4f}</div><div class="stat-label">Total Earnings</div></div>'
+        f'</div>'
+        + '<div class="row-2">'
+        + f'<div class="section"><h2>System Metrics</h2><table><tr><th>Metric</th><th>Value</th></tr>{metrics_html}</table></div>'
+        + f'<div class="section"><h2>Top Earners</h2><table><tr><th>Worker</th><th>Jobs</th><th>Tokens</th><th>Earnings</th></tr>{recent_earnings}</table></div>'
+        + "</div>"
+        + f'<div class="section"><h2>All Workers</h2><table>'
+        + "<tr><th>Worker ID</th><th>Status</th><th>Jobs</th><th>Tokens</th><th>Earnings</th></tr>"
+        + worker_rows
+        + "</table></div>"
+        + "</div></body></html>"
+    )
     return html
 
 
 # ---------- invite redemption (public, no auth) ----------
-_REDEEM_PAGE = """<!doctype html>
-<html><head><meta charset="utf-8"><title>You've been invited — GamerAI</title>
-<style>
-  body{{font-family:-apple-system,system-ui,sans-serif;max-width:580px;margin:3rem auto;padding:0 1rem;color:#1a1a1a;line-height:1.5}}
-  h1{{margin-bottom:.25rem}}
-  .sub{{color:#666;margin-bottom:1.5rem}}
-  .card{{background:#fafafa;border:1px solid #e5e5e5;border-radius:8px;padding:1.25rem;margin-bottom:1.25rem}}
-  .label{{color:#666;font-size:.85rem}}
-  .value{{font-weight:600;margin-bottom:.5rem}}
-  input[type=email]{{width:100%;padding:.5rem;font-size:1rem;box-sizing:border-box;margin-bottom:.5rem}}
-  button{{font-size:1rem;padding:.6rem 1.2rem;cursor:pointer;background:#2d6cdf;color:#fff;border:0;border-radius:4px}}
-  button:hover{{background:#1f55b8}}
-  button[disabled]{{background:#999;cursor:not-allowed}}
-  .err{{color:#b00020}}
-  .tos{{background:#fff8e8;border:1px solid #f0d57b;border-radius:8px;padding:1rem 1.1rem;margin-bottom:1rem;font-size:.92rem}}
-  .tos h2{{margin:0 0 .5rem;font-size:1.05rem}}
-  .tos ul{{margin:.25rem 0 .5rem 0;padding-left:1.25rem}}
-  .tos li{{margin-bottom:.25rem}}
-  .tos a{{color:#2d6cdf}}
-  .accept-row{{display:flex;align-items:flex-start;gap:.5rem;margin:.75rem 0 1rem}}
-  .accept-row input{{margin-top:.25rem}}
-</style></head>
-<body>
-<h1>You've been invited</h1>
-<div class="sub">Someone with a GamerAI contributor account wants to share their network with you.</div>
-
-<div class="card">
-  <div class="label">Invited by</div>
-  <div class="value">{contributor}</div>
-  <div class="label">Daily prompt cap</div>
-  <div class="value">{cap}</div>
-  {expiry_block}
-</div>
-
-<div class="tos">
-  <h2>Community terms (TL;DR)</h2>
-  <ul>
-    <li><strong>Prompts are visible</strong> to whichever contributor's GPU serves them. Don't paste passwords, API keys, or anything sensitive.</li>
-    <li><strong>Best-effort service.</strong> Things can break, timeouts happen, and answers can be wrong. Don't use this for anything that costs money or harms people if it fails.</li>
-    <li><strong>Be a good neighbor.</strong> No abuse, no scraping, no illegal content. We'll remove members who break trust.</li>
-  </ul>
-  <a href="/tos" target="_blank">Read the full terms</a>
-</div>
-
-<form method="POST">
-  <label for="email" class="label">Your email (optional, helps the inviter recognize you)</label>
-  <input id="email" name="invitee_email" type="email" placeholder="you@example.com" />
-
-  <div class="accept-row">
-    <input id="tos_accepted" name="tos_accepted" type="checkbox" required />
-    <label for="tos_accepted">I've read and accept the <a href="/tos" target="_blank">community terms</a>.</label>
-  </div>
-
-  <button id="submit" type="submit" disabled>Accept and get my token</button>
-</form>
-
-<script>
-  const cb = document.getElementById('tos_accepted');
-  const btn = document.getElementById('submit');
-  cb.addEventListener('change', () => {{ btn.disabled = !cb.checked; }});
-</script>
-</body></html>
+_REDEEM_CSS = """
+.page { max-width: 580px; }
+.label { color: var(--muted); font-size: .85rem; }
+.value { font-weight: 600; margin-bottom: .5rem; }
+.tos {
+  background: #fff8e8; border: 1px solid #f0d57b;
+  border-radius: var(--radius); padding: 1rem 1.1rem; margin-bottom: 1rem;
+  font-size: .92rem;
+}
+.tos h2 { margin: 0 0 .5rem; font-size: 1.05rem; }
+.tos ul { margin: .25rem 0 .5rem; padding-left: 1.25rem; }
+.tos li { margin-bottom: .25rem; }
+.accept-row { display: flex; align-items: flex-start; gap: .5rem; margin: .75rem 0 1rem; }
+.accept-row input { margin-top: .25rem; flex: 0 0 auto; width: auto; }
 """
 
-_REDEEM_DONE_PAGE = """<!doctype html>
-<html><head><meta charset="utf-8"><title>Welcome to GamerAI</title>
-<style>
-  body{{font-family:-apple-system,system-ui,sans-serif;max-width:680px;margin:2.5rem auto;padding:0 1rem;color:#1a1a1a}}
-  h1{{margin-bottom:.25rem}}
-  h2{{margin-top:2rem;font-size:1.15rem}}
-  .sub{{color:#666;margin-bottom:1.5rem}}
-  .token-row{{display:flex;gap:.5rem;align-items:stretch;margin-bottom:.25rem}}
-  .token{{flex:1;font-family:ui-monospace,Menlo,Consolas,monospace;background:#fff8c4;padding:.75rem;border-radius:4px;font-size:1rem;word-break:break-all;border:1px solid #ddc97a;user-select:all}}
-  .copy-btn{{font-size:.9rem;padding:.4rem .8rem;cursor:pointer;background:#444;color:#fff;border:0;border-radius:4px}}
-  .copy-btn:hover{{background:#222}}
-  .copy-btn.ok{{background:#1f8a3a}}
-  .download-btn{{display:inline-block;font-size:1rem;padding:.7rem 1.4rem;cursor:pointer;background:#2d6cdf;color:#fff;border:0;border-radius:4px;text-decoration:none;font-weight:600}}
-  .download-btn:hover{{background:#1f55b8}}
-  .warn{{color:#b06000;font-weight:600;margin:1.25rem 0 .25rem}}
-  .small{{color:#666;font-size:.9rem;margin-top:.5rem}}
-  ol{{padding-left:1.25rem;line-height:1.55}}
-  ol li{{margin-bottom:.5rem}}
-  code{{background:#f3f3f3;padding:.1rem .35rem;border-radius:3px;font-size:.92em}}
-  .note{{background:#f5f8ff;border:1px solid #cfd9ee;border-radius:6px;padding:.7rem .9rem;font-size:.9rem;color:#33425a;margin:.75rem 0}}
-</style></head>
-<body>
-<h1>Welcome to GamerAI</h1>
-<div class="sub">Your invitee account is live. Two quick steps and you're up.</div>
+_REDEEM_PAGE = Template(
+    '<!doctype html><html><head><meta charset="utf-8">'
+    + VIEWPORT_META
+    + "<title>You've been invited — GamerAI</title>"
+    + "<style>" + BASE_CSS + _REDEEM_CSS + "</style></head>"
+    + '<body><div class="page">'
+    + "<h1>You've been invited</h1>"
+    + '<div class="muted" style="margin-bottom:1.25rem">'
+      'Someone with a GamerAI contributor account wants to share their network with you.'
+      '</div>'
+    + '<div class="card">'
+      '<div class="label">Invited by</div><div class="value">$contributor</div>'
+      '<div class="label">Daily prompt cap</div><div class="value">$cap</div>'
+      "$expiry_block"
+      "</div>"
+    + '<div class="tos"><h2>Community terms (TL;DR)</h2><ul>'
+      '<li><strong>Prompts are visible</strong> to whichever contributor\'s GPU '
+      "serves them. Don't paste passwords, API keys, or anything sensitive.</li>"
+      '<li><strong>Best-effort service.</strong> Things can break, timeouts '
+      "happen, and answers can be wrong. Don't use this for anything that costs "
+      'money or harms people if it fails.</li>'
+      '<li><strong>Be a good neighbor.</strong> No abuse, no scraping, no '
+      "illegal content. We'll remove members who break trust.</li>"
+      '</ul><a href="/tos" target="_blank">Read the full terms</a></div>'
+    + '<form method="POST">'
+      '<label for="email" class="label">Your email (optional, helps the inviter recognize you)</label>'
+      '<input id="email" name="invitee_email" type="email" placeholder="you@example.com">'
+      '<div class="accept-row">'
+      '<input id="tos_accepted" name="tos_accepted" type="checkbox" required>'
+      '<label for="tos_accepted">I\'ve read and accept the '
+      '<a href="/tos" target="_blank">community terms</a>.</label></div>'
+      '<button id="submit" type="submit" disabled>Accept and get my token</button>'
+      '</form>'
+    + "<script>"
+      "const cb = document.getElementById('tos_accepted');"
+      "const btn = document.getElementById('submit');"
+      "cb.addEventListener('change', () => { btn.disabled = !cb.checked; });"
+      "</script>"
+    + "</div></body></html>"
+)
 
-<div class="warn">1. Save your bearer token (it cannot be recovered)</div>
-<div class="token-row">
-  <div class="token" id="tok">{token}</div>
-  <button class="copy-btn" id="copy" type="button">Copy</button>
-</div>
-<div class="small">
-  member_id: <code>{member_id}</code> &nbsp;·&nbsp; daily_quota_tokens: <code>{cap}</code>
-</div>
-
-<h2>2. Install the Windows agent</h2>
-<p>The agent runs in the background on a Windows PC and only takes work when the machine is idle. Power scales with demand, not uptime.</p>
-
-<p><a class="download-btn" href="/download/GamerAI-Agent-Setup.exe">Download installer (Windows, ~12 MB)</a></p>
-
-<div class="note">
-  <strong>Windows SmartScreen note:</strong> the installer isn't code-signed yet,
-  so Windows will pop a "Windows protected your PC" dialog the first time you
-  run it. Click <em>More info</em> → <em>Run anyway</em>. The source is at
-  github.com/Hyrumdrums/GamerAI; the binary is built by GitHub Actions on
-  every push (see <code>/download/BUILD.txt</code> for the commit SHA).
-</div>
-
-<h2>3. Paste your token on first run</h2>
-<p>When you launch the agent for the first time, it will prompt for your bearer token. Paste the one above; the agent persists it locally and the network knows you're online.</p>
-
-<div class="small">
-  Power user / not on Windows? You can also call the API directly with
-  <code>Authorization: Bearer &lt;token&gt;</code> against
-  <code>https://ai.dallinlayton.com</code>, or grab the standalone
-  <a href="/download/agent.exe">agent.exe</a> and pair it with a custom
-  <code>config.json</code>.
-</div>
-
-<script>
-const btn = document.getElementById('copy');
-const tok = document.getElementById('tok');
-btn.addEventListener('click', async () => {{
-  try {{
-    await navigator.clipboard.writeText(tok.textContent.trim());
-    btn.textContent = 'Copied ✓';
-    btn.classList.add('ok');
-    setTimeout(() => {{ btn.textContent = 'Copy'; btn.classList.remove('ok'); }}, 2000);
-  }} catch (e) {{
-    // Fallback: select the text so the user can copy with their keyboard.
-    const r = document.createRange();
-    r.selectNode(tok);
-    window.getSelection().removeAllRanges();
-    window.getSelection().addRange(r);
-    btn.textContent = 'Selected — Ctrl+C';
-  }}
-}});
-</script>
-</body></html>
+_REDEEM_DONE_CSS = """
+.page { max-width: 680px; }
+.token-row { display: flex; gap: .5rem; align-items: stretch; margin-bottom: .25rem; flex-wrap: wrap; }
+.token {
+  flex: 1 1 220px; font-family: var(--mono); background: #fff8c4;
+  padding: .75rem; border-radius: var(--radius); font-size: 1rem;
+  word-break: break-all; border: 1px solid #ddc97a; user-select: all;
+}
+.copy-btn {
+  font-size: .9rem; padding: .4rem .9rem; background: #444; color: #fff;
+  border: 0; border-radius: var(--radius); cursor: pointer; width: auto;
+}
+.copy-btn:hover { background: #222; }
+.copy-btn.ok { background: #1f8a3a; }
+.warn { color: #b06000; font-weight: 600; margin: 1.25rem 0 .25rem; }
+.small { color: var(--muted); font-size: .9rem; margin-top: .5rem; }
+.note {
+  background: #f5f8ff; border: 1px solid #cfd9ee; border-radius: var(--radius);
+  padding: .7rem .9rem; font-size: .9rem; color: #33425a; margin: .75rem 0;
+}
 """
 
-_REDEEM_ERROR_PAGE = """<!doctype html>
-<html><head><meta charset="utf-8"><title>Invite unavailable — GamerAI</title>
-<style>
-  body{{font-family:-apple-system,system-ui,sans-serif;max-width:560px;margin:3rem auto;padding:0 1rem;color:#1a1a1a}}
-  h1{{color:#b00020}}
-</style></head>
-<body>
-<h1>This invite isn't available</h1>
-<p>{detail}</p>
-<p>Ask the person who sent the invite for a fresh link.</p>
-</body></html>
-"""
+_REDEEM_DONE_PAGE = Template(
+    '<!doctype html><html><head><meta charset="utf-8">'
+    + VIEWPORT_META
+    + "<title>Welcome to GamerAI</title>"
+    + "<style>" + BASE_CSS + _REDEEM_DONE_CSS + "</style></head>"
+    + '<body><div class="page">'
+    + "<h1>Welcome to GamerAI</h1>"
+    + '<div class="muted" style="margin-bottom:1.5rem">'
+      "Your invitee account is live. Two quick steps and you're up.</div>"
+    + '<div class="warn">1. Save your bearer token (it cannot be recovered)</div>'
+    + '<div class="token-row">'
+      '<div class="token" id="tok">$token</div>'
+      '<button class="copy-btn" id="copy" type="button">Copy</button>'
+      '</div>'
+    + '<div class="small">member_id: <code>$member_id</code> '
+      '&nbsp;·&nbsp; daily_quota_tokens: <code>$cap</code></div>'
+    + "<h2>2. Install the Windows agent</h2>"
+      "<p>The agent runs in the background on a Windows PC and only takes work "
+      "when the machine is idle. Power scales with demand, not uptime.</p>"
+    + '<p><a class="btn" href="/download/GamerAI-Agent-Setup.exe">'
+      "Download installer (Windows, ~12 MB)</a></p>"
+    + '<div class="note">'
+      "<strong>Windows SmartScreen note:</strong> the installer isn't "
+      'code-signed yet, so Windows will pop a "Windows protected your PC" '
+      "dialog the first time you run it. Click <em>More info</em> → "
+      "<em>Run anyway</em>. The source is at github.com/Hyrumdrums/GamerAI; "
+      "the binary is built by GitHub Actions on every push (see "
+      "<code>/download/BUILD.txt</code> for the commit SHA)."
+      "</div>"
+    + "<h2>3. Paste your token on first run</h2>"
+      "<p>When you launch the agent for the first time, it will prompt for "
+      "your bearer token. Paste the one above; the agent persists it locally "
+      "and the network knows you're online.</p>"
+    + '<div class="small">Power user / not on Windows? You can also call '
+      "the API directly with <code>Authorization: Bearer &lt;token&gt;</code> "
+      "against <code>https://ai.dallinlayton.com</code>, or grab the "
+      'standalone <a href="/download/agent.exe">agent.exe</a> and pair it '
+      "with a custom <code>config.json</code>.</div>"
+    + "<script>"
+      "const btn = document.getElementById('copy');"
+      "const tok = document.getElementById('tok');"
+      "btn.addEventListener('click', async () => {"
+      "  try {"
+      "    await navigator.clipboard.writeText(tok.textContent.trim());"
+      "    btn.textContent = 'Copied ✓';"
+      "    btn.classList.add('ok');"
+      "    setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('ok'); }, 2000);"
+      "  } catch (e) {"
+      "    const r = document.createRange();"
+      "    r.selectNode(tok);"
+      "    window.getSelection().removeAllRanges();"
+      "    window.getSelection().addRange(r);"
+      "    btn.textContent = 'Selected — Ctrl+C';"
+      "  }"
+      "});"
+      "</script>"
+    + "</div></body></html>"
+)
+
+_REDEEM_ERROR_PAGE = Template(
+    '<!doctype html><html><head><meta charset="utf-8">'
+    + VIEWPORT_META
+    + "<title>Invite unavailable — GamerAI</title>"
+    + "<style>" + BASE_CSS
+    + " h1 { color: #b00020; }"
+    + "</style></head>"
+    + '<body><div class="page">'
+    + "<h1>This invite isn't available</h1>"
+    + "<p>$detail</p>"
+    + "<p>Ask the person who sent the invite for a fresh link.</p>"
+    + "</div></body></html>"
+)
 
 
 def _render_redeem_page(details: dict) -> str:
@@ -946,7 +989,7 @@ def _render_redeem_page(details: dict) -> str:
         expiry_block = f'<div class="label">Expires</div><div class="value">{html_lib.escape(when)}</div>'
     else:
         expiry_block = ""
-    return _REDEEM_PAGE.format(
+    return _REDEEM_PAGE.substitute(
         contributor=html_lib.escape(str(contributor)),
         cap=html_lib.escape(cap_text),
         expiry_block=expiry_block,
@@ -960,12 +1003,12 @@ async def invite_landing(code: str):
         r = await c.get(f"/invites/{code}", timeout=5)
     if r.status_code == 404:
         return HTMLResponse(
-            _REDEEM_ERROR_PAGE.format(detail="The invite code was not found."),
+            _REDEEM_ERROR_PAGE.substitute(detail="The invite code was not found."),
             status_code=404,
         )
     if r.status_code >= 400:
         return HTMLResponse(
-            _REDEEM_ERROR_PAGE.format(
+            _REDEEM_ERROR_PAGE.substitute(
                 detail=f"The coordinator returned status {r.status_code}."
             ),
             status_code=r.status_code,
@@ -974,7 +1017,7 @@ async def invite_landing(code: str):
     state = details.get("state")
     if state and state != "open":
         return HTMLResponse(
-            _REDEEM_ERROR_PAGE.format(
+            _REDEEM_ERROR_PAGE.substitute(
                 detail=f"This invite is {html_lib.escape(state)}."
             ),
             status_code=410,
@@ -995,7 +1038,7 @@ async def invite_accept(
     attribute via devtools, but the coordinator still refuses."""
     if tos_accepted != "on":
         return HTMLResponse(
-            _REDEEM_ERROR_PAGE.format(
+            _REDEEM_ERROR_PAGE.substitute(
                 detail=(
                     "The community terms must be accepted to redeem this "
                     "invite. Go back, check the box, and try again."
@@ -1011,20 +1054,20 @@ async def invite_accept(
         r = await c.post(f"/invites/{code}/accept", json=body, timeout=5)
     if r.status_code == 404:
         return HTMLResponse(
-            _REDEEM_ERROR_PAGE.format(detail="The invite code was not found."),
+            _REDEEM_ERROR_PAGE.substitute(detail="The invite code was not found."),
             status_code=404,
         )
     if r.status_code == 410:
         detail = r.json().get("detail", "no longer redeemable")
         return HTMLResponse(
-            _REDEEM_ERROR_PAGE.format(
+            _REDEEM_ERROR_PAGE.substitute(
                 detail=f"This invite is {html_lib.escape(detail)}."
             ),
             status_code=410,
         )
     if r.status_code >= 400:
         return HTMLResponse(
-            _REDEEM_ERROR_PAGE.format(
+            _REDEEM_ERROR_PAGE.substitute(
                 detail=f"Accept failed (status {r.status_code}). {html_lib.escape(r.text[:300])}"
             ),
             status_code=r.status_code,
@@ -1033,7 +1076,7 @@ async def invite_accept(
     cap = body_json.get("daily_quota_tokens")
     cap_text = str(cap) if cap else "unlimited"
     return HTMLResponse(
-        _REDEEM_DONE_PAGE.format(
+        _REDEEM_DONE_PAGE.substitute(
             token=html_lib.escape(body_json["token"]),
             member_id=html_lib.escape(body_json["member_id"]),
             cap=html_lib.escape(cap_text),
@@ -1084,25 +1127,21 @@ async def admin_members(request: Request):
         f"</tr>"
         for m in members
     )
-    html = f"""<!doctype html><html><head><meta charset="utf-8">
-<title>GamerAI — members</title>
-<style>
-  body{{font-family:system-ui;max-width:1100px;margin:2rem auto;padding:0 1rem}}
-  h1{{margin-bottom:.5rem}}
-  table{{width:100%;border-collapse:collapse;font-size:.9rem}}
-  th,td{{padding:.5rem;border-bottom:1px solid #eee;text-align:left;vertical-align:top}}
-  th{{background:#f5f5f5}}
-  code{{font-size:.85em}}
-  a{{color:#2d6cdf;text-decoration:none}}
-</style></head>
-<body>
-<h1>Members ({len(members)})</h1>
-<p><a href="/admin/invites">→ invites</a> · <a href="/dashboard">← dashboard</a></p>
-<table>
-<tr><th>member_id</th><th>role</th><th>tier</th><th>email</th><th>parent</th><th>quota/day</th><th>revoked</th></tr>
-{rows}
-</table>
-</body></html>"""
+    html = (
+        '<!doctype html><html><head><meta charset="utf-8">'
+        + VIEWPORT_META
+        + "<title>GamerAI — members</title>"
+        + "<style>" + BASE_CSS + ".page { max-width: 1100px; }</style>"
+        + "</head><body><div class=\"page\">"
+        + f"<h1>Members ({len(members)})</h1>"
+        + '<p class="muted"><a href="/admin/invites">→ invites</a> · '
+          '<a href="/dashboard">← dashboard</a></p>'
+        + "<table><tr>"
+          "<th>member_id</th><th>role</th><th>tier</th><th>email</th>"
+          "<th>parent</th><th>quota/day</th><th>revoked</th></tr>"
+        + rows
+        + "</table></div></body></html>"
+    )
     return HTMLResponse(html)
 
 
@@ -1128,25 +1167,21 @@ async def admin_invites(request: Request):
         f"</tr>"
         for i in invites
     )
-    html = f"""<!doctype html><html><head><meta charset="utf-8">
-<title>GamerAI — invites</title>
-<style>
-  body{{font-family:system-ui;max-width:1100px;margin:2rem auto;padding:0 1rem}}
-  h1{{margin-bottom:.5rem}}
-  table{{width:100%;border-collapse:collapse;font-size:.9rem}}
-  th,td{{padding:.5rem;border-bottom:1px solid #eee;text-align:left;vertical-align:top}}
-  th{{background:#f5f5f5}}
-  code{{font-size:.85em}}
-  a{{color:#2d6cdf;text-decoration:none}}
-</style></head>
-<body>
-<h1>Invites ({len(invites)})</h1>
-<p><a href="/admin/members">→ members</a> · <a href="/dashboard">← dashboard</a></p>
-<table>
-<tr><th>code</th><th>state</th><th>contributor</th><th>invitee email</th><th>quota/day</th><th>accepted by</th></tr>
-{rows}
-</table>
-</body></html>"""
+    html = (
+        '<!doctype html><html><head><meta charset="utf-8">'
+        + VIEWPORT_META
+        + "<title>GamerAI — invites</title>"
+        + "<style>" + BASE_CSS + ".page { max-width: 1100px; }</style>"
+        + "</head><body><div class=\"page\">"
+        + f"<h1>Invites ({len(invites)})</h1>"
+        + '<p class="muted"><a href="/admin/members">→ members</a> · '
+          '<a href="/dashboard">← dashboard</a></p>'
+        + "<table><tr>"
+          "<th>code</th><th>state</th><th>contributor</th><th>invitee email</th>"
+          "<th>quota/day</th><th>accepted by</th></tr>"
+        + rows
+        + "</table></div></body></html>"
+    )
     return HTMLResponse(html)
 
 
