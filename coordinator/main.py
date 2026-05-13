@@ -7,6 +7,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
@@ -41,6 +42,7 @@ from shared.config import (
     WORKER_TIMEOUT_SECONDS,
 )
 from shared.models import (
+    ConversationCreateRequest,
     GenerateRequest,
     GenerateResponse,
     HeartbeatRequest,
@@ -331,23 +333,86 @@ def generate(req: GenerateRequest, request: Request):
                 ),
             )
 
+    # Conversation context: if the caller passed conversation_id, load
+    # the prior turns and prepend them to the worker-facing prompt.
+    # Ownership is enforced — a caller cannot inject into someone else's
+    # conversation. The original (un-prepended) prompt is stored
+    # separately so it can be appended back as a user message on
+    # completion.
+    conversation_id: Optional[str] = req.conversation_id
+    worker_prompt = req.prompt
+    if conversation_id:
+        conv_row = db.get_conversation(conversation_id)
+        if conv_row is None:
+            raise HTTPException(status_code=404, detail="conversation not found")
+        _require_conversation_owner(request, conv_row)
+        if conv_row["archived_at"] is not None:
+            raise HTTPException(
+                status_code=410, detail="conversation is archived"
+            )
+        prior = db.list_messages(conversation_id)
+        if prior:
+            worker_prompt = _format_chat_prompt(prior, req.prompt)
+        # Conversation may pin a default model; honor it when the call
+        # didn't override.
+        if not req.model and conv_row["model"]:
+            req_model = conv_row["model"]
+        else:
+            req_model = req.model
+    else:
+        req_model = req.model
+
     job_id = str(uuid.uuid4())
     submitted_at = time.time()
     job = {
         "job_id": job_id,
-        "prompt": req.prompt,
-        "model": req.model,
+        "prompt": worker_prompt,
+        "model": req_model,
         "submitted_at": submitted_at,
         "submitted_by_member_id": submitted_by,
     }
-    db.insert_job(job_id, req.prompt, req.model, submitted_at, submitted_by)
+    # Store the ORIGINAL user message (not the prepended worker-prompt)
+    # so /jobs/complete can replay only the new turn into the
+    # conversation history.
+    db.insert_job(
+        job_id,
+        req.prompt,
+        req_model,
+        submitted_at,
+        submitted_by,
+        conversation_id=conversation_id,
+    )
     r.rpush(JOB_QUEUE, json.dumps(job))
     idem.remember(idem_key, job_id)
     log.info(
         "queued job",
-        extra={"event": "job_queued", "job_id": job_id},
+        extra={
+            "event": "job_queued",
+            "job_id": job_id,
+        },
     )
     return GenerateResponse(job_id=job_id)
+
+
+def _format_chat_prompt(prior_messages, new_user_text: str) -> str:
+    """Concatenate prior turns into a single chat-style prompt the
+    underlying model can consume. We keep this server-side so the
+    worker's /api/generate contract doesn't change (no switch to
+    Ollama's /api/chat). Model-instruction-tuned LLMs handle this
+    format well; we'll switch to /api/chat with role-aware messages
+    when we have streaming on the worker side anyway."""
+    lines = []
+    for m in prior_messages:
+        role = m["role"]
+        text = (m["text"] or "").strip()
+        if role == "user":
+            lines.append(f"User: {text}")
+        elif role == "assistant":
+            lines.append(f"Assistant: {text}")
+        # silently drop unknown roles
+    lines.append(f"User: {new_user_text.strip()}")
+    lines.append("Assistant:")
+    return "\n\n".join(lines)
 
 
 @app.get("/result/{job_id}")
@@ -616,6 +681,43 @@ def complete(req: JobCompleteRequest):
                 tokens_in=int(req.prompt_tokens or 0),
                 tokens_out=tokens,
             )
+        # Multi-turn: if the job was tied to a conversation, append the
+        # user message (the original prompt, NOT the worker-facing
+        # concatenation) and the assistant response as two new turns.
+        conv_id = (
+            job_row["conversation_id"]
+            if job_row is not None and "conversation_id" in job_row.keys()
+            else None
+        )
+        if conv_id:
+            user_text = job_row["prompt"] or ""
+            assistant_text = req.text or ""
+            base_seq = db.next_message_seq(conv_id)
+            db.append_message(
+                message_id="msg_" + uuid.uuid4().hex[:12],
+                conversation_id=conv_id,
+                seq=base_seq,
+                role="user",
+                text=user_text,
+                model=req.model,
+                prompt_tokens=int(req.prompt_tokens or 0),
+                created_at=now,
+            )
+            db.append_message(
+                message_id="msg_" + uuid.uuid4().hex[:12],
+                conversation_id=conv_id,
+                seq=base_seq + 1,
+                role="assistant",
+                text=assistant_text,
+                job_id=req.job_id,
+                model=req.model,
+                completion_tokens=tokens,
+                created_at=now,
+            )
+            db.touch_conversation(conv_id, now)
+            # First-prompt-becomes-the-title behavior. Title is set
+            # only if currently NULL/empty (idempotent for later turns).
+            db.set_conversation_title(conv_id, user_text[:80].strip())
         # mirror to redis hash for backwards compat
         existing = r.hget(WORKER_EARNINGS, req.worker_id)
         if existing:
@@ -706,6 +808,114 @@ def me(request: Request):
             "needs_reaccept": member.tos_version != TOS_VERSION,
         },
     }
+
+
+# ---------- conversations ----------
+def _conv_row_to_summary(row) -> dict:
+    return {
+        "conversation_id": row["conversation_id"],
+        "title": row["title"],
+        "model": row["model"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "archived_at": row["archived_at"],
+        "owner_member_id": row["owner_member_id"],
+    }
+
+
+def _message_row_to_dict(row) -> dict:
+    return {
+        "message_id": row["message_id"],
+        "seq": row["seq"],
+        "role": row["role"],
+        "text": row["text"],
+        "job_id": row["job_id"],
+        "model": row["model"],
+        "prompt_tokens": row["prompt_tokens"],
+        "completion_tokens": row["completion_tokens"],
+        "created_at": row["created_at"],
+    }
+
+
+def _require_conversation_owner(request: Request, conv_row) -> None:
+    """Reject if the caller is authenticated and the conversation has
+    an owner that isn't them. Auth-off mode permits everything (dev/test).
+    """
+    if not AUTH_ENABLED:
+        return
+    member = getattr(request.state, "member", None)
+    if member is None:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    owner = conv_row["owner_member_id"]
+    # Admin can read any conversation for moderation; otherwise strict
+    # member_id match. (When prompt-encryption-at-rest ships, even the
+    # admin won't be able to decrypt; for now this is honest.)
+    if owner is not None and owner != member.member_id and member.role != "admin":
+        raise HTTPException(status_code=404, detail="conversation not found")
+
+
+@app.post("/conversations")
+def create_conversation(req: ConversationCreateRequest, request: Request):
+    """Create a new conversation owned by the caller. When auth is off
+    (dev mode), owner_member_id is left NULL."""
+    member = getattr(request.state, "member", None)
+    owner_id = member.member_id if member is not None else None
+    conv_id = "conv_" + uuid.uuid4().hex[:12]
+    db.create_conversation(
+        conversation_id=conv_id,
+        owner_member_id=owner_id,
+        title=req.title,
+        model=req.model,
+    )
+    log.info(
+        "conversation created",
+        extra={"event": "conversation_created"},
+    )
+    return {"conversation_id": conv_id, "title": req.title, "model": req.model}
+
+
+@app.get("/conversations")
+def list_conversations(request: Request, include_archived: bool = False):
+    """List the caller's conversations, most-recently-updated first.
+    Admin gets back only their OWN conversations here, not the whole
+    table — admin moderation of others would go through a separate
+    /admin/conversations endpoint (not built yet)."""
+    member = getattr(request.state, "member", None)
+    if AUTH_ENABLED and member is None:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    owner_id = member.member_id if member is not None else None
+    if owner_id is None:
+        return {"conversations": []}
+    rows = db.list_conversations_for_member(
+        owner_id, include_archived=include_archived,
+    )
+    return {"conversations": [_conv_row_to_summary(r) for r in rows]}
+
+
+@app.get("/conversations/{conversation_id}")
+def get_conversation(conversation_id: str, request: Request):
+    row = db.get_conversation(conversation_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    _require_conversation_owner(request, row)
+    messages = db.list_messages(conversation_id)
+    return {
+        **_conv_row_to_summary(row),
+        "messages": [_message_row_to_dict(m) for m in messages],
+    }
+
+
+@app.delete("/conversations/{conversation_id}")
+def delete_conversation(conversation_id: str, request: Request):
+    """Soft delete (sets archived_at). The conversation and its
+    messages stay in the DB so an admin can audit, but they no longer
+    appear in the caller's default list."""
+    row = db.get_conversation(conversation_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    _require_conversation_owner(request, row)
+    db.archive_conversation(conversation_id, time.time())
+    return {"ok": True}
 
 
 # ---------- invites ----------

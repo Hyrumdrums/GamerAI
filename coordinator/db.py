@@ -132,6 +132,40 @@ CREATE TABLE IF NOT EXISTS canary_results (
 
 CREATE INDEX IF NOT EXISTS idx_canary_results_worker ON canary_results(worker_id);
 CREATE INDEX IF NOT EXISTS idx_canary_results_canary ON canary_results(canary_id);
+
+-- Multi-turn conversations. Each conversation is owned by a single
+-- member; messages stack in order via `seq`. The `model` column on
+-- the conversation pins the default model so a multi-turn thread
+-- doesn't drift when the user doesn't specify one per turn.
+CREATE TABLE IF NOT EXISTS conversations (
+    conversation_id TEXT PRIMARY KEY,
+    owner_member_id TEXT,
+    title TEXT,
+    model TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    archived_at REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_conversations_owner ON conversations(owner_member_id);
+
+-- One row per turn. `role` is 'user' or 'assistant'. Assistant rows
+-- link back to the jobs row that produced them via `job_id` so an
+-- admin debugging a bad answer can see worker_id / duration / etc.
+CREATE TABLE IF NOT EXISTS messages (
+    message_id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    role TEXT NOT NULL,
+    text TEXT NOT NULL,
+    job_id TEXT,
+    model TEXT,
+    prompt_tokens INTEGER,
+    completion_tokens INTEGER,
+    created_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, seq);
 """
 
 
@@ -170,6 +204,15 @@ class DB:
                 self._conn.execute(ddl)
             except sqlite3.OperationalError:
                 pass
+        # Multi-turn conversations — added with the conversations slice.
+        # When set on a job row, /jobs/complete will append the result
+        # to the named conversation.
+        try:
+            self._conn.execute(
+                "ALTER TABLE jobs ADD COLUMN conversation_id TEXT"
+            )
+        except sqlite3.OperationalError:
+            pass
 
     # ---------- jobs ----------
     def insert_job(
@@ -179,13 +222,18 @@ class DB:
         model: Optional[str],
         submitted_at: float,
         submitted_by_member_id: Optional[str] = None,
+        conversation_id: Optional[str] = None,
     ) -> None:
         with self._lock:
             self._conn.execute(
                 "INSERT OR REPLACE INTO jobs "
-                "(job_id, prompt, model, status, submitted_at, attempts, submitted_by_member_id) "
-                "VALUES (?, ?, ?, 'pending', ?, 0, ?)",
-                (job_id, prompt, model, submitted_at, submitted_by_member_id),
+                "(job_id, prompt, model, status, submitted_at, attempts, "
+                "submitted_by_member_id, conversation_id) "
+                "VALUES (?, ?, ?, 'pending', ?, 0, ?, ?)",
+                (
+                    job_id, prompt, model, submitted_at,
+                    submitted_by_member_id, conversation_id,
+                ),
             )
 
     def mark_job_running(self, job_id: str, worker_id: str, started_at: float) -> None:
@@ -527,6 +575,127 @@ class DB:
             except Exception:
                 self._conn.execute("ROLLBACK")
                 raise
+
+    # ---------- conversations ----------
+    def create_conversation(
+        self,
+        conversation_id: str,
+        owner_member_id: Optional[str],
+        title: Optional[str],
+        model: Optional[str],
+        created_at: Optional[float] = None,
+    ) -> None:
+        now = created_at if created_at is not None else time.time()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO conversations "
+                "(conversation_id, owner_member_id, title, model, "
+                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (conversation_id, owner_member_id, title, model, now, now),
+            )
+
+    def get_conversation(self, conversation_id: str) -> Optional[sqlite3.Row]:
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM conversations WHERE conversation_id=?",
+                (conversation_id,),
+            )
+            return cur.fetchone()
+
+    def list_conversations_for_member(
+        self, owner_member_id: str, include_archived: bool = False,
+    ) -> list[sqlite3.Row]:
+        with self._lock:
+            if include_archived:
+                cur = self._conn.execute(
+                    "SELECT * FROM conversations WHERE owner_member_id=? "
+                    "ORDER BY updated_at DESC",
+                    (owner_member_id,),
+                )
+            else:
+                cur = self._conn.execute(
+                    "SELECT * FROM conversations WHERE owner_member_id=? "
+                    "AND archived_at IS NULL "
+                    "ORDER BY updated_at DESC",
+                    (owner_member_id,),
+                )
+            return cur.fetchall()
+
+    def archive_conversation(
+        self, conversation_id: str, archived_at: float,
+    ) -> bool:
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE conversations SET archived_at=? "
+                "WHERE conversation_id=? AND archived_at IS NULL",
+                (archived_at, conversation_id),
+            )
+            return cur.rowcount > 0
+
+    def touch_conversation(self, conversation_id: str, when: float) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE conversations SET updated_at=? WHERE conversation_id=?",
+                (when, conversation_id),
+            )
+
+    def set_conversation_title(
+        self, conversation_id: str, title: str,
+    ) -> None:
+        """Used when the first user prompt is the natural title — set
+        only if the conversation has no title yet."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE conversations SET title=? "
+                "WHERE conversation_id=? AND (title IS NULL OR title='')",
+                (title, conversation_id),
+            )
+
+    # ---------- messages ----------
+    def list_messages(self, conversation_id: str) -> list[sqlite3.Row]:
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM messages WHERE conversation_id=? "
+                "ORDER BY seq ASC",
+                (conversation_id,),
+            )
+            return cur.fetchall()
+
+    def next_message_seq(self, conversation_id: str) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT COALESCE(MAX(seq), -1) + 1 AS next "
+                "FROM messages WHERE conversation_id=?",
+                (conversation_id,),
+            )
+            row = cur.fetchone()
+            return int(row["next"])
+
+    def append_message(
+        self,
+        message_id: str,
+        conversation_id: str,
+        seq: int,
+        role: str,
+        text: str,
+        job_id: Optional[str] = None,
+        model: Optional[str] = None,
+        prompt_tokens: Optional[int] = None,
+        completion_tokens: Optional[int] = None,
+        created_at: Optional[float] = None,
+    ) -> None:
+        now = created_at if created_at is not None else time.time()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO messages "
+                "(message_id, conversation_id, seq, role, text, job_id, "
+                "model, prompt_tokens, completion_tokens, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    message_id, conversation_id, seq, role, text, job_id,
+                    model, prompt_tokens, completion_tokens, now,
+                ),
+            )
 
     # ---------- canaries ----------
     def create_canary(

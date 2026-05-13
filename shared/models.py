@@ -7,6 +7,12 @@ from pydantic import BaseModel, Field
 class GenerateRequest(BaseModel):
     prompt: str
     model: Optional[str] = None
+    # When set, the coordinator loads the prior turns of this
+    # conversation, prepends them to the worker-facing prompt, and
+    # auto-appends the user message + assistant response back into
+    # the conversation on completion. Requires ownership: the caller's
+    # member_id must match the conversation's owner_member_id.
+    conversation_id: Optional[str] = None
 
 
 class GenerateResponse(BaseModel):
@@ -63,6 +69,14 @@ class InviteCreateRequest(BaseModel):
     invitee_email: Optional[str] = None
     expires_hours: Optional[float] = None
     notes: Optional[str] = None
+
+
+class ConversationCreateRequest(BaseModel):
+    """Empty body is fine — title is auto-derived from the first user
+    message if not provided here. ``model`` pins a default for every
+    turn in this conversation."""
+    title: Optional[str] = None
+    model: Optional[str] = None
 
 
 class InviteAcceptRequest(BaseModel):
