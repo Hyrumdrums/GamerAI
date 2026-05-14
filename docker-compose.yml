@@ -45,6 +45,7 @@ services:
       API_TOKEN: ${API_TOKEN:-}
       RATE_LIMIT_PER_MIN: ${RATE_LIMIT_PER_MIN:-0}
       IDEMPOTENCY_TTL_SECONDS: ${IDEMPOTENCY_TTL_SECONDS:-86400}
+      REQUIRE_LIVE_WORKER: ${REQUIRE_LIVE_WORKER:-false}
     volumes:
       - ./data:/data
     ports:

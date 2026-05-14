@@ -5,8 +5,12 @@
 # - Adds Caddy on :80/:443 with automatic Let's Encrypt TLS.
 # - Restricts internal services (coordinator, redis, client) to localhost-only
 #   port bindings; only Caddy faces the public internet.
-# - Defaults the in-VPS worker to mock inference (the VPS has no GPU; real
-#   inference comes from gamer machines connecting in via the public URL).
+# - Hides the in-VPS worker behind the `mock-worker` Compose profile.
+#   The VPS has no GPU, so the only thing that worker can do is run
+#   MOCK_INFERENCE — which we don't want fronting real users. Real
+#   inference comes from gamer machines connecting in via the public
+#   URL. Operators who explicitly want the in-VPS mock (e.g. for a
+#   staging walkthrough) pass `--profile mock-worker` to bring it up.
 # - restart: unless-stopped on every service so a reboot brings everything back.
 
 services:
@@ -23,6 +27,12 @@ services:
       - "127.0.0.1:8000:8000"
 
   worker:
+    # Gated behind the `mock-worker` profile — by default `docker compose
+    # up` on prod brings up everything EXCEPT this. Without a profile
+    # active, no in-VPS worker means /generate (with REQUIRE_LIVE_WORKER=true)
+    # returns "no community members available" until a real gamer
+    # machine connects in.
+    profiles: ["mock-worker"]
     restart: unless-stopped
     environment:
       MOCK_INFERENCE: "${MOCK_INFERENCE:-true}"

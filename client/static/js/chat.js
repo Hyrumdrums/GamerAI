@@ -363,9 +363,28 @@ document.getElementById('composer').onsubmit = async (e) => {
   });
   if (gr.status === 401) { location.href = '/login'; return; }
   if (!gr.ok) {
-    typing.querySelector('.bubble').classList.add('error');
-    typing.querySelector('.bubble').textContent =
-      'error: ' + gr.status + ' ' + (await gr.text());
+    // Try to read a JSON `detail` first — the coordinator and the
+    // BFF proxy both wrap user-friendly errors that way (e.g. 503
+    // "No community members are available right now"). Falls back
+    // to the raw body if the response isn't JSON.
+    let msg = '';
+    try {
+      const body = await gr.json();
+      if (body && typeof body.detail === 'string') {
+        msg = body.detail;
+      } else if (body) {
+        msg = JSON.stringify(body);
+      }
+    } catch (_e) {
+      msg = await gr.text();
+    }
+    const bubble = typing.querySelector('.bubble');
+    bubble.classList.add('error');
+    // 503 means "no workers" — show the message verbatim, no status
+    // prefix; the user doesn't need to see the HTTP code for that.
+    bubble.textContent = gr.status === 503
+      ? msg
+      : ('error: ' + gr.status + (msg ? ' ' + msg : ''));
     statusEl.textContent = '';
     submitBtn.disabled = false; textarea.disabled = false;
     return;

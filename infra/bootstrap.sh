@@ -131,7 +131,16 @@ if [[ ! -f "$ENV_FILE" ]]; then
 DOMAIN=$DOMAIN
 EMAIL=$EMAIL
 API_TOKEN=$API_TOKEN
-MOCK_INFERENCE=true
+# Refuse to enqueue jobs when no real worker is heartbeating. Without
+# this, prompts would sit on the queue indefinitely. The web UI
+# surfaces the 503 as "No community members are available right now".
+REQUIRE_LIVE_WORKER=true
+# To exercise the stack end-to-end without a real worker (e.g.
+# a staging walkthrough), uncomment the next two lines AND start
+# compose with --profile mock-worker. Leaving MOCK_INFERENCE unset
+# keeps the in-VPS worker out of the deploy entirely.
+# MOCK_INFERENCE=true
+# REQUIRE_LIVE_WORKER=false
 EOF
   chmod 600 "$ENV_FILE"
 else
@@ -144,8 +153,18 @@ fi
 # ---------- 6. bring services up ----------
 log "starting services (this builds images on first run)..."
 cd "$INSTALL_DIR"
+# Two profile toggles, decided by the env file:
+#   - MOCK_INFERENCE=true → bring up the in-VPS worker under the
+#     `mock-worker` profile so it picks up jobs with the mock.
+#   - MOCK_INFERENCE=false → bring up `local-inference` (the in-VPS
+#     ollama) so the in-VPS worker has a real model to call.
+#   - MOCK_INFERENCE unset (default prod) → neither profile; the
+#     in-VPS worker stays down and jobs only run on connected
+#     external gamer machines.
 PROFILE_ARGS=()
-if grep -q '^MOCK_INFERENCE=false' "$ENV_FILE" 2>/dev/null; then
+if grep -q '^MOCK_INFERENCE=true' "$ENV_FILE" 2>/dev/null; then
+  PROFILE_ARGS=(--profile mock-worker)
+elif grep -q '^MOCK_INFERENCE=false' "$ENV_FILE" 2>/dev/null; then
   PROFILE_ARGS=(--profile local-inference)
 fi
 docker compose \

@@ -41,6 +41,13 @@ DB_PATH = os.getenv("DB_PATH", "/data/gamerai.db")
 JOB_TIMEOUT_SECONDS = _int("JOB_TIMEOUT_SECONDS", 120)
 WORKER_TIMEOUT_SECONDS = _int("WORKER_TIMEOUT_SECONDS", 15)
 REAPER_INTERVAL_SECONDS = _float("REAPER_INTERVAL_SECONDS", 5.0)
+# If true, /generate (and retry) refuses to enqueue when no worker has
+# heartbeated within WORKER_TIMEOUT_SECONDS. Prod sets this so users
+# get an explicit "no community members available" message instead of
+# their prompt sitting on the queue indefinitely. Off by default so
+# tests and local-dev (which may run /generate before a worker has
+# come online) keep working.
+REQUIRE_LIVE_WORKER = _bool("REQUIRE_LIVE_WORKER", False)
 
 # --- worker ---
 WORKER_ID_OVERRIDE = os.getenv("WORKER_ID")

@@ -21,9 +21,16 @@ async def proxy_generate(payload: dict, request: Request):
     bearer = require_session_bearer(request)
     async with coordinator_client._client(bearer=bearer) as c:
         r = await c.post("/generate", json=payload, timeout=10)
-    if r.status_code >= 400:
-        raise HTTPException(status_code=r.status_code, detail=r.text)
-    return JSONResponse(r.json())
+    # Forward the coordinator's body verbatim instead of wrapping it
+    # in another HTTPException — otherwise a 503 like
+    # `{"detail":"No community members are available..."}` would come
+    # out as `{"detail":"{\"detail\":\"No community...\"}"}` (double-
+    # encoded) and the chat UI couldn't render the message cleanly.
+    try:
+        body = r.json()
+    except ValueError:
+        body = {"detail": r.text}
+    return JSONResponse(body, status_code=r.status_code)
 
 
 @router.get("/result/{job_id}")

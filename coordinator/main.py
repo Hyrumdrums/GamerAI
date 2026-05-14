@@ -34,6 +34,7 @@ from shared.config import (
     JOB_TIMEOUT_SECONDS,
     RATE_LIMIT_PER_MIN,
     RATE_PER_TOKEN,
+    REQUIRE_LIVE_WORKER,
     STRICT_MODELS,
     WORKER_CAPABILITIES,
     WORKER_EARNINGS,
@@ -256,6 +257,30 @@ def _worker_status(worker_id: str, now: float) -> str:
     return r.hget(WORKER_STATUS, worker_id) or "idle"
 
 
+_NO_WORKERS_MESSAGE = (
+    "No community members are available right now. Please try again in a few minutes."
+)
+
+
+def _ensure_live_worker_or_503() -> None:
+    """Refuse to enqueue when no worker has heartbeated recently.
+    Gated by REQUIRE_LIVE_WORKER so dev/tests can queue jobs without
+    a worker attached. Without this, a job sits on the queue
+    indefinitely (or, worse on a misconfigured prod, gets picked up
+    by an in-VPS mock that fakes a reply)."""
+    if not REQUIRE_LIVE_WORKER:
+        return
+    now = time.time()
+    heartbeats = r.hgetall(WORKER_HEARTBEATS) or {}
+    for ts in heartbeats.values():
+        try:
+            if (now - float(ts)) <= WORKER_TIMEOUT_SECONDS:
+                return
+        except (TypeError, ValueError):
+            continue
+    raise HTTPException(status_code=503, detail=_NO_WORKERS_MESSAGE)
+
+
 # ---------- public API ----------
 @app.get("/health")
 def health():
@@ -343,7 +368,10 @@ def generate(req: GenerateRequest, request: Request):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    # optional retry-safety: same Idempotency-Key returns the same job_id
+    # optional retry-safety: same Idempotency-Key returns the same job_id.
+    # The idempotent path returns BEFORE the live-worker check — the
+    # original submission was already accepted, so we just hand the
+    # caller back the same job_id to resume polling.
     idem_key = request.headers.get("idempotency-key")
     existing = idem.lookup(idem_key)
     if existing:
@@ -358,6 +386,12 @@ def generate(req: GenerateRequest, request: Request):
                 existing_msg["message_id"] if existing_msg is not None else None
             ),
         )
+
+    # Refuse to accept the job if no worker has heartbeated recently
+    # (REQUIRE_LIVE_WORKER=true on prod). Runs after prompt/idempotency
+    # validation so 400s still win, and BEFORE any DB writes so a 503
+    # leaves no orphan job/message rows.
+    _ensure_live_worker_or_503()
 
     member = getattr(request.state, "member", None)
     submitted_by = member.member_id if member is not None else None
@@ -1132,6 +1166,11 @@ def retry_message(message_id: str, request: Request):
     if conv_row is None:
         raise HTTPException(status_code=404, detail="conversation not found")
     _require_conversation_owner(request, conv_row)
+
+    # Refuse to re-enqueue when no worker has heartbeated recently —
+    # same policy as /generate. Runs BEFORE the cooldown gate so a
+    # 503 doesn't burn the user's retry window.
+    _ensure_live_worker_or_503()
 
     # Cooldown gate runs BEFORE the state check so a rapid double-click
     # gets 429'd (the spam signal) rather than 409'd (the "already

@@ -146,6 +146,49 @@ class CoordinatorE2ETests(unittest.TestCase):
         self.assertEqual(resp.status_code, 400)
 
     # ------------------------------------------------------------------
+    # no-workers-available gate (REQUIRE_LIVE_WORKER)
+    # ------------------------------------------------------------------
+    def test_generate_503s_when_required_and_no_workers(self):
+        # Toggle the live-worker gate via the module-level binding —
+        # the helper reads the name out of coordinator.main globals,
+        # so a patch here is sufficient without re-importing config.
+        original = coordinator_main.REQUIRE_LIVE_WORKER
+        coordinator_main.REQUIRE_LIVE_WORKER = True
+        try:
+            resp = self.client.post("/generate", json={"prompt": "hi"})
+            self.assertEqual(resp.status_code, 503)
+            self.assertIn(
+                "No community members are available",
+                resp.json()["detail"],
+            )
+            # No job should have been queued or persisted.
+            self.assertEqual(self.r.llen("job_queue"), 0)
+        finally:
+            coordinator_main.REQUIRE_LIVE_WORKER = original
+
+    def test_generate_succeeds_when_required_and_worker_is_live(self):
+        original = coordinator_main.REQUIRE_LIVE_WORKER
+        coordinator_main.REQUIRE_LIVE_WORKER = True
+        try:
+            self.assertEqual(
+                self.client.post(
+                    "/register", json={"worker_id": "wkr-live"}
+                ).status_code,
+                200,
+            )
+            resp = self.client.post("/generate", json={"prompt": "hi"})
+            self.assertEqual(resp.status_code, 200)
+            self.assertEqual(self.r.llen("job_queue"), 1)
+        finally:
+            coordinator_main.REQUIRE_LIVE_WORKER = original
+
+    def test_generate_skips_gate_when_disabled(self):
+        # Default config: gate off, no workers, /generate still works.
+        self.assertFalse(coordinator_main.REQUIRE_LIVE_WORKER)
+        resp = self.client.post("/generate", json={"prompt": "hi"})
+        self.assertEqual(resp.status_code, 200)
+
+    # ------------------------------------------------------------------
     # idempotency
     # ------------------------------------------------------------------
     def test_idempotency_key_returns_same_job_id(self):
