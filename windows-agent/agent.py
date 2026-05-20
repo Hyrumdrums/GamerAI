@@ -43,7 +43,7 @@ IS_WINDOWS = platform.system() == "Windows"
 # the moment it starts. The CI-generated version.txt (short-sha +
 # build timestamp) is still what the self-updater diffs against;
 # AGENT_VERSION is just the human-facing label.
-AGENT_VERSION = "1.0.2"
+AGENT_VERSION = "1.0.3"
 
 # ---------------------------------------------------------------------------
 # Idle detection
@@ -160,10 +160,21 @@ def _agent_exe_path() -> Optional[Path]:
     return Path(sys.executable).resolve()
 
 
-def _write_update_batch(exe: Path, new_exe: Path) -> Path:
+def _write_update_batch(
+    exe: Path, new_exe: Path, relaunch_args: Optional[list[str]] = None,
+) -> Path:
     """Generate the post-exit batch that swaps the binary and relaunches.
-    Lives next to the exe so it inherits the right working directory."""
+    Lives next to the exe so it inherits the right working directory.
+
+    ``relaunch_args`` is the argv list the swapped binary is started
+    with. ``None`` → restart in --background (the autostart default).
+    ``[]`` → restart with no args (foreground console, so a user who
+    typed ``update`` keeps their visible console after the swap)."""
     bat = exe.with_name("update.bat")
+    if relaunch_args is None:
+        relaunch_args = ["--background"]
+    quoted_args = " ".join(f'"{a}"' for a in relaunch_args)
+    relaunch_line = f'start "" "{exe}" {quoted_args}\r\n'.rstrip() + "\r\n"
     # Quote-and-escape paths defensively; the directory may have spaces
     # (e.g. C:\Program Files\GamerAI Agent).
     bat.write_text(
@@ -180,16 +191,20 @@ def _write_update_batch(exe: Path, new_exe: Path) -> Path:
         "  timeout /t 5 /nobreak >nul\r\n"
         f'  move /Y "{new_exe}" "{exe}"\r\n'
         ")\r\n"
-        ":: Step 4: relaunch in --background and clean up the batch.\r\n"
-        f'start "" "{exe}" --background\r\n'
-        'del "%~f0"\r\n',
+        ":: Step 4: relaunch and clean up the batch.\r\n"
+        + relaunch_line
+        + 'del "%~f0"\r\n',
         encoding="ascii",
     )
     return bat
 
 
 def _apply_update(
-    base_url: str, exe: Path, log: logging.Logger, keep_awake_active: bool
+    base_url: str,
+    exe: Path,
+    log: logging.Logger,
+    keep_awake_active: bool,
+    relaunch_args: Optional[list[str]] = None,
 ) -> bool:
     """Download the published agent.exe, stage it next to the running
     binary, write update.bat, fire it as a detached process, and exit.
@@ -227,7 +242,7 @@ def _apply_update(
         return False
 
     try:
-        bat = _write_update_batch(exe, staged)
+        bat = _write_update_batch(exe, staged, relaunch_args=relaunch_args)
     except OSError as e:
         log.warning("self-update: could not write update.bat (%s); aborting", e)
         staged.unlink(missing_ok=True)
@@ -266,11 +281,20 @@ def updater_loop(
     log: logging.Logger,
     keep_awake_holder: dict,
     stop_event: threading.Event,
+    force_event: Optional[threading.Event] = None,
+    relaunch_args: Optional[list[str]] = None,
 ) -> None:
     """Background thread: poll the published version, trigger an update
     when ours is stale. ``keep_awake_holder`` is a mutable container so
     we can read the boolean from the main thread without races (a single
-    flag is plenty here — we never write it from the updater)."""
+    flag is plenty here — we never write it from the updater).
+
+    ``force_event`` lets another thread (the stdin command reader)
+    request an immediate update: when set, the loop fetches the
+    published binary and applies it even if the version string matches,
+    so a contributor can type ``update`` in the console window to pull
+    a hotfix without restarting from scratch. ``relaunch_args`` is the
+    argv list to pass to the swapped binary."""
     if not IS_WINDOWS:
         log.info("self-update: not on Windows — skipping update loop")
         return
@@ -282,24 +306,46 @@ def updater_loop(
     initial_delay = min(60.0, cfg.update_check_interval_hours * 3600.0 / 4)
     if stop_event.wait(initial_delay):
         return
+    interval_seconds = cfg.update_check_interval_hours * 3600.0
+    last_scheduled_check = 0.0  # 0 ⇒ run a check on the first tick
+    # Tick cadence: short enough that a typed ``update`` lands within
+    # a couple of seconds, cheap enough that the steady-state cost is
+    # nothing (no network on idle ticks).
+    tick_seconds = 2.0
     while not stop_event.is_set():
-        latest = fetch_latest_version(cfg.coordinator_url)
-        if latest and latest != here and latest != "":
-            log.info("self-update: published version %s differs from running %s",
-                     latest, here)
-            exe = _agent_exe_path()
-            if exe is None:
-                log.info("self-update: not a frozen exe — skipping (dev mode)")
-            else:
-                fired = _apply_update(
-                    cfg.coordinator_url, exe, log,
-                    keep_awake_active=keep_awake_holder.get("active", False),
-                )
-                if fired:
-                    # Tell main thread it's time to die.
-                    keep_awake_holder["exit_requested"] = True
-                    return
-        stop_event.wait(cfg.update_check_interval_hours * 3600.0)
+        forced = force_event is not None and force_event.is_set()
+        if forced:
+            force_event.clear()
+            log.info("self-update: manual 'update' command received")
+        now = time.time()
+        scheduled_due = (now - last_scheduled_check) >= interval_seconds
+        if forced or scheduled_due:
+            last_scheduled_check = now
+            latest = fetch_latest_version(cfg.coordinator_url)
+            should_apply = forced or (
+                latest and latest != here and latest != ""
+            )
+            if should_apply:
+                if latest and latest != here:
+                    log.info(
+                        "self-update: published version %s differs from running %s",
+                        latest, here,
+                    )
+                exe = _agent_exe_path()
+                if exe is None:
+                    log.info("self-update: not a frozen exe — skipping (dev mode)")
+                else:
+                    fired = _apply_update(
+                        cfg.coordinator_url, exe, log,
+                        keep_awake_active=keep_awake_holder.get("active", False),
+                        relaunch_args=relaunch_args,
+                    )
+                    if fired:
+                        # Tell main thread it's time to die.
+                        keep_awake_holder["exit_requested"] = True
+                        return
+        if stop_event.wait(tick_seconds):
+            return
 
 
 # ---------------------------------------------------------------------------
@@ -1238,6 +1284,96 @@ def log_status_line(
     )
 
 
+_STDIN_HELP = (
+    "commands:\n"
+    "  update   download the latest agent.exe and relaunch\n"
+    "  version  print the running version + build\n"
+    "  status   print worker_id and current status\n"
+    "  help     show this list\n"
+    "  quit     exit the agent\n"
+)
+
+
+def stdin_command_loop(
+    log: logging.Logger,
+    worker_id: str,
+    force_update_event: threading.Event,
+    stop_event: threading.Event,
+) -> None:
+    """Read line-oriented commands from the console window. Foreground
+    only — there's no stdin in --background. The thread is a daemon so
+    a stuck read doesn't keep the process alive on shutdown.
+
+    Recognized commands are listed in ``_STDIN_HELP``. Unknown input
+    is echoed back with a hint instead of crashing the loop, because a
+    contributor poking at the window should never lose the agent."""
+    try:
+        sys.stdout.write(
+            "Type 'help' for commands; 'update' pulls the latest "
+            "agent.exe and relaunches.\n"
+        )
+        sys.stdout.flush()
+    except Exception:
+        pass
+    while not stop_event.is_set():
+        try:
+            line = sys.stdin.readline()
+        except Exception:
+            return
+        if not line:
+            # EOF (console closed) — leave it alone; the main loop's
+            # KeyboardInterrupt / parent-exit handling will clean up.
+            return
+        cmd = line.strip().lower()
+        if not cmd:
+            continue
+        if cmd in ("update", "u"):
+            force_update_event.set()
+            try:
+                sys.stdout.write(
+                    "update requested — downloading latest agent.exe; "
+                    "the window will close and relaunch when ready.\n"
+                )
+                sys.stdout.flush()
+            except Exception:
+                pass
+        elif cmd in ("version", "v"):
+            try:
+                sys.stdout.write(
+                    f"GamerAI agent v{AGENT_VERSION} (build {current_version()})\n"
+                )
+                sys.stdout.flush()
+            except Exception:
+                pass
+        elif cmd == "status":
+            try:
+                sys.stdout.write(
+                    f"worker_id={worker_id} v{AGENT_VERSION} "
+                    f"(build {current_version()})\n"
+                )
+                sys.stdout.flush()
+            except Exception:
+                pass
+        elif cmd in ("help", "?", "h"):
+            try:
+                sys.stdout.write(_STDIN_HELP)
+                sys.stdout.flush()
+            except Exception:
+                pass
+        elif cmd in ("quit", "exit", "q"):
+            log.info("quit requested from console")
+            stop_event.set()
+            return
+        else:
+            try:
+                sys.stdout.write(
+                    f"unknown command: {cmd!r} (type 'help')\n"
+                )
+                sys.stdout.flush()
+            except Exception:
+                pass
+
+
 def main_loop(
     cfg: Config,
     coord: Coordinator,
@@ -1592,28 +1728,52 @@ def main(argv: Optional[list[str]] = None) -> int:
             keep_awake_end(log)
         return 1
 
-    # Self-update background thread. Only runs in --background mode
-    # (the autostart-contributor path) and when the config knob is on.
+    # Self-update background thread. Runs in BOTH background and
+    # foreground modes now — a contributor running agent.exe by
+    # double-click should stay current without manual download trips.
     # Communicates with the main thread via stop_event + a tiny shared
     # holder dict: keep_awake.active is read-only for the updater; the
     # updater sets exit_requested when it kicks off the swap-and-restart.
+    # ``force_update_event`` lets the stdin command thread request an
+    # immediate update on the next tick. ``relaunch_args`` preserves
+    # launch mode across the swap (foreground stays foreground).
     updater_thread: Optional[threading.Thread] = None
     stop_event = threading.Event()
+    force_update_event = threading.Event()
     keep_awake_holder = {"active": keep_awake_active, "exit_requested": False}
-    if args.background and cfg.update_enabled:
+    relaunch_args = ["--background"] if args.background else []
+    if cfg.update_enabled:
         updater_thread = threading.Thread(
             target=updater_loop,
-            args=(cfg, log, keep_awake_holder, stop_event),
+            args=(
+                cfg, log, keep_awake_holder, stop_event,
+                force_update_event, relaunch_args,
+            ),
             name="gamerai-updater",
             daemon=True,
         )
         updater_thread.start()
 
+    # Foreground only: a stdin reader so the contributor can type
+    # ``update`` (or ``help``, ``status``, ``quit``) in the console
+    # window. Background mode has no console, so we skip it there.
+    if not args.background:
+        stdin_thread = threading.Thread(
+            target=stdin_command_loop,
+            args=(log, worker_id, force_update_event, stop_event),
+            name="gamerai-stdin",
+            daemon=True,
+        )
+        stdin_thread.start()
+
     try:
         main_loop(
             cfg, coord, state, log,
             once=args.once,
-            should_exit=lambda: keep_awake_holder.get("exit_requested", False),
+            should_exit=lambda: (
+                keep_awake_holder.get("exit_requested", False)
+                or stop_event.is_set()
+            ),
         )
     except KeyboardInterrupt:
         log.info("stopped by user")
