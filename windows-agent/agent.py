@@ -43,7 +43,7 @@ IS_WINDOWS = platform.system() == "Windows"
 # the moment it starts. The CI-generated version.txt (short-sha +
 # build timestamp) is still what the self-updater diffs against;
 # AGENT_VERSION is just the human-facing label.
-AGENT_VERSION = "1.0.1"
+AGENT_VERSION = "1.0.2"
 
 # ---------------------------------------------------------------------------
 # Idle detection
@@ -581,6 +581,18 @@ class Coordinator:
     def complete(self, payload: dict) -> Optional[dict]:
         return self._post("/jobs/complete", payload, timeout=30)
 
+    def partial(self, job_id: str, text: str) -> None:
+        """Push the accumulated streaming text so far. Fire-and-forget:
+        the coordinator overwrites with the latest call (text is the
+        FULL accumulated output, not a delta), and a dropped partial
+        just means the next one carries the full state. The final
+        ``/jobs/complete`` is the source of truth."""
+        self._post(
+            "/jobs/partial",
+            {"worker_id": self.worker_id, "job_id": job_id, "text": text},
+            timeout=3,
+        )
+
     def abandon(self, job_id: str) -> bool:
         """Voluntarily return a claimed job to the queue. Used in
         override-drain mode when the user becomes active between
@@ -1085,64 +1097,97 @@ def estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4) if text else 0
 
 
+# Min wall-clock between /jobs/partial pushes. Tight enough that the
+# browser's typewriter looks live, loose enough that we don't hammer
+# the coordinator with one POST per token on a fast model.
+PARTIAL_FLUSH_INTERVAL_SECONDS = 0.25
+
+
 def run_inference(
     prompt: str,
     model: Optional[str],
     log: logging.Logger,
     messages: Optional[list] = None,
+    on_partial=None,
 ) -> dict:
-    """Run a prompt (or chat-style ``messages`` list) against a local
-    Ollama if OLLAMA_URL is set, otherwise return a mock response.
+    """Stream a response from local Ollama (or return a mock when
+    OLLAMA_URL is unset). ``on_partial`` is invoked with the FULL
+    accumulated text every ~250ms so the coordinator can serve
+    progressive renders to the browser; a missed partial is harmless
+    since the next one carries the full state and /jobs/complete is
+    the source of truth.
 
-    When ``messages`` is provided the call goes to ``/api/chat`` so the
-    model's chat template is applied (proper multi-turn behavior).
+    When ``messages`` is provided the call goes to ``/api/chat`` so
+    the model's chat template is applied (proper multi-turn behavior).
     Single-shot prompts keep the legacy ``/api/generate`` path."""
     ollama_url = os.getenv("OLLAMA_URL")
     use_model = model or os.getenv("MODEL") or "llama3.2:1b"
     if not ollama_url:
         time.sleep(0.5)
         text = f"[mock] {prompt[:200]}"
+        if on_partial:
+            on_partial(text)
         return {
             "text": text,
             "prompt_tokens": estimate_tokens(prompt),
             "completion_tokens": estimate_tokens(text),
             "model": "mock",
         }
+    if messages:
+        endpoint = f"{ollama_url.rstrip('/')}/api/chat"
+        payload = {"model": use_model, "messages": messages, "stream": True}
+    else:
+        endpoint = f"{ollama_url.rstrip('/')}/api/generate"
+        payload = {"model": use_model, "prompt": prompt, "stream": True}
+    text = ""
+    prompt_tokens: Optional[int] = None
+    completion_tokens: Optional[int] = None
     try:
+        last_flush = 0.0
         with httpx.Client(timeout=600) as c:
-            if messages:
-                resp = c.post(
-                    f"{ollama_url.rstrip('/')}/api/chat",
-                    json={
-                        "model": use_model,
-                        "messages": messages,
-                        "stream": False,
-                    },
-                )
-            else:
-                resp = c.post(
-                    f"{ollama_url.rstrip('/')}/api/generate",
-                    json={
-                        "model": use_model,
-                        "prompt": prompt,
-                        "stream": False,
-                    },
-                )
-            resp.raise_for_status()
-            data = resp.json()
-        if messages:
-            text = (data.get("message") or {}).get("content", "")
-        else:
-            text = data.get("response", "")
+            with c.stream("POST", endpoint, json=payload) as resp:
+                resp.raise_for_status()
+                for line in resp.iter_lines():
+                    if not line:
+                        continue
+                    try:
+                        chunk = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    # /api/chat streams {"message": {"content": "..."}};
+                    # /api/generate streams {"response": "..."}. Read
+                    # whichever shape the current chunk carries.
+                    token = (
+                        (chunk.get("message") or {}).get("content", "")
+                        if messages
+                        else chunk.get("response", "")
+                    )
+                    if token:
+                        text += token
+                    if chunk.get("done"):
+                        prompt_tokens = chunk.get("prompt_eval_count")
+                        completion_tokens = chunk.get("eval_count")
+                        break
+                    now = time.time()
+                    if (
+                        on_partial
+                        and (now - last_flush) >= PARTIAL_FLUSH_INTERVAL_SECONDS
+                    ):
+                        on_partial(text)
+                        last_flush = now
+        if on_partial:
+            on_partial(text)
         return {
             "text": text,
-            "prompt_tokens": int(data.get("prompt_eval_count") or estimate_tokens(prompt)),
-            "completion_tokens": int(data.get("eval_count") or estimate_tokens(text)),
+            "prompt_tokens": int(prompt_tokens or estimate_tokens(prompt)),
+            "completion_tokens": int(completion_tokens or estimate_tokens(text)),
             "model": use_model,
         }
     except Exception as e:
         log.warning("ollama call failed (%s); falling back to mock", e)
         text = f"[mock-fallback] {prompt[:200]}"
+        if on_partial:
+            on_partial(text)
         return {
             "text": text,
             "prompt_tokens": estimate_tokens(prompt),
@@ -1307,6 +1352,7 @@ def process_one(
             cfg.model or job.get("model"),
             log,
             messages=job.get("messages"),
+            on_partial=lambda text: coord.partial(job_id, text),
         )
         duration = round(time.time() - started, 3)
         out = coord.complete(

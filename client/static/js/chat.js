@@ -239,6 +239,20 @@ async function retryMessage(messageId, btn) {
   streamIntoBubble(body.job_id, wrap, null, Date.now(), messageId);
 }
 
+// Min character-reveal rate for the typewriter render. The browser
+// polls /api/result every 200ms and gets the latest accumulated text,
+// but rendering all of it at once feels jarring on a fast model and
+// invisible when the agent doesn't stream. The typewriter advances
+// the visible substring toward the latest server text at >= this
+// rate, so even an instant response shows a brief reveal animation;
+// when partials arrive faster than this rate the typewriter just
+// matches arrival (no artificial slowdown).
+const TYPEWRITER_CHARS_PER_SECOND = 90;
+// Minimum chars revealed per animation frame, so we don't get stuck
+// at sub-pixel advance on a 60fps display when CPS is low. 1 char/
+// frame at 60fps = 60 cps floor, plenty for readability.
+const TYPEWRITER_MIN_CHARS_PER_FRAME = 1;
+
 // Poll /api/result/{jobId} and stream the accumulated text into the
 // given message element until the job reaches a terminal state. Owns
 // composer enable/disable for the duration, so both the fresh-submit
@@ -260,6 +274,63 @@ async function streamIntoBubble(jobId, wrap, statusEl, startMs, messageId) {
   // yanking the viewport on every token batch.
   const isNearBottom = () =>
     pane.scrollTop + pane.clientHeight >= pane.scrollHeight - 64;
+
+  // Typewriter state. ``target`` is the most recent server-side text;
+  // ``shownChars`` is how many characters we've revealed so far.
+  // A requestAnimationFrame loop advances ``shownChars`` toward
+  // ``target.length`` at TYPEWRITER_CHARS_PER_SECOND. When the server
+  // signals done, we keep the rAF loop running until the visible
+  // substring catches up to the final text, then finalize the bubble.
+  let target = '';
+  let shownChars = 0;
+  let serverDone = false;
+  let rafId = null;
+  let lastFrameTs = 0;
+  let finalizeResolver = null;
+  const finalizePromise = new Promise(r => { finalizeResolver = r; });
+
+  function renderShown() {
+    if (activeStream !== myToken) return;
+    const stick = isNearBottom();
+    setBubbleContent(bubble, 'assistant', target.substring(0, shownChars));
+    if (stick) pane.scrollTop = pane.scrollHeight;
+  }
+
+  function typewriterTick(ts) {
+    if (activeStream !== myToken) {
+      rafId = null;
+      return;
+    }
+    if (!lastFrameTs) lastFrameTs = ts;
+    const dtMs = ts - lastFrameTs;
+    lastFrameTs = ts;
+    if (shownChars < target.length) {
+      const advance = Math.max(
+        TYPEWRITER_MIN_CHARS_PER_FRAME,
+        Math.round((TYPEWRITER_CHARS_PER_SECOND * dtMs) / 1000),
+      );
+      shownChars = Math.min(target.length, shownChars + advance);
+      renderShown();
+    }
+    // Keep ticking while either (a) we still have chars to reveal or
+    // (b) the server hasn't said done yet (so more text may arrive).
+    if (shownChars < target.length || !serverDone) {
+      rafId = requestAnimationFrame(typewriterTick);
+    } else {
+      rafId = null;
+      if (finalizeResolver) {
+        const r = finalizeResolver; finalizeResolver = null; r();
+      }
+    }
+  }
+
+  function startTypewriter() {
+    if (rafId !== null) return;
+    lastFrameTs = 0;
+    rafId = requestAnimationFrame(typewriterTick);
+  }
+
+  let finalRes = null;
   try {
     while (true) {
       await new Promise(r => setTimeout(r, 200));
@@ -270,12 +341,20 @@ async function streamIntoBubble(jobId, wrap, statusEl, startMs, messageId) {
       } catch (e) {
         continue;
       }
-      if (res.text) {
-        const stick = isNearBottom();
-        setBubbleContent(bubble, 'assistant', res.text);
-        if (stick) pane.scrollTop = pane.scrollHeight;
+      if (res.text && res.text.length > target.length) {
+        target = res.text;
+        startTypewriter();
       }
       if (res.done || res.status === 'complete' || res.status === 'error') {
+        finalRes = res;
+        // Take the final server text as the authoritative target and
+        // let the typewriter finish revealing.
+        if (res.text) target = res.text;
+        serverDone = true;
+        startTypewriter();
+        if (rafId !== null) {
+          await finalizePromise;
+        }
         if (res.status === 'error') {
           bubble.classList.add('error');
           bubble.textContent = res.text || res.error || 'Generation failed.';
@@ -293,10 +372,11 @@ async function streamIntoBubble(jobId, wrap, statusEl, startMs, messageId) {
               ? `failed in ${dt}s`
               : `done in ${dt}s · ${res.completion_tokens || 0} tokens · ${res.worker_id || 'unknown worker'}`;
         }
-        return res;
+        return finalRes;
       }
     }
   } finally {
+    if (rafId !== null) cancelAnimationFrame(rafId);
     if (activeStream === myToken) {
       activeStream = null;
       submitBtn.disabled = false;
