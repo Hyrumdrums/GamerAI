@@ -2,6 +2,12 @@
 let me = null;
 let conversations = [];   // [{conversation_id, title, updated_at, ...}]
 let currentId = null;     // active conversation_id, or null = brand-new
+// 'chat' or 'image' — picked via the tool toggle. Defaults to chat so
+// every existing user lands on the prior UX unless they explicitly
+// switch. Persists in-memory only; we don't put it on the conversation
+// because users want to flip mid-thread (write a paragraph then ask
+// for an illustration).
+let currentTool = 'chat';
 // In-memory message cache so switching between already-opened
 // conversations is instant. Keyed by conversation_id; value is the
 // full messages[] array. Cleared on page refresh — not a substitute
@@ -119,7 +125,9 @@ function renderMessages(messages) {
   let pendingMessageId = null;
   for (const m of messages) {
     const el = messageEl(m.role, m.text, {
-      status: m.status, message_id: m.message_id,
+      status: m.status,
+      message_id: m.message_id,
+      image_path: m.image_path,
     });
     pane.appendChild(el);
     if (m.role === 'assistant' && m.status === 'pending') {
@@ -153,6 +161,25 @@ function setBubbleContent(bubbleEl, role, text) {
   }
 }
 
+function setImageBubble(bubbleEl, imagePath, captionPrompt) {
+  // Replace the bubble's contents with an <img> referencing the
+  // generated PNG. Path is the basename returned by the coordinator
+  // (job_id.png) — we proxy through /api/images so the bearer is
+  // attached server-side; <img> can't carry custom headers.
+  bubbleEl.innerHTML = '';
+  if (captionPrompt) {
+    const p = document.createElement('div');
+    p.className = 'img-prompt';
+    p.textContent = captionPrompt;
+    bubbleEl.appendChild(p);
+  }
+  const img = document.createElement('img');
+  img.className = 'generated';
+  img.alt = captionPrompt || 'generated image';
+  img.src = '/api/images/' + encodeURIComponent(imagePath);
+  bubbleEl.appendChild(img);
+}
+
 function messageEl(role, text, opts = {}) {
   const wrap = document.createElement('div');
   wrap.className = 'msg ' + role;
@@ -167,7 +194,18 @@ function messageEl(role, text, opts = {}) {
     b.classList.add('error');
     b.textContent = text || 'Generation failed.';
   } else if (opts.status === 'pending' && !text) {
-    b.innerHTML = '<span class="typing">thinking…</span>';
+    // Pending bubble — chat says "thinking…", image says "drawing…"
+    // so the user knows the response shape will be a picture.
+    b.innerHTML = opts.pending_kind === 'image'
+      ? '<span class="typing">drawing…</span>'
+      : '<span class="typing">thinking…</span>';
+  } else if (opts.image_path) {
+    // Persisted image turn — render the PNG bubble. The text field is
+    // a "[image: <prompt>]" sentinel from the coordinator so a no-CSS
+    // fallback still shows the prompt; we strip the wrapper to get
+    // the original caption.
+    const caption = (text || '').replace(/^\[image:\s*/, '').replace(/\]$/, '');
+    setImageBubble(b, opts.image_path, caption);
   } else {
     setBubbleContent(b, role, text);
   }
@@ -362,6 +400,13 @@ async function streamIntoBubble(jobId, wrap, statusEl, startMs, messageId) {
           if (mid && !wrap.querySelector('.retry-btn')) {
             wrap.appendChild(makeRetryButton(mid));
           }
+        } else if (res.image_path) {
+          // Image job complete — swap the typewriter contents for the
+          // PNG bubble. text is the "[image: <prompt>]" sentinel; pull
+          // the prompt back out for the caption.
+          const caption = (res.text || '')
+            .replace(/^\[image:\s*/, '').replace(/\]$/, '');
+          setImageBubble(bubble, res.image_path, caption);
         } else if (!res.text) {
           setBubbleContent(bubble, 'assistant', '(empty)');
         }
@@ -384,6 +429,30 @@ async function streamIntoBubble(jobId, wrap, statusEl, startMs, messageId) {
     }
   }
 }
+
+// ---- tool toggle ------------------------------------------------------
+// Pure UI glue — flipping doesn't talk to the server. The selection is
+// read at submit time and sent as the /api/generate `tool` field.
+function setTool(tool) {
+  currentTool = tool === 'image' ? 'image' : 'chat';
+  document.getElementById('tool-chat').classList.toggle(
+    'active', currentTool === 'chat',
+  );
+  document.getElementById('tool-image').classList.toggle(
+    'active', currentTool === 'image',
+  );
+  document.getElementById('tool-chat').setAttribute(
+    'aria-selected', currentTool === 'chat' ? 'true' : 'false',
+  );
+  document.getElementById('tool-image').setAttribute(
+    'aria-selected', currentTool === 'image' ? 'true' : 'false',
+  );
+  document.getElementById('prompt').placeholder = currentTool === 'image'
+    ? 'Describe the image you want…'
+    : 'Message GamerAI...';
+}
+document.getElementById('tool-chat').onclick = () => setTool('chat');
+document.getElementById('tool-image').onclick = () => setTool('image');
 
 // ---- composer ---------------------------------------------------------
 const textarea = document.getElementById('prompt');
@@ -422,24 +491,35 @@ document.getElementById('composer').onsubmit = async (e) => {
     currentId = (await cr.json()).conversation_id;
   }
 
+  // Snapshot the tool at submit time. Flipping the toggle mid-flight
+  // shouldn't change what this turn is.
+  const submitTool = currentTool;
+
   // Append the user message optimistically so it shows up right away.
   const pane = document.getElementById('chat-pane');
   const empty = document.getElementById('empty-state');
   if (empty) empty.remove();
   pane.appendChild(messageEl('user', prompt));
-  const typing = messageEl('assistant', '', {status: 'pending'});
+  const typing = messageEl('assistant', '', {
+    status: 'pending',
+    pending_kind: submitTool,
+  });
   pane.appendChild(typing);
   pane.scrollTop = pane.scrollHeight;
   textarea.value = '';
   textarea.style.height = 'auto';
 
   // Submit + stream.
-  statusEl.textContent = 'submitting…';
+  statusEl.textContent = submitTool === 'image' ? 'rendering…' : 'submitting…';
   const start = Date.now();
+  const body = {prompt, conversation_id: currentId};
+  if (submitTool === 'image') {
+    body.tool = 'image';
+  }
   const gr = await fetch('/api/generate', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({prompt, conversation_id: currentId}),
+    body: JSON.stringify(body),
   });
   if (gr.status === 401) { location.href = '/login'; return; }
   if (!gr.ok) {

@@ -7,7 +7,7 @@ coordinator. Requests without a session are rejected 401; the JS will
 notice and redirect to /login.
 """
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from client.services import coordinator_client
 from client.services.guards import require_session_bearer
@@ -39,6 +39,26 @@ async def proxy_result(job_id: str, request: Request):
     async with coordinator_client._client(bearer=bearer) as c:
         r = await c.get(f"/result/{job_id}", timeout=10)
     return JSONResponse(r.json(), status_code=r.status_code)
+
+
+@router.get("/images/{name}")
+async def proxy_image(name: str, request: Request):
+    """Forward a generated PNG with the session's bearer. The browser
+    can't send Authorization headers from <img> tags, so the chat UI
+    references images at /api/images/<name>; this proxy attaches the
+    coordinator bearer the same way other /api/* routes do. Coordinator
+    enforces conversation ownership before returning the bytes.
+
+    No need to JSON-decode the body — pass the PNG through as raw bytes
+    with the upstream content-type."""
+    bearer = require_session_bearer(request)
+    async with coordinator_client._client(bearer=bearer) as c:
+        r = await c.get(f"/images/{name}", timeout=30)
+    return Response(
+        content=r.content,
+        status_code=r.status_code,
+        media_type=r.headers.get("content-type", "image/png"),
+    )
 
 
 @router.get("/me")

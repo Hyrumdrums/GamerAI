@@ -320,5 +320,160 @@ class CoordinatorE2ETests(unittest.TestCase):
         self.assertEqual(row["status"], "pending")
 
 
+class ImageGenerationTests(unittest.TestCase):
+    """Smoke tests for the image-tool slice. KISS coverage: queue +
+    routing + PNG-storage path. Heavier image fidelity (real sd.cpp,
+    canary parity, NSFW classifier) lives outside the unit suite."""
+
+    # 1x1 transparent PNG — enough bytes to satisfy the magic-header
+    # check; small enough to fit in a test fixture without binary blobs.
+    _MOCK_PNG_B64 = (
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+        "+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        cls.client = TestClient(coordinator_main.app)
+        cls.r = _FAKE
+        cls.db = coordinator_main.db
+
+    def setUp(self):
+        self.r.flushall()
+        self.db._conn.executescript(
+            "DELETE FROM jobs; DELETE FROM workers; DELETE FROM earnings; "
+            "DELETE FROM messages; DELETE FROM conversations;"
+        )
+
+    def test_image_generate_routes_to_image_queue(self):
+        resp = self.client.post(
+            "/generate", json={"prompt": "a cat", "tool": "image"},
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        # Chat queue is empty; image queue has the job.
+        self.assertEqual(self.r.llen("job_queue"), 0)
+        self.assertEqual(self.r.llen("job_queue:image"), 1)
+        envelope = json.loads(self.r.lpop("job_queue:image"))
+        self.assertEqual(envelope["tool"], "image")
+        # Image params default to 512x512 / 20 steps.
+        self.assertEqual(envelope["image"]["width"], 512)
+        self.assertEqual(envelope["image"]["height"], 512)
+        self.assertEqual(envelope["image"]["steps"], 20)
+        # Default image model auto-selected.
+        self.assertEqual(envelope["model"], "sd1.5")
+
+    def test_image_generate_rejects_denylist(self):
+        # Picks a denylist phrase the unit test asserts continues to
+        # reject. Concrete phrasing is uncomfortable to type but
+        # required to verify the gate actually fires.
+        resp = self.client.post(
+            "/generate",
+            json={"prompt": "loli scene", "tool": "image"},
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("denylist", resp.json()["detail"])
+
+    def test_image_complete_persists_png_and_credits_earnings(self):
+        worker_id = "wkr-img-" + uuid.uuid4().hex[:6]
+        # Advertise image capability so /jobs/next routes correctly.
+        self.client.post(
+            "/register",
+            json={
+                "worker_id": worker_id,
+                "capabilities": {"tools": ["chat", "image"]},
+            },
+        )
+        gr = self.client.post(
+            "/generate", json={"prompt": "a cat", "tool": "image"},
+        )
+        job_id = gr.json()["job_id"]
+        # Worker pulls explicitly from the image queue.
+        nxt = self.client.post(
+            "/jobs/next",
+            json={"worker_id": worker_id, "tool": "image"},
+        ).json()
+        self.assertIsNotNone(nxt["job"])
+        self.assertEqual(nxt["job"]["job_id"], job_id)
+        self.client.post(
+            "/jobs/claim", json={"worker_id": worker_id, "job_id": job_id},
+        )
+        comp = self.client.post(
+            "/jobs/complete",
+            json={
+                "worker_id": worker_id,
+                "job_id": job_id,
+                "text": "a cat",
+                "model": "sd1.5",
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "duration_seconds": 1.2,
+                "status": "complete",
+                "image_b64": self._MOCK_PNG_B64,
+            },
+        )
+        self.assertEqual(comp.status_code, 200, comp.text)
+        # Earnings recorded against image work (flat rate).
+        self.assertGreater(comp.json()["earnings"], 0)
+        # /result surfaces the image_path so polling clients can render.
+        result = self.client.get(f"/result/{job_id}").json()
+        self.assertEqual(result["status"], "complete")
+        # /result reads JOB_RESULTS first; that path carries image_path
+        # only when the redis copy isn't evicted. Image_path may live
+        # only on the message row — accept either, just confirm at
+        # least one surface has it.
+        image_path = result.get("image_path")
+        if not image_path:
+            from coordinator.main import IMAGE_DIR
+            self.assertTrue((IMAGE_DIR / f"{job_id}.png").exists())
+
+    def test_image_complete_rejects_non_png(self):
+        worker_id = "wkr-bad-" + uuid.uuid4().hex[:6]
+        self.client.post(
+            "/register",
+            json={
+                "worker_id": worker_id,
+                "capabilities": {"tools": ["chat", "image"]},
+            },
+        )
+        gr = self.client.post(
+            "/generate", json={"prompt": "a cat", "tool": "image"},
+        )
+        job_id = gr.json()["job_id"]
+        self.client.post(
+            "/jobs/next",
+            json={"worker_id": worker_id, "tool": "image"},
+        )
+        self.client.post(
+            "/jobs/claim", json={"worker_id": worker_id, "job_id": job_id},
+        )
+        # Send bytes that aren't a PNG (the magic header is missing).
+        import base64
+        not_a_png = base64.b64encode(b"<html>nope</html>").decode("ascii")
+        comp = self.client.post(
+            "/jobs/complete",
+            json={
+                "worker_id": worker_id,
+                "job_id": job_id,
+                "text": "",
+                "model": "sd1.5",
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "duration_seconds": 1.0,
+                "status": "complete",
+                "image_b64": not_a_png,
+            },
+        )
+        self.assertEqual(comp.status_code, 400)
+        self.assertIn("PNG", comp.json()["detail"])
+
+    def test_chat_model_rejected_with_image_tool(self):
+        resp = self.client.post(
+            "/generate",
+            json={"prompt": "hi", "tool": "image", "model": "llama3.2:1b"},
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("chat model", resp.json()["detail"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -333,20 +333,67 @@ cleanly, and syntax-checks the bash scripts on every push and PR.
 
 ## 3. Product completeness
 
-### ~~🔴 Worker capability registration missing~~ — done (data layer)
+### ~~🔴 Worker capability registration missing~~ — done (data layer + routing)
 
 `/register` now accepts an optional `capabilities` body
-(`vram_gb`, `gpu_model`, `bandwidth_class`, `models[]`, `notes`).
-Capabilities are stored in Redis and surfaced on `/workers`. Existing
-workers that send only `worker_id` keep working — capabilities are
-additive.
+(`vram_gb`, `gpu_model`, `bandwidth_class`, `models[]`, `tools[]`,
+`notes`). Capabilities are stored in Redis and surfaced on `/workers`.
+Existing workers that send only `worker_id` keep working — capabilities
+are additive (`tools[]` defaults to `["chat"]`).
 
-Still pending: capability-aware *routing*. **Promoted from Phase 4 to
-Phase 3a** by the 2026-05-09 strategy refresh — the multi-tool toolbox
-plan (chat / image / search) requires per-tool routing, so we get this
-on the critical path. Plumbing is small: add `tools[]` to capabilities,
-namespace queues as `job_queue:<tool>`, have workers `BLPOP` only the
-queues that match their advertised tools. See README § 14 Phase 3a.
+Capability-aware **routing** also done as of the 2026-05-20 image-
+generation slice: per-tool Redis queues (`job_queue`, `job_queue:image`),
+`/jobs/next` accepts a `tool` field and pops from the matching queue,
+and `_ensure_live_worker_or_503` is tool-aware so image submissions
+return a 503 specific to "no image workers" instead of falling through
+to a chat worker.
+
+Still pending: **load balancing across tools** — see next section.
+
+### 🟢 No load balancing across multi-tool agents
+
+A dual-capable agent (chat + image) today polls chat queue first, then
+image queue if chat is empty. That's adequate for the small-network
+phase but leaves three gaps the bigger network will surface:
+
+- **Warm-model affinity (partially done, 2026-05-20).** Each agent
+  now persists its last-served tool in `state.json` and polls *that*
+  queue first on the next tick, so a chat streak keeps the LLM warm
+  in VRAM and an image streak keeps sd.cpp warm. Coordinator state
+  is untouched — affinity lives entirely in the agent. Sufficient
+  while the network is demand-shaped (chat traffic dominates → most
+  agents serve mostly chat and only flip when a chat lull lets an
+  image job through). Will *not* prevent thrashing once chat and
+  image queues are routinely non-empty in parallel.
+
+- **Soft pinning (Phase 2 — deferred).** Coordinator records each
+  registered agent's GPU class + contributor preference and pins
+  the agent to one tool at registration time. Two viable signals:
+  (a) contributor opts in via `config.json` (`agent.role: "image"`),
+  (b) coordinator infers from advertised VRAM (`vram_gb >= 12` →
+  eligible to specialize on image). No dynamic flipping; promotion
+  requires an agent restart. Plumbing is small and gives a reliable
+  starting role without committing to a real balancer.
+
+- **Dynamic rebalancing (Phase 3 — deferred until ≥50 contributors).**
+  Coordinator measures per-queue depth + worker utilization, demotes
+  idle image workers to chat (and vice versa, *subject to VRAM
+  asymmetry — see below*) above a hysteresis threshold. Requires
+  careful design around: (1) not yanking a busy worker mid-job;
+  (2) charging swap cost (~10-30s sd.cpp cold start) only when the
+  new role keeps the worker busy long enough to amortize it;
+  (3) per-contributor opt-outs for specialists; (4) flap dampening
+  on bursty demand.
+
+**GPU asymmetry caveat.** A naive "70% chat / 30% image at rest" ratio
+glosses over a real constraint: a contributor running an 8 GB GPU on
+7B chat *cannot* run SDXL (needs ~12 GB). Conversion is one-way —
+big GPUs can always fall back to chat, but small GPUs are chat-only.
+Any rebalancer needs per-agent VRAM-aware eligibility, not a global
+ratio. The natural breakdown is something like: small GPUs (4-8 GB) →
+chat-only or sd1.5-only; big GPUs (12 GB+) → swappable. The current
+capability-advertisement system already exposes the data needed; the
+balancer just hasn't been written.
 
 ### ~~🔴 Model registry missing~~ — done (catalog + validation)
 

@@ -43,7 +43,7 @@ IS_WINDOWS = platform.system() == "Windows"
 # the moment it starts. The CI-generated version.txt (short-sha +
 # build timestamp) is still what the self-updater diffs against;
 # AGENT_VERSION is just the human-facing label.
-AGENT_VERSION = "1.0.3"
+AGENT_VERSION = "1.1.0"
 
 # ---------------------------------------------------------------------------
 # Idle detection
@@ -397,6 +397,14 @@ DEFAULTS = {
         "model": "llama3.2:1b",
         "ollama_url": "http://localhost:11434",
         "mirror_base_url": None,  # null = use coordinator_url
+        # Image-generation bootstrap. Best-effort: failure leaves the
+        # agent running with chat only. Downloads sd.exe +
+        # stable-diffusion.dll + the default GGUF from
+        # {mirror_base}/download/{sd.exe,stable-diffusion.dll} and
+        # {mirror_base}/download/sd-models/<slug>.gguf. The mirror is
+        # populated by infra/setup-image-mirror.sh.
+        "image_enabled": True,
+        "image_model": "sd1.5",
     },
     "model": None,
     "worker_id": None,
@@ -420,6 +428,8 @@ class Config:
     bootstrap_model: str
     bootstrap_ollama_url: str
     bootstrap_mirror_base_url: Optional[str]
+    bootstrap_image_enabled: bool
+    bootstrap_image_model: str
     model: Optional[str]
     worker_id: Optional[str]
     api_token: Optional[str]
@@ -463,6 +473,8 @@ class Config:
                 if bootstrap.get("mirror_base_url")
                 else None
             ),
+            bootstrap_image_enabled=bool(bootstrap.get("image_enabled", False)),
+            bootstrap_image_model=str(bootstrap.get("image_model", "sd1.5")),
             model=data.get("model"),
             worker_id=data.get("worker_id"),
             api_token=token or None,
@@ -511,6 +523,9 @@ def load_state() -> dict:
         "jobs": 0,
         "tokens": 0,
         "earnings_usd": 0.0,
+        # Last tool this agent served. Used by _ordered_queues to put
+        # the warm queue first on the next tick. None on first run.
+        "last_tool": None,
     }
 
 
@@ -617,8 +632,16 @@ class Coordinator:
     def heartbeat(self, status: str) -> None:
         self._post("/heartbeat", {"worker_id": self.worker_id, "status": status}, timeout=5)
 
-    def next_job(self) -> Optional[dict]:
-        out = self._post("/jobs/next", {"worker_id": self.worker_id}, timeout=10)
+    def next_job(self, tool: str = "chat") -> Optional[dict]:
+        """Pull the next job for *tool*. Defaults to chat for the legacy
+        single-queue path; an image-capable worker calls this twice
+        (chat, then image) per main-loop tick so it serves both queues
+        without starving either."""
+        out = self._post(
+            "/jobs/next",
+            {"worker_id": self.worker_id, "tool": tool},
+            timeout=10,
+        )
         return (out or {}).get("job")
 
     def claim(self, job_id: str) -> bool:
@@ -1082,6 +1105,91 @@ def _install_model_via_pull(
     return _model_present(ollama_url, model, log)
 
 
+# ---------------------------------------------------------------------------
+# Image-generation bootstrap (Windows-only): install sd.exe + GGUF model
+# ---------------------------------------------------------------------------
+# Default chain on first-run:
+#   1. Check %APPDATA%\GamerAI\sd\sd.exe — skip if present.
+#   2. Else download {mirror}/download/sd.exe into that path.
+#   3. Check %APPDATA%\GamerAI\sd\models\<slug>.gguf — skip if present.
+#   4. Else download {mirror}/download/sd-models/<slug>.gguf.
+#
+# Best-effort: any failure leaves the agent running chat-only. Idempotent
+# — every step short-circuits when its target file is already present.
+
+def sd_install_dir() -> Path:
+    """Where sd.exe + DLLs + model weights live on the contributor box.
+    Sits under the same state_dir() as everything else the agent
+    persists so a contributor cleaning up has one folder to remove."""
+    d = state_dir() / "sd"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def sd_models_dir() -> Path:
+    d = sd_install_dir() / "models"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def sd_binary_path() -> Path:
+    return sd_install_dir() / "sd.exe"
+
+
+def sd_model_path(slug: str) -> Path:
+    return sd_models_dir() / f"{slug}.gguf"
+
+
+# Files the sd.cpp Windows build needs alongside sd.exe. sd.exe by
+# itself won't load — `stable-diffusion.dll` carries the ggml + the
+# GPU backend (vulkan/cuda/etc.). Add other names here when bundling
+# alternative builds (e.g. the CUDA build also needs cudart-*.dll).
+SD_RUNTIME_FILES = ("sd.exe", "stable-diffusion.dll")
+
+
+def bootstrap_image_inference(cfg: "Config", log: logging.Logger) -> bool:
+    """Make sure sd.exe + its runtime DLLs + the default GGUF are
+    ready. Returns True on success, False (best-effort) on failure —
+    caller falls back to chat-only capability advertisement."""
+    if not cfg.bootstrap_image_enabled:
+        log.info("image bootstrap: disabled in config — skipping")
+        return False
+    if not IS_WINDOWS:
+        log.info("image bootstrap: not on Windows — skipping (dev mode)")
+        return False
+    mirror_base = (cfg.bootstrap_mirror_base_url or cfg.coordinator_url).rstrip("/")
+    install_dir = sd_install_dir()
+    missing = [f for f in SD_RUNTIME_FILES if not (install_dir / f).exists()]
+    if missing:
+        log.info(
+            "image bootstrap: missing %s — pulling from mirror. "
+            "First-run image setup pulls ~90 MB of runtime plus a "
+            "~1.5 GB model — typically 5-15 minutes on home internet.",
+            ", ".join(missing),
+        )
+        for fname in missing:
+            url = f"{mirror_base}/download/{fname}"
+            if not _download_to(url, install_dir / fname, log, fname):
+                return False
+    model_path = sd_model_path(cfg.bootstrap_image_model)
+    if not model_path.exists():
+        url = (
+            f"{mirror_base}/download/sd-models/"
+            f"{cfg.bootstrap_image_model}.gguf"
+        )
+        log.info(
+            "image bootstrap: model %s not found; downloading from %s",
+            cfg.bootstrap_image_model, url,
+        )
+        if not _download_to(url, model_path, log, f"{cfg.bootstrap_image_model}.gguf"):
+            return False
+    log.info(
+        "image bootstrap: ready (install_dir=%s, model=%s)",
+        install_dir, model_path,
+    )
+    return True
+
+
 def bootstrap_inference(cfg: "Config", log: logging.Logger) -> Optional[str]:
     """Make sure Ollama + the default model are ready. Returns the
     working Ollama URL on success, or None on any failure (caller
@@ -1243,6 +1351,121 @@ def run_inference(
 
 
 # ---------------------------------------------------------------------------
+# Image inference (sd.cpp subprocess)
+# ---------------------------------------------------------------------------
+# How long sd.cpp is allowed to run before we give up. SD 1.5 at 512×512
+# / 20 steps is ~5-30s on a modern GPU; SDXL / large batches push past
+# a minute. The hard cap here is also coordinator JOB_TIMEOUT_SECONDS
+# (default 120) — a worker still running past that has already lost
+# the job to the reaper.
+SD_TIMEOUT_SECONDS = 180
+
+
+def run_image_inference(
+    prompt: str,
+    job: dict,
+    cfg: "Config",
+    log: logging.Logger,
+) -> tuple[str, str]:
+    """Generate one image with the bundled stable-diffusion.cpp binary
+    and return (base64_png, model_used). Raises on subprocess error so
+    process_one's outer try/except funnels it into a /jobs/complete
+    error result the user sees in the bubble.
+
+    Mock branch (non-Windows or sd.exe missing) returns a tiny solid-
+    color PNG so dev/test on Linux can still exercise the end-to-end
+    /jobs/complete + /images/{id} path. The mock PNG is deterministic
+    so a test can byte-compare it.
+    """
+    if not IS_WINDOWS or not sd_binary_path().exists():
+        log.info("image: sd.exe not available — returning mock PNG")
+        return _mock_image_b64(), "mock-image"
+    params = job.get("image") or {}
+    width = int(params.get("width") or 512)
+    height = int(params.get("height") or 512)
+    steps = int(params.get("steps") or 20)
+    seed = params.get("seed")
+    negative = params.get("negative_prompt") or ""
+    model_slug = cfg.bootstrap_image_model
+    model_path = sd_model_path(model_slug)
+    if not model_path.exists():
+        raise RuntimeError(
+            f"image model {model_slug}.gguf missing at {model_path}"
+        )
+    out_path = sd_install_dir() / f"out-{os.getpid()}-{int(time.time()*1000)}.png"
+    # sd.cpp CLI: see https://github.com/leejet/stable-diffusion.cpp
+    # `-M txt2img -m <gguf> -p <prompt> -W <w> -H <h> --steps N -o out.png`
+    # The prompt is passed via a temp file (sd.cpp tolerates long
+    # multi-line prompts that way) — using argv directly hits Windows'
+    # 32K command-line cap on pathological inputs.
+    prompt_file = out_path.with_suffix(".prompt.txt")
+    prompt_file.write_text(prompt, encoding="utf-8")
+    argv = [
+        str(sd_binary_path()),
+        "-M", "txt2img",
+        "-m", str(model_path),
+        "-p", prompt,
+        "-W", str(width),
+        "-H", str(height),
+        "--steps", str(steps),
+        "-o", str(out_path),
+    ]
+    if seed is not None:
+        argv.extend(["--seed", str(int(seed))])
+    if negative:
+        argv.extend(["-n", negative])
+    log.info(
+        "image: running sd.exe (model=%s %dx%d steps=%d)",
+        model_slug, width, height, steps,
+    )
+    try:
+        # Hide stdout — sd.cpp is chatty with progress dots. We surface
+        # stderr-on-error below.
+        result = subprocess.run(
+            argv,
+            timeout=SD_TIMEOUT_SECONDS,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    finally:
+        try:
+            prompt_file.unlink()
+        except OSError:
+            pass
+    if result.returncode != 0:
+        snippet = (result.stderr or result.stdout or "").strip()[:500]
+        raise RuntimeError(
+            f"sd.exe failed (rc={result.returncode}): {snippet}"
+        )
+    if not out_path.exists():
+        raise RuntimeError("sd.exe completed but produced no output PNG")
+    try:
+        data = out_path.read_bytes()
+    finally:
+        try:
+            out_path.unlink()
+        except OSError:
+            pass
+    if not data:
+        raise RuntimeError("sd.exe wrote an empty PNG")
+    import base64 as _b64
+    return _b64.b64encode(data).decode("ascii"), model_slug
+
+
+# 1×1 transparent PNG — base64-encoded. Returned by the mock branch so
+# the end-to-end coordinator+UI flow works on dev boxes without a GPU.
+_MOCK_PNG_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+    "+A8AAQUBAScY42YAAAAASUVORK5CYII="
+)
+
+
+def _mock_image_b64() -> str:
+    return _MOCK_PNG_B64
+
+
+# ---------------------------------------------------------------------------
 # Idle gate
 # ---------------------------------------------------------------------------
 def is_system_idle(cfg: Config) -> tuple[bool, str]:
@@ -1381,6 +1604,7 @@ def main_loop(
     log: logging.Logger,
     once: bool,
     should_exit=lambda: False,
+    tools: Optional[list[str]] = None,
 ) -> None:
     last_heartbeat = 0.0
     last_earnings_print = time.time()
@@ -1446,7 +1670,9 @@ def main_loop(
         just_drained_job_id = None
         emit_status("idle", reason)
 
-        did_work, processed_job_id = process_one(cfg, coord, state, log)
+        did_work, processed_job_id = process_one(
+            cfg, coord, state, log, tools=tools,
+        )
         if did_work:
             just_drained_job_id = processed_job_id
         if once and did_work:
@@ -1455,18 +1681,48 @@ def main_loop(
             time.sleep(cfg.polling_interval)
 
 
+def _ordered_queues(
+    tools: Optional[list[str]], last_tool: Optional[str],
+) -> list[str]:
+    """Per-tool poll order for one main-loop tick.
+
+    Defaults to ["chat"]; appends "image" when the agent advertises it.
+    Promotes the agent's *last-served* tool to the front so back-to-
+    back jobs of the same kind keep the model warm in VRAM — a chat
+    streak keeps Ollama hot; an image streak keeps sd.cpp's weights
+    loaded. The flip only happens when the preferred queue is empty
+    AND the other queue has work, so demand-shaped routing still
+    falls out naturally without any coordinator-side state."""
+    available = ["chat"]
+    if tools and "image" in tools:
+        available.append("image")
+    if last_tool in available and last_tool != available[0]:
+        return [last_tool] + [t for t in available if t != last_tool]
+    return available
+
+
 def process_one(
-    cfg: Config, coord: Coordinator, state: dict, log: logging.Logger,
+    cfg: Config,
+    coord: Coordinator,
+    state: dict,
+    log: logging.Logger,
+    tools: Optional[list[str]] = None,
 ) -> tuple[bool, Optional[str]]:
     """Pop, claim, run, complete one job. Returns (did_work, job_id).
     The job_id is captured so the main loop can reference it in the
     next iteration's drain-visibility log line."""
-    job = coord.next_job()
+    queue_order = _ordered_queues(tools, state.get("last_tool"))
+    job = None
+    for q in queue_order:
+        job = coord.next_job(tool=q)
+        if job:
+            break
     if not job:
         return False, None
     job_id = job.get("job_id")
+    tool = (job.get("tool") or "chat").lower()
     prompt = job.get("prompt", "")
-    log.info("job %s started", job_id)
+    log.info("job %s started (tool=%s)", job_id, tool)
     coord.claim(job_id)
     coord.heartbeat("busy")
 
@@ -1483,35 +1739,66 @@ def process_one(
 
     started = time.time()
     try:
-        result = run_inference(
-            prompt,
-            cfg.model or job.get("model"),
-            log,
-            messages=job.get("messages"),
-            on_partial=lambda text: coord.partial(job_id, text),
-        )
-        duration = round(time.time() - started, 3)
-        out = coord.complete(
-            {
-                "worker_id": coord.worker_id,
-                "job_id": job_id,
-                "text": result["text"],
-                "model": result["model"],
-                "prompt_tokens": result["prompt_tokens"],
-                "completion_tokens": result["completion_tokens"],
-                "duration_seconds": duration,
-                "status": "complete",
-            }
-        )
-        earnings = float((out or {}).get("earnings", 0.0))
-        state["jobs"] = int(state.get("jobs", 0)) + 1
-        state["tokens"] = int(state.get("tokens", 0)) + int(result["completion_tokens"])
-        state["earnings_usd"] = round(float(state.get("earnings_usd", 0.0)) + earnings, 10)
-        save_state(state)
-        log.info(
-            "job %s finished: %d tokens, $%.8f, %.2fs",
-            job_id, result["completion_tokens"], earnings, duration,
-        )
+        if tool == "image":
+            image_b64, model_used = run_image_inference(
+                prompt, job, cfg, log,
+            )
+            duration = round(time.time() - started, 3)
+            out = coord.complete(
+                {
+                    "worker_id": coord.worker_id,
+                    "job_id": job_id,
+                    "text": prompt[:200],
+                    "model": model_used,
+                    "prompt_tokens": estimate_tokens(prompt),
+                    "completion_tokens": 0,
+                    "duration_seconds": duration,
+                    "status": "complete",
+                    "image_b64": image_b64,
+                }
+            )
+            earnings = float((out or {}).get("earnings", 0.0))
+            state["jobs"] = int(state.get("jobs", 0)) + 1
+            state["earnings_usd"] = round(
+                float(state.get("earnings_usd", 0.0)) + earnings, 10,
+            )
+            state["last_tool"] = "image"
+            save_state(state)
+            log.info(
+                "job %s finished (image): $%.8f, %.2fs",
+                job_id, earnings, duration,
+            )
+        else:
+            result = run_inference(
+                prompt,
+                cfg.model or job.get("model"),
+                log,
+                messages=job.get("messages"),
+                on_partial=lambda text: coord.partial(job_id, text),
+            )
+            duration = round(time.time() - started, 3)
+            out = coord.complete(
+                {
+                    "worker_id": coord.worker_id,
+                    "job_id": job_id,
+                    "text": result["text"],
+                    "model": result["model"],
+                    "prompt_tokens": result["prompt_tokens"],
+                    "completion_tokens": result["completion_tokens"],
+                    "duration_seconds": duration,
+                    "status": "complete",
+                }
+            )
+            earnings = float((out or {}).get("earnings", 0.0))
+            state["jobs"] = int(state.get("jobs", 0)) + 1
+            state["tokens"] = int(state.get("tokens", 0)) + int(result["completion_tokens"])
+            state["earnings_usd"] = round(float(state.get("earnings_usd", 0.0)) + earnings, 10)
+            state["last_tool"] = "chat"
+            save_state(state)
+            log.info(
+                "job %s finished: %d tokens, $%.8f, %.2fs",
+                job_id, result["completion_tokens"], earnings, duration,
+            )
     except Exception as e:
         log.exception("job %s failed: %s", job_id, e)
         coord.complete(
@@ -1711,18 +1998,25 @@ def main(argv: Optional[list[str]] = None) -> int:
     elif args.background and not cfg.keep_awake_while_online:
         log.info("keep-awake off (power.keep_awake_while_online=false)")
 
+    # Image-tool bootstrap (best-effort; never blocks chat). When it
+    # succeeds the worker advertises tools=["chat","image"] and pulls
+    # from the per-tool image queue; on failure we stay chat-only.
+    image_ready = bootstrap_image_inference(cfg, log)
+
     coord = Coordinator(cfg.coordinator_url, worker_id, log, cfg.api_token)
-    # Advertise the model we can actually serve. The bootstrap above
-    # either confirmed the model is loaded into Ollama or fell back to
-    # mock — either way, the coordinator should know this worker is
-    # eligible for jobs targeting bootstrap_model. (Coordinator-side
-    # capability-aware routing is still on the deferred list; for now
-    # this is informational and surfaces in /workers.)
-    capabilities = (
-        {"models": [cfg.bootstrap_model]}
-        if cfg.bootstrap_enabled and os.getenv("OLLAMA_URL")
-        else None
-    )
+    # Advertise the model and tools we can actually serve. The chat
+    # bootstrap above either confirmed the model is loaded into Ollama
+    # or fell back to mock; image bootstrap is independent (sd.exe +
+    # GGUF on disk). Coordinator-side routing uses capabilities.tools
+    # to pick the right Redis queue when /jobs/next is called.
+    tools = ["chat"]
+    if image_ready:
+        tools.append("image")
+    capabilities: Optional[dict] = None
+    if cfg.bootstrap_enabled and os.getenv("OLLAMA_URL"):
+        capabilities = {"models": [cfg.bootstrap_model], "tools": tools}
+    elif image_ready:
+        capabilities = {"models": [cfg.bootstrap_image_model], "tools": ["image"]}
     if not coord.register(capabilities=capabilities):
         if keep_awake_active:
             keep_awake_end(log)
@@ -1774,6 +2068,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 keep_awake_holder.get("exit_requested", False)
                 or stop_event.is_set()
             ),
+            tools=tools,
         )
     except KeyboardInterrupt:
         log.info("stopped by user")

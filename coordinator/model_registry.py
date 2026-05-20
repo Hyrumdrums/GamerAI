@@ -29,6 +29,10 @@ class Model:
     min_vram_gb: float    # rough minimum VRAM at INT4 quantization
     license: str
     notes: str = ""
+    # "chat" (LLM) or "image" (diffusion). Most callers don't care, but
+    # routing + tool-aware validation does — an image model on a /generate
+    # call with tool="chat" should be rejected by STRICT_MODELS=true.
+    kind: str = "chat"
 
     @property
     def is_moe(self) -> bool:
@@ -55,6 +59,19 @@ _CATALOG: dict[str, Model] = {
         Model("deepseek-v3",  "deepseek", 671.0, 37.0,  20.0, "MIT-style", "MoE; 8 of 256 experts active"),
         Model("qwen2.5:7b",   "qwen",     7.6,   7.6,   6.0,  "Apache-2.0"),
         Model("phi3:14b",     "phi",      14.0,  14.0,  10.0, "MIT"),
+        # Image-generation models. params_b is the unet+text-encoder
+        # parameter count (estimate); min_vram_gb is the rough Q4 GGUF
+        # requirement for 512×512 generation. Defaults shipped with the
+        # MVP — the small one. SDXL is registered but the mirror only
+        # serves it once we promote it (see infra/setup-image-mirror.sh).
+        Model("sd1.5",  "stable-diffusion-1.5", 0.86, 0.86, 4.0,
+              "CreativeML Open RAIL-M",
+              "Q4_0 GGUF; mirror default; 512x512 in ~5-15s on a recent GPU",
+              kind="image"),
+        Model("sdxl",   "stable-diffusion-xl",  3.5,  3.5,  8.0,
+              "CreativeML Open RAIL++-M",
+              "1024x1024; high-end contributors only; not yet on the mirror",
+              kind="image"),
     )
 }
 
@@ -77,6 +94,22 @@ def get(name: str) -> Model | None:
 
 def list_all() -> list[Model]:
     return list(_CATALOG.values())
+
+
+# Default image model — what /generate falls back to when tool="image"
+# arrives with no `model` field. Single source of truth so the agent
+# bootstrap and the coordinator stay in sync.
+DEFAULT_IMAGE_MODEL = "sd1.5"
+
+
+def is_image_model(name: str | None) -> bool:
+    """True if *name* is registered as an image model. Unknown names
+    return False (so an undeclared name on a chat job doesn't get
+    accidentally treated as an image)."""
+    if not name:
+        return False
+    m = _CATALOG.get(name)
+    return m is not None and m.kind == "image"
 
 
 def validate_or_raise(name: str | None, *, strict: bool | None = None) -> None:

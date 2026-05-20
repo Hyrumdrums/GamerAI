@@ -106,11 +106,17 @@ class CanaryInjector(threading.Thread):
         # a malicious worker can fingerprint canaries and selectively
         # cheat. Keep these aligned with the /generate path.
         now = time.time()
+        # Canary envelopes pin tool="chat" — the canary system targets
+        # chat workers (image-canary support would need a known-good
+        # PNG fingerprint per prompt; not yet built). Including the
+        # field keeps real and canary envelopes shape-identical so a
+        # malicious worker can't fingerprint canaries by absence.
         envelope = {
             "job_id": job_id,
             "prompt": canary["prompt"],
             "model": canary["model"],
             "submitted_at": now,
+            "tool": "chat",
         }
         # Record canary mapping FIRST, then push to queue. If push fails
         # we leave a dangling entry (harmless — it just never gets

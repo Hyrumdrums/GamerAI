@@ -4,9 +4,29 @@ from typing import List, Optional
 from pydantic import BaseModel, Field
 
 
+class ImageParams(BaseModel):
+    """Optional per-image-job knobs. Defaults are set to match the
+    default model's recommendation (see model_registry.IMAGE_CATALOG)
+    so a UI that sends `{tool: "image"}` with no params still produces
+    a sensible image."""
+    width: int = 512
+    height: int = 512
+    steps: int = 20
+    seed: Optional[int] = None
+    negative_prompt: Optional[str] = None
+
+
 class GenerateRequest(BaseModel):
     prompt: str
     model: Optional[str] = None
+    # "chat" (default, legacy) or "image". Image jobs route to a
+    # different Redis queue (job_queue:image) and only image-capable
+    # workers pick them up. Defaulting to "chat" keeps every existing
+    # client (CLI, agent canaries, retry path) working unchanged.
+    tool: str = "chat"
+    # Image-only knobs. Ignored for tool="chat". When tool="image" and
+    # omitted, the model's defaults are used.
+    image: Optional[ImageParams] = None
     # When set, the coordinator loads the prior turns of this
     # conversation, prepends them to the worker-facing prompt, and
     # auto-appends the user message + assistant response back into
@@ -45,6 +65,12 @@ class WorkerCapabilities(BaseModel):
     gpu_model: Optional[str] = None       # e.g. "RTX 4090"
     bandwidth_class: Optional[str] = None  # "low" | "medium" | "high"
     models: List[str] = Field(default_factory=list)
+    # Per-tool capability. Defaults to ["chat"] for legacy agents that
+    # don't include the field. Image-capable agents send
+    # ["chat","image"] (or just ["image"] on a box too small for chat).
+    # Coordinator uses this to route /jobs/next requests and to refuse
+    # /generate when no worker advertising the requested tool is online.
+    tools: List[str] = Field(default_factory=lambda: ["chat"])
     notes: Optional[str] = None
 
 
@@ -63,6 +89,15 @@ class JobClaimRequest(BaseModel):
     job_id: str
 
 
+class JobNextRequest(BaseModel):
+    """Worker pulls the next job from a queue. ``tool`` selects which
+    per-tool Redis queue to LPOP. Defaults to "chat" so legacy agents
+    (no tool field) keep pulling chat jobs. Image-capable agents call
+    with tool="image" to pull from job_queue:image."""
+    worker_id: str
+    tool: str = "chat"
+
+
 class JobCompleteRequest(BaseModel):
     worker_id: str
     job_id: str
@@ -73,6 +108,10 @@ class JobCompleteRequest(BaseModel):
     duration_seconds: float = 0.0
     status: str = "complete"  # complete | error
     error: Optional[str] = None
+    # For image jobs: the generated PNG as base64. Coordinator decodes,
+    # validates the PNG header, writes to /data/images/<job_id>.png,
+    # and stamps the message's image_path. Empty/absent on chat jobs.
+    image_b64: Optional[str] = None
 
 
 class InviteCreateRequest(BaseModel):

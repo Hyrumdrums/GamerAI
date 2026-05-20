@@ -73,6 +73,29 @@ body { display: flex; flex-direction: column; }
 .typing { display: inline-block; color: var(--muted); font-style: italic; }
 
 .composer { border-top: 1px solid var(--border); padding: .65rem .9rem; background: var(--surface); }
+.tool-row { display: flex; justify-content: flex-start; margin-bottom: .4rem; }
+.tool-toggle {
+  display: inline-flex; border: 1px solid var(--border); border-radius: var(--radius);
+  overflow: hidden; background: #fafafa;
+}
+.tool-btn {
+  appearance: none; background: transparent; border: 0; padding: .3rem .7rem;
+  font-size: .8rem; color: var(--muted); cursor: pointer; width: auto;
+}
+.tool-btn.active { background: var(--brand); color: #fff; }
+.tool-btn:hover:not(.active) { background: #eef3fb; }
+
+/* Image bubble — assistant rendered as an <img> instead of text. Cap
+   the visible width so a 1024x1024 generation doesn't blow out the
+   chat column. */
+.msg .bubble img.generated {
+  display: block; max-width: 100%; max-height: 70vh;
+  border-radius: var(--radius); margin-top: .25rem;
+}
+.msg .bubble .img-prompt {
+  color: var(--muted); font-size: .85rem; margin-bottom: .35rem; font-style: italic;
+}
+
 .composer-inner { display: flex; gap: .5rem; align-items: flex-end; }
 .composer textarea {
   flex: 1; min-height: 2.5rem; max-height: 10rem; resize: none;

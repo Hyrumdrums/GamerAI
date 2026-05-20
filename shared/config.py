@@ -86,7 +86,21 @@ CANARY_SCORE_WINDOW = _int("CANARY_SCORE_WINDOW", 50)
 
 
 # --- redis keys ---
+# JOB_QUEUE is the legacy chat-only queue (kept as an alias for
+# job_queue:chat so the worker container, which BLPOPs this exact
+# name, doesn't need a config change to keep serving chat jobs).
 JOB_QUEUE = "job_queue"
+# Per-tool queue prefix. Image-capable workers pull from job_queue:image;
+# chat-capable workers pull from job_queue (= job_queue:chat). The
+# coordinator pushes to the right queue based on the request's tool
+# field.
+def job_queue_for(tool: str) -> str:
+    """Return the Redis list key a job of *tool* should be queued on.
+    Image jobs go to a dedicated queue so chat-only workers (the
+    majority of the network) never pick one up and fail."""
+    if tool == "image":
+        return "job_queue:image"
+    return JOB_QUEUE
 JOB_RESULTS = "job_results"
 JOB_PROCESSING = "job_processing"
 # Accumulated streaming text per in-flight job, keyed by job_id. Worker

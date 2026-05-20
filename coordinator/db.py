@@ -253,6 +253,20 @@ class DB:
             )
         except sqlite3.OperationalError:
             pass
+        # Multi-tool columns — added with the image-generation slice.
+        # jobs.tool discriminates chat vs. image so /jobs/next can route
+        # by queue and /jobs/complete knows whether to expect image_b64.
+        # Legacy rows default to 'chat' (the only thing the pre-image
+        # coordinator could produce). messages.image_path stores the
+        # filesystem path the UI fetches the generated PNG from.
+        for ddl in (
+            "ALTER TABLE jobs ADD COLUMN tool TEXT NOT NULL DEFAULT 'chat'",
+            "ALTER TABLE messages ADD COLUMN image_path TEXT",
+        ):
+            try:
+                self._conn.execute(ddl)
+            except sqlite3.OperationalError:
+                pass
 
     # ---------- jobs ----------
     def insert_job(
@@ -263,16 +277,17 @@ class DB:
         submitted_at: float,
         submitted_by_member_id: Optional[str] = None,
         conversation_id: Optional[str] = None,
+        tool: str = "chat",
     ) -> None:
         with self._lock:
             self._conn.execute(
                 "INSERT OR REPLACE INTO jobs "
                 "(job_id, prompt, model, status, submitted_at, attempts, "
-                "submitted_by_member_id, conversation_id) "
-                "VALUES (?, ?, ?, 'pending', ?, 0, ?, ?)",
+                "submitted_by_member_id, conversation_id, tool) "
+                "VALUES (?, ?, ?, 'pending', ?, 0, ?, ?, ?)",
                 (
                     job_id, prompt, model, submitted_at,
-                    submitted_by_member_id, conversation_id,
+                    submitted_by_member_id, conversation_id, tool,
                 ),
             )
 
@@ -851,18 +866,27 @@ class DB:
         prompt_tokens: Optional[int] = None,
         completion_tokens: Optional[int] = None,
         model: Optional[str] = None,
+        image_path: Optional[str] = None,
     ) -> None:
         """Move a pending message to its terminal state ('complete' or
         'error'). Status guard prevents double-finalization if both a
-        retry and the original worker race."""
+        retry and the original worker race.
+
+        ``image_path`` is set for image-tool jobs; the UI reads it to
+        decide whether to render an <img> bubble vs. text. Chat jobs
+        leave it NULL."""
         with self._lock:
             self._conn.execute(
                 "UPDATE messages SET text=?, status=?, "
                 "prompt_tokens=COALESCE(?, prompt_tokens), "
                 "completion_tokens=COALESCE(?, completion_tokens), "
-                "model=COALESCE(?, model) "
+                "model=COALESCE(?, model), "
+                "image_path=COALESCE(?, image_path) "
                 "WHERE message_id=? AND status='pending'",
-                (text, status, prompt_tokens, completion_tokens, model, message_id),
+                (
+                    text, status, prompt_tokens, completion_tokens,
+                    model, image_path, message_id,
+                ),
             )
 
     def get_message(self, message_id: str) -> Optional[sqlite3.Row]:

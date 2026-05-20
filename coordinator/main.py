@@ -1,7 +1,10 @@
 """Coordinator: REST API + Redis queue + SQLite write-through + reaper."""
+import base64
+import binascii
 import json
 import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -10,7 +13,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 from coordinator import canaries as canary_lib
@@ -43,6 +46,7 @@ from shared.config import (
     WORKER_SHARE,
     WORKER_STATUS,
     WORKER_TIMEOUT_SECONDS,
+    job_queue_for,
 )
 from shared.models import (
     ConversationCreateRequest,
@@ -53,6 +57,7 @@ from shared.models import (
     InviteCreateRequest,
     JobClaimRequest,
     JobCompleteRequest,
+    JobNextRequest,
     JobPartialRequest,
     WorkerIdent,
 )
@@ -87,6 +92,142 @@ idem = IdempotencyStore(r, IDEMPOTENCY_TTL_SECONDS)
 rate_limiter = RateLimiter(r, RATE_LIMIT_PER_MIN)
 _reaper: Reaper | None = None
 _canary_injector: CanaryInjector | None = None
+
+
+# Where generated images are written. Lives next to the SQLite DB so
+# it shares the same volume — one mount, one backup, one rotation
+# policy. Filename is {job_id}.png so the messages.image_path =
+# "{job_id}.png" suffix stays portable across deploys (no absolute
+# path baked into the DB).
+#
+# IMAGE_DIR resolves env var > sibling-of-DB_PATH > /data/images,
+# in that order. Test suites that override DB_PATH to a tmp dir
+# therefore get a writable images dir for free.
+def _resolve_image_dir() -> Path:
+    explicit = os.getenv("IMAGE_DIR")
+    if explicit:
+        return Path(explicit)
+    from shared.config import DB_PATH as _DB_PATH
+    db_parent = Path(_DB_PATH).parent
+    if db_parent and str(db_parent) not in ("", "."):
+        return db_parent / "images"
+    return Path("/data/images")
+
+
+IMAGE_DIR = _resolve_image_dir()
+try:
+    IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+except OSError:
+    # Fall back to a tmp dir if the configured path isn't writable
+    # (e.g. a developer running the coordinator outside Docker with
+    # no /data volume). Image features still work; persistence is
+    # lost across process restarts.
+    import tempfile
+    IMAGE_DIR = Path(tempfile.mkdtemp(prefix="gamerai-images-"))
+
+# Cap on accepted PNG size. 8 MB lets a 1024×1024 image through with
+# headroom; anything bigger is likely a misbehaving (or malicious)
+# worker. ``image_b64`` arrives base64-encoded so the wire payload is
+# ~4/3 of this.
+MAX_IMAGE_BYTES = 8 * 1024 * 1024
+
+# Lightweight prompt-side denylist. NOT a content moderation system —
+# this just refuses the most obviously banned categories at submit time
+# so a contributor's machine never has to run them. Phase 3b+ ships a
+# real classifier (image-side); for now we keep the surface small and
+# explicit so we can point at it during incident review.
+_IMAGE_PROMPT_DENYLIST = re.compile(
+    r"\b("
+    r"csam|child(?:\s+|-)porn|cp\b|"
+    r"loli(?:con)?|shota|underage\b|minor\b|prepubescent|"
+    r"bestiality|zoophilia|"
+    r"non[- ]?consensual|rape\b"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _image_prompt_is_blocked(prompt: str) -> Optional[str]:
+    """Return the matched denylist phrase if the prompt should be
+    refused, else None. Surface the phrase so the user sees a concrete
+    reason — vague 'rejected for content' is hostile and hides bugs."""
+    m = _IMAGE_PROMPT_DENYLIST.search(prompt or "")
+    return m.group(0) if m else None
+
+
+# sd.cpp requires image dims to be multiples of 64. We clamp into
+# [256, 1536] so a client can't ask the worker to render a 16K canvas.
+_IMAGE_DIM_MIN = 256
+_IMAGE_DIM_MAX = 1536
+
+
+def _clamp_image_dim(value: int) -> int:
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        v = 512
+    v = max(_IMAGE_DIM_MIN, min(_IMAGE_DIM_MAX, v))
+    return (v // 64) * 64 or _IMAGE_DIM_MIN
+
+
+def _default_image_params():
+    """Wraps ImageParams() so the import lives at the top of the file
+    only — keeps the /generate body short."""
+    from shared.models import ImageParams
+    return ImageParams()
+
+
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+
+def _save_image_or_raise(job_id: str, image_b64: Optional[str]) -> str:
+    """Decode the worker-supplied PNG and persist it under IMAGE_DIR.
+    Returns the basename (the messages.image_path the UI fetches from
+    /images/<basename>). Raises HTTPException on malformed payloads
+    so /jobs/complete responds 400 — the worker should not retry the
+    same broken bytes.
+
+    Validates the PNG magic header so a worker can't sneak a JPEG (or
+    a raw HTML page) past the route handler. Real moderation (NSFW
+    classifier) is post-MVP; this is just shape validation."""
+    if not image_b64:
+        raise HTTPException(
+            status_code=400,
+            detail="image job completed without image_b64",
+        )
+    # Estimated decoded size — base64 overhead is 4/3. Reject before
+    # decoding to avoid materializing a 1 GB string in memory.
+    if len(image_b64) > int(MAX_IMAGE_BYTES * 4 / 3) + 16:
+        raise HTTPException(
+            status_code=413,
+            detail=f"image too large (>{MAX_IMAGE_BYTES} bytes)",
+        )
+    try:
+        data = base64.b64decode(image_b64, validate=True)
+    except (binascii.Error, ValueError) as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"image_b64 not valid base64: {e}",
+        )
+    if len(data) > MAX_IMAGE_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"image too large after decode (>{MAX_IMAGE_BYTES} bytes)",
+        )
+    if not data.startswith(_PNG_SIGNATURE):
+        raise HTTPException(
+            status_code=400,
+            detail="image bytes are not a PNG (missing magic header)",
+        )
+    # job_id is a uuid we generated — safe as a path component, but
+    # belt-and-braces against ../ traversal.
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "_", job_id)
+    fname = f"{safe}.png"
+    dest = IMAGE_DIR / fname
+    tmp = dest.with_suffix(".png.tmp")
+    tmp.write_bytes(data)
+    tmp.replace(dest)
+    return fname
 
 
 def ensure_admin_seed() -> None:
@@ -260,25 +401,54 @@ def _worker_status(worker_id: str, now: float) -> str:
 _NO_WORKERS_MESSAGE = (
     "No community members are available right now. Please try again in a few minutes."
 )
+_NO_IMAGE_WORKERS_MESSAGE = (
+    "No image-capable community members are online right now. "
+    "Please try again in a few minutes, or use chat."
+)
 
 
-def _ensure_live_worker_or_503() -> None:
-    """Refuse to enqueue when no worker has heartbeated recently.
-    Gated by REQUIRE_LIVE_WORKER so dev/tests can queue jobs without
-    a worker attached. Without this, a job sits on the queue
-    indefinitely (or, worse on a misconfigured prod, gets picked up
-    by an in-VPS mock that fakes a reply)."""
+def _worker_advertises_tool(worker_id: str, tool: str) -> bool:
+    """Read the cached WorkerCapabilities for a worker and check whether
+    it claims the given tool. Missing/legacy capabilities default to
+    chat-only (the pre-multi-tool behavior)."""
+    raw = r.hget(WORKER_CAPABILITIES, worker_id)
+    if not raw:
+        return tool == "chat"
+    try:
+        caps = json.loads(raw)
+    except json.JSONDecodeError:
+        return tool == "chat"
+    tools = caps.get("tools") or ["chat"]
+    return tool in tools
+
+
+def _ensure_live_worker_or_503(tool: str = "chat") -> None:
+    """Refuse to enqueue when no worker advertising *tool* has
+    heartbeated recently. Gated by REQUIRE_LIVE_WORKER so dev/tests can
+    queue jobs without a worker attached. Without this, a job sits on
+    the queue indefinitely (or, worse on a misconfigured prod, gets
+    picked up by an in-VPS mock that fakes a reply).
+
+    Tool-aware: image jobs need an image-capable worker; a swarm of
+    chat-only workers does not unblock an image submission. The error
+    message differs accordingly so the user knows which tool to fall
+    back to."""
     if not REQUIRE_LIVE_WORKER:
         return
     now = time.time()
     heartbeats = r.hgetall(WORKER_HEARTBEATS) or {}
-    for ts in heartbeats.values():
+    for worker_id, ts in heartbeats.items():
         try:
-            if (now - float(ts)) <= WORKER_TIMEOUT_SECONDS:
-                return
+            if (now - float(ts)) > WORKER_TIMEOUT_SECONDS:
+                continue
         except (TypeError, ValueError):
             continue
-    raise HTTPException(status_code=503, detail=_NO_WORKERS_MESSAGE)
+        if _worker_advertises_tool(worker_id, tool):
+            return
+    detail = (
+        _NO_IMAGE_WORKERS_MESSAGE if tool == "image" else _NO_WORKERS_MESSAGE
+    )
+    raise HTTPException(status_code=503, detail=detail)
 
 
 # ---------- public API ----------
@@ -361,12 +531,53 @@ def tos_raw():
 def generate(req: GenerateRequest, request: Request):
     if not req.prompt or not req.prompt.strip():
         raise HTTPException(status_code=400, detail="prompt required")
+    tool = (req.tool or "chat").lower()
+    if tool not in ("chat", "image"):
+        raise HTTPException(
+            status_code=400, detail=f"unknown tool: {tool!r}",
+        )
+
+    # Default the model to sd1.5 for image jobs when the caller didn't
+    # pick one. Done before STRICT_MODELS validation so the registry
+    # check sees a concrete name.
+    if tool == "image" and not req.model:
+        req.model = model_registry.DEFAULT_IMAGE_MODEL
 
     # optional model-registry validation (off unless STRICT_MODELS=true)
     try:
         model_registry.validate_or_raise(req.model, strict=STRICT_MODELS)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+    # Cross-check: tool="chat" must not target an image model, and
+    # vice versa. Catches paste-bomb mistakes (someone passing `sd1.5`
+    # with tool="chat") regardless of STRICT_MODELS. Only enforced
+    # when the model is in the registry — unknown names slip through
+    # the same way validate_or_raise lets them through in lax mode.
+    if req.model and model_registry.is_known(req.model):
+        m = model_registry.get(req.model)
+        if m is not None and m.kind != tool:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"model {req.model!r} is a {m.kind} model; "
+                    f"submit with tool={m.kind!r} (got {tool!r})"
+                ),
+            )
+
+    # Refuse banned prompts for image jobs at submit time so a
+    # contributor's machine never has to run them. See
+    # _IMAGE_PROMPT_DENYLIST for what's covered.
+    if tool == "image":
+        blocked = _image_prompt_is_blocked(req.prompt)
+        if blocked:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"image prompt refused: matches denylist term "
+                    f"{blocked!r}. See /tos for the content policy."
+                ),
+            )
 
     # optional retry-safety: same Idempotency-Key returns the same job_id.
     # The idempotent path returns BEFORE the live-worker check — the
@@ -387,11 +598,11 @@ def generate(req: GenerateRequest, request: Request):
             ),
         )
 
-    # Refuse to accept the job if no worker has heartbeated recently
-    # (REQUIRE_LIVE_WORKER=true on prod). Runs after prompt/idempotency
-    # validation so 400s still win, and BEFORE any DB writes so a 503
-    # leaves no orphan job/message rows.
-    _ensure_live_worker_or_503()
+    # Refuse to accept the job if no worker advertising this tool has
+    # heartbeated recently (REQUIRE_LIVE_WORKER=true on prod). Runs
+    # after prompt/idempotency validation so 400s still win, and BEFORE
+    # any DB writes so a 503 leaves no orphan job/message rows.
+    _ensure_live_worker_or_503(tool=tool)
 
     member = getattr(request.state, "member", None)
     submitted_by = member.member_id if member is not None else None
@@ -420,6 +631,11 @@ def generate(req: GenerateRequest, request: Request):
     # (Ollama /api/chat) so the model gets its own chat template applied
     # instead of plain-text autocompletion. Ownership is enforced — a
     # caller cannot inject into someone else's conversation.
+    #
+    # Image jobs skip the messages[] envelope entirely — sd.cpp takes
+    # a single prompt string, not a chat history — but they DO live
+    # inside conversations so a user's image generations show up
+    # interleaved with chat in the sidebar.
     conversation_id: Optional[str] = req.conversation_id
     worker_messages: Optional[list[dict]] = None
     if conversation_id:
@@ -443,11 +659,25 @@ def generate(req: GenerateRequest, request: Request):
                 status_code=409,
                 detail="previous turn is still streaming",
             )
-        worker_messages = _build_chat_messages(prior, req.prompt)
+        if tool == "chat":
+            worker_messages = _build_chat_messages(prior, req.prompt)
         # Conversation may pin a default model; honor it when the call
-        # didn't override.
+        # didn't override. For image jobs we DO NOT inherit a
+        # chat-conversation's pinned LLM (that would re-trigger the
+        # tool/model mismatch above) — only inherit when the pinned
+        # model is in the same kind.
         if not req.model and conv_row["model"]:
-            req_model = conv_row["model"]
+            pinned = conv_row["model"]
+            pinned_kind = (
+                model_registry.get(pinned).kind
+                if model_registry.is_known(pinned)
+                and model_registry.get(pinned) is not None
+                else "chat"
+            )
+            if pinned_kind == tool:
+                req_model = pinned
+            else:
+                req_model = model_registry.DEFAULT_IMAGE_MODEL if tool == "image" else None
         else:
             req_model = req.model
     else:
@@ -466,6 +696,7 @@ def generate(req: GenerateRequest, request: Request):
         "prompt": req.prompt,
         "model": req_model,
         "submitted_at": submitted_at,
+        "tool": tool,
     }
     if worker_messages is not None:
         # The worker prefers messages[] (routed to Ollama /api/chat) when
@@ -474,6 +705,19 @@ def generate(req: GenerateRequest, request: Request):
         # envelope backward-compatible with any worker that's still on
         # the old build.
         job["messages"] = worker_messages
+    if tool == "image":
+        # Image-only knobs. Clamp width/height to sane bounds (multiple
+        # of 64 in [256, 1536]) so a malicious or buggy client can't
+        # ask the worker to spend 10 minutes on an 8K image. sd.cpp
+        # itself also requires multiples of 64.
+        params = req.image or _default_image_params()
+        job["image"] = {
+            "width": _clamp_image_dim(params.width),
+            "height": _clamp_image_dim(params.height),
+            "steps": max(1, min(50, int(params.steps))),
+            "seed": params.seed,
+            "negative_prompt": params.negative_prompt,
+        }
     # Store the ORIGINAL user message (not the prepended worker-prompt)
     # so /jobs/complete can replay only the new turn into the
     # conversation history.
@@ -484,6 +728,7 @@ def generate(req: GenerateRequest, request: Request):
         submitted_at,
         submitted_by,
         conversation_id=conversation_id,
+        tool=tool,
     )
     # Persist the user turn and an empty pending assistant turn now,
     # not at /jobs/complete time. This means: (a) a client that
@@ -522,7 +767,7 @@ def generate(req: GenerateRequest, request: Request):
         # when title is NULL/empty) so it's safe to call here even
         # though the message is now persisted earlier than before.
         db.set_conversation_title(conversation_id, req.prompt[:80].strip())
-    r.rpush(JOB_QUEUE, json.dumps(job))
+    r.rpush(job_queue_for(tool), json.dumps(job))
     idem.remember(idem_key, job_id)
     log.info(
         "queued job",
@@ -554,6 +799,36 @@ def _build_chat_messages(prior_messages, new_user_text: str) -> list[dict]:
         out.append({"role": role, "content": text})
     out.append({"role": "user", "content": (new_user_text or "").strip()})
     return out
+
+
+def _job_row_to_envelope(row) -> dict:
+    """Reconstruct the worker-facing job envelope from a jobs row.
+    Used when the in-flight processing-hash entry is missing (claim
+    raced with a reaper, or abandon arrived before claim).
+
+    Reconstructed envelope must match the shape /generate pushes —
+    no submitted_by_member_id (see the canary-detection comment in
+    /generate), tool carried through so requeue lands on the right
+    queue, and image_params restored to defaults for image jobs
+    (per-job params aren't persisted; a requeue after timeout may
+    therefore use defaults instead of the user's chosen width/steps —
+    a deliberate KISS tradeoff)."""
+    keys = row.keys() if hasattr(row, "keys") else []
+    tool = row["tool"] if "tool" in keys else "chat"
+    env: dict = {
+        "job_id": row["job_id"],
+        "prompt": row["prompt"],
+        "model": row["model"],
+        "submitted_at": row["submitted_at"],
+        "tool": tool,
+    }
+    if tool == "chat":
+        msgs = _rebuild_messages_for_requeue(row)
+        if msgs is not None:
+            env["messages"] = msgs
+    elif tool == "image":
+        env["image"] = _default_image_params().model_dump()
+    return env
 
 
 def _rebuild_messages_for_requeue(row) -> Optional[list[dict]]:
@@ -617,6 +892,13 @@ def result(job_id: str):
     # status stays 'pending'/'running' so the client keeps polling.
     partial_text = r.hget(JOB_PARTIALS, job_id)
     status = row["status"]
+    # Image jobs persist their result as messages.image_path (not on
+    # the jobs row). Look it up so the polling path can surface the
+    # PNG URL after a JOB_RESULTS eviction.
+    image_path: Optional[str] = None
+    msg = db.get_message_by_job(job_id)
+    if msg is not None and "image_path" in msg.keys():
+        image_path = msg["image_path"]
     return {
         "job_id": row["job_id"],
         "status": status,
@@ -630,8 +912,55 @@ def result(job_id: str):
         "attempts": row["attempts"],
         "error": row["error"],
         "submitted_by_member_id": submitted_by,
+        "image_path": image_path,
         "done": status in ("complete", "error"),
     }
+
+
+# ---------- image serving ----------
+@app.get("/images/{name}")
+def serve_image(name: str, request: Request):
+    """Serve a generated PNG. Ownership-checked: an authenticated caller
+    can only fetch images attached to a conversation they own (admin
+    bypass for moderation). Auth-off dev mode serves everything so
+    local development with no API_TOKEN still works.
+
+    The filename is the basename stored in messages.image_path
+    ({job_id}.png). We resolve the job → conversation → owner chain
+    on every request rather than baking a token into the URL so
+    revocation is automatic when a member is removed."""
+    # Path-traversal defense — filename must be plain.
+    if not re.fullmatch(r"[A-Za-z0-9_-]+\.png", name or ""):
+        raise HTTPException(status_code=400, detail="bad image name")
+    path = IMAGE_DIR / name
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="image not found")
+
+    if AUTH_ENABLED:
+        member = getattr(request.state, "member", None)
+        if member is None:
+            raise HTTPException(status_code=401, detail="unauthorized")
+        if member.role != "admin":
+            # Look up the job and walk to the conversation owner.
+            job_id = name[:-4]  # strip .png
+            job_row = db.get_job(job_id)
+            if job_row is None:
+                raise HTTPException(status_code=404, detail="image not found")
+            conv_id = (
+                job_row["conversation_id"]
+                if "conversation_id" in job_row.keys()
+                else None
+            )
+            if conv_id is None:
+                # Orphan image — no conversation to gate on. Refuse
+                # rather than leak; the only path that creates an
+                # orphan today is canary, which shouldn't produce
+                # images.
+                raise HTTPException(status_code=404, detail="image not found")
+            conv_row = db.get_conversation(conv_id)
+            if conv_row is None or conv_row["owner_member_id"] != member.member_id:
+                raise HTTPException(status_code=404, detail="image not found")
+    return FileResponse(str(path), media_type="image/png")
 
 
 # ---------- worker lifecycle ----------
@@ -711,12 +1040,18 @@ def heartbeat(req: HeartbeatRequest, request: Request):
 
 
 @app.post("/jobs/next")
-def next_job(req: WorkerIdent, request: Request):
+def next_job(req: JobNextRequest, request: Request):
     """HTTP-only job pickup for remote agents (e.g. the Windows gamer install).
-    Pops one job from the queue and returns it; the agent should immediately
-    POST /jobs/claim with the returned job_id."""
+    Pops one job from the per-tool queue and returns it; the agent should
+    immediately POST /jobs/claim with the returned job_id.
+
+    ``tool`` defaults to "chat" so legacy agents (no tool field in their
+    /jobs/next body) keep pulling chat jobs. Image-capable agents call
+    with tool="image" so they don't accidentally drain the chat queue
+    and stall it for the chat-only workers."""
     _require_worker_owner(request, req.worker_id)
-    raw = r.lpop(JOB_QUEUE)
+    tool = (req.tool or "chat").lower()
+    raw = r.lpop(job_queue_for(tool))
     if not raw:
         return {"job": None}
     try:
@@ -747,15 +1082,7 @@ def claim(req: JobClaimRequest, request: Request):
     if raw is None:
         row = db.get_job(req.job_id)
         if row:
-            original = {
-                "job_id": row["job_id"],
-                "prompt": row["prompt"],
-                "model": row["model"],
-                "submitted_at": row["submitted_at"],
-            }
-            msgs = _rebuild_messages_for_requeue(row)
-            if msgs is not None:
-                original["messages"] = msgs
+            original = _job_row_to_envelope(row)
 
     r.hset(
         JOB_PROCESSING,
@@ -796,20 +1123,15 @@ def abandon(req: JobClaimRequest, request: Request):
     if original is None:
         row = db.get_job(req.job_id)
         if row is not None:
-            # Reconstructed envelope must match the worker-facing shape
-            # we push from /generate — no submitted_by_member_id (see
-            # the comment there explaining the canary-detection issue).
-            original = {
-                "job_id": row["job_id"],
-                "prompt": row["prompt"],
-                "model": row["model"],
-                "submitted_at": row["submitted_at"],
-            }
-            msgs = _rebuild_messages_for_requeue(row)
-            if msgs is not None:
-                original["messages"] = msgs
+            original = _job_row_to_envelope(row)
     if original is not None:
-        r.rpush(JOB_QUEUE, json.dumps(original))
+        # Requeue to the original tool's queue so an abandoned image
+        # job doesn't end up in front of chat workers (which would
+        # then 'error' on every claim).
+        r.rpush(
+            job_queue_for(original.get("tool", "chat")),
+            json.dumps(original),
+        )
     r.hdel(JOB_PROCESSING, req.job_id)
     r.hdel(JOB_PARTIALS, req.job_id)
     r.hset(WORKER_STATUS, req.worker_id, "idle")
@@ -920,11 +1242,54 @@ def complete(req: JobCompleteRequest, request: Request):
         )
         return {"ok": True, "earnings": 0.0}
 
+    # Look up the original job row so we can branch image vs. chat
+    # before touching earnings + storage.
+    pre_complete_row = db.get_job(req.job_id)
+    pre_complete_tool = (
+        pre_complete_row["tool"]
+        if pre_complete_row is not None and "tool" in pre_complete_row.keys()
+        else "chat"
+    )
+
+    # Image jobs: decode + store the PNG, set image_path. Earnings are
+    # currently chat-token-priced; per-image pricing ships with the
+    # paid-customer slice (Phase 3b.ii). For MVP image earnings are
+    # flat-rated as if the job produced ~200 tokens of work — gives the
+    # contributor a non-zero credit without standing up a whole new
+    # pricing table.
+    image_path: Optional[str] = None
+    image_save_error: Optional[str] = None
+    if pre_complete_tool == "image" and req.status == "complete":
+        try:
+            image_path = _save_image_or_raise(req.job_id, req.image_b64)
+        except HTTPException:
+            # Re-raise — the worker sent malformed bytes; surface a 400.
+            raise
+        except Exception as e:
+            image_save_error = str(e)
+            log.warning(
+                "image save failed",
+                extra={
+                    "event": "image_save_failed",
+                    "job_id": req.job_id,
+                    "worker_id": req.worker_id,
+                },
+            )
+
     earnings = round(tokens * RATE_PER_TOKEN * WORKER_SHARE, 10) if req.status == "complete" else 0.0
+    if (
+        pre_complete_tool == "image"
+        and req.status == "complete"
+        and image_save_error is None
+    ):
+        # Flat-rate image earnings: treat each image as the rough work
+        # equivalent of a 200-token chat completion. Replaced by per-
+        # image pricing in Phase 3b.ii.
+        earnings = round(200 * RATE_PER_TOKEN * WORKER_SHARE, 10)
 
     payload = {
         "job_id": req.job_id,
-        "status": req.status,
+        "status": req.status if image_save_error is None else "error",
         "worker_id": req.worker_id,
         "model": req.model,
         "text": req.text,
@@ -932,8 +1297,10 @@ def complete(req: JobCompleteRequest, request: Request):
         "completion_tokens": tokens,
         "earnings": earnings,
         "duration_seconds": req.duration_seconds,
-        "error": req.error,
+        "error": image_save_error or req.error,
     }
+    if image_path:
+        payload["image_path"] = image_path
     r.hset(JOB_RESULTS, req.job_id, json.dumps(payload))
     r.hdel(JOB_PROCESSING, req.job_id)
     r.hdel(JOB_PARTIALS, req.job_id)
@@ -966,26 +1333,58 @@ def complete(req: JobCompleteRequest, request: Request):
     if conv_id:
         existing_msg = db.get_message_by_job(req.job_id)
         if existing_msg is not None:
-            if req.status == "complete":
+            terminal_status = (
+                "complete"
+                if req.status == "complete" and image_save_error is None
+                else "error"
+            )
+            if terminal_status == "complete":
+                # For image jobs the body text is the original prompt
+                # (we already stored that on the user message at enqueue
+                # time); the bubble itself is rendered as <img> off
+                # image_path. We persist the prompt as the assistant-
+                # bubble text too so a no-CSS fallback still shows
+                # something useful instead of an empty row.
+                bubble_text = (
+                    f"[image: {existing_msg['text'] or req.text or ''}]"
+                    if pre_complete_tool == "image"
+                    else (req.text or "")
+                )
                 db.finalize_message(
                     message_id=existing_msg["message_id"],
-                    text=req.text or "",
+                    text=bubble_text,
                     status="complete",
                     prompt_tokens=int(req.prompt_tokens or 0),
                     completion_tokens=tokens,
                     model=req.model,
+                    image_path=image_path,
                 )
             else:
                 db.finalize_message(
                     message_id=existing_msg["message_id"],
-                    text=(req.error or "Generation failed.")[:500],
+                    text=(
+                        image_save_error or req.error or "Generation failed."
+                    )[:500],
                     status="error",
                     model=req.model,
                 )
         db.touch_conversation(conv_id, now)
 
-    if req.status == "complete" and tokens > 0:
-        db.add_earnings(req.worker_id, tokens, earnings)
+    # Credit on completion. Chat jobs credit by completion_tokens; image
+    # jobs use the flat earnings computed above with a synthesized
+    # token count so the per-member-usage rollup still moves (the
+    # member's daily token quota is what gates additional jobs; not
+    # crediting image work would make image generation effectively
+    # free against the cap).
+    creditable_tokens = tokens
+    if (
+        pre_complete_tool == "image"
+        and req.status == "complete"
+        and image_save_error is None
+    ):
+        creditable_tokens = 200
+    if req.status == "complete" and creditable_tokens > 0 and image_save_error is None:
+        db.add_earnings(req.worker_id, creditable_tokens, earnings)
         submitter = (
             job_row["submitted_by_member_id"]
             if job_row is not None and "submitted_by_member_id" in job_row.keys()
@@ -996,7 +1395,7 @@ def complete(req: JobCompleteRequest, request: Request):
                 submitter,
                 now,
                 tokens_in=int(req.prompt_tokens or 0),
-                tokens_out=tokens,
+                tokens_out=creditable_tokens,
             )
         # mirror to redis hash for backwards compat
         existing = r.hget(WORKER_EARNINGS, req.worker_id)
@@ -1009,7 +1408,7 @@ def complete(req: JobCompleteRequest, request: Request):
             cur = {"earnings": 0.0, "jobs": 0, "tokens": 0}
         cur["earnings"] = round(float(cur.get("earnings", 0)) + earnings, 10)
         cur["jobs"] = int(cur.get("jobs", 0)) + 1
-        cur["tokens"] = int(cur.get("tokens", 0)) + tokens
+        cur["tokens"] = int(cur.get("tokens", 0)) + creditable_tokens
         cur["worker_id"] = req.worker_id
         r.hset(WORKER_EARNINGS, req.worker_id, json.dumps(cur))
 
@@ -1116,6 +1515,7 @@ def _message_row_to_dict(row) -> dict:
         "prompt_tokens": row["prompt_tokens"],
         "completion_tokens": row["completion_tokens"],
         "created_at": row["created_at"],
+        "image_path": row["image_path"] if "image_path" in keys else None,
     }
 
 

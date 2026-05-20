@@ -104,6 +104,8 @@ class BootstrapInferenceShortCircuitTests(unittest.TestCase):
             bootstrap_model="llama3.2:1b",
             bootstrap_ollama_url="http://localhost:11434",
             bootstrap_mirror_base_url=None,
+            bootstrap_image_enabled=True,
+            bootstrap_image_model="sd1.5",
             model=None,
             worker_id=None,
             api_token=None,
