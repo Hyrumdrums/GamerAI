@@ -416,13 +416,12 @@ def generate(req: GenerateRequest, request: Request):
             )
 
     # Conversation context: if the caller passed conversation_id, load
-    # the prior turns and prepend them to the worker-facing prompt.
-    # Ownership is enforced — a caller cannot inject into someone else's
-    # conversation. The original (un-prepended) prompt is stored
-    # separately so it can be appended back as a user message on
-    # completion.
+    # the prior turns and build a chat messages[] array for the worker
+    # (Ollama /api/chat) so the model gets its own chat template applied
+    # instead of plain-text autocompletion. Ownership is enforced — a
+    # caller cannot inject into someone else's conversation.
     conversation_id: Optional[str] = req.conversation_id
-    worker_prompt = req.prompt
+    worker_messages: Optional[list[dict]] = None
     if conversation_id:
         conv_row = db.get_conversation(conversation_id)
         if conv_row is None:
@@ -444,8 +443,7 @@ def generate(req: GenerateRequest, request: Request):
                 status_code=409,
                 detail="previous turn is still streaming",
             )
-        if prior:
-            worker_prompt = _format_chat_prompt(prior, req.prompt)
+        worker_messages = _build_chat_messages(prior, req.prompt)
         # Conversation may pin a default model; honor it when the call
         # didn't override.
         if not req.model and conv_row["model"]:
@@ -465,10 +463,17 @@ def generate(req: GenerateRequest, request: Request):
     # when crediting earnings / member_usage on /jobs/complete.
     job = {
         "job_id": job_id,
-        "prompt": worker_prompt,
+        "prompt": req.prompt,
         "model": req_model,
         "submitted_at": submitted_at,
     }
+    if worker_messages is not None:
+        # The worker prefers messages[] (routed to Ollama /api/chat) when
+        # present, falling back to the bare prompt for single-shot
+        # generations and canaries. Keeping both fields keeps the
+        # envelope backward-compatible with any worker that's still on
+        # the old build.
+        job["messages"] = worker_messages
     # Store the ORIGINAL user message (not the prepended worker-prompt)
     # so /jobs/complete can replay only the new turn into the
     # conversation history.
@@ -531,25 +536,64 @@ def generate(req: GenerateRequest, request: Request):
     )
 
 
-def _format_chat_prompt(prior_messages, new_user_text: str) -> str:
-    """Concatenate prior turns into a single chat-style prompt the
-    underlying model can consume. We keep this server-side so the
-    worker's /api/generate contract doesn't change (no switch to
-    Ollama's /api/chat). Model-instruction-tuned LLMs handle this
-    format well; we'll switch to /api/chat with role-aware messages
-    when we have streaming on the worker side anyway."""
-    lines = []
+def _build_chat_messages(prior_messages, new_user_text: str) -> list[dict]:
+    """Build the Ollama /api/chat messages[] array from the persisted
+    conversation rows plus the new user turn. Pending/empty assistant
+    rows from a previous-failed-but-not-yet-retried turn are skipped so
+    the model doesn't see a stray empty-assistant message in the middle
+    of the history."""
+    out: list[dict] = []
     for m in prior_messages:
         role = m["role"]
         text = (m["text"] or "").strip()
-        if role == "user":
-            lines.append(f"User: {text}")
-        elif role == "assistant":
-            lines.append(f"Assistant: {text}")
-        # silently drop unknown roles
-    lines.append(f"User: {new_user_text.strip()}")
-    lines.append("Assistant:")
-    return "\n\n".join(lines)
+        status = m["status"] if "status" in m.keys() else "complete"
+        if role not in ("user", "assistant", "system"):
+            continue
+        if role == "assistant" and (status != "complete" or not text):
+            continue
+        out.append({"role": role, "content": text})
+    out.append({"role": "user", "content": (new_user_text or "").strip()})
+    return out
+
+
+def _rebuild_messages_for_requeue(row) -> Optional[list[dict]]:
+    """When a worker abandons or times out a job, the next worker needs
+    the same chat envelope the original /generate produced. We rebuild
+    it from the persisted conversation messages so requeued jobs still
+    hit /api/chat instead of silently degrading to /api/generate.
+
+    Returns ``None`` for jobs that were never part of a conversation
+    (canaries, /generate calls with no ``conversation_id``) — those
+    keep the legacy single-prompt path."""
+    if row is None:
+        return None
+    keys = row.keys() if hasattr(row, "keys") else []
+    if "conversation_id" not in keys:
+        return None
+    conversation_id = row["conversation_id"]
+    if not conversation_id:
+        return None
+    all_msgs = db.list_messages(conversation_id)
+    # The user message that triggered this job is the latest non-empty
+    # user row; everything earlier than its assistant pair is the
+    # history. Since the coordinator stores the user turn at enqueue
+    # time, walking from the back picks it up reliably even when the
+    # in-flight assistant row is still pending/error.
+    new_user_text = row["prompt"] or ""
+    prior: list = []
+    found_match = False
+    for m in all_msgs:
+        if (
+            not found_match
+            and m["role"] == "user"
+            and (m["text"] or "") == new_user_text
+        ):
+            found_match = True
+            continue
+        if found_match:
+            continue
+        prior.append(m)
+    return _build_chat_messages(prior, new_user_text)
 
 
 @app.get("/result/{job_id}")
@@ -709,6 +753,9 @@ def claim(req: JobClaimRequest, request: Request):
                 "model": row["model"],
                 "submitted_at": row["submitted_at"],
             }
+            msgs = _rebuild_messages_for_requeue(row)
+            if msgs is not None:
+                original["messages"] = msgs
 
     r.hset(
         JOB_PROCESSING,
@@ -758,6 +805,9 @@ def abandon(req: JobClaimRequest, request: Request):
                 "model": row["model"],
                 "submitted_at": row["submitted_at"],
             }
+            msgs = _rebuild_messages_for_requeue(row)
+            if msgs is not None:
+                original["messages"] = msgs
     if original is not None:
         r.rpush(JOB_QUEUE, json.dumps(original))
     r.hdel(JOB_PROCESSING, req.job_id)
@@ -1217,7 +1267,7 @@ def retry_message(message_id: str, request: Request):
             status_code=500,
             detail="cannot find the user message that produced this failure",
         )
-    worker_prompt = _format_chat_prompt(prior, user_msg["text"] or "")
+    worker_messages = _build_chat_messages(prior, user_msg["text"] or "")
 
     # Pick a model: explicit conversation default → original message
     # model → coordinator default at job-fetch time. Keeping the same
@@ -1243,9 +1293,10 @@ def retry_message(message_id: str, request: Request):
     db.touch_conversation(msg["conversation_id"], submitted_at)
     job = {
         "job_id": new_job_id,
-        "prompt": worker_prompt,
+        "prompt": user_msg["text"] or "",
         "model": use_model,
         "submitted_at": submitted_at,
+        "messages": worker_messages,
     }
     r.rpush(JOB_QUEUE, json.dumps(job))
     log.info(

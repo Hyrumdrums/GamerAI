@@ -36,6 +36,15 @@ import psutil
 
 IS_WINDOWS = platform.system() == "Windows"
 
+# Human-readable agent version. Bump this in the same commit as any
+# behavior change you want a contributor to be able to verify on
+# their machine — it's surfaced in the console banner and in the
+# periodic status line so a manually-launched agent prints the version
+# the moment it starts. The CI-generated version.txt (short-sha +
+# build timestamp) is still what the self-updater diffs against;
+# AGENT_VERSION is just the human-facing label.
+AGENT_VERSION = "1.0.1"
+
 # ---------------------------------------------------------------------------
 # Idle detection
 # ---------------------------------------------------------------------------
@@ -1076,8 +1085,18 @@ def estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4) if text else 0
 
 
-def run_inference(prompt: str, model: Optional[str], log: logging.Logger) -> dict:
-    """Run the prompt against a local Ollama if OLLAMA_URL is set, otherwise mock."""
+def run_inference(
+    prompt: str,
+    model: Optional[str],
+    log: logging.Logger,
+    messages: Optional[list] = None,
+) -> dict:
+    """Run a prompt (or chat-style ``messages`` list) against a local
+    Ollama if OLLAMA_URL is set, otherwise return a mock response.
+
+    When ``messages`` is provided the call goes to ``/api/chat`` so the
+    model's chat template is applied (proper multi-turn behavior).
+    Single-shot prompts keep the legacy ``/api/generate`` path."""
     ollama_url = os.getenv("OLLAMA_URL")
     use_model = model or os.getenv("MODEL") or "llama3.2:1b"
     if not ollama_url:
@@ -1091,13 +1110,30 @@ def run_inference(prompt: str, model: Optional[str], log: logging.Logger) -> dic
         }
     try:
         with httpx.Client(timeout=600) as c:
-            resp = c.post(
-                f"{ollama_url.rstrip('/')}/api/generate",
-                json={"model": use_model, "prompt": prompt, "stream": False},
-            )
+            if messages:
+                resp = c.post(
+                    f"{ollama_url.rstrip('/')}/api/chat",
+                    json={
+                        "model": use_model,
+                        "messages": messages,
+                        "stream": False,
+                    },
+                )
+            else:
+                resp = c.post(
+                    f"{ollama_url.rstrip('/')}/api/generate",
+                    json={
+                        "model": use_model,
+                        "prompt": prompt,
+                        "stream": False,
+                    },
+                )
             resp.raise_for_status()
             data = resp.json()
-        text = data.get("response", "")
+        if messages:
+            text = (data.get("message") or {}).get("content", "")
+        else:
+            text = data.get("response", "")
         return {
             "text": text,
             "prompt_tokens": int(data.get("prompt_eval_count") or estimate_tokens(prompt)),
@@ -1139,6 +1175,24 @@ def print_earnings(state: dict, log: logging.Logger) -> None:
     )
 
 
+# How often the main loop logs a "status: idle/busy/offline" line for
+# the operator. This is in addition to the per-event lines (job claim,
+# job complete, etc.) — the idea is that a quiet machine still shows a
+# heartbeat in the console window every ~60s so you can tell at a
+# glance that the agent is running and on what version.
+STATUS_LINE_INTERVAL_SECONDS = 60.0
+
+
+def log_status_line(
+    log: logging.Logger, worker_id: str, status: str, reason: str = "",
+) -> None:
+    suffix = f" — {reason}" if reason else ""
+    log.info(
+        "status: %s | worker=%s | v%s (build %s)%s",
+        status, worker_id, AGENT_VERSION, current_version(), suffix,
+    )
+
+
 def main_loop(
     cfg: Config,
     coord: Coordinator,
@@ -1149,6 +1203,12 @@ def main_loop(
 ) -> None:
     last_heartbeat = 0.0
     last_earnings_print = time.time()
+    # Periodic heartbeat-in-the-console: the operator wants to glance
+    # at the agent window and immediately see status + version. We
+    # log on every state transition AND every STATUS_LINE_INTERVAL_SECONDS
+    # so a quiet machine still emits a line.
+    last_status_line = 0.0
+    last_logged_status: Optional[str] = None
     # Tracks whether the last main-loop iteration completed a real job.
     # Used to differentiate a plain "user became active" message from
     # "user became active right after a job completed" — the latter is
@@ -1156,6 +1216,17 @@ def main_loop(
     # surfacing it gives the contributor confidence that their last
     # work landed before the machine went offline.
     just_drained_job_id: Optional[str] = None
+
+    def emit_status(current: str, reason: str = "") -> None:
+        nonlocal last_status_line, last_logged_status
+        now2 = time.time()
+        if (
+            current != last_logged_status
+            or now2 - last_status_line >= STATUS_LINE_INTERVAL_SECONDS
+        ):
+            log_status_line(log, coord.worker_id, current, reason)
+            last_logged_status = current
+            last_status_line = now2
 
     while True:
         # The updater thread can signal a graceful exit when it has
@@ -1184,6 +1255,7 @@ def main_loop(
                 just_drained_job_id = None
             coord.heartbeat("offline")
             last_heartbeat = time.time()
+            emit_status("offline", reason)
             time.sleep(cfg.polling_interval)
             continue
 
@@ -1191,6 +1263,7 @@ def main_loop(
         # drain message, clear the breadcrumb so the next user-active
         # transition doesn't reference a stale job_id.
         just_drained_job_id = None
+        emit_status("idle", reason)
 
         did_work, processed_job_id = process_one(cfg, coord, state, log)
         if did_work:
@@ -1229,7 +1302,12 @@ def process_one(
 
     started = time.time()
     try:
-        result = run_inference(prompt, cfg.model or job.get("model"), log)
+        result = run_inference(
+            prompt,
+            cfg.model or job.get("model"),
+            log,
+            messages=job.get("messages"),
+        )
         duration = round(time.time() - started, 3)
         out = coord.complete(
             {
@@ -1285,6 +1363,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="process at most one job and exit (useful for tests)")
     p.add_argument("--status", action="store_true",
                    help="print local earnings totals and exit")
+    p.add_argument("--version", action="store_true",
+                   help="print agent version + build id and exit")
     return p.parse_args(argv)
 
 
@@ -1343,13 +1423,18 @@ def _print_greeting(once: bool, status: bool) -> None:
     freshly double-clicked agent.exe shows text immediately instead
     of a blank console while PyInstaller finishes extracting itself.
     Suppressed for --background (no console) and --status (the user
-    asked for a focused report)."""
+    asked for a focused report).
+
+    The version line is the load-bearing bit: after a self-update the
+    contributor (or you, when debugging) should see the new version
+    here without having to dig through %APPDATA% logs."""
     if once or status:
         return
     try:
+        build = current_version()
         sys.stdout.write(
             "\n"
-            "GamerAI agent: starting up...\n"
+            f"GamerAI agent v{AGENT_VERSION} (build {build})\n"
             "Logs:    %APPDATA%\\GamerAI\\logs\\agent.log\n"
             "\n"
         )
@@ -1360,6 +1445,9 @@ def _print_greeting(once: bool, status: bool) -> None:
 
 def main(argv: Optional[list[str]] = None) -> int:
     args = parse_args(argv if argv is not None else sys.argv[1:])
+    if args.version:
+        print(f"GamerAI agent v{AGENT_VERSION} (build {current_version()})")
+        return 0
     if not args.background:
         _print_greeting(args.once, args.status)
     cfg = Config.load(args.config if args.config.exists() else None)
@@ -1368,6 +1456,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     log = setup_logging(args.background)
 
     if args.status:
+        print(f"version:   v{AGENT_VERSION} (build {current_version()})")
         print(f"worker_id: {worker_id}")
         print(f"jobs:      {state.get('jobs', 0)}")
         print(f"tokens:    {state.get('tokens', 0)}")
@@ -1388,8 +1477,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 2
     cfg.api_token = token
 
-    log.info("agent starting on %s — worker_id=%s version=%s",
-             platform.platform(), worker_id, current_version())
+    log.info(
+        "GamerAI agent v%s (build %s) starting on %s — worker_id=%s",
+        AGENT_VERSION, current_version(), platform.platform(), worker_id,
+    )
     log.info("coordinator=%s polling=%ss idle threshold=%ss cpu<%s%% auth=%s",
              cfg.coordinator_url, cfg.polling_interval,
              cfg.min_input_idle_seconds, cfg.max_cpu_percent,

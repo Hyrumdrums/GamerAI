@@ -154,11 +154,18 @@ def run_inference(
     model: Optional[str],
     http: httpx.Client,
     on_partial=None,
+    messages: Optional[list[dict]] = None,
 ) -> dict:
     """Generate a response, streaming intermediate text via ``on_partial``
     (called with the FULL accumulated text, not a delta). The final
     return is the same shape as before so /jobs/complete callers don't
-    need to change."""
+    need to change.
+
+    When ``messages`` is provided the call is routed to Ollama's
+    ``/api/chat`` endpoint, so the model's own chat template is applied
+    instead of feeding it a hand-rolled ``User:/Assistant:`` transcript.
+    Single-shot jobs (canaries, /generate without a conversation) keep
+    the legacy ``/api/generate`` path."""
     if MOCK_INFERENCE:
         # Push every character — no throttle. The mock is a UX demo,
         # not a load test, and flushing per char makes the streaming
@@ -180,12 +187,13 @@ def run_inference(
     prompt_tokens: Optional[int] = None
     completion_tokens: Optional[int] = None
     last_flush = 0.0
-    with http.stream(
-        "POST",
-        f"{OLLAMA_URL}/api/generate",
-        json={"model": use_model, "prompt": prompt, "stream": True},
-        timeout=600,
-    ) as resp:
+    if messages:
+        endpoint = f"{OLLAMA_URL}/api/chat"
+        payload = {"model": use_model, "messages": messages, "stream": True}
+    else:
+        endpoint = f"{OLLAMA_URL}/api/generate"
+        payload = {"model": use_model, "prompt": prompt, "stream": True}
+    with http.stream("POST", endpoint, json=payload, timeout=600) as resp:
         resp.raise_for_status()
         for line in resp.iter_lines():
             if not line:
@@ -194,7 +202,15 @@ def run_inference(
                 chunk = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            token = chunk.get("response", "")
+            # /api/chat streams {"message": {"role": "assistant",
+            # "content": "..."}, "done": ...}; /api/generate streams
+            # {"response": "...", "done": ...}. Read whichever shape
+            # the current chunk carries.
+            token = (
+                (chunk.get("message") or {}).get("content", "")
+                if messages
+                else chunk.get("response", "")
+            )
             if token:
                 text += token
             if chunk.get("done"):
@@ -251,7 +267,11 @@ def process_job(r: redis.Redis, http: httpx.Client, job: dict, last_job_finished
         maybe_simulate_cold_start(last_job_finished)
         simulate_network_delay()
         result = run_inference(
-            job["prompt"], job.get("model"), http, on_partial=push_partial,
+            job["prompt"],
+            job.get("model"),
+            http,
+            on_partial=push_partial,
+            messages=job.get("messages"),
         )
         duration = round(time.time() - started, 3)
         post(

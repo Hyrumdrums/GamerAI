@@ -338,22 +338,46 @@ class ConversationCompleteAppendsTests(_BaseE2E):
         self.assertEqual(info["title"], "what's the capital of france?")
 
 
-class ChatPromptFormatTests(_BaseE2E):
-    """Pure-function test on _format_chat_prompt. Inherits the
-    boot-the-coordinator scaffolding so env (DB_PATH etc.) is set
-    before any coordinator.* import."""
+class ChatMessagesBuilderTests(_BaseE2E):
+    """Pure-function test on _build_chat_messages. The coordinator
+    sends this messages[] array to Ollama's /api/chat so the model's
+    own chat template is applied — no more hand-rolled User:/Assistant:
+    transcript that the model would echo back at us."""
 
-    def test_concatenates_turns(self):
-        _format_chat_prompt = self.coord_main._format_chat_prompt
+    def test_builds_role_tagged_messages(self):
+        _build_chat_messages = self.coord_main._build_chat_messages
         prior = [
-            {"role": "user", "text": "hi"},
-            {"role": "assistant", "text": "hello!"},
+            {"role": "user", "text": "hi", "status": "complete"},
+            {"role": "assistant", "text": "hello!", "status": "complete"},
         ]
-        out = _format_chat_prompt(prior, "how are you?")
-        self.assertIn("User: hi", out)
-        self.assertIn("Assistant: hello!", out)
-        self.assertIn("User: how are you?", out)
-        self.assertTrue(out.rstrip().endswith("Assistant:"))
+        out = _build_chat_messages(prior, "how are you?")
+        self.assertEqual(
+            out,
+            [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello!"},
+                {"role": "user", "content": "how are you?"},
+            ],
+        )
+
+    def test_skips_empty_pending_assistant(self):
+        # A failed-but-not-retried turn leaves an empty/pending assistant
+        # row in the history. It must NOT appear in the messages array
+        # we send to the model, or we'd inject a blank assistant turn
+        # mid-conversation.
+        _build_chat_messages = self.coord_main._build_chat_messages
+        prior = [
+            {"role": "user", "text": "first", "status": "complete"},
+            {"role": "assistant", "text": "", "status": "pending"},
+        ]
+        out = _build_chat_messages(prior, "retry please")
+        self.assertEqual(
+            out,
+            [
+                {"role": "user", "content": "first"},
+                {"role": "user", "content": "retry please"},
+            ],
+        )
 
 
 class StreamingPersistenceTests(_BaseE2E):
