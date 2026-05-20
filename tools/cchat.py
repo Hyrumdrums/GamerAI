@@ -38,7 +38,10 @@ import httpx
 DEFAULT_BASE = os.environ.get("GAMERAI_BASE", "https://ai.dallinlayton.com")
 POLL_INTERVAL_SECONDS = 0.2
 SUBMIT_TIMEOUT_SECONDS = 15.0
-GENERATE_OVERALL_TIMEOUT_SECONDS = 300.0
+# Worker has a ~60s input-idle gate before it claims a job, plus the
+# inference itself. 600s covers a sleepy worker + a long generation
+# without giving up too eagerly during interactive use.
+GENERATE_OVERALL_TIMEOUT_SECONDS = 600.0
 
 
 def _die(msg: str, code: int = 1) -> None:
