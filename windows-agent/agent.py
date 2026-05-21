@@ -43,7 +43,7 @@ IS_WINDOWS = platform.system() == "Windows"
 # the moment it starts. The CI-generated version.txt (short-sha +
 # build timestamp) is still what the self-updater diffs against;
 # AGENT_VERSION is just the human-facing label.
-AGENT_VERSION = "1.1.3"
+AGENT_VERSION = "1.1.4"
 
 # ---------------------------------------------------------------------------
 # Idle detection
@@ -2049,6 +2049,298 @@ def process_one(
 # ---------------------------------------------------------------------------
 # Entry
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# --diagnose
+# ---------------------------------------------------------------------------
+# Process names of AV products commonly seen on contributor machines.
+# Used by the diagnose command to call out known-problematic combos
+# (Avast in particular routinely blocks auto-updates). Heuristic only —
+# absence here doesn't mean "no AV running."
+_AV_PROCESS_HINTS: dict[str, str] = {
+    # Avast / AVG (shared engine)
+    "avastsvc.exe": "Avast Service",
+    "avastui.exe": "Avast UI",
+    "aswidsagent.exe": "Avast Web Shield",
+    "avgsvc.exe": "AVG Service",
+    "avgui.exe": "AVG UI",
+    # Microsoft Defender
+    "msmpeng.exe": "Windows Defender",
+    "nissrv.exe": "Defender Network Inspection",
+    # Norton
+    "nortonsecurity.exe": "Norton Security",
+    "ns.exe": "Norton",
+    # McAfee
+    "mcshield.exe": "McAfee Shield",
+    "mcuicnt.exe": "McAfee UI",
+    # Bitdefender
+    "bdservicehost.exe": "Bitdefender Service",
+    "vsserv.exe": "Bitdefender",
+    # Kaspersky
+    "avp.exe": "Kaspersky",
+    # ESET
+    "ekrn.exe": "ESET Service",
+}
+
+
+def _detect_av() -> list[str]:
+    """Enumerate known AV processes by exact name match. Returns the
+    set of human-readable labels found. Empty list on non-Windows."""
+    if not IS_WINDOWS:
+        return []
+    found: set[str] = set()
+    try:
+        for proc in psutil.process_iter(["name"]):
+            name = (proc.info.get("name") or "").lower()
+            label = _AV_PROCESS_HINTS.get(name)
+            if label:
+                found.add(label)
+    except (psutil.AccessDenied, psutil.NoSuchProcess, RuntimeError):
+        pass
+    return sorted(found)
+
+
+def cmd_diagnose(cfg: Config) -> int:
+    """Sectioned self-check report. Designed to compress the multi-step
+    "where's the agent installed, is it talking to the coordinator,
+    is the image stack present, what version is on disk, is AV doing
+    something" diagnostic dance into one command.
+
+    Side-effect-free: does NOT register with the coordinator, does NOT
+    trigger any bootstrap downloads, does NOT mutate state.json.
+    Returns 0 if every check is OK or WARN, 1 if any check is FAIL.
+    """
+    fails = 0
+    warns = 0
+
+    def section(name: str) -> None:
+        print(name)
+
+    def ok(line: str) -> None:
+        print(f"  OK   {line}")
+
+    def warn(line: str) -> None:
+        nonlocal warns
+        print(f"  WARN {line}")
+        warns += 1
+
+    def fail(line: str) -> None:
+        nonlocal fails
+        print(f"  FAIL {line}")
+        fails += 1
+
+    def info(label: str, value: str) -> None:
+        print(f"  {label:<14} {value}")
+
+    print("GamerAI Agent Diagnostic Report")
+    print("=" * 40)
+    print()
+
+    # ---- Binary ---------------------------------------------------------
+    section("Binary")
+    info("version", f"v{AGENT_VERSION} (build {current_version()})")
+    if getattr(sys, "frozen", False):
+        path = Path(sys.executable).resolve()
+        info("install path", str(path))
+        try:
+            local_appdata = (
+                Path(os.getenv("LOCALAPPDATA")) if os.getenv("LOCALAPPDATA") else None
+            )
+            downloads = Path.home() / "Downloads"
+            if downloads in path.parents:
+                warn(
+                    f"running from %USERPROFILE%\\Downloads — AV scans "
+                    f"this dir aggressively. Consider moving the agent "
+                    f"to {local_appdata / 'Programs' / 'GamerAI Agent'} "
+                    f"if available."
+                )
+            elif local_appdata is not None and local_appdata in path.parents:
+                ok("running from %LOCALAPPDATA% (AV-friendly)")
+            else:
+                info("location", "non-standard install path")
+        except OSError:
+            pass
+    else:
+        info("running from", "python source (dev mode)")
+    print()
+
+    # ---- Configuration --------------------------------------------------
+    section("Configuration")
+    info("coordinator", cfg.coordinator_url)
+    info("auth", "configured" if cfg.api_token else "MISSING")
+    if not cfg.api_token:
+        fail(
+            "no api_token configured — agent cannot register or claim "
+            "jobs. Edit %APPDATA%\\GamerAI\\state.json or config.json."
+        )
+    # Use the raw state value to avoid resolve_worker_id's side effect
+    # of WRITING a new worker_id to state.json. Diagnose must be read-only.
+    state = load_state()
+    info(
+        "worker_id",
+        state.get("worker_id") or cfg.worker_id or "(none — first run will allocate)",
+    )
+    print()
+
+    # ---- Coordinator connectivity --------------------------------------
+    section("Coordinator connectivity")
+    auth_headers = (
+        {"Authorization": f"Bearer {cfg.api_token}"} if cfg.api_token else {}
+    )
+    try:
+        t0 = time.time()
+        with httpx.Client(timeout=10.0) as c:
+            r = c.get(f"{cfg.coordinator_url}/health")
+        dt_ms = int((time.time() - t0) * 1000)
+        if r.status_code == 200:
+            ok(f"/health returned 200 in {dt_ms}ms")
+        else:
+            fail(f"/health returned {r.status_code} in {dt_ms}ms")
+    except Exception as e:
+        fail(f"/health unreachable: {e}")
+    if cfg.api_token:
+        try:
+            with httpx.Client(timeout=10.0, headers=auth_headers) as c:
+                r = c.get(f"{cfg.coordinator_url}/workers")
+            if r.status_code == 200:
+                workers = (r.json() or {}).get("workers") or []
+                wid = state.get("worker_id") or cfg.worker_id
+                mine = next((w for w in workers if w.get("worker_id") == wid), None)
+                if mine is not None:
+                    secs = mine.get("seconds_since_heartbeat")
+                    caps = mine.get("capabilities") or {}
+                    tools = caps.get("tools") or ["chat"]
+                    if secs is not None and secs < 30:
+                        ok(f"worker registered (last heartbeat: {secs}s ago)")
+                    else:
+                        warn(
+                            f"worker registered but stale "
+                            f"(last heartbeat: {secs}s ago)"
+                        )
+                    info("advertised tools", ", ".join(tools))
+                else:
+                    warn(
+                        f"worker_id {wid!r} not in /workers — will "
+                        f"register on next agent run"
+                    )
+            elif r.status_code == 401:
+                fail("/workers returned 401 — api_token rejected by coordinator")
+            else:
+                warn(f"/workers returned {r.status_code}")
+        except Exception as e:
+            warn(f"could not query /workers: {e}")
+    print()
+
+    # ---- Ollama / chat tool --------------------------------------------
+    section("Ollama (chat tool)")
+    ollama_url = (os.getenv("OLLAMA_URL") or cfg.bootstrap_ollama_url).rstrip("/")
+    info("url", ollama_url)
+    try:
+        with httpx.Client(timeout=3.0) as c:
+            r = c.get(f"{ollama_url}/api/tags")
+        if r.status_code == 200:
+            tags = (r.json() or {}).get("models") or []
+            ok(f"API responding ({len(tags)} model(s) loaded)")
+            target = cfg.bootstrap_model
+            if any(t.get("name") == target for t in tags):
+                ok(f"{target} present")
+            else:
+                fail(
+                    f"{target} not installed — chat jobs will fail. "
+                    f"Run `ollama pull {target}` or let the next agent "
+                    f"start re-bootstrap."
+                )
+        else:
+            fail(f"/api/tags returned {r.status_code}")
+    except Exception as e:
+        fail(f"/api/tags unreachable: {e}")
+    print()
+
+    # ---- Image generation ----------------------------------------------
+    section("Image generation (sd.cpp)")
+    info("install dir", str(sd_install_dir()))
+    if not cfg.bootstrap_image_enabled:
+        warn(
+            "image bootstrap disabled in config — agent will advertise "
+            "chat only"
+        )
+    else:
+        for fname in SD_RUNTIME_FILES:
+            p = sd_install_dir() / fname
+            if p.exists():
+                ok(f"{fname} present ({p.stat().st_size / (1024 * 1024):.1f} MB)")
+            else:
+                fail(f"{fname} missing — image jobs will fail")
+        model = sd_model_path(cfg.bootstrap_image_model)
+        if model.exists():
+            ok(f"{model.name} present ({model.stat().st_size / (1024 * 1024):.1f} MB)")
+        else:
+            fail(f"{model.name} missing — image jobs will fail")
+    print()
+
+    # ---- State ----------------------------------------------------------
+    section("State")
+    info("jobs done", str(int(state.get("jobs", 0))))
+    info("tokens", str(int(state.get("tokens", 0))))
+    info("earnings", f"${float(state.get('earnings_usd', 0.0)):.6f}")
+    info("last tool", str(state.get("last_tool") or "(none yet)"))
+    print()
+
+    # ---- Recent auto-update --------------------------------------------
+    section("Recent auto-update")
+    marker_found = False
+    for marker in (
+        local_state_dir() / "update-failed.txt",
+        state_dir() / "update-failed.txt",
+    ):
+        if not marker.exists():
+            continue
+        marker_found = True
+        try:
+            text = marker.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            warn(f"failure marker present but unreadable: {marker}")
+            continue
+        warn(f"failure marker at {marker}:")
+        for line in text.splitlines()[-5:]:
+            print(f"           {line.strip()[:120]}")
+    if not marker_found:
+        ok("no pending failure marker")
+    print()
+
+    # ---- System / AV ----------------------------------------------------
+    section("System")
+    info("OS", platform.platform())
+    av = _detect_av()
+    if av:
+        info("AV detected", ", ".join(av))
+        avast_running = any("avast" in a.lower() or "avg" in a.lower() for a in av)
+        if avast_running:
+            warn(
+                "Avast/AVG detected — known to interfere with auto-update. "
+                "Exclude %LOCALAPPDATA%\\Programs\\GamerAI Agent\\ and "
+                "%LOCALAPPDATA%\\GamerAI\\updates\\ from real-time scanning "
+                "if updates keep failing."
+            )
+    else:
+        info("AV detected", "none recognized")
+    print()
+
+    # ---- Log file -------------------------------------------------------
+    section("Log file")
+    log_path = logs_dir() / "agent.log"
+    if log_path.exists():
+        info("path", str(log_path))
+        info("size", f"{log_path.stat().st_size / (1024 * 1024):.2f} MB")
+    else:
+        warn(f"log file missing at {log_path}")
+    print()
+
+    # ---- Summary --------------------------------------------------------
+    print("=" * 40)
+    print(f"Diagnostic complete. {fails} error(s), {warns} warning(s).")
+    return 1 if fails > 0 else 0
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="GamerAI Windows agent")
     here = Path(__file__).resolve().parent
@@ -2061,6 +2353,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="print local earnings totals and exit")
     p.add_argument("--version", action="store_true",
                    help="print agent version + build id and exit")
+    p.add_argument("--diagnose", action="store_true",
+                   help="run a self-check (config, coordinator, ollama, "
+                        "image stack, AV) and print a report")
     return p.parse_args(argv)
 
 
@@ -2144,6 +2439,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.version:
         print(f"GamerAI agent v{AGENT_VERSION} (build {current_version()})")
         return 0
+    if args.diagnose:
+        # Diagnose loads config but skips logging setup + worker_id
+        # allocation. Both write to disk; diagnose must be read-only.
+        cfg = Config.load(args.config if args.config.exists() else None)
+        return cmd_diagnose(cfg)
     if not args.background:
         _print_greeting(args.once, args.status)
     cfg = Config.load(args.config if args.config.exists() else None)
