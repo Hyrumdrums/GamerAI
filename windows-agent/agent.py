@@ -24,7 +24,6 @@ import platform
 import socket
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import uuid
@@ -44,7 +43,7 @@ IS_WINDOWS = platform.system() == "Windows"
 # the moment it starts. The CI-generated version.txt (short-sha +
 # build timestamp) is still what the self-updater diffs against;
 # AGENT_VERSION is just the human-facing label.
-AGENT_VERSION = "1.1.1"
+AGENT_VERSION = "1.1.2"
 
 # ---------------------------------------------------------------------------
 # Idle detection
@@ -141,28 +140,37 @@ def current_version() -> str:
 
 def _check_previous_update_failure(log: logging.Logger) -> None:
     """If update.bat's :move_failed branch ran on the previous cycle,
-    it dropped a marker at %APPDATA%\\GamerAI\\update-failed.txt. Log
-    each line as WARN so the regression is visible (instead of the
-    silent rollback the v1.0.x retry loop produced), then delete the
-    marker so it's a one-time signal per failure event."""
-    marker = state_dir() / "update-failed.txt"
-    if not marker.exists():
-        return
-    try:
-        text = marker.read_text(encoding="utf-8", errors="replace").strip()
-    except OSError as e:
-        log.warning("could not read update-failed marker: %s", e)
-        return
-    for line in text.splitlines() or [text]:
-        if line.strip():
-            log.warning(
-                "previous auto-update failed (probably AV interference). "
-                "Marker: %s", line.strip()[:400],
-            )
-    try:
-        marker.unlink()
-    except OSError:
-        pass
+    it dropped a marker at %LOCALAPPDATA%\\GamerAI\\update-failed.txt.
+    Log each line as WARN so the regression is visible (instead of
+    the silent rollback the v1.0.x retry loop produced), then delete
+    the marker so it's a one-time signal per failure event.
+
+    Also checks the legacy %APPDATA%\\GamerAI\\update-failed.txt path
+    used by v1.1.1 (before the path-convention audit moved markers to
+    local-only state). A user upgrading from v1.1.1 with a pending
+    marker still gets the warning."""
+    candidates = [
+        local_state_dir() / "update-failed.txt",
+        state_dir() / "update-failed.txt",  # legacy v1.1.1 location
+    ]
+    for marker in candidates:
+        if not marker.exists():
+            continue
+        try:
+            text = marker.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError as e:
+            log.warning("could not read update-failed marker at %s: %s", marker, e)
+            continue
+        for line in text.splitlines() or [text]:
+            if line.strip():
+                log.warning(
+                    "previous auto-update failed (probably AV interference). "
+                    "Marker: %s", line.strip()[:400],
+                )
+        try:
+            marker.unlink()
+        except OSError:
+            pass
 
 
 def _check_stale_install_dir(log: logging.Logger) -> None:
@@ -279,11 +287,14 @@ def _write_update_batch(
         ":: the next agent boot picks up + logs as WARN, leave\r\n"
         ":: update.bat in place for forensics, then relaunch the OLD\r\n"
         ":: exe so the user is not left with no running agent.\r\n"
-        'if not exist "%APPDATA%\\GamerAI" mkdir "%APPDATA%\\GamerAI" '
-        ">nul 2>nul\r\n"
+        ":: Marker goes in %LOCALAPPDATA% (local-only state), NOT\r\n"
+        ":: %APPDATA% (Roaming) -- update failures are inherently\r\n"
+        ":: per-machine and should never sync across an AD profile.\r\n"
+        'if not exist "%LOCALAPPDATA%\\GamerAI" mkdir '
+        '"%LOCALAPPDATA%\\GamerAI" >nul 2>nul\r\n'
         'echo update-failed %DATE% %TIME% attempts=%attempts% '
         f'target="{exe}" staged="{new_exe}" '
-        '>> "%APPDATA%\\GamerAI\\update-failed.txt"\r\n'
+        '>> "%LOCALAPPDATA%\\GamerAI\\update-failed.txt"\r\n'
         + relaunch_line
         + "exit /b 1\r\n",
         encoding="ascii",
@@ -304,16 +315,23 @@ def _apply_update(
     Returns True if the update kicked off (caller should exit); False
     means we stayed put (download failed, etc.) and life continues."""
     new_url = f"{base_url.rstrip('/')}/download/agent.exe"
-    # Stage in %TEMP%, not next to the running exe. Avast (and Windows
-    # Defender, less aggressively) scrutinizes freshly-downloaded .exe
-    # files in user-visible folders like %USERPROFILE%\Downloads
-    # aggressively enough to hold the file lock for 30+s during
-    # behavioral analysis — long enough to break the swap. %TEMP% is
-    # excluded by most AV products' default rules. PID + timestamp
-    # in the filename prevents collisions if two agent processes
-    # ever race.
-    staged_dir = Path(tempfile.gettempdir())
-    staged = staged_dir / f"gamerai-agent-{os.getpid()}-{int(time.time())}.exe"
+    # Stage under %LOCALAPPDATA%\GamerAI\updates\, NOT next to the
+    # running exe and NOT in %TEMP%. Reasoning:
+    #   1. Next to the exe (the v1.1.0 behavior) was %USERPROFILE%\
+    #      Downloads\... for users who run from there — AV products
+    #      scan that dir aggressively, breaking the swap.
+    #   2. %TEMP% (the v1.1.1 behavior) gets nuked by Disk Cleanup,
+    #      Storage Sense, and many third-party "PC cleanup" tools —
+    #      potentially mid-update. It's also sometimes on a different
+    #      volume than the install dir, making `move` a slow copy.
+    #   3. %LOCALAPPDATA%\<App>\ is the Windows-native location for
+    #      local app state. AV products typically exclude it from
+    #      real-time scanning (it's where AV products themselves
+    #      stage their own updates). Same volume as the per-user
+    #      install dir, so `move` is atomic.
+    # PID + timestamp keeps multiple-agent-update scenarios from
+    # colliding on the staging filename.
+    staged = update_staging_dir() / f"agent-{os.getpid()}-{int(time.time())}.exe"
     log.info("self-update: downloading %s -> %s", new_url, staged)
     try:
         with httpx.Client(timeout=120.0) as c, c.stream("GET", new_url) as r:
@@ -594,11 +612,49 @@ def _deep_merge(into: dict, src: dict) -> None:
 # Local state — worker_id + cumulative earnings, persisted next to config
 # ---------------------------------------------------------------------------
 def state_dir() -> Path:
+    """Per-user agent state: worker_id, api_token, earnings totals,
+    logs. Currently lives in %APPDATA% (Roaming) on Windows for
+    backwards compatibility with installs created before the
+    %APPDATA% vs %LOCALAPPDATA% audit — moving it would orphan
+    existing workers' tokens + earnings. New local-only paths
+    (update staging, failure markers) go through ``local_state_dir``
+    instead. See devlog 2026-05-21 for the convention discussion."""
     if IS_WINDOWS:
         base = os.getenv("APPDATA") or os.path.expanduser("~")
         d = Path(base) / "GamerAI"
     else:
         d = Path.home() / ".gamerai"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def local_state_dir() -> Path:
+    """Local-machine-only agent state — never roams across machines.
+    Used for things that are inherently per-machine: the update
+    staging area (the .new exe and update.bat), the post-failure
+    marker file, anti-virus-friendly caches.
+
+    On Windows, resolves to %LOCALAPPDATA%\\GamerAI\\ — the right
+    convention for local app state per Microsoft's app-data
+    guidelines. On non-Windows we fall back to the same dir as
+    ``state_dir`` since there's no Roaming/Local split."""
+    if IS_WINDOWS:
+        base = os.getenv("LOCALAPPDATA") or os.getenv("APPDATA") or os.path.expanduser("~")
+        d = Path(base) / "GamerAI"
+    else:
+        d = state_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def update_staging_dir() -> Path:
+    """Where ``_apply_update`` drops the freshly-downloaded agent.exe
+    before update.bat moves it into place. Lives under local state so
+    Disk Cleanup / Storage Sense don't nuke it (which is the real
+    failure mode of using %TEMP%). Same volume as %LOCALAPPDATA%\\
+    Programs\\<App>\\, so the eventual ``move`` is atomic rather than
+    falling back to copy+delete across volumes."""
+    d = local_state_dir() / "updates"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
