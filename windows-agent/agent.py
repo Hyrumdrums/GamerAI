@@ -43,7 +43,7 @@ IS_WINDOWS = platform.system() == "Windows"
 # the moment it starts. The CI-generated version.txt (short-sha +
 # build timestamp) is still what the self-updater diffs against;
 # AGENT_VERSION is just the human-facing label.
-AGENT_VERSION = "1.1.4"
+AGENT_VERSION = "1.1.5"
 
 # ---------------------------------------------------------------------------
 # Idle detection
@@ -2082,6 +2082,34 @@ _AV_PROCESS_HINTS: dict[str, str] = {
 }
 
 
+def _resolve_effective_token(
+    cfg_token: Optional[str], state: dict,
+) -> tuple[Optional[str], Optional[str]]:
+    """Mirror resolve_api_token's chain (env > config.json > state.json)
+    without the interactive-prompt branch and without writing anywhere.
+
+    Returns (token, source_label) where source_label is
+    ``"env API_TOKEN"``, ``"config.json"``, ``"state.json"``, or
+    ``None`` when no token is found.
+
+    Config.load already merges env + config.json into ``cfg_token``
+    (env wins on collision). We add the state.json branch here the
+    same way the agent's main() does at startup via
+    resolve_api_token. Read-only — never modifies state.
+
+    Used by ``cmd_diagnose`` so the auth check reports the same
+    answer the running agent's token resolver would give, instead
+    of only knowing about env + config.json sources."""
+    if os.getenv("API_TOKEN"):
+        return cfg_token, "env API_TOKEN"
+    if cfg_token:
+        return cfg_token, "config.json"
+    state_token = (state.get("api_token") or "").strip() or None
+    if state_token:
+        return state_token, "state.json"
+    return None, None
+
+
 def _detect_av() -> list[str]:
     """Enumerate known AV processes by exact name match. Returns the
     set of human-readable labels found. Empty list on non-Windows."""
@@ -2164,17 +2192,24 @@ def cmd_diagnose(cfg: Config) -> int:
     print()
 
     # ---- Configuration --------------------------------------------------
+    # Load state.json early so the auth check can consult it. ``load_state``
+    # is read-only -- distinct from ``resolve_worker_id`` which would
+    # WRITE a new id on first run. Diagnose must never mutate state.
+    state = load_state()
+    effective_token, token_source = _resolve_effective_token(cfg.api_token, state)
+
     section("Configuration")
     info("coordinator", cfg.coordinator_url)
-    info("auth", "configured" if cfg.api_token else "MISSING")
-    if not cfg.api_token:
+    if effective_token:
+        info("auth", f"configured (source: {token_source})")
+    else:
+        info("auth", "MISSING")
         fail(
-            "no api_token configured — agent cannot register or claim "
-            "jobs. Edit %APPDATA%\\GamerAI\\state.json or config.json."
+            "no api_token resolved from env API_TOKEN, config.json, or "
+            "state.json -- agent cannot register or claim jobs. Edit "
+            "%APPDATA%\\GamerAI\\state.json's api_token field, or set "
+            "$API_TOKEN, or paste the token at the foreground prompt."
         )
-    # Use the raw state value to avoid resolve_worker_id's side effect
-    # of WRITING a new worker_id to state.json. Diagnose must be read-only.
-    state = load_state()
     info(
         "worker_id",
         state.get("worker_id") or cfg.worker_id or "(none — first run will allocate)",
@@ -2184,7 +2219,7 @@ def cmd_diagnose(cfg: Config) -> int:
     # ---- Coordinator connectivity --------------------------------------
     section("Coordinator connectivity")
     auth_headers = (
-        {"Authorization": f"Bearer {cfg.api_token}"} if cfg.api_token else {}
+        {"Authorization": f"Bearer {effective_token}"} if effective_token else {}
     )
     try:
         t0 = time.time()
@@ -2197,7 +2232,7 @@ def cmd_diagnose(cfg: Config) -> int:
             fail(f"/health returned {r.status_code} in {dt_ms}ms")
     except Exception as e:
         fail(f"/health unreachable: {e}")
-    if cfg.api_token:
+    if effective_token:
         try:
             with httpx.Client(timeout=10.0, headers=auth_headers) as c:
                 r = c.get(f"{cfg.coordinator_url}/workers")
