@@ -107,6 +107,15 @@ jobs:
           # version.txt is the latest-published-version file the
           # installed agents poll for self-update.
           Copy-Item version.txt upload\version.txt
+          # SHA256 sidecar — the agent's _apply_update fetches this
+          # alongside agent.exe and refuses to swap if the local hash
+          # doesn't match. Defends against truncated downloads, AV
+          # quarantine-and-restore stubs, and bit-rot in transit.
+          # Format matches `sha256sum agent.exe` output so the file is
+          # also usable with stock POSIX tools for manual verification.
+          $hash = (Get-FileHash dist\agent.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  agent.exe" | Out-File -FilePath upload\agent.exe.sha256 -Encoding ascii -NoNewline
+          Write-Host "Published SHA256: $hash"
           # A small index helps Caddy's browse view be self-explanatory.
           $sha = "${{ github.sha }}".Substring(0, 7)
           $now = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm 'UTC'")
@@ -115,6 +124,7 @@ jobs:
           Repo commit: ${{ github.sha }}
           Files:
             agent.exe                  standalone executable; pair with a config.json
+            agent.exe.sha256           sha256sum-format sidecar; self-update verifies against this
             GamerAI-Agent-Setup.exe    Inno Setup installer (Start Menu shortcuts, optional autostart)
           "@ | Out-File -FilePath upload\BUILD.txt -Encoding utf8
 
@@ -133,8 +143,15 @@ jobs:
           VPS_HOST: ${{ secrets.VPS_HOST }}
         run: |
           # sftp batch file — uploads into the chroot's /uploads dir
+          # Upload the sha256 sidecar BEFORE agent.exe + version.txt so
+          # an agent that races the publish window never sees a
+          # version.txt mismatch driving it to download an agent.exe
+          # whose .sha256 hasn't landed yet. Once .sha256 is on disk,
+          # we publish agent.exe; once that's on disk, we bump
+          # version.txt (the trigger for clients). Strict ordering.
           @"
           cd uploads
+          put upload/agent.exe.sha256 agent.exe.sha256
           put upload/agent.exe agent.exe
           put upload/GamerAI-Agent-Setup.exe GamerAI-Agent-Setup.exe
           put upload/version.txt version.txt
@@ -155,5 +172,6 @@ jobs:
         run: |
           Write-Host "Published artifacts:"
           Write-Host "  https://ai.dallinlayton.com/download/agent.exe"
+          Write-Host "  https://ai.dallinlayton.com/download/agent.exe.sha256"
           Write-Host "  https://ai.dallinlayton.com/download/GamerAI-Agent-Setup.exe"
           Write-Host "  https://ai.dallinlayton.com/download/BUILD.txt"
