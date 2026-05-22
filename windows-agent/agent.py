@@ -45,7 +45,7 @@ IS_WINDOWS = platform.system() == "Windows"
 # the moment it starts. The CI-generated version.txt (short-sha +
 # build timestamp) is still what the self-updater diffs against;
 # AGENT_VERSION is just the human-facing label.
-AGENT_VERSION = "1.1.16"
+AGENT_VERSION = "1.1.17"
 
 # ---------------------------------------------------------------------------
 # Idle detection
@@ -1181,6 +1181,15 @@ class Config:
     model: Optional[str]
     worker_id: Optional[str]
     api_token: Optional[str]
+    # stayalive: when True, is_system_idle() ignores user-input
+    # idleness and only gates on CPU. Useful for dev sessions over
+    # Chrome Remote Desktop (which generates continuous mouse-move
+    # events) or any scenario where the operator wants the agent to
+    # keep accepting jobs without satisfying the 60 s no-input
+    # requirement. Set via the --stayalive CLI flag, persisted in
+    # state.json (so it survives restarts and auto-updates), cleared
+    # with --no-stayalive.
+    stayalive: bool = False
 
     @classmethod
     def load(cls, path: Optional[Path]) -> "Config":
@@ -2269,12 +2278,13 @@ def _mock_image_b64() -> str:
 # ---------------------------------------------------------------------------
 def is_system_idle(cfg: Config) -> tuple[bool, str]:
     idle_for = input_idle_seconds()
-    if idle_for < cfg.min_input_idle_seconds:
+    if not cfg.stayalive and idle_for < cfg.min_input_idle_seconds:
         return False, f"user active ({idle_for:.0f}s since last input)"
     cpu = cpu_percent(cfg.cpu_sample_seconds)
     if cpu >= cfg.max_cpu_percent:
         return False, f"cpu busy ({cpu:.1f}%)"
-    return True, f"idle ({idle_for:.0f}s, cpu {cpu:.1f}%)"
+    suffix = " stayalive" if cfg.stayalive else ""
+    return True, f"idle ({idle_for:.0f}s, cpu {cpu:.1f}%{suffix})"
 
 
 # ---------------------------------------------------------------------------
@@ -2970,6 +2980,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--diagnose", action="store_true",
                    help="run a self-check (config, coordinator, ollama, "
                         "image stack, AV) and print a report")
+    p.add_argument("--stayalive", action="store_true",
+                   help="ignore user-input idleness; idle gate is CPU "
+                        "only. Persists in state.json so the setting "
+                        "survives restarts and auto-updates.")
+    p.add_argument("--no-stayalive", dest="no_stayalive",
+                   action="store_true",
+                   help="clear the persisted stayalive setting.")
     args = p.parse_args(argv)
     # Deprecation alias: --background → --tray. v1.1.12 replaces the
     # silent --background mode with tray + hidden console; existing
@@ -3138,6 +3155,56 @@ def main(argv: Optional[list[str]] = None) -> int:
     # truly-headless mode would pass headless=True.
     log = setup_logging(headless=False)
     _boot_log("main: setup_logging ok — further trace goes to agent.log")
+
+    # Apply --stayalive / --no-stayalive (CLI overrides persisted
+    # value; the new value is itself persisted so the next launch +
+    # any post-update relaunch inherit it without re-passing the
+    # flag). Useful for dev sessions over Chrome Remote Desktop
+    # which generates continuous mouse-move events that defeat the
+    # 60 s no-input idle gate.
+    if args.no_stayalive:
+        if state.get("stayalive"):
+            log.info("stayalive: cleared via --no-stayalive (was on)")
+        state["stayalive"] = False
+        save_state(state)
+    elif args.stayalive:
+        if not state.get("stayalive"):
+            log.info("stayalive: enabled via --stayalive (persisted)")
+        state["stayalive"] = True
+        save_state(state)
+    cfg.stayalive = bool(state.get("stayalive", False))
+    if cfg.stayalive:
+        log.warning(
+            "stayalive: ON — user-input idleness is ignored, CPU is "
+            "the only idle gate. Clear with --no-stayalive."
+        )
+
+    # Rapid-restart detection. An update loop (e.g. v1.1.9's
+    # stale-MEIPASS bug) used to manifest as the agent restarting
+    # every ~60 s with no human-visible signal. The gap from the
+    # previous start is logged at INFO/WARN/ERROR depending on how
+    # tight it is, so a grep for "previous start" surfaces a runaway
+    # restart pattern in seconds instead of hours.
+    now_ts = time.time()
+    prev_start = state.get("last_start_at")
+    if isinstance(prev_start, (int, float)):
+        delta = now_ts - prev_start
+        if delta < 60:
+            log.error(
+                "rapid-restart: %.0fs since previous start "
+                "(<60s — likely a restart loop, check update path)",
+                delta,
+            )
+        elif delta < 300:
+            log.warning(
+                "rapid-restart: %.0fs since previous start "
+                "(<5min — investigate if this repeats)",
+                delta,
+            )
+        elif delta < 3600:
+            log.info("previous start was %.0fs ago", delta)
+    state["last_start_at"] = now_ts
+    save_state(state)
 
     if args.status:
         print(f"version:   v{AGENT_VERSION} (build {current_version()})")
