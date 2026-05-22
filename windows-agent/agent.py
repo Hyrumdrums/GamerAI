@@ -43,7 +43,7 @@ IS_WINDOWS = platform.system() == "Windows"
 # the moment it starts. The CI-generated version.txt (short-sha +
 # build timestamp) is still what the self-updater diffs against;
 # AGENT_VERSION is just the human-facing label.
-AGENT_VERSION = "1.1.5"
+AGENT_VERSION = "1.1.6"
 
 # ---------------------------------------------------------------------------
 # Idle detection
@@ -1621,7 +1621,13 @@ def run_image_inference(
         )
     out_path = sd_install_dir() / f"out-{os.getpid()}-{int(time.time()*1000)}.png"
     # sd.cpp CLI: see https://github.com/leejet/stable-diffusion.cpp
-    # `-M txt2img -m <gguf> -p <prompt> -W <w> -H <h> --steps N -o out.png`
+    # `-M img_gen -m <gguf> -p <prompt> -W <w> -H <h> --steps N -o out.png`
+    # NOTE: upstream consolidated txt2img / img2img / etc. into a
+    # single `img_gen` mode in the master-637-ef92a00 build pinned by
+    # infra/setup-image-mirror.sh. The old `txt2img` mode name was
+    # rejected with "must be one of [img_gen, vid_gen, convert,
+    # upscale, metadata]". If you bump the mirror's pinned sd.cpp
+    # version, re-verify this flag still applies.
     # The prompt is passed via a temp file (sd.cpp tolerates long
     # multi-line prompts that way) — using argv directly hits Windows'
     # 32K command-line cap on pathological inputs.
@@ -1629,7 +1635,7 @@ def run_image_inference(
     prompt_file.write_text(prompt, encoding="utf-8")
     argv = [
         str(sd_binary_path()),
-        "-M", "txt2img",
+        "-M", "img_gen",
         "-m", str(model_path),
         "-p", prompt,
         "-W", str(width),
