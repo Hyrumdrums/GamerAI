@@ -43,7 +43,7 @@ IS_WINDOWS = platform.system() == "Windows"
 # the moment it starts. The CI-generated version.txt (short-sha +
 # build timestamp) is still what the self-updater diffs against;
 # AGENT_VERSION is just the human-facing label.
-AGENT_VERSION = "1.1.6"
+AGENT_VERSION = "1.1.7"
 
 # ---------------------------------------------------------------------------
 # Idle detection
