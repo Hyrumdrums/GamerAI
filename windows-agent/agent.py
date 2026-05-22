@@ -17,6 +17,7 @@ This file is single-file by design so it can be packaged with:
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import logging
 import logging.handlers
@@ -44,7 +45,7 @@ IS_WINDOWS = platform.system() == "Windows"
 # the moment it starts. The CI-generated version.txt (short-sha +
 # build timestamp) is still what the self-updater diffs against;
 # AGENT_VERSION is just the human-facing label.
-AGENT_VERSION = "1.1.14"
+AGENT_VERSION = "1.1.15"
 
 # ---------------------------------------------------------------------------
 # Idle detection
@@ -682,32 +683,56 @@ def _write_update_batch(
     # this was the silent bug behind every "agent never relaunched
     # after update" failure on contributor machines.
     def _ps_relaunch(target: Path, args: list[str]) -> str:
+        """Build the PowerShell line that update.bat invokes to launch
+        the swapped agent.exe.
+
+        v1.1.15+ uses WMI's Win32_Process.Create rather than
+        Start-Process. Why: the v1.1.13 -> v1.1.14 test exposed a
+        silent-relaunch failure where the new agent.exe was spawned
+        (Start-Process returned errorlevel=0) but its PyInstaller
+        bootloader exited before extracting (no _MEI orphan, no event
+        log entry, no agent-boot.log line). Manual launches of the
+        SAME exe immediately afterward worked. The strongest theory
+        is that the chain `subprocess.Popen(cmd, DETACHED_PROCESS) ->
+        cmd.exe -> powershell.exe -> Start-Process -> agent.exe`
+        keeps the new agent.exe inside the parent PyInstaller worker's
+        job object — and when the bat finishes and the job's last
+        handle goes away, the new bootstrap gets terminated as a
+        side-effect.
+
+        Win32_Process.Create routes the spawn through WmiPrvSE
+        (svchost), so the new agent.exe's parent is the WMI service.
+        Complete escape from any inherited job, console state, or
+        env-var chain (WMI gives the spawned process its own clean
+        env, so the _MEIPASS2 inheritance fix from v1.1.13 is now
+        redundant — left as belt-and-suspenders for anyone bypassing
+        WMI in a custom build).
+
+        Encoding via -EncodedCommand sidesteps the cmd-quote /
+        PowerShell-quote escaping nightmare. The base64-encoded
+        UTF-16LE string is opaque to cmd, so paths with spaces,
+        single quotes, etc. all pass through cleanly.
+        """
         target_str = str(target).replace("'", "''")
         dir_str = str(target.parent).replace("'", "''")
-        # Clear PyInstaller's bootloader-handoff env vars before
-        # Start-Process. update.bat inherits them from the v1.1.11
-        # parent that wrote it, and Start-Process passes its current
-        # session env to the new process. If the new agent.exe sees
-        # _MEIPASS2 already set, its bootloader thinks it's the
-        # post-extract re-exec and points sys._MEIPASS at the OLD
-        # _MEI<random> dir — which still holds the previous version's
-        # bundled version.txt. Result (v1.1.12 fresh install bug):
-        # the relaunched agent reports the previous build's SHA in
-        # its banner, even though AGENT_VERSION (compiled into the
-        # binary) is the new one. Symptom is purely cosmetic but
-        # corrodes trust during support sessions, so we clear here.
-        ps_cmd = (
-            "Remove-Item Env:\\_MEIPASS2 -ErrorAction SilentlyContinue; "
-            "Remove-Item Env:\\_MEIPASS -ErrorAction SilentlyContinue; "
-            f"Start-Process -FilePath '{target_str}' "
-            f"-WorkingDirectory '{dir_str}'"
+        args_str = " ".join(args)
+        # Build the new process's command line in PowerShell rather
+        # than baking it into a single literal — keeps the embedded
+        # double-quotes around the exe path out of the surrounding
+        # encoding chain.
+        ps_inner = (
+            f"$exe = '{target_str}'; "
+            f"$dir = '{dir_str}'; "
+            f"$cmd = '\"' + $exe + '\" {args_str}'.Trim(); "
+            f"$r = Invoke-WmiMethod -Class Win32_Process -Name Create "
+            f"-ArgumentList $cmd, $dir; "
+            f"Write-Host ('wmi-spawn ReturnValue=' + $r.ReturnValue + "
+            f"' ProcessId=' + $r.ProcessId)"
         )
-        if args:
-            arg_list = ", ".join(f"'{a}'" for a in args)
-            ps_cmd += f" -ArgumentList {arg_list}"
+        encoded = base64.b64encode(ps_inner.encode("utf-16-le")).decode("ascii")
         return (
             f'powershell -NoProfile -WindowStyle Hidden '
-            f'-Command "{ps_cmd}"\r\n'
+            f'-EncodedCommand {encoded}\r\n'
         )
     relaunch_line = _ps_relaunch(exe, relaunch_args)
     # taskkill matches the running exe's actual filename — required for
@@ -3027,7 +3052,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     # _boot_log itself never raises.
     _raw_argv = argv if argv is not None else sys.argv[1:]
     _boot_log(f"main entry v{AGENT_VERSION} argv={_raw_argv!r}")
+    _boot_log(f"main: sys.frozen={getattr(sys, 'frozen', False)} _MEIPASS={getattr(sys, '_MEIPASS', None)!r}")
     args = parse_args(_raw_argv)
+    _boot_log(f"main: parse_args ok tray={args.tray} background_was_used={args.background_was_used}")
     if args.version:
         print(f"GamerAI agent v{AGENT_VERSION} (build {current_version()})")
         return 0
@@ -3086,13 +3113,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         _boot_log(f"single-instance: proceeding as first instance (ipc_sock={'bound' if ipc_sock else 'none/collision'})")
 
     _print_greeting(args.once, args.status)
+    _boot_log("main: greeting printed, loading config")
     cfg = Config.load(args.config if args.config.exists() else None)
     state = load_state()
     worker_id = resolve_worker_id(cfg.worker_id, state)
+    _boot_log(f"main: config+state loaded, worker_id={worker_id[:12]}")
     # Tray mode keeps the StreamHandler on — the hidden console's
     # scrollback is what "Show console" surfaces. Only a hypothetical
     # truly-headless mode would pass headless=True.
     log = setup_logging(headless=False)
+    _boot_log("main: setup_logging ok — further trace goes to agent.log")
 
     if args.status:
         print(f"version:   v{AGENT_VERSION} (build {current_version()})")
