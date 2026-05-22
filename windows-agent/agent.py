@@ -43,7 +43,7 @@ IS_WINDOWS = platform.system() == "Windows"
 # the moment it starts. The CI-generated version.txt (short-sha +
 # build timestamp) is still what the self-updater diffs against;
 # AGENT_VERSION is just the human-facing label.
-AGENT_VERSION = "1.1.9"
+AGENT_VERSION = "1.1.10"
 
 # ---------------------------------------------------------------------------
 # Idle detection
@@ -118,24 +118,95 @@ def keep_awake_end(log: logging.Logger) -> None:
 # Self-update
 # ---------------------------------------------------------------------------
 # version.txt is written by CI at build time (commit SHA + ISO timestamp)
-# and bundled into the exe via PyInstaller --add-data. Read-from-bundle
-# path uses sys._MEIPASS when frozen; falls back to a sibling file or
-# the literal "dev" string when running from source.
+# and bundled into the exe via PyInstaller --add-data. For frozen
+# builds we read STRICTLY from sys._MEIPASS — the bootloader-set
+# extraction dir for this exact process. Previous versions also
+# fell back to <exe_parent>/version.txt and <__file__>.parent/
+# version.txt; both could pick up stale content from leftover
+# %TEMP%\_MEI<random>\ dirs when PyInstaller's atexit cleanup
+# failed (AV holding files at process exit). That stale read drove
+# an auto-update loop in v1.1.9: current_version() returned an old
+# sha that didn't match /download/version.txt, agent updated, new
+# process spawned, repeated every 60s. The narrower read here is
+# the load-bearing fix; the cleanup function below removes the
+# accumulated stale dirs as belt-and-suspenders. See v1.1.10
+# devlog entry for the full diagnosis.
 def current_version() -> str:
-    candidates: list[Path] = []
     if getattr(sys, "frozen", False):
         meipass = getattr(sys, "_MEIPASS", None)
         if meipass:
-            candidates.append(Path(meipass) / "version.txt")
-        candidates.append(Path(sys.executable).parent / "version.txt")
-    candidates.append(Path(__file__).parent / "version.txt")
-    for p in candidates:
-        try:
-            if p.exists():
-                return p.read_text(encoding="utf-8").strip() or "unknown"
-        except OSError:
-            continue
+            try:
+                p = Path(meipass) / "version.txt"
+                if p.exists():
+                    return p.read_text(encoding="utf-8").strip() or "unknown"
+            except OSError:
+                pass
+        # Frozen build with no readable MEIPASS/version.txt is a
+        # catastrophic bootloader failure. Return a sentinel that
+        # the updater_loop guard treats as "do not auto-update" so
+        # a broken read can't drive an infinite update cycle.
+        return "unknown"
+    # Source / non-frozen path (dev): read alongside agent.py.
+    try:
+        p = Path(__file__).parent / "version.txt"
+        if p.exists():
+            return p.read_text(encoding="utf-8").strip() or "unknown"
+    except OSError:
+        pass
     return "dev"
+
+
+def cleanup_stale_meipass_dirs(log: logging.Logger) -> int:
+    """Best-effort removal of leftover ``%TEMP%\\_MEI<random>`` dirs
+    that PyInstaller's atexit cleanup failed to delete. Skips the
+    current process's MEIPASS and any dir touched in the last hour
+    (might be another agent process still using it). Returns the
+    count of dirs removed for the log line.
+
+    Belt-and-suspenders behind the strict ``current_version()``
+    fix in v1.1.10. With current_version reading strictly from
+    sys._MEIPASS, stale dirs no longer drive the auto-update loop
+    — but they still waste disk and can confuse manual diagnosis,
+    so we sweep them on startup."""
+    if not IS_WINDOWS or not getattr(sys, "frozen", False):
+        return 0
+    tmp = os.getenv("TEMP") or os.getenv("TMP")
+    if not tmp:
+        return 0
+    current = getattr(sys, "_MEIPASS", None)
+    try:
+        current_resolved = (
+            str(Path(current).resolve()) if current else None
+        )
+    except OSError:
+        current_resolved = None
+    cutoff = time.time() - 3600  # one hour
+    removed = 0
+    try:
+        for entry in Path(tmp).iterdir():
+            if not entry.is_dir() or not entry.name.startswith("_MEI"):
+                continue
+            try:
+                if str(entry.resolve()) == current_resolved:
+                    continue
+                if entry.stat().st_mtime > cutoff:
+                    continue
+            except OSError:
+                continue
+            try:
+                import shutil
+                shutil.rmtree(entry, ignore_errors=True)
+                if not entry.exists():
+                    removed += 1
+            except Exception:
+                pass
+    except OSError:
+        pass
+    if removed:
+        log.info(
+            "cleaned up %d stale _MEI dir(s) in %TEMP%", removed,
+        )
+    return removed
 
 
 def _check_previous_update_failure(log: logging.Logger) -> None:
@@ -535,6 +606,24 @@ def updater_loop(
         if forced or scheduled_due:
             last_scheduled_check = now
             latest = fetch_latest_version(cfg.coordinator_url)
+            # Guard against an infinite update cycle: if current_version()
+            # returned the "unknown" or "dev" sentinel (catastrophic
+            # MEIPASS read failure or non-frozen build), any non-empty
+            # latest will compare unequal and trigger updates forever.
+            # Force-update via stdin still works since `forced` bypasses
+            # the version compare entirely. v1.1.10 added this after
+            # v1.1.9 looped on every cycle when current_version() was
+            # picking up stale content from leftover _MEI dirs.
+            if not forced and here in ("unknown", "dev"):
+                log.warning(
+                    "self-update: skipping scheduled check — local "
+                    "version reads as %r (PyInstaller MEIPASS issue?). "
+                    "Use the `update` stdin command to force-update.",
+                    here,
+                )
+                if stop_event.wait(tick_seconds):
+                    return
+                continue
             should_apply = forced or (
                 latest and latest != here and latest != ""
             )
@@ -2553,6 +2642,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     # blocks startup.
     _check_previous_update_failure(log)
     _check_stale_install_dir(log)
+    # Sweep stale %TEMP%\_MEI<random> dirs left over from prior agent
+    # runs where PyInstaller's atexit cleanup failed (e.g. AV holding
+    # files at exit). Defunct since current_version() now reads
+    # strictly from sys._MEIPASS, but keeps temp space sane.
+    cleanup_stale_meipass_dirs(log)
 
     # Visibility-only check. If the contributor has OLLAMA_DEBUG=1 set
     # in the agent's environment they likely also have it set for the
