@@ -51,8 +51,8 @@ that power cost.
 
 1. Download `GamerAI-Agent-Setup.exe`.
 2. Run it. Defaults are fine for most users.
-3. (Optional) Tick **"Run on Windows startup (background mode)"** during
-   install to launch silently on every boot.
+3. (Optional) Tick **"Run on Windows startup (tray mode)"** during
+   install to launch silently on every boot with a system tray icon.
 4. Edit `config.json` (Start menu → "Edit configuration") to point at your
    coordinator URL if it's not the default.
 
@@ -61,8 +61,8 @@ that power cost.
 1. Download `agent.exe` and `config.json` into the same folder.
 2. Edit `config.json` and set `"coordinator_url"`.
 3. Double-click `agent.exe` — or, for silent operation, create a shortcut
-   with the argument `--background` and drop it in
-   `shell:startup`.
+   with the argument `--tray` and drop it in `shell:startup`. The
+   agent will appear as a small icon in the system tray overflow.
 
 ### Option C — from source
 
@@ -79,13 +79,14 @@ python agent.py
 
 ## How to run
 
-| command                                | what it does                                  |
-| -------------------------------------- | --------------------------------------------- |
-| `agent.exe`                            | foreground — logs to console **and** file     |
-| `agent.exe --background`               | no console output; rotating log file only     |
-| `agent.exe --once`                     | process one job and exit (smoke test)         |
-| `agent.exe --status`                   | print local earnings totals and exit          |
-| `agent.exe --config C:\path\to\config.json` | override config path                     |
+| command                                | what it does                                                       |
+| -------------------------------------- | ------------------------------------------------------------------ |
+| `agent.exe`                            | foreground — visible console, logs to console **and** file         |
+| `agent.exe --tray`                     | tray mode: hidden console + system tray icon (autostart default)   |
+| `agent.exe --background`               | deprecated alias for `--tray`, kept for one release                |
+| `agent.exe --once`                     | process one job and exit (smoke test)                              |
+| `agent.exe --status`                   | print local earnings totals and exit                               |
+| `agent.exe --config C:\path\to\config.json` | override config path                                          |
 
 Logs live at:
 
@@ -98,6 +99,56 @@ State (`worker_id` + cumulative earnings) is persisted to:
 ```
 %APPDATA%\GamerAI\state.json
 ```
+
+---
+
+## Tray mode UX
+
+`--tray` (the autostart default) hides the console window and surfaces a
+small system tray icon. Right-click the icon for:
+
+- **Show console** — surfaces the live log window with every line since
+  boot still in scrollback. Double-click does the same.
+- **Hide console** — slides it back into the tray.
+- **Open log file** — opens `%APPDATA%\GamerAI\logs\agent.log` in the
+  system default text editor (Notepad).
+- **GamerAI Agent v*x.y.z*** — disabled item, shows the running version.
+- **Exit** — graceful shutdown: heartbeats `offline`, releases keep-awake,
+  prints earnings, then exits.
+
+### "Where did my tray icon go?"
+
+Windows 10/11 hide new tray icons in the **overflow chevron** (the small
+`^` next to the clock) by default. To promote the GamerAI icon to the
+always-visible row, drag it out of the overflow flyout, or
+**Settings → Personalization → Taskbar → Other system tray icons**.
+This is a Windows policy — apps cannot force-promote themselves.
+
+### Notifications
+
+The agent uses Windows Action Center toasts for:
+
+- **First-run token missing** — fires once at startup with a prompt to
+  open the console and paste your token.
+- **Updated** — fires once after an auto-update successfully relaunches
+  into a newer version (e.g. "Now running v1.1.13").
+
+### Single-instance behavior
+
+If you double-click `agent.exe` while the agent is already running, the
+existing instance's console pops to front instead of starting a second
+worker. This is handled by binding `127.0.0.1:48591` — a quick
+`netstat -ano | findstr 48591` confirms exactly one listener.
+
+### Windows Terminal caveat
+
+If you set **Windows Terminal** as your default terminal app, double-clicking
+`agent.exe` directly from Explorer may host the console under `wt.exe`,
+whose window can't be hidden via `GetConsoleWindow()`. The autostart
+shortcut runs the exe through the standard Windows shell loader, which
+always uses conhost — so the boot path is unaffected. If you hit the
+issue manually, switch the default terminal back to "Windows Console
+Host" or run the agent via the Start Menu shortcut.
 
 ---
 
@@ -195,10 +246,16 @@ build.bat
 That's a wrapper for:
 
 ```powershell
-pyinstaller --onefile --name agent --add-data "config.json;." agent.py
+pyinstaller --onefile --name agent ^
+    --add-data "config.json;." ^
+    --add-data "tray.ico;." ^
+    --collect-submodules pystray ^
+    --icon "tray.ico" ^
+    agent.py
 ```
 
-Output: `dist\agent.exe`. Distribute that file together with `config.json`.
+Output: `dist\agent.exe`. Distribute that file together with `config.json`
+and `tray.ico` (or rely on the bundled installer, which carries both).
 
 ### Building the installer (optional)
 
@@ -210,10 +267,11 @@ Output: `dist\agent.exe`. Distribute that file together with `config.json`.
 3. Output: `Output\GamerAI-Agent-Setup.exe`.
 
 The installer:
-- copies `agent.exe`, `config.json`, and this README to `Program Files\GamerAI Agent`
-- adds Start Menu shortcuts (foreground, background, edit config, view logs)
+- copies `agent.exe`, `config.json`, `tray.ico`, and this README to
+  `Program Files\GamerAI Agent`
+- adds Start Menu shortcuts (foreground, tray, edit config, view logs)
 - optionally adds a desktop shortcut
-- optionally adds a `--background` startup shortcut to `shell:startup`
+- optionally adds a `--tray` startup shortcut to `shell:startup`
 - registers a normal Windows uninstall entry
 
 ---

@@ -5,7 +5,8 @@ the coordinator only when the system is idle, and tracks per-job earnings.
 
 Usage:
     python agent.py                      # foreground, prints to console
-    python agent.py --background         # log to file only, no console output
+    python agent.py --tray               # tray mode: hidden console + system tray icon
+    python agent.py --background         # deprecated alias for --tray
     python agent.py --config config.json
     python agent.py --once               # process at most one job, then exit
     python agent.py --status             # print local earnings totals and exit
@@ -43,7 +44,7 @@ IS_WINDOWS = platform.system() == "Windows"
 # the moment it starts. The CI-generated version.txt (short-sha +
 # build timestamp) is still what the self-updater diffs against;
 # AGENT_VERSION is just the human-facing label.
-AGENT_VERSION = "1.1.11"
+AGENT_VERSION = "1.1.12"
 
 # ---------------------------------------------------------------------------
 # Idle detection
@@ -112,6 +113,245 @@ def keep_awake_end(log: logging.Logger) -> None:
         log.info("keep-awake released")
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Tray mode (Windows-only)
+# ---------------------------------------------------------------------------
+# Hidden-console + system tray icon for autostart users (v1.1.12). The
+# console window is preserved so its scrollback retains the full session
+# log, but it's hidden until the user clicks "Show console" in the tray
+# menu. Single-instance + inter-process signalling binds 127.0.0.1:48591
+# (the Spotify/Discord pattern) — works across conhost/Windows Terminal
+# hosts and gives us a free IPC channel for future CLI subcommands.
+#
+# See windows-agent/README_addendum.md for the user-facing UX notes.
+SW_HIDE = 0
+SW_RESTORE = 9
+
+SINGLE_INSTANCE_PORT = 48591   # localhost-only dynamic-range port
+IPC_HANDSHAKE = "OK GAMERAI"   # second-instance sanity check (port collision)
+
+
+def _set_aumid() -> None:
+    """Set an explicit AppUserModelID so the (unhidden) console window groups
+    under the same taskbar identity as our toast notifications. No-op on
+    older Windows or non-Windows."""
+    if not IS_WINDOWS:
+        return
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "com.gamerai.agent"
+        )
+    except Exception:
+        pass
+
+
+def _get_console_hwnd() -> int:
+    if not IS_WINDOWS:
+        return 0
+    try:
+        return int(ctypes.windll.kernel32.GetConsoleWindow() or 0)
+    except Exception:
+        return 0
+
+
+def _hide_console(hwnd: int) -> None:
+    if not (IS_WINDOWS and hwnd):
+        return
+    try:
+        ctypes.windll.user32.ShowWindow(hwnd, SW_HIDE)
+    except Exception:
+        pass
+
+
+def _show_console(hwnd: int) -> None:
+    if not (IS_WINDOWS and hwnd):
+        return
+    try:
+        ctypes.windll.user32.ShowWindow(hwnd, SW_RESTORE)
+        ctypes.windll.user32.SetForegroundWindow(hwnd)
+    except Exception:
+        pass
+
+
+def _set_console_title(title: str) -> None:
+    if not IS_WINDOWS:
+        return
+    try:
+        ctypes.windll.kernel32.SetConsoleTitleW(title)
+    except Exception:
+        pass
+
+
+def _tray_icon_path() -> Optional[Path]:
+    """Locate tray.ico — bundled in MEIPASS for frozen builds, next to
+    agent.py during dev. Returns None if missing; callers substitute a
+    blank coloured square."""
+    candidates = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.append(Path(meipass) / "tray.ico")
+    candidates.append(Path(__file__).parent / "tray.ico")
+    for p in candidates:
+        try:
+            if p.exists():
+                return p
+        except OSError:
+            continue
+    return None
+
+
+def _claim_single_instance() -> tuple[Optional["socket.socket"], bool]:
+    """Bind 127.0.0.1:48591 as the first instance, or signal the running one.
+
+    Returns (listening_socket, is_first_instance):
+      (socket, True)   first instance; caller runs the IPC accept loop.
+      (None,  False)   second instance, delegated to running agent;
+                       caller should exit immediately.
+      (None,  True)    port collision (not us); proceed without
+                       single-instance enforcement rather than block start.
+    """
+    if not IS_WINDOWS:
+        return (None, True)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(("127.0.0.1", SINGLE_INSTANCE_PORT))
+        sock.listen(4)
+        return (sock, True)
+    except OSError:
+        try:
+            sock.close()
+        except OSError:
+            pass
+    # Port held by someone — verify it's actually another GamerAI agent
+    # via the handshake before treating ourselves as the second instance.
+    try:
+        with socket.create_connection(
+            ("127.0.0.1", SINGLE_INSTANCE_PORT), timeout=2.0
+        ) as c:
+            c.sendall(b"SHOW\n")
+            c.settimeout(2.0)
+            reply = c.recv(64).decode(errors="ignore").strip()
+        if reply.startswith(IPC_HANDSHAKE):
+            return (None, False)
+    except OSError:
+        pass
+    # Some unrelated process owns 48591. Surrender the single-instance
+    # check rather than refuse to start — a stray duplicate is a smaller
+    # failure mode than an agent that never comes online.
+    return (None, True)
+
+
+def _ipc_serve(server_sock, on_show, log: logging.Logger) -> None:
+    """Daemon-thread accept loop. Replies with the handshake so a
+    second instance can verify it's talking to us, then dispatches."""
+    while True:
+        try:
+            conn, _addr = server_sock.accept()
+        except OSError:
+            return  # listening socket closed → process exiting
+        try:
+            conn.settimeout(2.0)
+            with conn:
+                data = conn.recv(64).decode(errors="ignore").strip()
+                reply = f"{IPC_HANDSHAKE} v{AGENT_VERSION}\n".encode()
+                try:
+                    conn.sendall(reply)
+                except OSError:
+                    pass
+                if data == "SHOW":
+                    try:
+                        on_show()
+                    except Exception as exc:
+                        log.warning("ipc SHOW handler failed: %s", exc)
+                # Add STATUS / VERSION / QUIT here when future CLI
+                # subcommands need to query the running instance.
+        except Exception as exc:
+            log.debug("ipc accept loop error: %s", exc)
+
+
+def _toast(title: str, msg: str, *, icon_path: Optional[Path] = None) -> None:
+    """Fire-and-forget Windows toast. Silent no-op on non-Windows or if
+    winotify is missing."""
+    if not IS_WINDOWS:
+        return
+    try:
+        from winotify import Notification, audio
+    except Exception:
+        return
+    try:
+        n = Notification(
+            app_id="GamerAI Agent",
+            title=title,
+            msg=msg,
+            icon=str(icon_path) if icon_path else "",
+        )
+        n.set_audio(audio.Default, loop=False)
+        n.show()
+    except Exception:
+        pass
+
+
+def _start_tray(
+    *,
+    stop_event: "threading.Event",
+    console_hwnd: int,
+    log_path: Path,
+    icon_path: Optional[Path],
+    log: logging.Logger,
+):
+    """Spawn the pystray icon on a daemon thread. Returns the Icon
+    instance (or None if pystray / Pillow failed to import) so callers
+    can stop it cleanly during shutdown."""
+    try:
+        import pystray
+        from PIL import Image
+    except Exception as exc:
+        log.warning("tray init failed (pystray/Pillow missing?): %s", exc)
+        return None
+
+    img = None
+    if icon_path and icon_path.exists():
+        try:
+            img = Image.open(icon_path)
+        except Exception as exc:
+            log.warning("tray icon load failed (%s): %s", icon_path, exc)
+    if img is None:
+        img = Image.new("RGBA", (32, 32), (15, 118, 110, 255))
+
+    def _on_show(_icon, _item):
+        _show_console(console_hwnd)
+
+    def _on_hide(_icon, _item):
+        _hide_console(console_hwnd)
+
+    def _on_log(_icon, _item):
+        try:
+            os.startfile(str(log_path))
+        except Exception as exc:
+            log.warning("open log file failed: %s", exc)
+
+    def _on_exit(icon, _item):
+        log.info("tray Exit requested")
+        stop_event.set()
+        icon.stop()
+
+    menu = pystray.Menu(
+        pystray.MenuItem("Show console", _on_show, default=True),
+        pystray.MenuItem("Hide console", _on_hide),
+        pystray.MenuItem("Open log file", _on_log),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem(
+            f"GamerAI Agent v{AGENT_VERSION}", None, enabled=False
+        ),
+        pystray.MenuItem("Exit", _on_exit),
+    )
+    icon = pystray.Icon("gamerai", img, "GamerAI Agent", menu)
+    threading.Thread(
+        target=icon.run, name="gamerai-tray", daemon=True
+    ).start()
+    return icon
 
 
 # ---------------------------------------------------------------------------
@@ -299,9 +539,10 @@ def _write_update_batch(
     Lives next to the exe so it inherits the right working directory.
 
     ``relaunch_args`` is the argv list the swapped binary is started
-    with. ``None`` → restart in --background (the autostart default).
-    ``[]`` → restart with no args (foreground console, so a user who
-    typed ``update`` keeps their visible console after the swap).
+    with. ``None`` → restart in --tray (the autostart default since
+    v1.1.12). ``[]`` → restart with no args (foreground console, so a
+    user who typed ``update`` keeps their visible console after the
+    swap).
 
     Retry policy (v1.1.1):
       The original 2-attempt, 9-second window wasn't long enough to
@@ -315,7 +556,7 @@ def _write_update_batch(
     bat = exe.with_name("update.bat")
     previous_exe = exe.with_suffix(exe.suffix + ".previous")
     if relaunch_args is None:
-        relaunch_args = ["--background"]
+        relaunch_args = ["--tray"]
     # Relaunch uses PowerShell's Start-Process, NOT cmd's `start ""`.
     # Reason: cmd's `start` calls ShellExecuteEx, which silently no-ops
     # when the calling process has no console handle. update.bat is
@@ -699,20 +940,20 @@ DEFAULTS = {
         "override_drain": False,
     },
     "power": {
-        # When true and running in --background mode, ask Windows not
-        # to sleep while the agent is online. This is the "I've opted
-        # my machine into the network" contract — autostart shortcuts
-        # set --background, so this only fires for explicit
-        # background-contributor mode. Foreground / --once never
-        # touches power state.
+        # When true and running in --tray mode, ask Windows not to
+        # sleep while the agent is online. This is the "I've opted my
+        # machine into the network" contract — autostart shortcuts
+        # pass --tray, so this only fires for explicit autostart
+        # contributors. Foreground / --once never touches power state.
         "keep_awake_while_online": True,
     },
     "update": {
-        # Background self-update. Only active in --background mode
-        # (autostart contributors). The agent polls
+        # Background self-update. The agent polls
         # {coordinator_url}/download/version.txt every
         # check_interval_hours; on a version mismatch it pulls a fresh
         # agent.exe, writes update.bat, fires it detached, and exits.
+        # Active in both --tray (autostart contributors) and
+        # foreground (devs / manual launches) modes since v1.1.7.
         # Set enabled=false on a contributor's machine to pin the
         # version (e.g. for a developer running a custom build).
         "enabled": True,
@@ -920,7 +1161,14 @@ def resolve_worker_id(cfg_worker_id: Optional[str], state: dict) -> str:
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
-def setup_logging(background: bool) -> logging.Logger:
+def setup_logging(headless: bool = False) -> logging.Logger:
+    """Install the file + (optionally) stdout log handlers.
+
+    ``headless=True`` skips the StreamHandler entirely — meant for any
+    future truly-console-less mode. Tray mode passes ``headless=False``
+    because the hidden console buffers stdout into its scrollback, which
+    is exactly what the user sees when they click "Show console".
+    """
     log = logging.getLogger("gamerai.agent")
     log.setLevel(logging.INFO)
     log.propagate = False
@@ -939,7 +1187,7 @@ def setup_logging(background: bool) -> logging.Logger:
     file_handler.setFormatter(fmt)
     log.addHandler(file_handler)
 
-    if not background:
+    if not headless:
         try:
             stream = logging.StreamHandler(sys.stdout)
             stream.setFormatter(fmt)
@@ -1900,9 +2148,11 @@ def stdin_command_loop(
     force_update_event: threading.Event,
     stop_event: threading.Event,
 ) -> None:
-    """Read line-oriented commands from the console window. Foreground
-    only — there's no stdin in --background. The thread is a daemon so
-    a stuck read doesn't keep the process alive on shutdown.
+    """Read line-oriented commands from the console window. Runs in
+    both foreground and tray modes — in tray mode the console starts
+    hidden but stdin remains attached, so reads block silently until
+    the user clicks "Show console" and types. The thread is a daemon
+    so a stuck read doesn't keep the process alive on shutdown.
 
     Recognized commands are listed in ``_STDIN_HELP``. Unknown input
     is echoed back with a hint instead of crashing the loop, because a
@@ -2530,8 +2780,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="GamerAI Windows agent")
     here = Path(__file__).resolve().parent
     p.add_argument("--config", type=Path, default=here / "config.json")
+    p.add_argument("--tray", action="store_true",
+                   help="run in tray mode: hide the console window, surface a "
+                        "system tray icon (Show/Hide/Open-log/Exit). Used by "
+                        "the autostart shortcut.")
     p.add_argument("--background", action="store_true",
-                   help="suppress console output; log to file only")
+                   help="deprecated alias for --tray; kept so existing "
+                        "startup shortcuts keep working through one release.")
     p.add_argument("--once", action="store_true",
                    help="process at most one job and exit (useful for tests)")
     p.add_argument("--status", action="store_true",
@@ -2541,7 +2796,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--diagnose", action="store_true",
                    help="run a self-check (config, coordinator, ollama, "
                         "image stack, AV) and print a report")
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    # Deprecation alias: --background → --tray. v1.1.12 replaces the
+    # silent --background mode with tray + hidden console; existing
+    # autostart shortcuts (created by pre-1.1.12 installers) pass
+    # --background and must keep working until the user reinstalls.
+    args.background_was_used = bool(args.background)
+    if args.background and not args.tray:
+        args.tray = True
+    return args
 
 
 def resolve_api_token(
@@ -2554,11 +2817,13 @@ def resolve_api_token(
       env API_TOKEN   ← already merged into cfg.api_token by Config.load
         →  config.json["api_token"]
         →  state.json["api_token"]      (persisted from a prior first-run prompt)
-        →  interactive prompt (foreground only)
+        →  interactive prompt (skipped when ``background`` is True)
 
-    Returns the resolved token, or None when running in --background and
+    Returns the resolved token, or None when ``background`` is True and
     no token is available (caller should error out — we can't prompt
-    when there's no console).
+    when there's no console). Since v1.1.12, tray mode pre-unhides the
+    console before calling this with ``background=False``, so the prompt
+    is visible to the user.
     """
     if cfg_token:
         return cfg_token
@@ -2598,8 +2863,9 @@ def _print_greeting(once: bool, status: bool) -> None:
     """First visible output. Runs before logging is wired up so a
     freshly double-clicked agent.exe shows text immediately instead
     of a blank console while PyInstaller finishes extracting itself.
-    Suppressed for --background (no console) and --status (the user
-    asked for a focused report).
+    Suppressed for --once and --status (focused subcommands); always
+    runs in --tray mode (output goes to the hidden console's
+    scrollback, surfaced later by "Show console" in the tray menu).
 
     The version line is the load-bearing bit: after a self-update the
     contributor (or you, when debugging) should see the new version
@@ -2629,12 +2895,40 @@ def main(argv: Optional[list[str]] = None) -> int:
         # allocation. Both write to disk; diagnose must be read-only.
         cfg = Config.load(args.config if args.config.exists() else None)
         return cmd_diagnose(cfg)
-    if not args.background:
-        _print_greeting(args.once, args.status)
+
+    # Tray-mode init: hide the console window and claim 127.0.0.1:48591
+    # as the single-instance + IPC port. Done BEFORE the greeting and
+    # logger setup so a second launch exits immediately without
+    # touching state. --once / --status / --version skip tray setup;
+    # they're foreground subcommands a user invoked directly.
+    console_hwnd = 0
+    ipc_sock: Optional[socket.socket] = None
+    tray_active = args.tray and not args.once and not args.status
+    if tray_active:
+        _set_aumid()
+        _set_console_title(f"GamerAI Agent — v{AGENT_VERSION}")
+        console_hwnd = _get_console_hwnd()
+        _hide_console(console_hwnd)
+        ipc_sock, is_first = _claim_single_instance()
+        if not is_first:
+            # Another agent is already running; we already told it to
+            # surface its console. Exit silently.
+            return 0
+
+    _print_greeting(args.once, args.status)
     cfg = Config.load(args.config if args.config.exists() else None)
     state = load_state()
     worker_id = resolve_worker_id(cfg.worker_id, state)
-    log = setup_logging(args.background)
+    # Tray mode keeps the StreamHandler on — the hidden console's
+    # scrollback is what "Show console" surfaces. Only a hypothetical
+    # truly-headless mode would pass headless=True.
+    log = setup_logging(headless=False)
+
+    if args.background_was_used:
+        log.warning(
+            "--background is deprecated; use --tray instead "
+            "(silently aliased for one release)."
+        )
 
     if args.status:
         print(f"version:   v{AGENT_VERSION} (build {current_version()})")
@@ -2644,7 +2938,50 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"earnings:  ${float(state.get('earnings_usd', 0.0)):.6f}")
         return 0
 
-    token = resolve_api_token(cfg.api_token, state, args.background)
+    # Update-applied toast: compare AGENT_VERSION against the value we
+    # persisted on the previous run. Only fires when versions actually
+    # differ — silent on first install and on plain restarts.
+    if tray_active:
+        last_seen = state.get("last_seen_version")
+        if last_seen and last_seen != AGENT_VERSION:
+            _toast(
+                "GamerAI updated",
+                f"Now running v{AGENT_VERSION} (was v{last_seen}).",
+                icon_path=_tray_icon_path(),
+            )
+        if last_seen != AGENT_VERSION:
+            state["last_seen_version"] = AGENT_VERSION
+            save_state(state)
+
+    # Start the IPC accept loop now that we have a logger. The lambda
+    # closes over console_hwnd so future SHOW commands surface the
+    # right window.
+    if ipc_sock is not None:
+        threading.Thread(
+            target=_ipc_serve,
+            args=(ipc_sock, lambda: _show_console(console_hwnd), log),
+            name="gamerai-ipc",
+            daemon=True,
+        ).start()
+
+    # First-run token UX: tray mode hides the console at startup, so
+    # the existing input("token: ") prompt would block invisibly. If
+    # we know we'll need to prompt (no token in env/config/state),
+    # fire a toast and unhide the console first. We re-hide after a
+    # successful coordinator registration below.
+    have_token = bool(cfg.api_token or state.get("api_token"))
+    auto_unhidden_for_token = False
+    if tray_active and not have_token:
+        _toast(
+            "GamerAI Agent needs your token",
+            "The console will open — paste the token from your invite page.",
+            icon_path=_tray_icon_path(),
+        )
+        _show_console(console_hwnd)
+        auto_unhidden_for_token = True
+    # background=False: we always have a console available (hidden or
+    # visible). The deprecated truly-headless path no longer exists.
+    token = resolve_api_token(cfg.api_token, state, background=False)
     if not token:
         msg = (
             "no api_token configured. "
@@ -2696,7 +3033,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     # Skipped if OLLAMA_URL is already set in the environment, so devs
     # pointing at a remote/test Ollama keep that override.
     if not os.getenv("OLLAMA_URL"):
-        if not args.background and cfg.bootstrap_enabled and IS_WINDOWS:
+        if not tray_active and cfg.bootstrap_enabled and IS_WINDOWS:
             try:
                 sys.stdout.write(
                     "First-run setup: ensuring Ollama and the default model "
@@ -2713,13 +3050,13 @@ def main(argv: Optional[list[str]] = None) -> int:
             os.environ["OLLAMA_URL"] = ready_url
 
     # Keep-awake is the "I've committed my machine" contract — only
-    # enabled when the contributor opts into background mode (autostart
+    # enabled when the contributor opts into tray mode (autostart
     # installer toggle) and the config knob is on. Foreground/--once
     # runs never touch power state.
     keep_awake_active = False
-    if args.background and cfg.keep_awake_while_online:
+    if tray_active and cfg.keep_awake_while_online:
         keep_awake_active = keep_awake_begin(log)
-    elif args.background and not cfg.keep_awake_while_online:
+    elif tray_active and not cfg.keep_awake_while_online:
         log.info("keep-awake off (power.keep_awake_while_online=false)")
 
     # Image-tool bootstrap (best-effort; never blocks chat). When it
@@ -2746,6 +3083,17 @@ def main(argv: Optional[list[str]] = None) -> int:
             keep_awake_end(log)
         return 1
 
+    # Registration succeeded. If we forcibly unhid the console for the
+    # first-run token prompt, hide it again now and fire a confirmation
+    # toast so the user knows the agent is online.
+    if auto_unhidden_for_token:
+        _toast(
+            "GamerAI Agent online",
+            f"Token saved. Worker {worker_id[:8]}… connected.",
+            icon_path=_tray_icon_path(),
+        )
+        _hide_console(console_hwnd)
+
     # Self-update background thread. Runs in BOTH background and
     # foreground modes now — a contributor running agent.exe by
     # double-click should stay current without manual download trips.
@@ -2759,7 +3107,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     stop_event = threading.Event()
     force_update_event = threading.Event()
     keep_awake_holder = {"active": keep_awake_active, "exit_requested": False}
-    relaunch_args = ["--background"] if args.background else []
+    relaunch_args = ["--tray"] if args.tray else []
     if cfg.update_enabled:
         updater_thread = threading.Thread(
             target=updater_loop,
@@ -2772,17 +3120,31 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
         updater_thread.start()
 
-    # Foreground only: a stdin reader so the contributor can type
-    # ``update`` (or ``help``, ``status``, ``quit``) in the console
-    # window. Background mode has no console, so we skip it there.
-    if not args.background:
-        stdin_thread = threading.Thread(
-            target=stdin_command_loop,
-            args=(log, worker_id, force_update_event, stop_event),
-            name="gamerai-stdin",
-            daemon=True,
+    # Stdin reader for the typed ``update`` / ``help`` / ``status`` /
+    # ``quit`` commands. In tray mode the console starts hidden, but
+    # the stdin handle is still attached — power users can type into
+    # it after clicking "Show console". A blocking read on a hidden
+    # console just waits silently, so the thread is harmless.
+    stdin_thread = threading.Thread(
+        target=stdin_command_loop,
+        args=(log, worker_id, force_update_event, stop_event),
+        name="gamerai-stdin",
+        daemon=True,
+    )
+    stdin_thread.start()
+
+    # Tray icon: spawn after stop_event exists so Exit can signal a
+    # clean shutdown. Returns None if pystray/Pillow failed to import
+    # (e.g. dev environment); the agent still runs, just without UI.
+    tray_icon = None
+    if tray_active:
+        tray_icon = _start_tray(
+            stop_event=stop_event,
+            console_hwnd=console_hwnd,
+            log_path=logs_dir() / "agent.log",
+            icon_path=_tray_icon_path(),
+            log=log,
         )
-        stdin_thread.start()
 
     try:
         main_loop(
@@ -2798,6 +3160,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         log.info("stopped by user")
     finally:
         stop_event.set()
+        if tray_icon is not None:
+            try:
+                tray_icon.stop()
+            except Exception:
+                pass
         try:
             coord.heartbeat("offline")
         except Exception:

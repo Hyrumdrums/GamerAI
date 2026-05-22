@@ -33,21 +33,22 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
-Name: "startupicon"; Description: "Run on Windows startup (background mode)"; GroupDescription: "Startup:"; Flags: unchecked
+Name: "startupicon"; Description: "Run on Windows startup (tray mode)"; GroupDescription: "Startup:"; Flags: unchecked
 
 [Files]
 Source: "dist\agent.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "config.json";    DestDir: "{app}"; Flags: ignoreversion onlyifdoesntexist
 Source: "README_addendum.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "tray.ico";       DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\{#MyAppName}";              Filename: "{app}\{#MyAppExeName}"
-Name: "{group}\{#MyAppName} (background)"; Filename: "{app}\{#MyAppExeName}"; Parameters: "--background"
+Name: "{group}\{#MyAppName}";              Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\tray.ico"
+Name: "{group}\{#MyAppName} (tray)";       Filename: "{app}\{#MyAppExeName}"; Parameters: "--tray"; IconFilename: "{app}\tray.ico"
 Name: "{group}\Edit configuration";         Filename: "notepad.exe"; Parameters: """{app}\config.json"""
 Name: "{group}\View logs folder";           Filename: "explorer.exe"; Parameters: """%APPDATA%\GamerAI\logs"""
 Name: "{group}\Uninstall {#MyAppName}";    Filename: "{uninstallexe}"
-Name: "{autodesktop}\{#MyAppName}";         Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
-Name: "{userstartup}\{#MyAppName}";         Filename: "{app}\{#MyAppExeName}"; Parameters: "--background"; Tasks: startupicon
+Name: "{autodesktop}\{#MyAppName}";         Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\tray.ico"; Tasks: desktopicon
+Name: "{userstartup}\{#MyAppName}";         Filename: "{app}\{#MyAppExeName}"; Parameters: "--tray"; IconFilename: "{app}\tray.ico"; Tasks: startupicon
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName} now"; Flags: postinstall skipifsilent nowait

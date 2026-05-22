@@ -12,6 +12,9 @@ if errorlevel 1 (
 echo Building agent.exe...
 pyinstaller --onefile --name agent ^
     --add-data "config.json;." ^
+    --add-data "tray.ico;." ^
+    --collect-submodules pystray ^
+    --icon "tray.ico" ^
     agent.py || goto :error
 
 echo.

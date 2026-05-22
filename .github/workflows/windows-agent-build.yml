@@ -72,6 +72,9 @@ jobs:
           pyinstaller --onefile --name agent `
             --add-data "config.json;." `
             --add-data "version.txt;." `
+            --add-data "tray.ico;." `
+            --collect-submodules pystray `
+            --icon "tray.ico" `
             agent.py
           if (-not (Test-Path "dist\agent.exe")) {
             Write-Error "agent.exe was not produced"
