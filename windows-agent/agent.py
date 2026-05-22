@@ -44,7 +44,7 @@ IS_WINDOWS = platform.system() == "Windows"
 # the moment it starts. The CI-generated version.txt (short-sha +
 # build timestamp) is still what the self-updater diffs against;
 # AGENT_VERSION is just the human-facing label.
-AGENT_VERSION = "1.1.13"
+AGENT_VERSION = "1.1.14"
 
 # ---------------------------------------------------------------------------
 # Idle detection
@@ -243,8 +243,10 @@ def _claim_single_instance() -> tuple[Optional["socket.socket"], bool]:
     try:
         sock.bind(("127.0.0.1", SINGLE_INSTANCE_PORT))
         sock.listen(4)
+        _boot_log(f"single-instance: bind ok on :{SINGLE_INSTANCE_PORT}")
         return (sock, True)
-    except OSError:
+    except OSError as exc:
+        _boot_log(f"single-instance: bind FAILED ({exc!r}) — probing existing listener")
         try:
             sock.close()
         except OSError:
@@ -259,9 +261,11 @@ def _claim_single_instance() -> tuple[Optional["socket.socket"], bool]:
             c.settimeout(2.0)
             reply = c.recv(64).decode(errors="ignore").strip()
         if reply.startswith(IPC_HANDSHAKE):
+            _boot_log(f"single-instance: handoff ok (reply={reply!r})")
             return (None, False)
-    except OSError:
-        pass
+        _boot_log(f"single-instance: handshake mismatch (reply={reply!r}) — port collision, proceeding without enforcement")
+    except OSError as exc:
+        _boot_log(f"single-instance: probe FAILED ({exc!r}) — port collision or stale state, proceeding without enforcement")
     # Some unrelated process owns 48591. Surrender the single-instance
     # check rather than refuse to start — a stray duplicate is a smaller
     # failure mode than an agent that never comes online.
@@ -294,6 +298,33 @@ def _ipc_serve(server_sock, on_show, log: logging.Logger) -> None:
                 # subcommands need to query the running instance.
         except Exception as exc:
             log.debug("ipc accept loop error: %s", exc)
+
+
+def _boot_log(message: str) -> None:
+    """Append a timestamped line to %LOCALAPPDATA%\\GamerAI\\agent-boot.log.
+
+    Used for the earliest possible diagnostic trail — BEFORE
+    setup_logging runs, BEFORE the single-instance check returns. If
+    a new agent process exits silently (bootstrap-stage crash, early
+    return from the single-instance check, etc.) the rotating
+    agent.log shows nothing because the logger never came up. This
+    file is the breadcrumb that proves Python actually entered main().
+
+    First-line entries are always written; subsequent lines per boot
+    are append-only. Best-effort: silent no-op if the local-state dir
+    isn't writable, because boot diagnostics must never block startup.
+    """
+    try:
+        from datetime import datetime
+        path = local_state_dir() / "agent-boot.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(
+                f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} "
+                f"pid={os.getpid()} {message}\n"
+            )
+    except Exception:
+        pass
 
 
 def _toast(title: str, msg: str, *, icon_path: Optional[Path] = None) -> None:
@@ -723,7 +754,14 @@ def _write_update_batch(
         ":: Step 2: defensive taskkill against the running exe by name.\r\n"
         'echo %TIME% step 2: taskkill /F /IM "' + exe_basename + '" >> "%TRACE%"\r\n'
         f'taskkill /F /IM "{exe_basename}" >>"%TRACE%" 2>&1\r\n'
-        "timeout /t 2 /nobreak >nul\r\n"
+        ":: 8s (was 2s pre-v1.1.14): taskkill /F doesn't wait for the\r\n"
+        ":: kernel to release mapped sections, file handles, or the\r\n"
+        ":: parent's job object. A new PyInstaller --onefile bootstrap\r\n"
+        ":: launched too eagerly into that residual state has been\r\n"
+        ":: observed to exit silently (no event log, no _MEI orphan).\r\n"
+        ":: 8s is empirically generous; the cost is acceptable on an\r\n"
+        ":: update path that runs at most every few hours.\r\n"
+        "timeout /t 8 /nobreak >nul\r\n"
         ":: Step 3: snapshot the current exe as a manual rollback path.\r\n"
         ":: `copy` (not move) so a subsequent swap-failure leaves the\r\n"
         ":: original target intact. After a successful swap, the user\r\n"
@@ -2982,7 +3020,14 @@ def _print_greeting(once: bool, status: bool) -> None:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    args = parse_args(argv if argv is not None else sys.argv[1:])
+    # Literal first line — proves the process reached Python at all.
+    # Surfaces silent bootstrap-stage exits and the early-return paths
+    # below (single-instance handoff, --version, --diagnose, --status)
+    # that otherwise leave nothing in agent.log. Always best-effort;
+    # _boot_log itself never raises.
+    _raw_argv = argv if argv is not None else sys.argv[1:]
+    _boot_log(f"main entry v{AGENT_VERSION} argv={_raw_argv!r}")
+    args = parse_args(_raw_argv)
     if args.version:
         print(f"GamerAI agent v{AGENT_VERSION} (build {current_version()})")
         return 0
@@ -3036,7 +3081,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         if not is_first:
             # Another agent is already running; we already told it to
             # surface its console. Exit silently.
+            _boot_log("exit: deferred to existing instance via single-instance handoff")
             return 0
+        _boot_log(f"single-instance: proceeding as first instance (ipc_sock={'bound' if ipc_sock else 'none/collision'})")
 
     _print_greeting(args.once, args.status)
     cfg = Config.load(args.config if args.config.exists() else None)
