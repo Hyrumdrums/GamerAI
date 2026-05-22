@@ -8,9 +8,12 @@ This repo is a fully local, containerized MVP. One command brings up a
 coordinator, Redis queue, SQLite store, a web UI, and any number of worker
 nodes that simulate contributor machines.
 
-The MVP today serves a single tool (chat). The architecture is job-based and
-capability-routed by design, so adding image generation and web-augmented
-answers is additive — see § 14 (Roadmap) for the multi-tool plan.
+The MVP today serves **two tools** — chat and image generation — with the
+architecture job-based and per-tool capability-routed (agents advertise
+`tools=["chat","image"]` at registration; the coordinator queues each
+job to the matching per-tool Redis queue and only image-capable workers
+pick up image jobs). Web-augmented answers and additional tools are
+additive on top of this same plumbing — see § 14 (Roadmap).
 
 **Membership is contribute-to-use.** When you run the agent, your GPU serves
 jobs from the network's shared queue anonymously — not just your own
@@ -561,24 +564,43 @@ optional paid customer revenue.
 
 **Phase 3a — multi-tool foundations**
 
-- [ ] `job_type` on `/generate` (`chat` | `image` | `search`) with a
-      discriminated-union `params` block. Legacy `{prompt, model}` keeps
-      working as implicit `job_type=chat`.
-- [ ] Worker `capabilities.tools[]` registration; coordinator routes via
-      per-tool Redis queues (`job_queue:chat`, `job_queue:image`, …).
-      Workers `BLPOP` only the queues that match their advertised tools.
-- [ ] DB schema: add `job_type` and `result_blob` columns to `jobs`;
-      backfill default `chat` for existing rows.
-- [ ] Web-search tool — runs *server-side* on the coordinator. Fetches
-      results from a search API, prepends them to the prompt as context,
-      then dispatches a chat job. No new worker type needed; biggest
-      perceived-intelligence boost for small models.
-- [ ] Image-generation worker mode — `windows-agent --tool=image` boots
-      an SDXL pipeline and registers `tools=["chat", "image"]` (or
-      `["image"]` if the box is too small for chat). Earnings priced per
-      image, not per token.
-- [ ] Unified "toolbox" UI — slash-commands or tabs in the web client so
-      one chat surface can dispatch any of the three job types.
+- [x] `tool` on `/generate` (`chat` | `image`) with an optional
+      `image: {width, height, steps, seed, negative_prompt}` params
+      block. Legacy `{prompt, model}` payloads keep working as
+      implicit `tool=chat`. (Shipped 2026-05-20.)
+- [x] Worker `capabilities.tools[]` registration; coordinator routes
+      via per-tool Redis queues (`job_queue`, `job_queue:image`).
+      Workers call `/jobs/next` with a `tool` field per tick and
+      receive only matching jobs. (Shipped 2026-05-20.)
+- [x] DB schema: `jobs.tool` column added; `messages.image_path`
+      column for image attachments; `/data/images/<job_id>.png` for
+      generated PNG storage; ownership-checked `/images/<name>`
+      route. (Shipped 2026-05-20.)
+- [x] Image-generation worker mode — Windows agent bootstraps
+      `sd.exe` + `stable-diffusion.dll` + `sd1.5.gguf` from the
+      mirror on first run, advertises `tools=["chat","image"]`, and
+      runs `stable-diffusion.cpp` as a subprocess on image jobs.
+      Returns PNG via base64 in `/jobs/complete`. (Shipped
+      2026-05-21 end-to-end at agent v1.1.6.)
+- [x] Unified "toolbox" UI — Chat/Image toggle in the existing chat
+      composer (no separate route). Image messages render as inline
+      `<img>` bubbles via `/api/images/<name>` proxy. (Shipped
+      2026-05-20.)
+- [ ] Web-search tool — runs *server-side* on the coordinator.
+      Fetches results from a search API, prepends them to the prompt
+      as context, then dispatches a chat job. No new worker type
+      needed; biggest perceived-intelligence boost for small models.
+- [ ] SDXL on the mirror — currently MVP ships SD 1.5 (1.5 GB Q4_0).
+      SDXL (~6.5 GB) is registered in the model catalog but the
+      mirror only serves it when promoted. See
+      `infra/setup-image-mirror.sh` TODO.
+- [ ] Per-image-job pricing — image earnings are flat-rated as
+      ~200-token equivalents for MVP. Real per-image rates ship
+      alongside paid-customer pricing in Phase 3b.ii.
+- [ ] Image canaries — chat canaries cover model-swap detection
+      for chat workers; image equivalent would need a known-good
+      PNG fingerprint per prompt. Currently image worker outputs
+      are trusted (PNG-magic + size cap only).
 
 **Phase 3b — community plumbing first, paid layer second**
 

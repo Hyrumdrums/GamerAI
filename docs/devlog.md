@@ -5,6 +5,226 @@ entries on top. Skim for context before resuming work.
 
 ---
 
+## 2026-05-21 — Image generation end-to-end + auto-update hardening (v1.1.0 → v1.1.6)
+
+Two-day arc that shipped Phase 3a's multi-tool foundation: image
+generation alongside chat, with the underlying job routing and
+contributor capability advertising that future tools will reuse.
+Six agent releases in close succession because the auto-update
+mechanism (which we needed to deliver any of those agent fixes
+without a manual install on each contributor) had to be hardened
+against Avast in parallel.
+
+### The feature
+
+`/generate` now accepts `tool: "chat" | "image"` (default chat for
+back-compat). Image jobs route to `job_queue:image` instead of the
+legacy `job_queue` (= `job_queue:chat`); only workers advertising
+`tools=["chat","image"]` pull from it. PNG storage lives at
+`/data/images/<job_id>.png` and is served via an ownership-checked
+`/images/<name>` route — non-admins can only fetch images attached
+to their own conversations.
+
+Worker side: Windows agent's bootstrap chain extended with a parallel
+image branch. On first run it pulls `sd.exe`, `stable-diffusion.dll`,
+and `sd1.5.gguf` (1.5 GB Q4_0) from the mirror, then advertises both
+tools at register-time. The runtime invokes
+[stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp)
+as a subprocess, base64-encodes the resulting PNG, and posts it back
+in `/jobs/complete`. Coordinator decodes, validates the PNG magic
+header, enforces an 8 MB cap, writes to disk, and stamps the
+`messages.image_path` column the UI reads.
+
+Web UI is a single toggle in the existing composer; image messages
+render as `<img class="generated">` via `/api/images/<name>` (BFF
+proxy attaches the session bearer since `<img>` tags can't carry
+custom headers).
+
+### What Phase 3a strategy got right vs. what it missed
+
+README § 14 Phase 3a was written assuming a clean rewrite of `/generate`
+to a discriminated-union `params` block. In practice the additive
+shape (`{prompt, model, tool, image: {...}}`) was simpler and let
+every existing client — Windows agent, canary injector, retry path —
+keep working unchanged. Same conclusion as previous additive
+extensions: don't break the wire format when you can avoid it.
+
+What the strategy doc missed: the **GPU asymmetry constraint**. A
+contributor running an 8 GB GPU on a 7B chat model *can't* run
+SDXL (~12 GB). The "70/30 chat/image ratio at rest" framing only
+makes sense for the big-GPU subset of the pool; the small-GPU
+subset is chat-only. Documented this as a load-balancer design
+constraint in `project-gaps.md` and shipped a degenerate
+"warm-affinity" version (each agent polls its last-served queue
+first, no coordinator-side balancing logic) instead of a real
+rebalancer. Soft pinning + dynamic rebalancing are deferred until
+the network has 50+ contributors and an actual queue-depth
+imbalance to drive thresholds.
+
+### The auto-update saga (the real time sink)
+
+Six agent releases in 48 hours — v1.1.0 through v1.1.6 — because
+the image feature was shipped via auto-update and Avast kept
+breaking the update path. Worth recording what we tried and what
+actually worked.
+
+**v1.1.0** shipped image gen. The agent was running from
+`%USERPROFILE%\Downloads\software\GamerAI-Agent (1).exe` (a one-off
+copy from a previous re-download). Auto-update fired, downloaded
+the new agent.exe.new *next to the running binary in Downloads*,
+spawned a detached cmd /c update.bat to do the swap. Avast's
+behavioral shield scrutinizes Downloads especially aggressively
+and held the .new file's lock for ~30s during first-execute scan.
+Original update.bat retry budget was 9s across 2 attempts. Swap
+failed both times, batch fell through to `start "" "agent.exe"`,
+which silently relaunched the OLD agent without the user knowing.
+
+**v1.1.1** (six fixes bundled): 6 retries across ~60s with
+exponential backoff; `taskkill /F /IM` uses the actual exe's
+basename so renamed binaries get caught; failure-marker file
+written when all retries exhausted; update.bat preserved on
+failure for forensics; agent reads the marker at next startup and
+logs WARN; one-line startup advisory when a stale agent.exe sits
+at the standard install path but doesn't match the running copy.
+
+**v1.1.2** (after a Windows-conventions audit): staging path moved
+from `%TEMP%` (which gets nuked by Disk Cleanup and Storage Sense)
+to `%LOCALAPPDATA%\GamerAI\updates\` (durable, AV-friendly, same
+volume as the install dir so `move` is atomic). Failure marker
+moved from `%APPDATA%` (Roaming — syncs across machines in
+AD/domain envs) to `%LOCALAPPDATA%` (local-only state, where
+update failures actually belong). `state_dir()` itself kept on
+`%APPDATA%` for back-compat with installed contributors' worker_ids
++ earnings totals; the audit notes the eventual v2 migration.
+
+**v1.1.3** (defense in depth): CI publishes
+`agent.exe.sha256` sidecar alongside `agent.exe`. Agent fetches
+the sidecar, computes local SHA256, refuses to swap on mismatch.
+update.bat snapshots the current exe to `agent.exe.previous`
+before swap so a contributor can manually roll back if a release
+ships a regression. Caught a real bug while doing this: I called
+`exit /b 0` after `:move_done` "dead code" and almost removed it.
+It's actually a fall-through guard — without it, a successful swap
+walks into `:move_failed` and writes a spurious failure marker +
+nukes the new `.previous`. Dry-rendering the bat caught it before
+commit. Documented in the bat comment.
+
+**v1.1.4** added `agent.exe --diagnose` — a sectioned self-check
+(version, install path, coordinator reachability, Ollama state,
+image-stack files present, AV detection, pending failure marker,
+log path). OK / WARN / FAIL prefixes, exits non-zero on FAILs.
+No side effects: uses `load_state()` raw rather than
+`resolve_worker_id()` which would write a new id, never registers,
+never bootstraps. Compresses the multi-step "where's the agent
+installed, what's working, what's not" diagnostic dance into one
+command.
+
+**v1.1.5** fixed a bug in v1.1.4's diagnose: it was checking
+`cfg.api_token` only, which contains just the env + config.json
+sources. The most common install path — interactive first-run
+prompt → token saved to state.json — produces an agent whose
+`cfg.api_token` is None even though the agent runs fine
+(`resolve_api_token` at startup consults state.json as the third
+fallback). Refactored to a `_resolve_effective_token` helper that
+mirrors the full chain, returns `(token, source_label)` so the
+diagnose report can show *which* source the token came from.
+The agent's runtime path was never broken; only the diagnostic
+was lying.
+
+**v1.1.6** fixed `sd.exe failed (rc=1): error: invalid mode txt2img,
+must be one of [img_gen, vid_gen, convert, upscale, metadata]`.
+Upstream stable-diffusion.cpp consolidated `txt2img`/`img2img`/etc.
+into a unified `img_gen` mode in the `master-637-ef92a00` build
+pinned by the mirror. The agent's `run_image_inference` was still
+passing the old name. Single-string fix. Comment now warns that
+this flag is coupled to the pinned sd.cpp version — a future bump
+should re-verify.
+
+### The pipeline coupling we kept missing
+
+Agent publishes via `windows-agent-build.yml` (PyInstaller on a
+Windows runner → SFTP to the mirror). Coordinator + client deploy
+via `infra/deploy.sh` on the VPS (`git pull` + `docker compose up
+--build`). The two drift independently. When the image-gen feature
+landed in v1.1.0, the agent.exe got the code automatically via
+auto-update — but the coordinator + client containers were still
+running pre-image code. Users would have seen a working image
+toggle (had they been able to update to v1.1.0+) but `/generate`
+with `tool=image` would have errored on the unrecognized field.
+
+Hit this twice: once when the feature first landed (caught by
+"why doesn't the toggle appear in the UI"), again when the
+post-deploy worker_capabilities cache was stale (caught by "Redis
+shows chat-only despite agent advertising chat+image"). The cached
+capabilities were sent to the OLD coordinator which silently
+stripped the `tools` field under Pydantic's default extra="ignore"
+mode. Fix was just bouncing the agent so it re-registered against
+the new coordinator.
+
+Worth flagging in any multi-component feature plan: list both
+"agent updated?" and "coordinator/client deployed?" as separate
+checklist items. Cache state (Redis capabilities, etc.) is a
+third silent dependency that benefits from a forced re-register
+after coordinator changes that affect schema parsing.
+
+### Other gotchas
+
+- **Mirror-server-vs-agent CLI rename coupling.** The agent code
+  has to match the pinned sd.cpp version's flag set. Pinning the
+  binary on the mirror (`master-637-ef92a00` in
+  `infra/setup-image-mirror.sh`) protects against upstream
+  rotation but the agent code itself encodes the version's flag
+  syntax. Bumping the pinned sd.cpp tag should be an explicit
+  PR that updates both the mirror script and the agent code in
+  one commit.
+
+- **Inno Setup install path vs. running-from-Downloads.** The
+  installer puts agent.exe at `%LOCALAPPDATA%\Programs\GamerAI
+  Agent\` (Windows-native convention, AV-friendly). When a
+  contributor downloads agent.exe directly (e.g. browser-resumed
+  `GamerAI-Agent (1).exe` in Downloads), the binary lives in an
+  AV-heavy folder and `sys.executable` resolves there — auto-update
+  staging + swap both happen in Downloads. The startup advisory
+  in v1.1.1+ ("stale agent.exe at <install dir> doesn't match
+  running copy") nudges users back to the right location, but
+  there's no enforcement. Future work: warn (don't refuse) when
+  running from `Downloads\`, and document
+  `%LOCALAPPDATA%\Programs\GamerAI Agent\` as canonical in the
+  onboarding flow.
+
+- **Authenticode signing remains the real fix.** No amount of
+  retry-loop tuning matches what a signed binary gets — AV
+  products cache the signature after first scan, then skip the
+  lengthy behavioral analysis. Without a cert, the v1.1.1+
+  retry+rollback+marker stack is the best we can do.
+
+### What we deferred (intentionally)
+
+- Authenticode code-signing — needs cert procurement (~$75/yr
+  standard, ~$300/yr EV).
+- PowerShell rewrite of update.bat — bat is currently working;
+  cert work will revisit this anyway.
+- Compiled `Updater.exe` — gets its own signature, decouples
+  from PyInstaller startup time. Heavier; would only justify if
+  the bat keeps fighting us under load.
+- Squirrel-style side-by-side install — the gold standard
+  (Slack, Discord, GitHub Desktop use it). Overkill until the
+  network has 50+ contributors.
+- Image canaries — chat canary integrity monitoring covers chat;
+  image equivalent needs known-good PNG fingerprints per prompt.
+
+### Summary
+
+Image gen end-to-end at agent v1.1.6, coordinator at fd8c5c0
+(v1.1.5 — only agent code changed between v1.1.5 and v1.1.6, so
+no coordinator redeploy needed). First contributor (running the
+Windows agent on a real machine) has done 132+ chat jobs in the
+session and produced at least one verified image. Phase 3a's
+multi-tool foundation is now in place; web search and additional
+tools slot into the same plumbing.
+
+---
+
 ## 2026-05-13 — Security review: three critical fixes shipped
 
 A focused security pass surfaced three real exploitable issues, two

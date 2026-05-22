@@ -186,6 +186,24 @@ Local-only today. Once we have remote workers, the Caddy+coordinator
 hop is TLS but the worker→Redis path is not. Worth fixing once Redis
 is no longer co-resident with the coordinator (Phase 2b ElastiCache).
 
+### 🟡 Secrets stored as plaintext in `.env.prod`
+
+The `API_TOKEN` admin bearer and any future per-service secrets
+live as plain values in `/opt/gamerai/.env.prod` on the VPS, file-
+permissioned to root. Adequate for a single-machine MVP with one
+operator; doesn't scale to a Phase 2b AWS deploy where multiple
+services + auto-scaling need shared secret access.
+
+**Fix when Phase 2b lands:** AWS Parameter Store (or Secrets
+Manager — Parameter Store is cheaper and sufficient for this use
+case). IAM-scoped read access from each service's task role; rotation
+becomes `aws ssm put-parameter --overwrite` + a service restart.
+Document the rotation runbook in `OPERATOR.md` when this ships.
+
+Also consider: per-component secrets (the worker shouldn't need
+the admin bearer; it has its own per-worker token) once the
+worker-identity migration happens.
+
 ### 🟢 No persistent client-side cache (offline / reload-resilience)
 
 The chat UI keeps an in-memory `Map` of loaded conversation messages
