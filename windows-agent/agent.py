@@ -43,7 +43,7 @@ IS_WINDOWS = platform.system() == "Windows"
 # the moment it starts. The CI-generated version.txt (short-sha +
 # build timestamp) is still what the self-updater diffs against;
 # AGENT_VERSION is just the human-facing label.
-AGENT_VERSION = "1.1.7"
+AGENT_VERSION = "1.1.8"
 
 # ---------------------------------------------------------------------------
 # Idle detection
@@ -245,8 +245,32 @@ def _write_update_batch(
     previous_exe = exe.with_suffix(exe.suffix + ".previous")
     if relaunch_args is None:
         relaunch_args = ["--background"]
-    quoted_args = " ".join(f'"{a}"' for a in relaunch_args)
-    relaunch_line = f'start "" "{exe}" {quoted_args}\r\n'.rstrip() + "\r\n"
+    # Relaunch uses PowerShell's Start-Process, NOT cmd's `start ""`.
+    # Reason: cmd's `start` calls ShellExecuteEx, which silently no-ops
+    # when the calling process has no console handle. update.bat is
+    # launched via subprocess.DETACHED_PROCESS from agent.py, so its
+    # cmd has no console — exactly the case ShellExecuteEx breaks on.
+    # PowerShell's Start-Process uses CreateProcess directly, which
+    # works regardless of console state. -WindowStyle Hidden suppresses
+    # the PowerShell host's own window; agent.exe gets its default
+    # console (matches the user's foreground experience). Pre-v1.1.8
+    # this was the silent bug behind every "agent never relaunched
+    # after update" failure on contributor machines.
+    def _ps_relaunch(target: Path, args: list[str]) -> str:
+        target_str = str(target).replace("'", "''")
+        dir_str = str(target.parent).replace("'", "''")
+        ps_cmd = (
+            f"Start-Process -FilePath '{target_str}' "
+            f"-WorkingDirectory '{dir_str}'"
+        )
+        if args:
+            arg_list = ", ".join(f"'{a}'" for a in args)
+            ps_cmd += f" -ArgumentList {arg_list}"
+        return (
+            f'powershell -NoProfile -WindowStyle Hidden '
+            f'-Command "{ps_cmd}"\r\n'
+        )
+    relaunch_line = _ps_relaunch(exe, relaunch_args)
     # taskkill matches the running exe's actual filename — required for
     # users who renamed their binary (e.g. "GamerAI-Agent (1).exe" from
     # a re-download). The previous hard-coded "agent.exe" missed those.
