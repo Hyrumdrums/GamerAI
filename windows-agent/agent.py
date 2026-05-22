@@ -45,7 +45,7 @@ IS_WINDOWS = platform.system() == "Windows"
 # the moment it starts. The CI-generated version.txt (short-sha +
 # build timestamp) is still what the self-updater diffs against;
 # AGENT_VERSION is just the human-facing label.
-AGENT_VERSION = "1.1.17"
+AGENT_VERSION = "1.1.18"
 
 # ---------------------------------------------------------------------------
 # Idle detection
@@ -1324,10 +1324,19 @@ def load_state() -> dict:
     }
 
 
+_STATE_LOCK = threading.Lock()
+
+
 def save_state(state: dict) -> None:
-    tmp = STATE_PATH.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
-    tmp.replace(STATE_PATH)
+    # The stdin command thread can mutate state (e.g., the `stayalive`
+    # toggle) while the main loop also writes after each job. json.dumps
+    # iterates the dict, so a concurrent write would raise
+    # RuntimeError: dictionary changed size during iteration. Lock keeps
+    # the serialize+replace pair atomic across threads.
+    with _STATE_LOCK:
+        tmp = STATE_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        tmp.replace(STATE_PATH)
 
 
 def resolve_worker_id(cfg_worker_id: Optional[str], state: dict) -> str:
@@ -2318,11 +2327,14 @@ def log_status_line(
 
 _STDIN_HELP = (
     "commands:\n"
-    "  update   download the latest agent.exe and relaunch\n"
-    "  version  print the running version + build\n"
-    "  status   print worker_id and current status\n"
-    "  help     show this list\n"
-    "  quit     exit the agent\n"
+    "  update          download the latest agent.exe and relaunch\n"
+    "  version         print the running version + build\n"
+    "  status          print worker_id and current status\n"
+    "  stayalive       toggle the user-input idle gate (or use 'on'/'off')\n"
+    "  stayalive on    ignore user-input idleness (CPU-only gate)\n"
+    "  stayalive off   restore normal user-input idle gate\n"
+    "  help            show this list\n"
+    "  quit            exit the agent\n"
 )
 
 
@@ -2331,6 +2343,8 @@ def stdin_command_loop(
     worker_id: str,
     force_update_event: threading.Event,
     stop_event: threading.Event,
+    cfg: "Config",
+    state: dict,
 ) -> None:
     """Read line-oriented commands from the console window. Runs in
     both foreground and tray modes — in tray mode the console starts
@@ -2384,6 +2398,41 @@ def stdin_command_loop(
                 sys.stdout.write(
                     f"worker_id={worker_id} v{AGENT_VERSION} "
                     f"(build {current_version()})\n"
+                )
+                sys.stdout.flush()
+            except Exception:
+                pass
+        elif cmd.startswith("stayalive"):
+            # Accept: "stayalive" (toggle), "stayalive on", "stayalive off".
+            parts = cmd.split()
+            arg = parts[1] if len(parts) > 1 else ""
+            if arg in ("on", "true", "1", "yes"):
+                new_value = True
+            elif arg in ("off", "false", "0", "no"):
+                new_value = False
+            elif arg == "":
+                new_value = not cfg.stayalive
+            else:
+                try:
+                    sys.stdout.write(
+                        f"stayalive: unknown argument {arg!r} — "
+                        f"use 'on' / 'off' / nothing-to-toggle\n"
+                    )
+                    sys.stdout.flush()
+                except Exception:
+                    pass
+                continue
+            cfg.stayalive = new_value
+            state["stayalive"] = new_value
+            try:
+                save_state(state)
+            except Exception as exc:
+                log.warning("stayalive: state save failed (%s)", exc)
+            log.info("stayalive %s (via stdin command)", "ON" if new_value else "OFF")
+            try:
+                sys.stdout.write(
+                    f"stayalive: {'ON' if new_value else 'OFF'} "
+                    f"(persisted to state.json)\n"
                 )
                 sys.stdout.flush()
             except Exception:
@@ -3403,7 +3452,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     # console just waits silently, so the thread is harmless.
     stdin_thread = threading.Thread(
         target=stdin_command_loop,
-        args=(log, worker_id, force_update_event, stop_event),
+        args=(log, worker_id, force_update_event, stop_event, cfg, state),
         name="gamerai-stdin",
         daemon=True,
     )
