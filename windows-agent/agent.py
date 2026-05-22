@@ -45,7 +45,7 @@ IS_WINDOWS = platform.system() == "Windows"
 # the moment it starts. The CI-generated version.txt (short-sha +
 # build timestamp) is still what the self-updater diffs against;
 # AGENT_VERSION is just the human-facing label.
-AGENT_VERSION = "1.1.21"
+AGENT_VERSION = "1.1.22"
 
 # ---------------------------------------------------------------------------
 # Idle detection
@@ -1669,13 +1669,79 @@ def _format_eta(seconds: float) -> str:
     return f"{s // 3600}h {(s % 3600) // 60:02d}m"
 
 
+# Retry budget for the staged-file rename. Windows Defender's
+# real-time scan can hold an open handle on a freshly-written 1.5 GB
+# file for several seconds, which makes the very first
+# `staged.replace(dest)` fail with WinError 32. The scan completes;
+# subsequent attempts succeed. Delays in seconds; total wait ~38 s.
+_RENAME_RETRY_DELAYS = (1.0, 2.0, 5.0, 10.0, 20.0)
+
+
+def _atomic_rename_with_retry(
+    staged: Path, dest: Path, log: logging.Logger, label: str,
+) -> bool:
+    """Promote *staged* to *dest* with exponential backoff. Returns True
+    on success. The first attempt is the normal path; the retries exist
+    to ride out Windows Defender holding an open scan handle on the
+    just-written file."""
+    last_err: Optional[OSError] = None
+    for attempt, delay in enumerate((0.0,) + _RENAME_RETRY_DELAYS):
+        if delay:
+            time.sleep(delay)
+        try:
+            staged.replace(dest)
+            if attempt:
+                log.info(
+                    "bootstrap: %s rename succeeded on retry %d", label, attempt,
+                )
+            return True
+        except OSError as e:
+            last_err = e
+            if attempt < len(_RENAME_RETRY_DELAYS):
+                log.info(
+                    "bootstrap: %s rename busy (%s); retrying in %.0fs",
+                    label, e, _RENAME_RETRY_DELAYS[attempt],
+                )
+    log.warning(
+        "bootstrap: could not finalize %s after %d retries: %s",
+        label, len(_RENAME_RETRY_DELAYS), last_err,
+    )
+    return False
+
+
 def _download_to(url: str, dest: Path, log: logging.Logger, label: str) -> bool:
     """Stream a URL to a temp file then rename atomically. Returns True
     only on a complete, non-empty download. Logs progress as percent +
     ETA when the server provides Content-Length (the usual case for a
     static file). Falls back to byte counts when Content-Length is
-    absent (e.g. a chunked-encoded response)."""
+    absent (e.g. a chunked-encoded response).
+
+    Recovery: if a prior run left a *.part file whose size matches the
+    server's Content-Length, skip the redownload and go straight to
+    the rename. Saves a 1.5 GB redo when only the rename failed
+    previously (the Windows Defender / WinError 32 case)."""
     staged = dest.with_suffix(dest.suffix + ".part")
+    if (
+        not dest.exists()
+        and staged.exists()
+        and staged.stat().st_size > 0
+    ):
+        try:
+            with httpx.Client(timeout=30.0, follow_redirects=True) as c:
+                head = c.head(url)
+            remote_total = int(head.headers.get("content-length") or 0)
+        except Exception as e:
+            log.info(
+                "bootstrap: %s recovery HEAD failed (%s); falling back to redownload",
+                label, e,
+            )
+            remote_total = 0
+        if remote_total > 0 and staged.stat().st_size == remote_total:
+            log.info(
+                "bootstrap: %s found complete %s (%.0f MB); skipping redownload",
+                label, staged.name, remote_total / (1024 * 1024),
+            )
+            return _atomic_rename_with_retry(staged, dest, log, label)
     log.info("bootstrap: downloading %s -> %s", url, dest)
     try:
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -1748,11 +1814,10 @@ def _download_to(url: str, dest: Path, log: logging.Logger, label: str) -> bool:
             staged.stat().st_size / (1024 * 1024),
             _format_eta(time.time() - started),
         )
-        staged.replace(dest)
     except OSError as e:
-        log.warning("bootstrap: could not finalize %s: %s", label, e)
+        log.warning("bootstrap: could not stat %s: %s", label, e)
         return False
-    return True
+    return _atomic_rename_with_retry(staged, dest, log, label)
 
 
 def _install_ollama(mirror_base: str, log: logging.Logger) -> Optional[Path]:

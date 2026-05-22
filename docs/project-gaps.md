@@ -204,6 +204,35 @@ Also consider: per-component secrets (the worker shouldn't need
 the admin bearer; it has its own per-worker token) once the
 worker-identity migration happens.
 
+### 🟡 VPS holds an outbound deploy key to GitHub
+
+The production VPS has `/root/.ssh/github_deploy` — a private key that
+authenticates to `git@github.com:Hyrumdrums/GamerAI.git` for the
+`/opt/gamerai` checkout. `infra/deploy.sh` (and ad-hoc `git pull` on
+the box) use this key to bring in new source. Standard self-hosted
+deploy pattern, but inconsistent with the *safer* pattern we already
+use for `agent.exe` — that one is CI-built and SFTP-pushed to a
+chrooted `gamerai-uploads` user that can only write into
+`/var/www/downloads-chroot/uploads`. The VPS has zero outbound
+credentials in the agent.exe path; we should aim for the same in the
+container-deploy path.
+
+Blast radius today depends on the GitHub-side configuration:
+- If `github_deploy` is registered as a per-repo **Deploy Key** with
+  "Allow write access" UNCHECKED → VPS compromise leaks a private-repo
+  clone (bad, not catastrophic).
+- If it's a personal user SSH key OR a write-enabled deploy key →
+  VPS compromise = push to repo = supply-chain compromise of every
+  downstream contributor's `agent.exe`. Verify which it is.
+
+**Fix when container registry lands:** Build coordinator + worker
+images in CI, push to GHCR (or similar). `deploy.sh` becomes a
+`docker compose pull && docker compose up -d` — no git checkout on the
+VPS, no key on the VPS. Static mirror assets (GGUFs, sd.exe, ollama
+installer) follow the same SFTP-chroot path that agent.exe uses today.
+End state: VPS has no outbound credentials to any source-of-truth
+system. Discussed 2026-05-22 during the DreamShaper mirror rollout.
+
 ### 🟢 No persistent client-side cache (offline / reload-resilience)
 
 The chat UI keeps an in-memory `Map` of loaded conversation messages
