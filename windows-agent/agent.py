@@ -45,7 +45,7 @@ IS_WINDOWS = platform.system() == "Windows"
 # the moment it starts. The CI-generated version.txt (short-sha +
 # build timestamp) is still what the self-updater diffs against;
 # AGENT_VERSION is just the human-facing label.
-AGENT_VERSION = "1.1.15"
+AGENT_VERSION = "1.1.16"
 
 # ---------------------------------------------------------------------------
 # Idle detection
@@ -1064,6 +1064,21 @@ def updater_loop(
                         "self-update: published version %s differs from running %s",
                         latest, here,
                     )
+                # Heads-up toast so the user understands the
+                # incoming ~10-15 s tray-icon gap during update.bat's
+                # taskkill -> 8s wait -> swap -> relaunch sequence.
+                # Fires for both scheduled and forced ('update'
+                # stdin) update paths. Best-effort: silent no-op on
+                # non-Windows or if winotify is missing.
+                _build_str = (
+                    latest.split()[0] if latest else "new build"
+                )
+                _toast(
+                    "GamerAI updating",
+                    f"Downloading build {_build_str} — agent will "
+                    f"restart in ~15 seconds.",
+                    icon_path=_tray_icon_path(),
+                )
                 exe = _agent_exe_path()
                 if exe is None:
                     log.info("self-update: not a frozen exe — skipping (dev mode)")
@@ -3117,7 +3132,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     cfg = Config.load(args.config if args.config.exists() else None)
     state = load_state()
     worker_id = resolve_worker_id(cfg.worker_id, state)
-    _boot_log(f"main: config+state loaded, worker_id={worker_id[:12]}")
+    _boot_log(f"main: config+state loaded, worker_id={worker_id}")
     # Tray mode keeps the StreamHandler on — the hidden console's
     # scrollback is what "Show console" surfaces. Only a hypothetical
     # truly-headless mode would pass headless=True.
