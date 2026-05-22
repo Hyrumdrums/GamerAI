@@ -44,7 +44,7 @@ IS_WINDOWS = platform.system() == "Windows"
 # the moment it starts. The CI-generated version.txt (short-sha +
 # build timestamp) is still what the self-updater diffs against;
 # AGENT_VERSION is just the human-facing label.
-AGENT_VERSION = "1.1.12"
+AGENT_VERSION = "1.1.13"
 
 # ---------------------------------------------------------------------------
 # Idle detection
@@ -163,6 +163,31 @@ def _hide_console(hwnd: int) -> None:
         ctypes.windll.user32.ShowWindow(hwnd, SW_HIDE)
     except Exception:
         pass
+
+
+def _persist_console_hidden(hwnd: int, duration_seconds: float = 2.0) -> None:
+    """Background-thread re-hide loop. PyInstaller's --onefile bootstrap
+    creates the conhost window asynchronously, so a single ShowWindow(
+    SW_HIDE) at main() entry sometimes runs before the window is fully
+    realized — by which point our hide is a no-op and the console then
+    pops visible. Poll IsWindowVisible for ``duration_seconds`` and
+    re-hide on any flicker. After that window the user's explicit
+    Show/Hide actions via the tray menu take over (this thread exits)."""
+    if not (IS_WINDOWS and hwnd):
+        return
+
+    def _loop():
+        deadline = time.monotonic() + duration_seconds
+        while time.monotonic() < deadline:
+            try:
+                if ctypes.windll.user32.IsWindowVisible(hwnd):
+                    ctypes.windll.user32.ShowWindow(hwnd, SW_HIDE)
+            except Exception:
+                pass
+            time.sleep(0.05)
+    threading.Thread(
+        target=_loop, name="gamerai-console-hide", daemon=True,
+    ).start()
 
 
 def _show_console(hwnd: int) -> None:
@@ -289,6 +314,63 @@ def _toast(title: str, msg: str, *, icon_path: Optional[Path] = None) -> None:
         )
         n.set_audio(audio.Default, loop=False)
         n.show()
+    except Exception:
+        pass
+
+
+# CTRL_* constants for SetConsoleCtrlHandler. CTRL_C_EVENT (Ctrl+C) and
+# CTRL_BREAK_EVENT are already covered by Python's KeyboardInterrupt
+# path; we install our handler primarily for CTRL_CLOSE_EVENT (user
+# clicked the console's X button or ran `taskkill /PID <pid>` without
+# /F) plus CTRL_LOGOFF_EVENT and CTRL_SHUTDOWN_EVENT. Windows gives the
+# handler up to ~5 s of runway before forced termination, so the
+# shutdown_now callable must complete quickly.
+_CTRL_C_EVENT = 0
+_CTRL_BREAK_EVENT = 1
+_CTRL_CLOSE_EVENT = 2
+_CTRL_LOGOFF_EVENT = 5
+_CTRL_SHUTDOWN_EVENT = 6
+
+# Module-level reference so the WINFUNCTYPE-wrapped callback isn't
+# garbage-collected while Windows still holds the function pointer.
+_console_ctrl_handler_ref = None  # type: ignore[var-annotated]
+
+
+def _install_console_close_handler(shutdown_now) -> None:
+    """Trap console-close / logoff / shutdown so the graceful-shutdown
+    sequence (heartbeat offline + earnings) runs inside Windows' ~5 s
+    grace window. Without this, the user's main_loop poll can still be
+    asleep in time.sleep(polling_interval) when CTRL_CLOSE fires, and
+    Windows force-terminates the process before main()'s finally block
+    runs — leaving the worker registered as ``idle`` on the coordinator
+    and the user's last earnings line never written to disk.
+
+    ``shutdown_now`` is the same idempotent closure main()'s finally
+    block calls. We invoke it synchronously from the OS handler thread
+    so its work completes before Windows kills us.
+    """
+    global _console_ctrl_handler_ref
+    if not IS_WINDOWS:
+        return
+    try:
+        from ctypes import wintypes
+        HANDLER = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+
+        def _handler(ctrl_type):
+            if ctrl_type in (
+                _CTRL_C_EVENT, _CTRL_BREAK_EVENT, _CTRL_CLOSE_EVENT,
+                _CTRL_LOGOFF_EVENT, _CTRL_SHUTDOWN_EVENT,
+            ):
+                try:
+                    shutdown_now()
+                except Exception:
+                    pass
+                return True
+            return False
+
+        cb = HANDLER(_handler)
+        _console_ctrl_handler_ref = cb  # keep alive
+        ctypes.windll.kernel32.SetConsoleCtrlHandler(cb, True)
     except Exception:
         pass
 
@@ -571,7 +653,21 @@ def _write_update_batch(
     def _ps_relaunch(target: Path, args: list[str]) -> str:
         target_str = str(target).replace("'", "''")
         dir_str = str(target.parent).replace("'", "''")
+        # Clear PyInstaller's bootloader-handoff env vars before
+        # Start-Process. update.bat inherits them from the v1.1.11
+        # parent that wrote it, and Start-Process passes its current
+        # session env to the new process. If the new agent.exe sees
+        # _MEIPASS2 already set, its bootloader thinks it's the
+        # post-extract re-exec and points sys._MEIPASS at the OLD
+        # _MEI<random> dir — which still holds the previous version's
+        # bundled version.txt. Result (v1.1.12 fresh install bug):
+        # the relaunched agent reports the previous build's SHA in
+        # its banner, even though AGENT_VERSION (compiled into the
+        # binary) is the new one. Symptom is purely cosmetic but
+        # corrodes trust during support sessions, so we clear here.
         ps_cmd = (
+            "Remove-Item Env:\\_MEIPASS2 -ErrorAction SilentlyContinue; "
+            "Remove-Item Env:\\_MEIPASS -ErrorAction SilentlyContinue; "
             f"Start-Process -FilePath '{target_str}' "
             f"-WorkingDirectory '{dir_str}'"
         )
@@ -2896,6 +2992,27 @@ def main(argv: Optional[list[str]] = None) -> int:
         cfg = Config.load(args.config if args.config.exists() else None)
         return cmd_diagnose(cfg)
 
+    # Early deprecation log for --background. Has to land in agent.log
+    # BEFORE the single-instance check, because a second-instance
+    # launch with --background returns 0 below before setup_logging
+    # runs — and a deprecation notice the user never sees is no
+    # notice at all. setup_logging's RotatingFileHandler opens in
+    # append mode, so a one-line direct write here doesn't conflict
+    # with the proper logger taking over a few lines later.
+    if args.background_was_used:
+        try:
+            from datetime import datetime
+            log_path = logs_dir() / "agent.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(
+                    f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} "
+                    f"[WARNING] --background is deprecated; use --tray "
+                    f"instead (silently aliased for one release).\n"
+                )
+        except Exception:
+            pass
+
     # Tray-mode init: hide the console window and claim 127.0.0.1:48591
     # as the single-instance + IPC port. Done BEFORE the greeting and
     # logger setup so a second launch exits immediately without
@@ -2909,6 +3026,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         _set_console_title(f"GamerAI Agent — v{AGENT_VERSION}")
         console_hwnd = _get_console_hwnd()
         _hide_console(console_hwnd)
+        # PyInstaller bootstrap creates the conhost window
+        # asynchronously, so the single hide above sometimes races
+        # the window's realization and gets lost. A short polling
+        # thread keeps re-hiding for 2 seconds; after that any
+        # visibility change comes from the user's tray menu.
+        _persist_console_hidden(console_hwnd)
         ipc_sock, is_first = _claim_single_instance()
         if not is_first:
             # Another agent is already running; we already told it to
@@ -2923,12 +3046,6 @@ def main(argv: Optional[list[str]] = None) -> int:
     # scrollback is what "Show console" surfaces. Only a hypothetical
     # truly-headless mode would pass headless=True.
     log = setup_logging(headless=False)
-
-    if args.background_was_used:
-        log.warning(
-            "--background is deprecated; use --tray instead "
-            "(silently aliased for one release)."
-        )
 
     if args.status:
         print(f"version:   v{AGENT_VERSION} (build {current_version()})")
@@ -3146,6 +3263,47 @@ def main(argv: Optional[list[str]] = None) -> int:
             log=log,
         )
 
+    # Graceful-shutdown closure. Same body as the finally block below,
+    # but ALSO invoked from the SetConsoleCtrlHandler trampoline so
+    # console-close / logoff / shutdown events flush the offline
+    # heartbeat + final earnings line before Windows force-terminates
+    # us. Python's KeyboardInterrupt path does NOT fire for
+    # CTRL_CLOSE_EVENT (console X button, `taskkill /PID` without /F),
+    # so without this the user's last earnings + the worker's offline
+    # status are silently lost. Idempotent via shutdown_done.
+    shutdown_done = threading.Event()
+
+    def _shutdown_now():
+        if shutdown_done.is_set():
+            return
+        shutdown_done.set()
+        stop_event.set()
+        if tray_icon is not None:
+            try:
+                tray_icon.stop()
+            except Exception:
+                pass
+        try:
+            log.info("graceful shutdown")
+        except Exception:
+            pass
+        try:
+            coord.heartbeat("offline")
+        except Exception:
+            pass
+        if (keep_awake_holder.get("active")
+                and not keep_awake_holder.get("exit_requested")):
+            try:
+                keep_awake_end(log)
+            except Exception:
+                pass
+        try:
+            print_earnings(state, log)
+        except Exception:
+            pass
+
+    _install_console_close_handler(_shutdown_now)
+
     try:
         main_loop(
             cfg, coord, state, log,
@@ -3159,19 +3317,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     except KeyboardInterrupt:
         log.info("stopped by user")
     finally:
-        stop_event.set()
-        if tray_icon is not None:
-            try:
-                tray_icon.stop()
-            except Exception:
-                pass
-        try:
-            coord.heartbeat("offline")
-        except Exception:
-            pass
-        if keep_awake_holder.get("active") and not keep_awake_holder.get("exit_requested"):
-            keep_awake_end(log)
-        print_earnings(state, log)
+        _shutdown_now()
     return 0
 
 
