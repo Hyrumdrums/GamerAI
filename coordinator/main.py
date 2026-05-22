@@ -537,9 +537,9 @@ def generate(req: GenerateRequest, request: Request):
             status_code=400, detail=f"unknown tool: {tool!r}",
         )
 
-    # Default the model to sd1.5 for image jobs when the caller didn't
-    # pick one. Done before STRICT_MODELS validation so the registry
-    # check sees a concrete name.
+    # Default the model for image jobs when the caller didn't pick one.
+    # Done before STRICT_MODELS validation so the registry check sees a
+    # concrete name. Single source of truth: model_registry.DEFAULT_IMAGE_MODEL.
     if tool == "image" and not req.model:
         req.model = model_registry.DEFAULT_IMAGE_MODEL
 

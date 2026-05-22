@@ -359,8 +359,8 @@ class ImageGenerationTests(unittest.TestCase):
         self.assertEqual(envelope["image"]["width"], 512)
         self.assertEqual(envelope["image"]["height"], 512)
         self.assertEqual(envelope["image"]["steps"], 20)
-        # Default image model auto-selected.
-        self.assertEqual(envelope["model"], "sd1.5")
+        # Default image model auto-selected (model_registry.DEFAULT_IMAGE_MODEL).
+        self.assertEqual(envelope["model"], "dreamshaper8")
 
     def test_image_generate_rejects_denylist(self):
         # Picks a denylist phrase the unit test asserts continues to
@@ -403,7 +403,7 @@ class ImageGenerationTests(unittest.TestCase):
                 "worker_id": worker_id,
                 "job_id": job_id,
                 "text": "a cat",
-                "model": "sd1.5",
+                "model": "dreamshaper8",
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
                 "duration_seconds": 1.2,
@@ -455,7 +455,7 @@ class ImageGenerationTests(unittest.TestCase):
                 "worker_id": worker_id,
                 "job_id": job_id,
                 "text": "",
-                "model": "sd1.5",
+                "model": "dreamshaper8",
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
                 "duration_seconds": 1.0,

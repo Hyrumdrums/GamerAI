@@ -45,7 +45,7 @@ IS_WINDOWS = platform.system() == "Windows"
 # the moment it starts. The CI-generated version.txt (short-sha +
 # build timestamp) is still what the self-updater diffs against;
 # AGENT_VERSION is just the human-facing label.
-AGENT_VERSION = "1.1.20"
+AGENT_VERSION = "1.1.21"
 
 # ---------------------------------------------------------------------------
 # Idle detection
@@ -1227,7 +1227,7 @@ DEFAULTS = {
         # {mirror_base}/download/sd-models/<slug>.gguf. The mirror is
         # populated by infra/setup-image-mirror.sh.
         "image_enabled": True,
-        "image_model": "sd1.5",
+        "image_model": "dreamshaper8",
     },
     "model": None,
     "worker_id": None,
@@ -1306,7 +1306,7 @@ class Config:
                 else None
             ),
             bootstrap_image_enabled=bool(bootstrap.get("image_enabled", False)),
-            bootstrap_image_model=str(bootstrap.get("image_model", "sd1.5")),
+            bootstrap_image_model=str(bootstrap.get("image_model", "dreamshaper8")),
             model=data.get("model"),
             worker_id=data.get("worker_id"),
             api_token=token or None,
@@ -2026,6 +2026,43 @@ def sd_model_path(slug: str) -> Path:
     return sd_models_dir() / f"{slug}.gguf"
 
 
+def sd_sidecar_path(slug: str) -> Path:
+    return sd_models_dir() / f"{slug}.json"
+
+
+# Per-model inference defaults the agent feeds to sd.exe when the
+# job didn't override them. Loaded from sd-models/<slug>.json staged
+# by infra/setup-image-mirror.sh; falls back to vanilla SD 1.5 numbers
+# when the sidecar is missing or malformed (older deployments).
+_SD_DEFAULTS_FALLBACK = {
+    "default_width": 512,
+    "default_height": 512,
+    "default_steps": 20,
+    "default_cfg_scale": 7.0,
+    "default_sampler": "euler_a",
+}
+
+
+def load_sd_model_defaults(slug: str, log: logging.Logger) -> dict:
+    """Read sd-models/<slug>.json and return the (steps, cfg, sampler,
+    size) defaults for this model. Tolerates missing / malformed files
+    by falling back to vanilla-SD1.5 numbers — callers don't have to
+    branch on the absence."""
+    path = sd_sidecar_path(slug)
+    if not path.exists():
+        return dict(_SD_DEFAULTS_FALLBACK)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        log.warning("image: sidecar %s unreadable (%s) — using fallback", path, exc)
+        return dict(_SD_DEFAULTS_FALLBACK)
+    merged = dict(_SD_DEFAULTS_FALLBACK)
+    for k in _SD_DEFAULTS_FALLBACK:
+        if k in data:
+            merged[k] = data[k]
+    return merged
+
+
 # Files the sd.cpp Windows build needs alongside sd.exe. sd.exe by
 # itself won't load — `stable-diffusion.dll` carries the ggml + the
 # GPU backend (vulkan/cuda/etc.). Add other names here when bundling
@@ -2069,11 +2106,52 @@ def bootstrap_image_inference(cfg: "Config", log: logging.Logger) -> bool:
         )
         if not _download_to(url, model_path, log, f"{cfg.bootstrap_image_model}.gguf"):
             return False
+    # Sidecar JSON carries per-model defaults (steps / cfg / sampler).
+    # Treated as best-effort — if the mirror doesn't have it, the agent
+    # falls back to hardcoded SD1.5 numbers. Refetched whenever the
+    # file is missing locally so a mirror-side update to the defaults
+    # propagates on the next bootstrap tick (cheap, ~200 B).
+    sidecar_path = sd_sidecar_path(cfg.bootstrap_image_model)
+    if not sidecar_path.exists():
+        url = (
+            f"{mirror_base}/download/sd-models/"
+            f"{cfg.bootstrap_image_model}.json"
+        )
+        # Failure is non-fatal — fallback defaults kick in.
+        _download_to(url, sidecar_path, log, f"{cfg.bootstrap_image_model}.json")
+    # Sweep stale GGUF/JSON sidecars from previous model selections so
+    # contributor disks don't accumulate a 1.5 GB blob per model swap.
+    # Keeps only the currently configured slug.
+    _sweep_stale_image_models(cfg.bootstrap_image_model, log)
     log.info(
         "image bootstrap: ready (install_dir=%s, model=%s)",
         install_dir, model_path,
     )
     return True
+
+
+def _sweep_stale_image_models(active_slug: str, log: logging.Logger) -> None:
+    """Delete *.gguf / *.json in sd_models_dir() that don't match the
+    active slug. Best-effort: an OSError on one file shouldn't stop the
+    others from being removed."""
+    models_dir = sd_models_dir()
+    if not models_dir.exists():
+        return
+    keep = {f"{active_slug}.gguf", f"{active_slug}.json"}
+    for entry in models_dir.iterdir():
+        if entry.name in keep:
+            continue
+        if entry.suffix not in (".gguf", ".json"):
+            continue
+        try:
+            size_mb = entry.stat().st_size / (1024 * 1024)
+            entry.unlink()
+            log.info(
+                "image bootstrap: removed stale %s (%.1f MB)",
+                entry.name, size_mb,
+            )
+        except OSError as exc:
+            log.warning("image bootstrap: could not remove %s (%s)", entry.name, exc)
 
 
 def bootstrap_inference(cfg: "Config", log: logging.Logger) -> Optional[str]:
@@ -2267,12 +2345,20 @@ def run_image_inference(
         log.info("image: sd.exe not available — returning mock PNG")
         return _mock_image_b64(), "mock-image"
     params = job.get("image") or {}
-    width = int(params.get("width") or 512)
-    height = int(params.get("height") or 512)
-    steps = int(params.get("steps") or 20)
+    model_slug = cfg.bootstrap_image_model
+    # Pull per-model defaults from the sidecar JSON — LCM-distilled
+    # models need step≈8 / cfg≈1.5 / sampler=lcm, vanilla SD1.5 wants
+    # step≈20 / cfg≈7 / sampler=euler_a. Using the wrong numbers gives
+    # mushy output (LCM at 20 steps) or wasted compute. Job-level
+    # overrides still win.
+    sd_defaults = load_sd_model_defaults(model_slug, log)
+    width = int(params.get("width") or sd_defaults["default_width"])
+    height = int(params.get("height") or sd_defaults["default_height"])
+    steps = int(params.get("steps") or sd_defaults["default_steps"])
+    cfg_scale = float(params.get("cfg_scale") or sd_defaults["default_cfg_scale"])
+    sampler = str(params.get("sampler") or sd_defaults["default_sampler"])
     seed = params.get("seed")
     negative = params.get("negative_prompt") or ""
-    model_slug = cfg.bootstrap_image_model
     model_path = sd_model_path(model_slug)
     if not model_path.exists():
         raise RuntimeError(
@@ -2300,6 +2386,8 @@ def run_image_inference(
         "-W", str(width),
         "-H", str(height),
         "--steps", str(steps),
+        "--cfg-scale", str(cfg_scale),
+        "--sampling-method", sampler,
         "-o", str(out_path),
     ]
     if seed is not None:
@@ -2307,8 +2395,8 @@ def run_image_inference(
     if negative:
         argv.extend(["-n", negative])
     log.info(
-        "image: running sd.exe (model=%s %dx%d steps=%d)",
-        model_slug, width, height, steps,
+        "image: running sd.exe (model=%s %dx%d steps=%d cfg=%.1f sampler=%s)",
+        model_slug, width, height, steps, cfg_scale, sampler,
     )
     try:
         # Hide stdout — sd.cpp is chatty with progress dots. We surface

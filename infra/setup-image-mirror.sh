@@ -28,18 +28,19 @@ SD_BINARY="${MIRROR_ROOT}/sd.exe"
 # win-cu12-x64.zip too).
 SD_BINARY_URL="${SD_BINARY_URL:-https://github.com/leejet/stable-diffusion.cpp/releases/download/master-637-ef92a00/sd-master-ef92a00-bin-win-vulkan-x64.zip}"
 
-# Small SD 1.5 model — ~1.5 GB Q4_0 GGUF. The smallest credible model
-# that produces recognizable images. Default for first-run installs;
-# SDXL ships later for higher-VRAM contributors.
+# Image model catalog. Each entry is "<slug>|<local-src>|<family>|<steps>|<cfg>|<sampler>".
+# The agent's image bootstrap downloads `<slug>.gguf` + `<slug>.json`;
+# `<slug>.json` carries the per-model defaults (steps, cfg scale, sampler)
+# the agent feeds to sd.exe. LCM-distilled models need step≈8 / cfg≈1.5 /
+# sampler=lcm; vanilla SD1.5 wants step≈20 / cfg≈7 / sampler=euler_a.
 #
-# DEFAULT_MODEL_SRC is a local file path; we copy it into the mirror
-# rather than re-downloading from HF (where the leejet/stable-
-# diffusion-v1-5 repo is currently auth-gated — re-fetching there
-# would 401). Override DEFAULT_MODEL_URL=<https://...> to fall back
-# to a network source.
-DEFAULT_SLUG="${DEFAULT_SLUG:-sd1.5}"
-DEFAULT_MODEL_SRC="${DEFAULT_MODEL_SRC:-/home/beargroup/ai/models/sd/stable-diffusion-v1-5-pruned-emaonly-Q4_0.gguf}"
-DEFAULT_MODEL_URL="${DEFAULT_MODEL_URL:-}"
+# Local-src files are copied (not re-downloaded from HF) since the
+# upstream repos are sometimes auth-gated. The script bails per-entry
+# if a source file is missing — easier to add models incrementally.
+MODEL_CATALOG=(
+  "dreamshaper8|/home/beargroup/ai/models/sd/dreamshaper_8LCM-iq4_nl-imv2.gguf|dreamshaper-8-lcm|8|1.5|lcm"
+  "sd1.5|/home/beargroup/ai/models/sd/stable-diffusion-v1-5-pruned-emaonly-Q4_0.gguf|stable-diffusion-1.5|20|7.0|euler_a"
+)
 
 mkdir -p "${SD_MODELS_DIR}"
 
@@ -104,57 +105,61 @@ if [[ ! -s "${SD_BINARY}" || "${FORCE:-0}" == "1" ]]; then
   fi
 fi
 
-# Stage the GGUF: prefer a local file (no re-download of a 1.5 GB
-# blob we already have); fall back to URL if local source is missing
-# and a URL was provided.
-MODEL_DEST="${SD_MODELS_DIR}/${DEFAULT_SLUG}.gguf"
-if [[ "${FORCE:-0}" != "1" && -s "${MODEL_DEST}" ]]; then
-  echo "skip ${DEFAULT_SLUG}.gguf (already present: $(du -h "${MODEL_DEST}" | cut -f1))"
-elif [[ -s "${DEFAULT_MODEL_SRC}" ]]; then
-  echo "copying ${DEFAULT_SLUG}.gguf from ${DEFAULT_MODEL_SRC}..."
-  cp -f "${DEFAULT_MODEL_SRC}" "${MODEL_DEST}.part"
-  # Sanity-check GGUF magic bytes before promoting the staged file —
-  # catches `cp` from a wrong-format file (a safetensors blob
-  # masquerading as gguf would silently break sd.cpp).
-  if [[ "$(head -c 4 "${MODEL_DEST}.part" | od -An -c | tr -d ' ')" != "GGUF" ]]; then
-    echo "error: ${DEFAULT_MODEL_SRC} is not a GGUF file (magic mismatch)" >&2
-    rm -f "${MODEL_DEST}.part"
-    exit 1
-  fi
-  mv "${MODEL_DEST}.part" "${MODEL_DEST}"
-  echo "ok   ${DEFAULT_SLUG}.gguf ($(du -h "${MODEL_DEST}" | cut -f1))"
-elif [[ -n "${DEFAULT_MODEL_URL}" ]]; then
-  fetch_if_missing "${DEFAULT_MODEL_URL}" "${MODEL_DEST}" "${DEFAULT_SLUG}.gguf"
-else
-  echo "error: ${DEFAULT_MODEL_SRC} not found and DEFAULT_MODEL_URL is empty" >&2
-  echo "       set DEFAULT_MODEL_SRC=<local-path> or DEFAULT_MODEL_URL=<https://...>" >&2
-  exit 1
-fi
+# Stage each entry in the catalog. Prefers local files (no re-download
+# of a 1.5 GB blob we already have) and writes a sidecar JSON the agent
+# reads for per-model defaults (steps / cfg / sampler).
+for entry in "${MODEL_CATALOG[@]}"; do
+  IFS='|' read -r slug src family steps cfg sampler <<<"${entry}"
+  dest="${SD_MODELS_DIR}/${slug}.gguf"
+  sidecar="${SD_MODELS_DIR}/${slug}.json"
 
-# Sidecar JSON the agent reads to know defaults (size, steps, license).
-# Kept minimal — extend when adding SDXL or other models.
-cat > "${SD_MODELS_DIR}/${DEFAULT_SLUG}.json" <<JSON
+  if [[ "${FORCE:-0}" != "1" && -s "${dest}" ]]; then
+    echo "skip ${slug}.gguf (already present: $(du -h "${dest}" | cut -f1))"
+  elif [[ -s "${src}" ]]; then
+    echo "copying ${slug}.gguf from ${src}..."
+    cp -f "${src}" "${dest}.part"
+    # Sanity-check GGUF magic bytes before promoting the staged file —
+    # catches `cp` from a wrong-format file (a safetensors blob
+    # masquerading as gguf would silently break sd.cpp).
+    if [[ "$(head -c 4 "${dest}.part" | od -An -c | tr -d ' ')" != "GGUF" ]]; then
+      echo "error: ${src} is not a GGUF file (magic mismatch)" >&2
+      rm -f "${dest}.part"
+      exit 1
+    fi
+    mv "${dest}.part" "${dest}"
+    echo "ok   ${slug}.gguf ($(du -h "${dest}" | cut -f1))"
+  else
+    echo "warn ${slug}: source missing at ${src} — skipping" >&2
+    continue
+  fi
+
+  cat > "${sidecar}" <<JSON
 {
-  "name": "${DEFAULT_SLUG}",
-  "family": "stable-diffusion-1.5",
+  "name": "${slug}",
+  "family": "${family}",
   "kind": "image",
   "default_width": 512,
   "default_height": 512,
-  "default_steps": 20,
+  "default_steps": ${steps},
+  "default_cfg_scale": ${cfg},
+  "default_sampler": "${sampler}",
   "license": "CreativeML Open RAIL-M"
 }
 JSON
-echo "wrote ${SD_MODELS_DIR}/${DEFAULT_SLUG}.json"
+  echo "wrote ${sidecar}"
+done
 
 echo
 echo "mirror image contents:"
-ls -lh "${SD_BINARY}" "${SD_MODELS_DIR}/${DEFAULT_SLUG}.gguf" \
-       "${SD_MODELS_DIR}/${DEFAULT_SLUG}.json" 2>/dev/null
+ls -lh "${SD_BINARY}" "${SD_MODELS_DIR}"/*.gguf "${SD_MODELS_DIR}"/*.json 2>/dev/null
 
 echo
 echo "verify from a client:"
 echo "  curl -I https://ai.dallinlayton.com/download/sd.exe"
-echo "  curl -I https://ai.dallinlayton.com/download/sd-models/${DEFAULT_SLUG}.gguf"
+for entry in "${MODEL_CATALOG[@]}"; do
+  IFS='|' read -r slug _ <<<"${entry}"
+  echo "  curl -I https://ai.dallinlayton.com/download/sd-models/${slug}.gguf"
+done
 echo
-echo "TODO: SDXL ships once the small model is proven end-to-end."
+echo "TODO: SDXL ships once a high-VRAM contributor tier exists."
 echo "      Source: /home/beargroup/ai/image-generation/models/checkpoints/sd_xl_base_1.0.safetensors"

@@ -61,12 +61,19 @@ _CATALOG: dict[str, Model] = {
         Model("phi3:14b",     "phi",      14.0,  14.0,  10.0, "MIT"),
         # Image-generation models. params_b is the unet+text-encoder
         # parameter count (estimate); min_vram_gb is the rough Q4 GGUF
-        # requirement for 512×512 generation. Defaults shipped with the
-        # MVP — the small one. SDXL is registered but the mirror only
+        # requirement for 512×512 generation. DreamShaper 8 LCM is the
+        # mirror default — versatile community fine-tune, runs in 8
+        # steps thanks to LCM distillation (~8s on a 1660 Ti vs ~20s
+        # for vanilla SD1.5 at 20 steps). Vanilla sd1.5 stays around as
+        # a debugging fallback. SDXL is registered but the mirror only
         # serves it once we promote it (see infra/setup-image-mirror.sh).
+        Model("dreamshaper8", "dreamshaper-8-lcm", 0.86, 0.86, 4.0,
+              "CreativeML Open RAIL-M",
+              "iq4_nl GGUF; LCM-distilled (8 steps); mirror default; ~8s/image on a 1660 Ti",
+              kind="image"),
         Model("sd1.5",  "stable-diffusion-1.5", 0.86, 0.86, 4.0,
               "CreativeML Open RAIL-M",
-              "Q4_0 GGUF; mirror default; 512x512 in ~5-15s on a recent GPU",
+              "Q4_0 GGUF; vanilla baseline kept for debugging/comparison",
               kind="image"),
         Model("sdxl",   "stable-diffusion-xl",  3.5,  3.5,  8.0,
               "CreativeML Open RAIL++-M",
@@ -99,7 +106,7 @@ def list_all() -> list[Model]:
 # Default image model — what /generate falls back to when tool="image"
 # arrives with no `model` field. Single source of truth so the agent
 # bootstrap and the coordinator stay in sync.
-DEFAULT_IMAGE_MODEL = "sd1.5"
+DEFAULT_IMAGE_MODEL = "dreamshaper8"
 
 
 def is_image_model(name: str | None) -> bool:
