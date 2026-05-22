@@ -45,7 +45,7 @@ IS_WINDOWS = platform.system() == "Windows"
 # the moment it starts. The CI-generated version.txt (short-sha +
 # build timestamp) is still what the self-updater diffs against;
 # AGENT_VERSION is just the human-facing label.
-AGENT_VERSION = "1.1.18"
+AGENT_VERSION = "1.1.19"
 
 # ---------------------------------------------------------------------------
 # Idle detection
@@ -164,6 +164,53 @@ def _hide_console(hwnd: int) -> None:
         ctypes.windll.user32.ShowWindow(hwnd, SW_HIDE)
     except Exception:
         pass
+
+
+def _print_welcome_banner() -> None:
+    """First-launch banner shown in the visible console after an
+    auto-update (or any version transition). Without it, the post-
+    update tray flash + 10 s pause feels like the agent broke — the
+    Windows test pass surfaced this UX gap. Pairs with
+    _schedule_delayed_hide so the user has time to read it."""
+    try:
+        build = current_version()
+        banner = (
+            "\n"
+            "============================================================\n"
+            "============================================================\n"
+            "\n"
+            f"     Welcome to GamerAI Agent v{AGENT_VERSION}!\n"
+            f"     Build {build}\n"
+            "\n"
+            "     This console will hide in 10 seconds.\n"
+            "     Right-click the tray icon to show it again any time.\n"
+            "\n"
+            "============================================================\n"
+            "============================================================\n"
+            "\n"
+        )
+        sys.stdout.write(banner)
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+
+def _schedule_delayed_hide(hwnd: int, delay_seconds: float = 10.0) -> None:
+    """Hide the console after ``delay_seconds`` on a daemon thread.
+    Used in the welcome-banner path so the user gets a full read of
+    the banner before the console disappears."""
+    if not (IS_WINDOWS and hwnd):
+        return
+
+    def _hide_later():
+        time.sleep(delay_seconds)
+        try:
+            ctypes.windll.user32.ShowWindow(hwnd, SW_HIDE)
+        except Exception:
+            pass
+    threading.Thread(
+        target=_hide_later, name="gamerai-welcome-hide", daemon=True,
+    ).start()
 
 
 def _persist_console_hidden(hwnd: int, duration_seconds: float = 2.0) -> None:
@@ -3166,6 +3213,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         except Exception:
             pass
 
+    # State load moved up here (was after _print_greeting) so the
+    # tray-mode init can read state["last_seen_version"] to decide
+    # whether to show the post-update welcome banner. The captured
+    # _was_last_seen_version is also used by the update-applied toast
+    # below so it sees the pre-mutation value too.
+    state = load_state()
+    _was_last_seen_version = state.get("last_seen_version")
+    _boot_log(f"main: state loaded, last_seen_version={_was_last_seen_version!r}")
+
     # Tray-mode init: hide the console window and claim 127.0.0.1:48591
     # as the single-instance + IPC port. Done BEFORE the greeting and
     # logger setup so a second launch exits immediately without
@@ -3174,17 +3230,35 @@ def main(argv: Optional[list[str]] = None) -> int:
     console_hwnd = 0
     ipc_sock: Optional[socket.socket] = None
     tray_active = args.tray and not args.once and not args.status
+    show_welcome = False
     if tray_active:
         _set_aumid()
         _set_console_title(f"GamerAI Agent — v{AGENT_VERSION}")
         console_hwnd = _get_console_hwnd()
-        _hide_console(console_hwnd)
-        # PyInstaller bootstrap creates the conhost window
-        # asynchronously, so the single hide above sometimes races
-        # the window's realization and gets lost. A short polling
-        # thread keeps re-hiding for 2 seconds; after that any
-        # visibility change comes from the user's tray menu.
-        _persist_console_hidden(console_hwnd)
+        # First launch on a new version (or first install) shows a
+        # 10-second welcome banner instead of hiding immediately.
+        # Otherwise the post-update tray flash + invisible startup
+        # reads as "the agent broke" to a user expecting visible
+        # feedback. state["last_seen_version"] is updated by the
+        # toast block below, so the welcome runs exactly once per
+        # transition.
+        show_welcome = _was_last_seen_version != AGENT_VERSION
+        if show_welcome:
+            _print_welcome_banner()
+            _schedule_delayed_hide(console_hwnd, 10.0)
+            _boot_log(
+                f"tray: welcome banner shown (was={_was_last_seen_version!r})"
+            )
+        else:
+            _hide_console(console_hwnd)
+            # PyInstaller bootstrap creates the conhost window
+            # asynchronously, so the single hide above sometimes
+            # races the window's realization and gets lost. A short
+            # polling thread keeps re-hiding for 2 seconds; after
+            # that any visibility change comes from the user's tray
+            # menu.
+            _persist_console_hidden(console_hwnd)
+            _boot_log("tray: console hidden (welcome already shown for this version)")
         ipc_sock, is_first = _claim_single_instance()
         if not is_first:
             # Another agent is already running; we already told it to
@@ -3196,7 +3270,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     _print_greeting(args.once, args.status)
     _boot_log("main: greeting printed, loading config")
     cfg = Config.load(args.config if args.config.exists() else None)
-    state = load_state()
+    # state was already loaded above (before tray init) so the welcome
+    # banner could check last_seen_version. Don't re-load here — that
+    # would clobber any state mutations the tray init path made.
     worker_id = resolve_worker_id(cfg.worker_id, state)
     _boot_log(f"main: config+state loaded, worker_id={worker_id}")
     # Tray mode keeps the StreamHandler on — the hidden console's
@@ -3263,18 +3339,20 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"earnings:  ${float(state.get('earnings_usd', 0.0)):.6f}")
         return 0
 
-    # Update-applied toast: compare AGENT_VERSION against the value we
-    # persisted on the previous run. Only fires when versions actually
-    # differ — silent on first install and on plain restarts.
+    # Update-applied toast + welcome-banner marker. Uses the
+    # _was_last_seen_version captured before tray init so welcome and
+    # toast see the same pre-mutation value. Toast skips first install
+    # (no prior version to compare against). last_seen_version is
+    # updated here so the welcome banner runs exactly once per
+    # version transition.
     if tray_active:
-        last_seen = state.get("last_seen_version")
-        if last_seen and last_seen != AGENT_VERSION:
+        if _was_last_seen_version and _was_last_seen_version != AGENT_VERSION:
             _toast(
                 "GamerAI updated",
-                f"Now running v{AGENT_VERSION} (was v{last_seen}).",
+                f"Now running v{AGENT_VERSION} (was v{_was_last_seen_version}).",
                 icon_path=_tray_icon_path(),
             )
-        if last_seen != AGENT_VERSION:
+        if _was_last_seen_version != AGENT_VERSION:
             state["last_seen_version"] = AGENT_VERSION
             save_state(state)
 
