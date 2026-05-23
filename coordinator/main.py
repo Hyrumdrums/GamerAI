@@ -52,6 +52,7 @@ from shared.config import (
     job_queue_for,
 )
 from shared.models import (
+    AgentPairPollRequest,
     ConversationCreateRequest,
     GenerateRequest,
     GenerateResponse,
@@ -1177,7 +1178,22 @@ def _is_public(method: str, path: str) -> bool:
         return True
     if method == "POST" and path == "/login":
         return True
+    # Agent pairing — the agent has no token yet, so all three of these
+    # are public. Security relies on the short-lived pair_code (5-min
+    # TTL) plus the requirement that an authenticated browser session
+    # explicitly approves it before the token is handed out.
+    if method == "POST" and path == "/agents/pair/start":
+        return True
+    if method == "POST" and path == "/agents/pair/poll":
+        return True
     parts = path.strip("/").split("/")
+    if (
+        method == "GET"
+        and len(parts) == 3
+        and parts[0] == "agents"
+        and parts[1] == "pair"
+    ):
+        return True
     if method == "GET" and len(parts) == 2 and parts[0] == "invites":
         return True
     if (
@@ -3690,3 +3706,149 @@ def metrics():
     )
     m["registered_workers"] = len(workers_rows)
     return m
+
+
+# ---------- agent pairing (browser handoff) ----------
+# Redis keys for the pair-code lifecycle. The code is short-lived
+# (PAIR_TTL_SECONDS) and one-shot: once the agent picks up its token via
+# /poll, the record is deleted. The token itself is stored in member_tokens
+# at /confirm time, so a re-played /poll after pickup is a 404 — the
+# token has already been delivered exactly once.
+PAIR_KEY_PREFIX = "agents:pair:"
+PAIR_TTL_SECONDS = 300
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+
+
+def _pair_key(code: str) -> str:
+    return f"{PAIR_KEY_PREFIX}{code}"
+
+
+@app.post("/agents/pair/start")
+def agent_pair_start(request: Request):
+    """Agent starts the pairing flow. Public — the agent has no token
+    yet. Returns the pairing code + a URL the agent should pop open in
+    the user's default browser. The browser-side flow happens at
+    ``GET /agent/pair?code=<>`` on the web UI, which proxies to
+    ``/agents/pair/{code}/confirm`` here on click."""
+    code = "pair_" + uuid.uuid4().hex[:16]
+    expires_at = time.time() + PAIR_TTL_SECONDS
+    r.set(
+        _pair_key(code),
+        json.dumps({"state": "pending", "expires_at": expires_at}),
+        ex=PAIR_TTL_SECONDS,
+    )
+    base = PUBLIC_BASE_URL or str(request.base_url).rstrip("/")
+    return {
+        "pair_code": code,
+        "pair_url": f"{base}/agent/pair?code={code}",
+        "expires_at": expires_at,
+        "ttl_seconds": PAIR_TTL_SECONDS,
+    }
+
+
+@app.get("/agents/pair/{code}")
+def agent_pair_info(code: str):
+    """Public read of a pair code's state. The web UI calls this from
+    the /agent/pair page so a user landing on a stale link gets a clean
+    404 rather than seeing a Confirm button that won't work.
+
+    Reveals only state + expiry — never the token, even if the code is
+    in 'approved' state."""
+    raw = r.get(_pair_key(code))
+    if raw is None:
+        raise HTTPException(status_code=404, detail="pair code not found or expired")
+    try:
+        record = json.loads(raw)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=404, detail="pair code corrupt")
+    return {
+        "state": record.get("state"),
+        "expires_at": record.get("expires_at"),
+    }
+
+
+@app.post("/agents/pair/{code}/confirm")
+def agent_pair_confirm(code: str, request: Request):
+    """Web UI calls this when the signed-in user clicks "Pair this PC".
+    Mints a fresh ``gai_…`` bearer, stores its hash in ``member_tokens``
+    tied to the caller's member_id (so future agent requests
+    authenticate as that member), and stashes the raw token in Redis
+    behind the pair code for the agent to retrieve via /poll.
+
+    Auth required — the calling browser has to be signed in. The
+    coordinator middleware already enforces this for any path that
+    isn't on the public allowlist."""
+    member = getattr(request.state, "member", None)
+    if member is None:
+        if AUTH_ENABLED:
+            raise HTTPException(status_code=401, detail="unauthorized")
+        # Dev-mode without API_TOKEN — no real identity to pair against.
+        raise HTTPException(
+            status_code=400,
+            detail="pairing requires auth; set API_TOKEN to enable",
+        )
+
+    raw = r.get(_pair_key(code))
+    if raw is None:
+        raise HTTPException(status_code=404, detail="pair code not found or expired")
+    try:
+        record = json.loads(raw)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=404, detail="pair code corrupt")
+    if record.get("state") != "pending":
+        raise HTTPException(status_code=410, detail="pair code already used")
+
+    raw_token = member_auth.generate_token()
+    token_hash = member_auth.hash_token(raw_token)
+    now = time.time()
+    db.add_member_token(
+        token_hash=token_hash,
+        member_id=member.member_id,
+        label=f"agent (paired {time.strftime('%Y-%m-%d', time.gmtime(now))})",
+        when=now,
+    )
+
+    # Approved state: stash the raw token in Redis for /poll to pick up.
+    # The same TTL applies — if the agent disappears before polling,
+    # the token rots out of Redis but the member_tokens row stays.
+    # Trade-off: a dead token sticks around in the DB until manually
+    # cleaned up via /account → unpair. Acceptable for v1 — the alt
+    # (delete-then-re-add on poll) wastes a SQL write per pair.
+    record["state"] = "approved"
+    record["member_id"] = member.member_id
+    record["token"] = raw_token
+    record["approved_at"] = now
+    r.set(_pair_key(code), json.dumps(record), ex=PAIR_TTL_SECONDS)
+    log.info(
+        "agent pair approved",
+        extra={"event": "agent_pair_approved", "worker_id": None},
+    )
+    return {"ok": True}
+
+
+@app.post("/agents/pair/poll")
+def agent_pair_poll(req: AgentPairPollRequest):
+    """Agent polls for the user's approval. Public — the agent has no
+    token yet. Returns ``state="pending"`` until the user confirms;
+    once approved, returns the fresh token exactly once and deletes the
+    pair record so a second poll gets 404."""
+    raw = r.get(_pair_key(req.pair_code))
+    if raw is None:
+        raise HTTPException(status_code=404, detail="pair code not found or expired")
+    try:
+        record = json.loads(raw)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=404, detail="pair code corrupt")
+
+    state = record.get("state", "pending")
+    if state != "approved":
+        return {"state": state, "expires_at": record.get("expires_at")}
+
+    # One-shot pickup — delete the record so a second poll can't
+    # exfiltrate the token.
+    r.delete(_pair_key(req.pair_code))
+    return {
+        "state": "approved",
+        "token": record.get("token"),
+        "member_id": record.get("member_id"),
+    }

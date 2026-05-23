@@ -168,3 +168,67 @@ async def account_revoke_invite(code: str, request: Request):
     return RedirectResponse(
         "/account?flash=Invite revoked.", status_code=303,
     )
+
+
+@router.get("/agent/pair", response_class=HTMLResponse)
+async def agent_pair_landing(request: Request, code: str = ""):
+    """Browser-side of the agent-pairing handoff. The Windows agent
+    opens the user's default browser to this URL. We require an
+    authenticated session — if they aren't signed in we bounce to
+    /login with this URL as the ``next`` param so they come right back
+    after sign-in."""
+    bearer = session_bearer(request)
+    me = await identify(bearer) if bearer else None
+    if me is None:
+        return login_redirect(f"/agent/pair?code={code}")
+    if not code.startswith("pair_"):
+        return templates.TemplateResponse(
+            request,
+            "agent_pair.html.j2",
+            {"state": "invalid", "me": me, "code": code},
+            status_code=400,
+        )
+    async with coordinator_client._client(bearer=bearer) as c:
+        r = await c.get(f"/agents/pair/{code}", timeout=5)
+    if r.status_code == 404:
+        return templates.TemplateResponse(
+            request,
+            "agent_pair.html.j2",
+            {"state": "expired", "me": me, "code": code},
+            status_code=404,
+        )
+    info = r.json() if r.status_code == 200 else {}
+    return templates.TemplateResponse(
+        request,
+        "agent_pair.html.j2",
+        {"state": info.get("state", "unknown"), "me": me, "code": code,
+         "expires_at": info.get("expires_at")},
+    )
+
+
+@router.post("/agent/pair")
+async def agent_pair_confirm(request: Request, code: str = Form(...)):
+    bearer = session_bearer(request)
+    me = await identify(bearer) if bearer else None
+    if me is None:
+        return login_redirect(f"/agent/pair?code={code}")
+    async with coordinator_client._client(bearer=bearer) as c:
+        r = await c.post(f"/agents/pair/{code}/confirm", timeout=5)
+    if r.status_code == 200:
+        return templates.TemplateResponse(
+            request,
+            "agent_pair.html.j2",
+            {"state": "confirmed", "me": me, "code": code},
+        )
+    detail = "couldn't confirm"
+    try:
+        detail = r.json().get("detail", detail)
+    except ValueError:
+        pass
+    status = "expired" if r.status_code in (404, 410) else "error"
+    return templates.TemplateResponse(
+        request,
+        "agent_pair.html.j2",
+        {"state": status, "me": me, "code": code, "error_detail": detail},
+        status_code=r.status_code,
+    )

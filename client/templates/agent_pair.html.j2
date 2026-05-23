@@ -1,0 +1,77 @@
+{% extends "base.html.j2" %}
+{% block title %}Pair this PC — GamerAI{% endblock %}
+{% block extra_css %}
+<link rel="stylesheet" href="/static/css/account.css">
+{% endblock %}
+
+{% block topbar %}
+<div class="topbar">
+  <div class="brand">GamerAI · pair</div>
+  <div class="topbar-actions">
+    <a href="/account" class="hide-mobile">← account</a>
+    <a href="/logout">sign out</a>
+  </div>
+</div>
+{% endblock %}
+
+{% block content %}
+<div class="page">
+  <section class="card">
+    {% if state == 'pending' %}
+    <h1>Pair this PC with your account</h1>
+    <p>
+      A GamerAI agent on a Windows PC is asking to sign in as
+      <strong>{{ me.username or me.email or me.member_id }}</strong>.
+      Approving will let it serve jobs and contribute uptime under your
+      account.
+    </p>
+    <p class="muted">
+      Only approve if you started the pairing yourself. The code is
+      short-lived (5 minutes) and can be used by exactly one agent.
+    </p>
+    <form method="POST" action="/agent/pair">
+      <input type="hidden" name="code" value="{{ code }}">
+      <button type="submit">Pair this PC</button>
+    </form>
+
+    {% elif state == 'confirmed' %}
+    <h1>Paired</h1>
+    <p>
+      The agent on your PC will pick up its credentials in a moment.
+      Leave it running and head back to
+      <a href="/">the chat page</a> — it'll start serving jobs from
+      the network as soon as the machine is idle.
+    </p>
+
+    {% elif state == 'approved' %}
+    <h1>This code has already been approved</h1>
+    <p>
+      Looks like you already clicked Pair on this code. The agent
+      should already have its credentials. If it didn't pick them up,
+      restart the agent and run <code>agent pair</code> again to get a
+      fresh code.
+    </p>
+
+    {% elif state == 'expired' %}
+    <h1>This pairing code has expired</h1>
+    <p>
+      Pairing codes are valid for 5 minutes. On the PC running the
+      agent, run <code>agent pair</code> again to get a fresh one.
+    </p>
+    {% if error_detail %}
+    <p class="muted">Server detail: {{ error_detail }}</p>
+    {% endif %}
+
+    {% elif state == 'invalid' %}
+    <h1>This pairing link looks malformed</h1>
+    <p>
+      Double-check the URL the agent printed in its console.
+    </p>
+
+    {% else %}
+    <h1>Something went wrong</h1>
+    <p class="muted">{{ error_detail or 'Unknown state: ' ~ state }}</p>
+    {% endif %}
+  </section>
+</div>
+{% endblock %}

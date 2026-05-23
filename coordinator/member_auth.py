@@ -189,12 +189,22 @@ def _row_to_member(row) -> Member:
 def lookup_member_by_token(db, raw_token: str) -> Optional[Member]:
     """Resolve a raw bearer token to a Member, or None if not found / revoked.
 
-    The raw_token is hashed before the DB hit, so callers can pass the
-    string straight from the Authorization header.
+    Checks the additive ``member_tokens`` table first (per-agent and per-
+    CLI tokens added after the multi-token slice landed), then falls
+    back to the single ``members.token_hash`` that holds the web-session
+    credential. The raw_token is hashed before the DB hit, so callers
+    can pass the string straight from the Authorization header.
     """
     if not raw_token:
         return None
-    row = db.get_member_by_token_hash(hash_token(raw_token))
+    th = hash_token(raw_token)
+    secondary_member_id = db.lookup_member_id_by_token_hash_in_tokens_table(th)
+    if secondary_member_id is not None:
+        row = db.get_member(secondary_member_id)
+        if row is None or row["revoked_at"] is not None:
+            return None
+        return _row_to_member(row)
+    row = db.get_member_by_token_hash(th)
     if row is None:
         return None
     if row["revoked_at"] is not None:

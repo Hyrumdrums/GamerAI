@@ -333,6 +333,43 @@ class WebUISmokeTests(unittest.TestCase):
         )
         self.assertEqual(login.status_code, 303)
 
+    def test_agent_pair_page_redirects_anonymous_to_login(self):
+        anon = TestClient(client_web.app, follow_redirects=False)
+        resp = anon.get("/agent/pair?code=pair_anything")
+        self.assertIn(resp.status_code, (302, 303, 307))
+        self.assertIn("/login", resp.headers["location"])
+        # next= preserves the pair url so the user lands back on it.
+        self.assertIn("pair_anything", resp.headers["location"])
+
+    def test_agent_pair_page_renders_pending_form_for_signed_in_user(self):
+        # Start a real pair code on the coordinator.
+        start = self.coord.post("/agents/pair/start").json()
+        resp = self.web.get(f"/agent/pair?code={start['pair_code']}")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("Pair this PC", resp.text)
+        self.assertIn(start["pair_code"], resp.text)
+
+    def test_agent_pair_post_confirms_via_coordinator(self):
+        start = self.coord.post("/agents/pair/start").json()
+        resp = self.web.post(
+            "/agent/pair",
+            data={"code": start["pair_code"]},
+            follow_redirects=False,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("Paired", resp.text)
+        # Confirm that the pair record is now approved on the coord.
+        info = self.coord.get(
+            f"/agents/pair/{start['pair_code']}",
+            headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+        ).json()
+        self.assertEqual(info["state"], "approved")
+
+    def test_agent_pair_page_shows_expired_for_unknown_code(self):
+        resp = self.web.get("/agent/pair?code=pair_nonexistent00")
+        self.assertEqual(resp.status_code, 404)
+        self.assertIn("expired", resp.text)
+
     def test_account_create_invite_then_revoke_round_trips(self):
         # Admin creates an invite from the account page, then revokes it.
         resp = self.web.post(

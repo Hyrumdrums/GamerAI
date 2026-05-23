@@ -291,6 +291,25 @@ class DB:
             )
         except sqlite3.OperationalError:
             pass
+        # Per-member additional bearer tokens — added with the agent-
+        # pairing slice. ``members.token_hash`` stays as the (single)
+        # web-session credential rotated by /login. ``member_tokens``
+        # holds extras: paired agents, future per-CLI tokens, anything
+        # else that needs to authenticate as a member without kicking
+        # the user's browser session. Lookups by hash check this table
+        # first, then fall back to ``members.token_hash`` for legacy
+        # / web-session compatibility.
+        self._conn.executescript(
+            "CREATE TABLE IF NOT EXISTS member_tokens ("
+            "  token_hash TEXT PRIMARY KEY,"
+            "  member_id TEXT NOT NULL,"
+            "  label TEXT,"
+            "  created_at REAL NOT NULL,"
+            "  last_used_at REAL"
+            ");"
+            "CREATE INDEX IF NOT EXISTS idx_member_tokens_member "
+            "ON member_tokens(member_id);"
+        )
 
     # ---------- jobs ----------
     def insert_job(
@@ -582,6 +601,72 @@ class DB:
                 "WHERE member_id=?",
                 (username, password_hash, password_hash, when, member_id),
             )
+
+    # ---------- member tokens (multi) ----------
+    def add_member_token(
+        self,
+        token_hash: str,
+        member_id: str,
+        label: Optional[str],
+        when: float,
+    ) -> None:
+        """Register an additional bearer for ``member_id``. The hash is
+        the PRIMARY KEY so the same token can't be re-added twice —
+        callers regenerate on collision (statistically impossible at
+        256 bits)."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO member_tokens "
+                "(token_hash, member_id, label, created_at, last_used_at) "
+                "VALUES (?, ?, ?, ?, NULL)",
+                (token_hash, member_id, label, when),
+            )
+
+    def lookup_member_id_by_token_hash_in_tokens_table(
+        self,
+        token_hash: str,
+    ) -> Optional[str]:
+        """Return ``member_id`` if the hash is registered in
+        ``member_tokens``, else None. Distinct from the legacy
+        single-token lookup that reads ``members.token_hash`` — that's
+        the wire credential rotated by /login, while this is the
+        secondary-token table populated by pairing and future API
+        keys."""
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT member_id FROM member_tokens WHERE token_hash=?",
+                (token_hash,),
+            )
+            row = cur.fetchone()
+        if row is None:
+            return None
+        return row["member_id"]
+
+    def touch_member_token(self, token_hash: str, when: float) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE member_tokens SET last_used_at=? WHERE token_hash=?",
+                (when, token_hash),
+            )
+
+    def list_member_tokens(self, member_id: str) -> list[sqlite3.Row]:
+        """Returns rows for the Account page's "This PC" section.
+        Excludes the legacy single token stored on ``members``."""
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT token_hash, label, created_at, last_used_at "
+                "FROM member_tokens WHERE member_id=? ORDER BY created_at DESC",
+                (member_id,),
+            )
+            return cur.fetchall()
+
+    def delete_member_token(self, member_id: str, token_hash: str) -> bool:
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM member_tokens WHERE member_id=? AND token_hash=?",
+                (member_id, token_hash),
+            )
+            return cur.rowcount > 0
 
     def rotate_member_token(
         self,

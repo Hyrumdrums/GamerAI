@@ -3867,6 +3867,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--no-stayalive", dest="no_stayalive",
                    action="store_true",
                    help="clear the persisted stayalive setting.")
+    p.add_argument("--pair", action="store_true",
+                   help="run the browser-handoff pairing flow: open the "
+                        "default browser to the coordinator's /agent/pair "
+                        "page, wait for the signed-in user to click "
+                        "Pair this PC, then save the issued token to "
+                        "state.json and exit.")
     args = p.parse_args(argv)
     # Deprecation alias: --background → --tray. v1.1.12 replaces the
     # silent --background mode with tray + hidden console; existing
@@ -3876,6 +3882,115 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     if args.background and not args.tray:
         args.tray = True
     return args
+
+
+def run_pair_flow(
+    coordinator_url: str,
+    state: dict,
+    *,
+    poll_interval_seconds: float = 2.0,
+    timeout_seconds: float = 300.0,
+    open_browser: bool = True,
+) -> Optional[str]:
+    """Browser-handoff pairing.
+
+    1. POST /agents/pair/start → ``{pair_code, pair_url}``
+    2. Open the user's default browser to ``pair_url``. (Skip when
+       running headless — caller passes ``open_browser=False`` and the
+       contributor pastes the URL manually.)
+    3. Poll ``POST /agents/pair/poll`` every ``poll_interval_seconds``
+       until the user clicks Pair, then persist the returned bearer in
+       ``state.json``.
+
+    Returns the new token on success, None on failure / timeout /
+    user-abort. Prints status to stdout so a contributor running this
+    interactively gets a visible progress trail.
+    """
+    import webbrowser  # local import — only used in this code path
+
+    base = coordinator_url.rstrip("/")
+    try:
+        r = httpx.post(f"{base}/agents/pair/start", timeout=10)
+        r.raise_for_status()
+    except httpx.HTTPError as e:
+        sys.stderr.write(f"pair: couldn't reach coordinator at {base}: {e}\n")
+        return None
+    info = r.json()
+    code = info.get("pair_code")
+    url = info.get("pair_url")
+    if not code or not url:
+        sys.stderr.write(
+            f"pair: coordinator returned unexpected payload: {info!r}\n"
+        )
+        return None
+
+    sys.stdout.write(
+        "\n"
+        "Pairing this PC with your GamerAI account\n"
+        "-----------------------------------------\n"
+        f"Sign in (or stay signed in) on your browser and approve at:\n"
+        f"  {url}\n"
+        f"Pairing code (5-minute TTL): {code}\n"
+        "Waiting for your approval"
+    )
+    sys.stdout.flush()
+    if open_browser:
+        try:
+            webbrowser.open(url, new=2)
+        except Exception:
+            # webbrowser is best-effort — on Server Core or a stripped
+            # Linux container there may be no browser. The URL is
+            # already printed above; user can paste it manually.
+            pass
+
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        try:
+            r = httpx.post(
+                f"{base}/agents/pair/poll",
+                json={"pair_code": code},
+                timeout=10,
+            )
+        except httpx.HTTPError as e:
+            sys.stdout.write(f"\npair: poll failed: {e}\n")
+            return None
+        if r.status_code == 404:
+            sys.stdout.write(
+                "\npair: code expired before the browser approved it. "
+                "Run --pair again to get a new code.\n"
+            )
+            return None
+        if r.status_code != 200:
+            sys.stdout.write(
+                f"\npair: unexpected poll status {r.status_code}: "
+                f"{r.text[:200]}\n"
+            )
+            return None
+        body = r.json()
+        if body.get("state") == "approved":
+            token = body.get("token")
+            if not token:
+                sys.stderr.write(
+                    "\npair: approval payload missing token; aborting\n"
+                )
+                return None
+            state["api_token"] = token
+            save_state(state)
+            sys.stdout.write(
+                f"\nPaired. Token saved to {STATE_PATH}.\n"
+                "You can close the browser tab; the agent will pick the "
+                "token up on its next run.\n"
+            )
+            return token
+        sys.stdout.write(".")
+        sys.stdout.flush()
+        time.sleep(poll_interval_seconds)
+
+    sys.stdout.write(
+        "\npair: timed out waiting for browser approval. "
+        "Run --pair again when ready.\n"
+    )
+    return None
 
 
 def resolve_api_token(
@@ -3908,15 +4023,22 @@ def resolve_api_token(
         "\n"
         "GamerAI agent first-run setup\n"
         "-----------------------------\n"
-        "Paste the bearer token from your invite redemption page.\n"
-        "Looks like:  gai_<64 hex chars>\n"
+        "This agent isn't paired with an account yet. Easiest path:\n"
+        "  agent --pair\n"
+        "That opens your browser to confirm pairing under your account.\n"
+        "\n"
+        "If you have a bearer token instead, paste it now (looks like\n"
+        "gai_<64 hex chars>), or press Enter to abort and run --pair.\n"
         "\n"
     )
     sys.stdout.flush()
     try:
-        entered = input("token: ").strip()
+        entered = input("token (or Enter to abort): ").strip()
     except (EOFError, KeyboardInterrupt):
-        sys.stderr.write("\naborted — no token entered.\n")
+        sys.stderr.write("\naborted — no token entered. Run --pair when ready.\n")
+        return None
+    if not entered:
+        sys.stderr.write("aborted — run --pair to pair this PC.\n")
         return None
     if not entered.startswith("gai_"):
         sys.stderr.write(
@@ -3970,6 +4092,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.version:
         print(f"GamerAI agent v{AGENT_VERSION} (build {current_version()})")
         return 0
+    if args.pair:
+        cfg = Config.load(args.config if args.config.exists() else None)
+        state = load_state()
+        token = run_pair_flow(cfg.coordinator_url, state)
+        return 0 if token else 2
     if args.diagnose:
         # Diagnose loads config but skips logging setup + worker_id
         # allocation. Both write to disk; diagnose must be read-only.

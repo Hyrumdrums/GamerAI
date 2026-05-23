@@ -227,6 +227,18 @@ class PasswordChangeRequest(BaseModel):
     new_password: str
 
 
+class AgentPairPollRequest(BaseModel):
+    """Agent's polling body during browser-handoff pairing.
+
+    Carries only the short pairing code; the request is unauthenticated
+    because the agent does not yet have a token (that's the whole point
+    of pairing). The code itself is the credential — leaking it lets a
+    bystander steal the token once the user clicks Confirm in the
+    browser, so we keep the TTL short (default 5 minutes).
+    """
+    pair_code: str
+
+
 class JobCancelRequest(BaseModel):
     """Member-initiated cancel. The caller's session identifies the
     submitter; the coordinator verifies ownership of the job before
