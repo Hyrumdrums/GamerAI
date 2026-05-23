@@ -695,6 +695,19 @@ class DB:
             )
             return cur.fetchall()
 
+    def has_active_admin(self) -> bool:
+        """True iff at least one un-revoked admin member exists. Used by
+        ``ensure_admin_seed`` to avoid duplicating the admin row after
+        the founding admin claims u/p credentials — at that point their
+        token has rotated, so the seed's token_hash lookup misses and
+        would otherwise create a stale duplicate on every restart."""
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT 1 FROM members "
+                "WHERE role='admin' AND revoked_at IS NULL LIMIT 1"
+            )
+            return cur.fetchone() is not None
+
     def revoke_member_by_token_hash(self, token_hash: str, revoked_at: float) -> bool:
         with self._lock:
             cur = self._conn.execute(

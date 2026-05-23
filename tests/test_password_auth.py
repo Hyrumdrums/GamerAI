@@ -334,6 +334,35 @@ class PasswordAuthTests(unittest.TestCase):
         )
         self.assertEqual(new.status_code, 200)
 
+    def test_admin_seed_skips_when_other_admin_exists(self):
+        """Once the founding admin claims u/p their primary token has
+        been rotated, so a coordinator restart would otherwise re-seed
+        a duplicate admin from API_TOKEN. has_active_admin() short-
+        circuits that path."""
+        # Claim u/p — this rotates the API_TOKEN bearer out.
+        coordinator_admin.main([
+            "set-credentials",
+            "--token", ADMIN_TOKEN,
+            "--username", "rootadmin",
+            "--password", "correct-horse-battery",
+        ])
+        self.client.post(
+            "/login",
+            json={"username": "rootadmin", "password": "correct-horse-battery"},
+        )
+        admins_before = [
+            m for m in self.db.list_members() if m["role"] == "admin"
+        ]
+        self.assertEqual(len(admins_before), 1)
+        # Restart-style reseed.
+        coordinator_main.ensure_admin_seed()
+        coordinator_main.ensure_admin_seed()
+        admins_after = [
+            m for m in self.db.list_members() if m["role"] == "admin"
+        ]
+        # Still exactly one admin — no duplicate from the env token.
+        self.assertEqual(len(admins_after), 1)
+
     def test_change_password_first_set_works_without_current(self):
         """A member who has never set a password (legacy invitee, raw
         token only) can use /me/password to set their first one without

@@ -1097,15 +1097,26 @@ def _save_image_or_raise(job_id: str, image_b64: Optional[str]) -> str:
 
 
 def ensure_admin_seed() -> None:
-    """If ``API_TOKEN`` is set in the env, make sure a corresponding admin
-    member exists. Pre-existing clients that send ``Authorization: Bearer
-    $API_TOKEN`` are now logged in as that admin member — no client-side
-    changes required.
+    """If ``API_TOKEN`` is set in the env, make sure an admin member
+    exists. Pre-existing clients that send ``Authorization: Bearer
+    $API_TOKEN`` are logged in as that admin — no client-side changes
+    required.
 
-    Idempotent: the seed runs on every startup but does nothing if a
-    member with the same token_hash already exists.
+    The check is "is there any active admin?" rather than "does
+    API_TOKEN match an existing member?" Once the founding admin
+    claims u/p credentials, their token rotates and the env value no
+    longer matches any row; without this broader check we'd seed a
+    second admin row on every restart.
+
+    Trade-off: in the rare case of "I lost the password AND
+    rotated-out-API_TOKEN no longer logs in," recovery is
+    ``revoke + manual DELETE`` rather than ``set a fresh API_TOKEN
+    and restart``. Acceptable — the multi-token table + the
+    set-credentials CLI cover the realistic recovery paths.
     """
     if not API_TOKEN:
+        return
+    if db.has_active_admin():
         return
     token_hash = member_auth.hash_token(API_TOKEN)
     if db.get_member_by_token_hash(token_hash) is not None:
