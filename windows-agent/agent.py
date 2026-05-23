@@ -604,8 +604,12 @@ def cleanup_stale_meipass_dirs(log: logging.Logger) -> int:
     except OSError:
         pass
     if removed:
+        # Escape the literal %TEMP% — logging treats the format string
+        # as printf-style and tries to consume %T as a specifier
+        # otherwise, raising TypeError on every startup that finds
+        # stale dirs to sweep.
         log.info(
-            "cleaned up %d stale _MEI dir(s) in %TEMP%", removed,
+            "cleaned up %d stale _MEI dir(s) in %%TEMP%%", removed,
         )
     return removed
 
