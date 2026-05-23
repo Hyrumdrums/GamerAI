@@ -403,6 +403,12 @@ class WebUISmokeTests(unittest.TestCase):
         self.assertIn("GamerAI-Agent-Setup.exe", resp.text)
         # Signed-out users see a sign-in link, not the account link.
         self.assertIn('href="/login"', resp.text)
+        # Regression guards: no pricing claims, no repo links, no
+        # earnings table — the page deliberately stays vague.
+        self.assertNotIn("github.com", resp.text)
+        self.assertNotIn("80%", resp.text)
+        self.assertNotIn("$/mo", resp.text)
+        self.assertNotIn("Haiku", resp.text)
 
     def test_contribute_page_renders_for_signed_in_user(self):
         resp = self.web.get("/contribute")
