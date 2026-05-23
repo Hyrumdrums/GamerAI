@@ -16,6 +16,7 @@ There is no recovery — losing it means revoke + reissue.
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import sys
@@ -97,6 +98,62 @@ def cmd_list_members(args: argparse.Namespace) -> None:
                 "yes" if row["revoked_at"] else "no",
             )
         )
+
+
+def cmd_set_credentials(args: argparse.Namespace) -> None:
+    """Set or rotate a member's username + password. Used by the founding
+    admin to claim u/p sign-in after running with token-only auth, and as
+    an out-of-band recovery path while email-based reset is on hold (see
+    docs/auth-design.md)."""
+    db = DB()
+    row = db.get_member_by_token_hash(member_auth.hash_token(args.token))
+    if row is None:
+        print("error: --token does not match any member", file=sys.stderr)
+        sys.exit(2)
+    if row["revoked_at"] is not None:
+        print("error: that member is revoked", file=sys.stderr)
+        sys.exit(2)
+
+    try:
+        clean_username = member_auth.validate_username(args.username)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    # Prevent a UNIQUE violation by checking up front; the CLI is the
+    # only path that picks a username on someone else's behalf, so a
+    # clear error here beats a SQL exception.
+    existing = db.get_member_by_username(clean_username)
+    if existing is not None and existing["member_id"] != row["member_id"]:
+        print(
+            f"error: username {clean_username!r} is taken by {existing['member_id']}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    if args.password:
+        password = args.password
+    else:
+        password = getpass.getpass("password: ")
+        confirm = getpass.getpass("confirm:  ")
+        if password != confirm:
+            print("error: passwords did not match", file=sys.stderr)
+            sys.exit(2)
+    try:
+        member_auth.validate_password(password)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    db.set_member_credentials(
+        member_id=row["member_id"],
+        username=clean_username,
+        password_hash=member_auth.hash_password(password),
+        when=time.time(),
+    )
+    print(f"member_id={row['member_id']}")
+    print(f"username={clean_username}")
+    print("password set; sign in at /login")
 
 
 def cmd_revoke(args: argparse.Namespace) -> None:
@@ -272,6 +329,24 @@ def _build_parser() -> argparse.ArgumentParser:
     p_revoke.add_argument("--token", required=True)
     p_revoke.set_defaults(fn=cmd_revoke)
 
+    p_sc = sub.add_parser(
+        "set-credentials",
+        help="set or rotate a member's username + password (u/p sign-in)",
+    )
+    p_sc.add_argument(
+        "--token", required=True,
+        help="raw bearer of the member to update",
+    )
+    p_sc.add_argument(
+        "--username", required=True,
+        help="login handle; letters, digits, _-. only",
+    )
+    p_sc.add_argument(
+        "--password", default=None,
+        help="new password; omitted to prompt interactively (safer for shell history)",
+    )
+    p_sc.set_defaults(fn=cmd_set_credentials)
+
     p_inv = sub.add_parser("create-invite", help="create an invite for an outsider")
     p_inv.add_argument(
         "--contributor-token",
@@ -306,16 +381,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p_ri.add_argument("--code", required=True)
     p_ri.set_defaults(fn=cmd_revoke_invite)
 
-    p_sc = sub.add_parser(
+    p_canary = sub.add_parser(
         "seed-canaries",
         help="install the default factual-answer canary prompts",
     )
-    p_sc.add_argument(
+    p_canary.add_argument(
         "--model",
         default="llama3.2:1b",
         help="model name to target; should match what most contributors run",
     )
-    p_sc.set_defaults(fn=cmd_seed_canaries)
+    p_canary.set_defaults(fn=cmd_seed_canaries)
 
     return ap
 

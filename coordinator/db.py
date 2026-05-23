@@ -267,6 +267,30 @@ class DB:
                 self._conn.execute(ddl)
             except sqlite3.OperationalError:
                 pass
+        # u/p credentials — added with the username+password slice. The
+        # raw bearer in ``members.token_hash`` stays as the wire-format
+        # session credential; ``password_hash`` is the argon2-encoded
+        # secret a member uses to mint a fresh token via /login.
+        # ``username`` is UNIQUE among non-NULL values so legacy invitee
+        # rows (created before this slice) can keep NULL until their
+        # owner sets credentials. Partial unique index implemented as a
+        # filtered CREATE UNIQUE INDEX so SQLite enforces it.
+        for ddl in (
+            "ALTER TABLE members ADD COLUMN username TEXT",
+            "ALTER TABLE members ADD COLUMN password_hash TEXT",
+            "ALTER TABLE members ADD COLUMN password_set_at REAL",
+        ):
+            try:
+                self._conn.execute(ddl)
+            except sqlite3.OperationalError:
+                pass
+        try:
+            self._conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_members_username "
+                "ON members(username) WHERE username IS NOT NULL"
+            )
+        except sqlite3.OperationalError:
+            pass
 
     # ---------- jobs ----------
     def insert_job(
@@ -521,6 +545,63 @@ class DB:
                 "SELECT * FROM members WHERE member_id=?", (member_id,)
             )
             return cur.fetchone()
+
+    def get_member_by_username(self, username: str) -> Optional[sqlite3.Row]:
+        """Case-insensitive username lookup. Returns None for the active-
+        but-no-username legacy rows since they store NULL. Login callers
+        get a row only if the caller has both registered and not been
+        revoked."""
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM members "
+                "WHERE LOWER(username)=LOWER(?) AND revoked_at IS NULL",
+                (username,),
+            )
+            return cur.fetchone()
+
+    def set_member_credentials(
+        self,
+        member_id: str,
+        username: Optional[str],
+        password_hash: Optional[str],
+        when: float,
+    ) -> None:
+        """Set username and/or password_hash on a member row. COALESCE
+        leaves the prior value when the caller passes None — so
+        ``set_credentials(member_id, None, new_hash, now)`` rotates only
+        the password and ``(member_id, new_name, None, now)`` claims a
+        username without touching the secret. Callers that want to clear
+        a value must do so explicitly via a separate UPDATE."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE members SET "
+                "username=COALESCE(?, username), "
+                "password_hash=COALESCE(?, password_hash), "
+                "password_set_at=CASE WHEN ? IS NOT NULL THEN ? "
+                "ELSE password_set_at END "
+                "WHERE member_id=?",
+                (username, password_hash, password_hash, when, member_id),
+            )
+
+    def rotate_member_token(
+        self,
+        member_id: str,
+        new_token_hash: str,
+    ) -> bool:
+        """Replace a member's wire-format bearer token. Used by /login
+        each time u/p auth succeeds — the old token is invalidated, the
+        new one becomes the session cookie. Returns False if the new
+        hash collides with another member (should be statistically
+        impossible with 256-bit tokens but guarded just in case)."""
+        with self._lock:
+            try:
+                self._conn.execute(
+                    "UPDATE members SET token_hash=? WHERE member_id=?",
+                    (new_token_hash, member_id),
+                )
+            except sqlite3.IntegrityError:
+                return False
+            return True
 
     def list_members(self) -> list[sqlite3.Row]:
         with self._lock:

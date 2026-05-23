@@ -9,6 +9,11 @@ Token format: ``gai_<64 hex>``. Tokens are random secrets; we never
 store the raw token, only ``sha256(token)``. The first time an admin
 runs ``python -m coordinator.admin create-member`` they get the raw
 token printed to stdout; thereafter it's the holder's responsibility.
+
+Password hashes are argon2id (via ``argon2-cffi``). Token rotation on
+each u/p login is intentional — sessions on other devices die when
+the user re-logs-in. A multi-device session table is on the deferred
+list (see ``docs/auth-design.md``).
 """
 from __future__ import annotations
 
@@ -18,8 +23,32 @@ import secrets
 from dataclasses import dataclass
 from typing import Optional
 
+from argon2 import PasswordHasher
+from argon2.exceptions import (
+    InvalidHash,
+    VerificationError,
+    VerifyMismatchError,
+)
+
 TOKEN_PREFIX = "gai_"
 _TOKEN_BYTES = 32  # → 64 hex chars after the prefix
+
+# Username constraints. Kept loose enough for casual handles ("dallin",
+# "alex_h", "rkc-1") while excluding shell-special and url-special
+# characters that would force escaping in admin tooling.
+USERNAME_MIN_LEN = 3
+USERNAME_MAX_LEN = 32
+_USERNAME_OK = set(
+    "abcdefghijklmnopqrstuvwxyz"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "0123456789_-."
+)
+
+# Password is enforced at signup; we don't store a copy anywhere, so the
+# length floor is the only structural check. argon2id has no useful
+# maximum but a 1KB cap stops obvious DoS-by-megabyte-password.
+PASSWORD_MIN_LEN = 8
+PASSWORD_MAX_LEN = 1024
 
 
 def generate_token() -> str:
@@ -47,6 +76,67 @@ def parse_bearer(header_value: Optional[str]) -> Optional[str]:
     return parts[1].strip() or None
 
 
+# Single, module-level hasher. argon2-cffi recommends reuse so the
+# expensive parameter detection runs once per process.
+_PH = PasswordHasher()
+
+
+def validate_username(username: str) -> str:
+    """Normalize and validate a candidate username. Returns the cleaned
+    value, raises ValueError with a user-facing message on failure."""
+    if username is None:
+        raise ValueError("username is required")
+    name = username.strip()
+    if len(name) < USERNAME_MIN_LEN:
+        raise ValueError(
+            f"username must be at least {USERNAME_MIN_LEN} characters"
+        )
+    if len(name) > USERNAME_MAX_LEN:
+        raise ValueError(
+            f"username must be at most {USERNAME_MAX_LEN} characters"
+        )
+    bad = [c for c in name if c not in _USERNAME_OK]
+    if bad:
+        raise ValueError(
+            "username may only contain letters, digits, underscore, "
+            "hyphen, and dot"
+        )
+    return name
+
+
+def validate_password(password: str) -> str:
+    if password is None:
+        raise ValueError("password is required")
+    if len(password) < PASSWORD_MIN_LEN:
+        raise ValueError(
+            f"password must be at least {PASSWORD_MIN_LEN} characters"
+        )
+    if len(password) > PASSWORD_MAX_LEN:
+        raise ValueError(
+            f"password must be at most {PASSWORD_MAX_LEN} characters"
+        )
+    return password
+
+
+def hash_password(password: str) -> str:
+    """Return an argon2id encoded hash including salt + parameters.
+    Callers should ``validate_password`` first so the failure surfaces
+    as a 400 rather than a hash on weak input."""
+    return _PH.hash(password)
+
+
+def verify_password(password: str, encoded: Optional[str]) -> bool:
+    """Constant-time-ish password check. Returns False for an empty
+    stored hash (member who never set credentials) so callers don't
+    have to special-case the bootstrap state."""
+    if not encoded:
+        return False
+    try:
+        return _PH.verify(encoded, password)
+    except (VerifyMismatchError, VerificationError, InvalidHash):
+        return False
+
+
 @dataclass(frozen=True)
 class Member:
     member_id: str
@@ -59,12 +149,20 @@ class Member:
     created_at: float
     tos_accepted_at: Optional[float] = None
     tos_version: Optional[str] = None
+    username: Optional[str] = None
+    has_password: bool = False
+    password_set_at: Optional[float] = None
 
 
 def _row_to_member(row) -> Member:
     keys = row.keys()
     tos_accepted = row["tos_accepted_at"] if "tos_accepted_at" in keys else None
     tos_version = row["tos_version"] if "tos_version" in keys else None
+    username = row["username"] if "username" in keys else None
+    password_hash = row["password_hash"] if "password_hash" in keys else None
+    password_set_at = (
+        row["password_set_at"] if "password_set_at" in keys else None
+    )
     return Member(
         member_id=row["member_id"],
         email=row["email"],
@@ -80,6 +178,11 @@ def _row_to_member(row) -> Member:
         created_at=float(row["created_at"]),
         tos_accepted_at=float(tos_accepted) if tos_accepted is not None else None,
         tos_version=tos_version,
+        username=username,
+        has_password=bool(password_hash),
+        password_set_at=(
+            float(password_set_at) if password_set_at is not None else None
+        ),
     )
 
 

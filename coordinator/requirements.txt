@@ -2,6 +2,10 @@ fastapi==0.115.0
 uvicorn[standard]==0.30.6
 redis==5.0.8
 pydantic==2.9.2
+# Password hashing for u/p sign-in. argon2 is the modern default; the
+# cffi binding is small and has no transitive heavy deps. Used by
+# coordinator.member_auth.{hash_password,verify_password}.
+argon2-cffi==23.1.0
 # NSFW output classifier — runs on /jobs/complete to reject explicit
 # generations before they hit disk. Lazy-loaded with soft-fail so a
 # missing dep doesn't break image jobs in dev/test where this isn't

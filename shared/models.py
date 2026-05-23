@@ -203,6 +203,22 @@ class InviteAcceptRequest(BaseModel):
     tos_accepted: bool = False
 
 
+class LoginRequest(BaseModel):
+    """Username + password sign-in. The coordinator validates the pair
+    against the argon2 hash on ``members.password_hash`` and, on
+    success, mints a fresh bearer token (rotating the prior one). The
+    caller stores the new token as their session credential."""
+    username: str
+    password: str
+
+
+class PasswordChangeRequest(BaseModel):
+    """Authenticated password change. Current password is required so a
+    stolen session cookie cannot silently rotate the secret."""
+    current_password: str
+    new_password: str
+
+
 class JobCancelRequest(BaseModel):
     """Member-initiated cancel. The caller's session identifies the
     submitter; the coordinator verifies ownership of the job before

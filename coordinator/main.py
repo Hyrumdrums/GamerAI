@@ -63,6 +63,8 @@ from shared.models import (
     JobCompleteRequest,
     JobNextRequest,
     JobPartialRequest,
+    LoginRequest,
+    PasswordChangeRequest,
     WorkerIdent,
 )
 
@@ -1165,11 +1167,15 @@ def _is_public(method: str, path: str) -> bool:
     """Path+method auth exemption. ``/health`` is fully open. The
     invite-redemption flow needs exactly two endpoints reachable
     without auth: ``GET /invites/<code>`` and ``POST /invites/<code>/accept``.
-    The community ToS is public (``/tos`` and ``/tos/raw``). Everything
+    The community ToS is public (``/tos`` and ``/tos/raw``). Username +
+    password sign-in (``POST /login``) is public so the web UI can call
+    it without a bearer — the credentials are the credential. Everything
     else under ``/invites`` (create, list, revoke) requires a valid bearer."""
     if is_public_path(path):
         return True
     if method == "GET" and path in ("/tos", "/tos/raw"):
+        return True
+    if method == "POST" and path == "/login":
         return True
     parts = path.strip("/").split("/")
     if method == "GET" and len(parts) == 2 and parts[0] == "invites":
@@ -2809,6 +2815,9 @@ def me(request: Request):
         "parent_member_id": member.parent_member_id,
         "tier": member.tier,
         "daily_quota_tokens": member.daily_quota_tokens,
+        "username": member.username,
+        "has_password": member.has_password,
+        "password_set_at": member.password_set_at,
         "usage_today": usage,
         "tos": {
             "accepted_at": member.tos_accepted_at,
@@ -2817,6 +2826,92 @@ def me(request: Request):
             "needs_reaccept": member.tos_version != TOS_VERSION,
         },
     }
+
+
+@app.post("/login")
+def login(req: LoginRequest):
+    """Public username + password sign-in. On success, rotates the
+    member's wire-format bearer (so any prior session/device is
+    immediately logged out) and returns the fresh token for the caller
+    to store as their session credential.
+
+    Always returns the same 401 detail for unknown-username and
+    bad-password so an attacker can't enumerate accounts."""
+    INVALID = HTTPException(status_code=401, detail="invalid credentials")
+    username = (req.username or "").strip()
+    password = req.password or ""
+    if not username or not password:
+        raise INVALID
+    row = db.get_member_by_username(username)
+    if row is None:
+        raise INVALID
+    keys = row.keys()
+    stored_hash = row["password_hash"] if "password_hash" in keys else None
+    if not member_auth.verify_password(password, stored_hash):
+        raise INVALID
+    raw_token = member_auth.generate_token()
+    new_hash = member_auth.hash_token(raw_token)
+    if not db.rotate_member_token(row["member_id"], new_hash):
+        # Token-hash collision is statistically impossible at 256 bits,
+        # but if it ever fires we want a clean 500 rather than a silent
+        # auth failure on next request.
+        raise HTTPException(status_code=500, detail="token rotation failed")
+    db.touch_member(row["member_id"], time.time())
+    log.info(
+        "login ok",
+        extra={"event": "login_ok", "worker_id": None},
+    )
+    return {
+        "member_id": row["member_id"],
+        "token": raw_token,
+        "role": row["role"],
+        "username": row["username"],
+    }
+
+
+@app.post("/me/password")
+def change_password(req: PasswordChangeRequest, request: Request):
+    """Authenticated password rotation. Requires the current password
+    so a stolen session cookie can't silently lock the real owner out.
+    Does NOT rotate the bearer token — the caller stays signed in on
+    this device. To kick other devices, use /login again afterward."""
+    member = getattr(request.state, "member", None)
+    if member is None:
+        if not AUTH_ENABLED:
+            raise HTTPException(
+                status_code=400,
+                detail="password change requires auth; set API_TOKEN first",
+            )
+        raise HTTPException(status_code=401, detail="unauthorized")
+    row = db.get_member(member.member_id)
+    if row is None:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    keys = row.keys()
+    stored_hash = row["password_hash"] if "password_hash" in keys else None
+    # A member without a password yet (legacy admin, freshly-claimed
+    # invite that didn't set one) can use this endpoint to set their
+    # first password — current_password is ignored in that case.
+    if stored_hash and not member_auth.verify_password(
+        req.current_password or "", stored_hash
+    ):
+        raise HTTPException(
+            status_code=401, detail="current password is incorrect"
+        )
+    try:
+        new_clean = member_auth.validate_password(req.new_password or "")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    db.set_member_credentials(
+        member_id=member.member_id,
+        username=None,
+        password_hash=member_auth.hash_password(new_clean),
+        when=time.time(),
+    )
+    log.info(
+        "password changed",
+        extra={"event": "password_changed", "worker_id": None},
+    )
+    return {"ok": True}
 
 
 # ---------- conversations ----------
