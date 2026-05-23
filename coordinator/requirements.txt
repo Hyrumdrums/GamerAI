@@ -2,3 +2,9 @@ fastapi==0.115.0
 uvicorn[standard]==0.30.6
 redis==5.0.8
 pydantic==2.9.2
+# NSFW output classifier — runs on /jobs/complete to reject explicit
+# generations before they hit disk. Lazy-loaded with soft-fail so a
+# missing dep doesn't break image jobs in dev/test where this isn't
+# installed (it's pulled in by the production Dockerfile only via
+# requirements.txt → here).
+nudenet==3.4.2

@@ -6,8 +6,25 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+# NudeNet (and onnxruntime under the hood) needs libGL + libglib for
+# OpenCV's image I/O, and curl for the model warm-up below. -slim
+# omits these by default; install them once at the top so subsequent
+# layers stay deterministic.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        libgl1 libglib2.0-0 curl && \
+    rm -rf /var/lib/apt/lists/*
+
 COPY coordinator/requirements.txt ./coordinator/requirements.txt
 RUN pip install --no-cache-dir -r coordinator/requirements.txt
+
+# Warm up the NudeNet model cache so the first image submission after
+# a deploy doesn't pay the ~50 MB download tax (and so deploys are
+# repeatable when the upstream model host has a bad day). NudeDetector
+# downloads to ~/.NudeNet on first construction — instantiating it at
+# build time bakes the model into the image.
+RUN python -c "from nudenet import NudeDetector; NudeDetector()" \
+    || echo "nudenet warm-up failed; classifier will lazy-load at runtime"
 
 COPY shared/ ./shared/
 COPY coordinator/ ./coordinator/

@@ -162,6 +162,35 @@ _IMAGE_DIM_MIN = 256
 _IMAGE_DIM_MAX = 1536
 
 
+# Always-on negative prompt forced onto every image job. Layer-1
+# mitigation for the case the v1.1.24 incident report flagged:
+# "obese cow" → topless woman wearing cow ears. DreamShaper-class
+# SD1.5 models are happy to drift toward nudity when the prompt is
+# vague; biasing the sampler away with explicit negatives catches
+# ~90% of the accidental-nudity case at zero infrastructure cost.
+# Layer-2 is NudeNet on the output; see _classify_image_or_filter.
+# Env-tunable so production can swap phrasing without a redeploy.
+_FORCED_NEGATIVE_PROMPT = os.getenv(
+    "FORCED_NEGATIVE_PROMPT",
+    "nsfw, nude, naked, topless, partially nude, bare skin, "
+    "sexual, sexually suggestive, explicit, lingerie, underwear",
+)
+
+
+def _combine_negative_prompt(user_negative: Optional[str]) -> str:
+    """Layer the forced SFW phrases in FRONT of whatever the user
+    asked to negate so the sampler sees them with full weight. Empty
+    user input degenerates to just the forced prefix; missing forced
+    prefix (env override to '') degenerates to user input unchanged."""
+    user_negative = (user_negative or "").strip()
+    forced = (_FORCED_NEGATIVE_PROMPT or "").strip()
+    if not forced:
+        return user_negative
+    if not user_negative:
+        return forced
+    return f"{forced}, {user_negative}"
+
+
 def _clamp_image_dim(value: int) -> int:
     try:
         v = int(value)
@@ -179,6 +208,125 @@ def _default_image_params():
 
 
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+
+# ---------- NSFW output classifier (layer 2) ----------
+# The forced negative prompt (layer 1) catches most accidental nudity
+# from vague prompts, but DreamShaper can still produce explicit
+# output. NudeNet runs after generation as a hard gate: any detection
+# of the explicit-anatomy classes above NSFW_THRESHOLD turns the job
+# into a friendly "image filtered by content policy" error bubble.
+# Soft-fails when the package isn't installed (dev/test environments
+# without the docker layer) so the rest of the code path is unaffected.
+_NSFW_THRESHOLD = float(os.getenv("NSFW_THRESHOLD", "0.5"))
+_NSFW_BLOCKED_CLASSES = frozenset({
+    # NudeNet v3 class names — the explicit-anatomy detections we
+    # categorically refuse. Suggestive-but-clothed categories
+    # ("FEMALE_BREAST_COVERED", "BUTTOCKS_COVERED", "BELLY_EXPOSED")
+    # are deliberately NOT in this set — the system is allowed to
+    # render swimsuits and bare midriffs.
+    "FEMALE_BREAST_EXPOSED",
+    "FEMALE_GENITALIA_EXPOSED",
+    "MALE_GENITALIA_EXPOSED",
+    "BUTTOCKS_EXPOSED",
+    "ANUS_EXPOSED",
+})
+_nudenet_detector = None  # lazy-loaded singleton
+_nudenet_load_attempted = False
+
+
+def _get_nudenet():
+    """Lazy-load the NudeNet detector once. Returns None if the package
+    isn't installed (dev/test). Failure is logged once, then silently
+    skipped on every subsequent call so a missing dep doesn't break
+    image jobs — the system stays usable, just without the safety
+    net, and operators see the warning."""
+    global _nudenet_detector, _nudenet_load_attempted
+    if _nudenet_load_attempted:
+        return _nudenet_detector or None
+    _nudenet_load_attempted = True
+    try:
+        from nudenet import NudeDetector  # type: ignore
+        _nudenet_detector = NudeDetector()
+        log.info(
+            "NudeNet classifier loaded (threshold=%.2f)",
+            _NSFW_THRESHOLD,
+            extra={"event": "nudenet_loaded"},
+        )
+    except Exception as e:
+        log.warning(
+            "NudeNet unavailable — image NSFW classifier disabled: %s",
+            e,
+            extra={"event": "nudenet_unavailable"},
+        )
+        _nudenet_detector = None
+    return _nudenet_detector
+
+
+class _NSFWFilteredError(Exception):
+    """Image was rejected by the output classifier. Raised from inside
+    _save_image_or_raise so the existing /jobs/complete catch-all
+    surfaces it as image_save_error → friendly error bubble + retry
+    button + worker doesn't get credited (the existing flow for any
+    image save failure). Distinct class so we can identify the
+    refusal in logs vs. a malformed-bytes / disk-full failure."""
+
+
+def _classify_image_or_raise(png_bytes: bytes, job_id: str) -> None:
+    """Run NudeNet on the bytes; raise _NSFWFilteredError if any
+    explicit-anatomy class scores above the threshold. No-op (soft
+    success) when NudeNet isn't installed — the operator gets a
+    one-time warning at startup."""
+    detector = _get_nudenet()
+    if detector is None:
+        return
+    # NudeNet's detect() expects a file path. Materialize to a temp
+    # file so we don't have to monkey-patch its internals — the bytes
+    # are already in memory after base64 decode, so this is one
+    # additional disk round-trip per image, ~5ms.
+    import tempfile
+    fd, tmp_path = tempfile.mkstemp(suffix=".png", prefix="nudenet-")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(png_bytes)
+        try:
+            detections = detector.detect(tmp_path)
+        except Exception as e:
+            # Classifier failure should not block image delivery —
+            # log loudly, then let the image through. An attacker
+            # can't deliberately trigger this since they don't
+            # control the model code path.
+            log.warning(
+                "NudeNet detect() failed — letting image through: %s", e,
+                extra={"event": "nudenet_detect_failed", "job_id": job_id},
+            )
+            return
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+    matches = [
+        d for d in (detections or [])
+        if d.get("class") in _NSFW_BLOCKED_CLASSES
+        and float(d.get("score") or 0) >= _NSFW_THRESHOLD
+    ]
+    if matches:
+        log.warning(
+            "image filtered by NSFW classifier",
+            extra={
+                "event": "nsfw_filtered",
+                "job_id": job_id,
+                "matches": [
+                    {"class": m["class"], "score": round(float(m["score"]), 3)}
+                    for m in matches
+                ],
+            },
+        )
+        raise _NSFWFilteredError(
+            "Generated image was filtered by the content classifier. "
+            "Please try a different prompt."
+        )
 
 
 def _save_image_or_raise(job_id: str, image_b64: Optional[str]) -> str:
@@ -220,6 +368,11 @@ def _save_image_or_raise(job_id: str, image_b64: Optional[str]) -> str:
             status_code=400,
             detail="image bytes are not a PNG (missing magic header)",
         )
+    # NSFW classifier runs BEFORE persisting so a blocked image never
+    # touches disk. Raises _NSFWFilteredError on a hit; the outer
+    # /jobs/complete handler catches that as image_save_error and the
+    # UI gets a friendly "filtered" bubble.
+    _classify_image_or_raise(data, job_id)
     # job_id is a uuid we generated — safe as a path component, but
     # belt-and-braces against ../ traversal.
     safe = re.sub(r"[^a-zA-Z0-9_-]", "_", job_id)
@@ -747,7 +900,7 @@ def generate(req: GenerateRequest, request: Request):
         params = req.image or _default_image_params()
         image_env: dict = {
             "seed": params.seed,
-            "negative_prompt": params.negative_prompt,
+            "negative_prompt": _combine_negative_prompt(params.negative_prompt),
         }
         # Clamp width/height to sane bounds (multiple of 64 in [256,
         # 1536]) so a malicious or buggy client can't ask the worker

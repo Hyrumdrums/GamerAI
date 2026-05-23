@@ -417,6 +417,44 @@ class ImageGenerationTests(unittest.TestCase):
         self.assertLessEqual(envelope["image"]["width"], 1536)
         self.assertLessEqual(envelope["image"]["height"], 1536)
 
+    def test_image_envelope_carries_forced_negative_prompt(self):
+        # The coordinator prepends a forced SFW negative onto every
+        # image job — the layer-1 mitigation that catches "obese cow"
+        # → topless woman drift on DreamShaper-class models.
+        resp = self.client.post(
+            "/generate",
+            json={"prompt": "an obese cow", "tool": "image"},
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        envelope = json.loads(self.r.lpop("job_queue:image"))
+        neg = envelope["image"]["negative_prompt"] or ""
+        # Phrases from the default FORCED_NEGATIVE_PROMPT — assert
+        # presence rather than exact match so the prompt text can be
+        # tuned without breaking the test.
+        for term in ("nsfw", "nude", "topless"):
+            self.assertIn(term, neg.lower())
+
+    def test_image_envelope_combines_forced_and_user_negative(self):
+        # When the user supplies their own negative prompt, the forced
+        # SFW prefix goes BEFORE it (full weight to the safety
+        # phrases). Both halves must survive.
+        resp = self.client.post(
+            "/generate",
+            json={
+                "prompt": "a dog",
+                "tool": "image",
+                "image": {"negative_prompt": "blurry, lowres"},
+            },
+        )
+        envelope = json.loads(self.r.lpop("job_queue:image"))
+        neg = envelope["image"]["negative_prompt"] or ""
+        self.assertIn("nsfw", neg.lower())
+        self.assertIn("blurry", neg.lower())
+        self.assertIn("lowres", neg.lower())
+        # Forced phrases come first so the sampler sees them with
+        # full weight, then the user's terms.
+        self.assertLess(neg.lower().index("nsfw"), neg.lower().index("blurry"))
+
     def test_image_generate_rejects_denylist(self):
         # Picks a denylist phrase the unit test asserts continues to
         # reject. Concrete phrasing is uncomfortable to type but
