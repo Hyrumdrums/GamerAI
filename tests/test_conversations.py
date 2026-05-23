@@ -822,5 +822,329 @@ class RetryEndpointTests(_BaseE2E):
         self.assertEqual(r.status_code, 404)
 
 
+class ImagePromptRewriteTests(_BaseE2E):
+    """v1.1.26: when an image submission lives inside a conversation
+    that already has prior turns, /generate enqueues a hidden chat
+    job that rewrites the image prompt using context, then dispatches
+    the real image job with the rewritten text. Skipped (image goes
+    directly to the queue with the raw prompt) when there's no
+    context to draw on or no chat worker is online."""
+
+    def _make_chat_worker(self, token: str) -> str:
+        # Register a chat-capable worker AND give it a fresh heartbeat
+        # so _chat_worker_available_for_rewrite() sees it. Without the
+        # heartbeat the worker is considered offline.
+        worker_id = f"wkr-rw-{uuid.uuid4().hex[:6]}"
+        self.client.post(
+            "/register", json={"worker_id": worker_id},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.client.post(
+            "/heartbeat", json={"worker_id": worker_id, "status": "idle"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        return worker_id
+
+    def setUp(self):
+        # Class-level setUp doesn't reset Redis between tests, so each
+        # test in this class clears just the queue + rewrite-link
+        # state it asserts on. Avoids a full flushall (which would
+        # blow away worker registrations and heartbeats that prior
+        # tests in OTHER classes rely on).
+        self.r.delete("job_queue", "job_queue:image", "image_rewrite_pending")
+
+    def _seed_conversation_with_chat_turn(self, t: str) -> str:
+        # Build a conversation that has at least one prior completed
+        # message, so the "first message in this conv" skip doesn't
+        # apply.
+        conv = self.client.post(
+            "/conversations", json={},
+            headers={"Authorization": f"Bearer {t}"},
+        ).json()
+        cid = conv["conversation_id"]
+        sub = self.client.post(
+            "/generate",
+            json={"prompt": "draw some corn", "conversation_id": cid},
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        job_id = sub.json()["job_id"]
+        # /generate enqueues onto the chat queue; a real worker would
+        # have LPOPed via /jobs/next. We mimic that by popping
+        # directly so the seed doesn't leak residue into the rewrite
+        # assertions below.
+        self.r.lpop("job_queue")
+        claim = self.client.post(
+            "/jobs/claim",
+            json={"worker_id": "wkr-seed", "job_id": job_id},
+            headers=self._admin_headers(),
+        )
+        self.client.post(
+            "/jobs/complete",
+            json={
+                "worker_id": "wkr-seed", "job_id": job_id,
+                "text": "[image: corn]", "model": "llama3.2:1b",
+                "prompt_tokens": 5, "completion_tokens": 5,
+                "duration_seconds": 0.1, "status": "complete",
+                "claim_token": claim.json()["claim_token"],
+            },
+            headers=self._admin_headers(),
+        )
+        return cid
+
+    def test_image_in_empty_conversation_skips_rewrite(self):
+        # First message in a brand-new conversation is the image
+        # request → no context to combine, send straight to image
+        # queue with the raw prompt. Tests the explicit skip the
+        # user asked for ("yes skip if first message is the image
+        # request, with no context").
+        _, t = self._make_member(email="rwskip1@x.com")
+        self._make_chat_worker(t)
+        conv = self.client.post(
+            "/conversations", json={},
+            headers={"Authorization": f"Bearer {t}"},
+        ).json()
+        cid = conv["conversation_id"]
+        gr = self.client.post(
+            "/generate",
+            json={"prompt": "a cat", "tool": "image", "conversation_id": cid},
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        self.assertEqual(gr.status_code, 200, gr.text)
+        # Image landed directly on the image queue, no rewrite link
+        # was created.
+        self.assertEqual(self.r.llen("job_queue:image"), 1)
+        self.assertEqual(self.r.hlen("image_rewrite_pending"), 0)
+        # Job row is normal 'pending', not 'awaiting_rewrite'.
+        job_row = self.db.get_job(gr.json()["job_id"])
+        self.assertEqual(job_row["status"], "pending")
+
+    def test_image_without_conversation_id_skips_rewrite(self):
+        # No conversation_id → nothing to draw context from → no
+        # rewrite. Same behavior as before the feature shipped.
+        _, t = self._make_member(email="rwskip2@x.com")
+        self._make_chat_worker(t)
+        gr = self.client.post(
+            "/generate",
+            json={"prompt": "a dog", "tool": "image"},
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        self.assertEqual(gr.status_code, 200, gr.text)
+        self.assertEqual(self.r.llen("job_queue:image"), 1)
+        self.assertEqual(self.r.hlen("image_rewrite_pending"), 0)
+
+    def test_image_with_no_chat_worker_online_skips_rewrite(self):
+        # Conversation has context but NO chat worker is heartbeating
+        # — we fall back to the raw prompt rather than stranding the
+        # image behind a rewrite no one can complete. Use the seeded
+        # conversation, but DON'T register a fresh worker for the
+        # image submission.
+        _, t = self._make_member(email="rwskip3@x.com")
+        self._make_chat_worker(t)
+        cid = self._seed_conversation_with_chat_turn(t)
+        # Now blow away the heartbeats so the worker is considered
+        # offline at submit time.
+        self.r.delete("worker_heartbeats")
+        gr = self.client.post(
+            "/generate",
+            json={
+                "prompt": "wrapped in bacon",
+                "tool": "image",
+                "conversation_id": cid,
+            },
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        self.assertEqual(gr.status_code, 200, gr.text)
+        # Image queue gets the raw prompt, no rewrite link stored.
+        self.assertEqual(self.r.llen("job_queue:image"), 1)
+        envelope = json.loads(self.r.lpop("job_queue:image"))
+        self.assertEqual(envelope["prompt"], "wrapped in bacon")
+        self.assertEqual(self.r.hlen("image_rewrite_pending"), 0)
+
+    def test_image_with_context_routes_through_rewrite_pipeline(self):
+        # The happy path: conversation has a prior turn, chat worker
+        # online → /generate enqueues a hidden chat rewrite job
+        # (NOT the image directly), the image job row is
+        # 'awaiting_rewrite', and an image_rewrite_pending link
+        # exists.
+        _, t = self._make_member(email="rwhappy@x.com")
+        self._make_chat_worker(t)
+        cid = self._seed_conversation_with_chat_turn(t)
+        gr = self.client.post(
+            "/generate",
+            json={
+                "prompt": "wrapped in bacon",
+                "tool": "image",
+                "conversation_id": cid,
+            },
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        self.assertEqual(gr.status_code, 200, gr.text)
+        image_job_id = gr.json()["job_id"]
+        # Image is NOT on the image queue yet.
+        self.assertEqual(self.r.llen("job_queue:image"), 0)
+        # A chat rewrite job IS on the chat queue.
+        self.assertEqual(self.r.llen("job_queue"), 1)
+        rewrite_env = json.loads(self.r.lindex("job_queue", 0))
+        self.assertEqual(rewrite_env["tool"], "chat")
+        # The meta-prompt mentions both the original request and the
+        # prior turn (the corn).
+        self.assertIn("wrapped in bacon", rewrite_env["prompt"])
+        self.assertIn("corn", rewrite_env["prompt"].lower())
+        # Image job row is 'awaiting_rewrite'.
+        img_row = self.db.get_job(image_job_id)
+        self.assertEqual(img_row["status"], "awaiting_rewrite")
+        # Linkage stored.
+        rewrite_job_id = rewrite_env["job_id"]
+        link_raw = self.r.hget("image_rewrite_pending", rewrite_job_id)
+        self.assertIsNotNone(link_raw)
+        link = json.loads(link_raw)
+        self.assertEqual(link["image_job_id"], image_job_id)
+        self.assertEqual(link["original_prompt"], "wrapped in bacon")
+
+    def test_rewrite_complete_dispatches_image_with_rewritten_prompt(self):
+        # Simulate a chat worker completing the rewrite job and
+        # verify the image gets pushed onto the image queue with the
+        # rewritten text — and the image job row flips to 'pending'.
+        _, t = self._make_member(email="rwdispatch@x.com")
+        worker_id = self._make_chat_worker(t)
+        cid = self._seed_conversation_with_chat_turn(t)
+        image_job_id = self.client.post(
+            "/generate",
+            json={
+                "prompt": "wrapped in bacon",
+                "tool": "image",
+                "conversation_id": cid,
+            },
+            headers={"Authorization": f"Bearer {t}"},
+        ).json()["job_id"]
+        rewrite_env = json.loads(self.r.lpop("job_queue"))
+        rewrite_job_id = rewrite_env["job_id"]
+        # Chat worker claims and completes the rewrite job.
+        claim = self.client.post(
+            "/jobs/claim",
+            json={"worker_id": worker_id, "job_id": rewrite_job_id},
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        self.assertEqual(claim.status_code, 200, claim.text)
+        rewritten = "corn wrapped in bacon"
+        comp = self.client.post(
+            "/jobs/complete",
+            json={
+                "worker_id": worker_id,
+                "job_id": rewrite_job_id,
+                "text": rewritten,
+                "model": "llama3.2:1b",
+                "prompt_tokens": 50,
+                "completion_tokens": 5,
+                "duration_seconds": 1.0,
+                "status": "complete",
+                "claim_token": claim.json()["claim_token"],
+            },
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        self.assertEqual(comp.status_code, 200, comp.text)
+        # Image was pushed onto the image queue with the rewritten
+        # prompt, image job is now 'pending', link is gone.
+        self.assertEqual(self.r.llen("job_queue:image"), 1)
+        image_env = json.loads(self.r.lpop("job_queue:image"))
+        self.assertEqual(image_env["prompt"], rewritten)
+        img_row = self.db.get_job(image_job_id)
+        self.assertEqual(img_row["status"], "pending")
+        self.assertEqual(img_row["prompt"], rewritten)
+        self.assertEqual(self.r.hlen("image_rewrite_pending"), 0)
+
+    def test_rewrite_error_falls_back_to_original_prompt(self):
+        # If the chat worker errors out on the rewrite job (model
+        # crash, etc.), the image must still go through — with the
+        # original prompt — so the user isn't stranded.
+        _, t = self._make_member(email="rwerror@x.com")
+        worker_id = self._make_chat_worker(t)
+        cid = self._seed_conversation_with_chat_turn(t)
+        self.client.post(
+            "/generate",
+            json={
+                "prompt": "wrapped in bacon",
+                "tool": "image",
+                "conversation_id": cid,
+            },
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        rewrite_env = json.loads(self.r.lpop("job_queue"))
+        rewrite_job_id = rewrite_env["job_id"]
+        claim = self.client.post(
+            "/jobs/claim",
+            json={"worker_id": worker_id, "job_id": rewrite_job_id},
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        self.client.post(
+            "/jobs/complete",
+            json={
+                "worker_id": worker_id, "job_id": rewrite_job_id,
+                "text": "", "model": "llama3.2:1b",
+                "prompt_tokens": 0, "completion_tokens": 0,
+                "duration_seconds": 0.05, "status": "error",
+                "error": "model crashed",
+                "claim_token": claim.json()["claim_token"],
+            },
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        # Image got dispatched with the ORIGINAL prompt (fallback).
+        self.assertEqual(self.r.llen("job_queue:image"), 1)
+        image_env = json.loads(self.r.lpop("job_queue:image"))
+        self.assertEqual(image_env["prompt"], "wrapped in bacon")
+        self.assertEqual(self.r.hlen("image_rewrite_pending"), 0)
+
+    def test_cancel_during_awaiting_rewrite_prevents_dispatch(self):
+        # User cancels the image while the rewrite is still in
+        # flight. When the rewrite later completes, the dispatcher
+        # must notice the image is no longer awaiting_rewrite and
+        # NOT push it onto the image queue.
+        _, t = self._make_member(email="rwcancel@x.com")
+        worker_id = self._make_chat_worker(t)
+        cid = self._seed_conversation_with_chat_turn(t)
+        image_job_id = self.client.post(
+            "/generate",
+            json={
+                "prompt": "wrapped in bacon",
+                "tool": "image",
+                "conversation_id": cid,
+            },
+            headers={"Authorization": f"Bearer {t}"},
+        ).json()["job_id"]
+        rewrite_env = json.loads(self.r.lpop("job_queue"))
+        rewrite_job_id = rewrite_env["job_id"]
+        # User cancels.
+        cancel = self.client.post(
+            "/jobs/cancel", json={"job_id": image_job_id},
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        self.assertEqual(cancel.status_code, 200, cancel.text)
+        # Rewrite chat worker eventually returns.
+        claim = self.client.post(
+            "/jobs/claim",
+            json={"worker_id": worker_id, "job_id": rewrite_job_id},
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        self.client.post(
+            "/jobs/complete",
+            json={
+                "worker_id": worker_id, "job_id": rewrite_job_id,
+                "text": "corn wrapped in bacon",
+                "model": "llama3.2:1b",
+                "prompt_tokens": 50, "completion_tokens": 5,
+                "duration_seconds": 1.0, "status": "complete",
+                "claim_token": claim.json()["claim_token"],
+            },
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        # Image was NOT pushed onto the image queue — the dispatcher
+        # saw the cancelled status and bailed.
+        self.assertEqual(self.r.llen("job_queue:image"), 0)
+        # Link cleaned up.
+        self.assertEqual(self.r.hlen("image_rewrite_pending"), 0)
+        # Image stays cancelled.
+        self.assertEqual(self.db.get_job(image_job_id)["status"], "cancelled")
+
+
 if __name__ == "__main__":
     unittest.main()

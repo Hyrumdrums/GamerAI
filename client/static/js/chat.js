@@ -7,7 +7,6 @@ let currentId = null;     // active conversation_id, or null = brand-new
 // switch. Persists in-memory only; we don't put it on the conversation
 // because users want to flip mid-thread (write a paragraph then ask
 // for an illustration).
-let currentTool = 'chat';
 // In-memory message cache so switching between already-opened
 // conversations is instant. Keyed by conversation_id; value is the
 // full messages[] array. Cleared on page refresh — not a substitute
@@ -584,29 +583,21 @@ async function streamIntoBubble(jobId, wrap, statusEl, startMs, messageId) {
   }
 }
 
-// ---- tool toggle ------------------------------------------------------
-// Pure UI glue — flipping doesn't talk to the server. The selection is
-// read at submit time and sent as the /api/generate `tool` field.
-function setTool(tool) {
-  currentTool = tool === 'image' ? 'image' : 'chat';
-  document.getElementById('tool-chat').classList.toggle(
-    'active', currentTool === 'chat',
-  );
-  document.getElementById('tool-image').classList.toggle(
-    'active', currentTool === 'image',
-  );
-  document.getElementById('tool-chat').setAttribute(
-    'aria-selected', currentTool === 'chat' ? 'true' : 'false',
-  );
-  document.getElementById('tool-image').setAttribute(
-    'aria-selected', currentTool === 'image' ? 'true' : 'false',
-  );
-  document.getElementById('prompt').placeholder = currentTool === 'image'
+// ---- image toggle (one-shot checkbox) --------------------------------
+// Replaces the old chat/image tab toggle. Checking the box makes the
+// NEXT submit an image generation; after submit the box auto-clears
+// so an accidental sticky-image-mode can't burn 5 contributor jobs in
+// a row. The "image is the unusual case" UX is explicit because of
+// that auto-clear — chat is the default state, image is an opt-in
+// per-turn.
+const imageCheckbox = document.getElementById('tool-image-cb');
+function refreshPlaceholder() {
+  document.getElementById('prompt').placeholder = imageCheckbox.checked
     ? 'Describe the image you want…'
     : 'Message GamerAI...';
 }
-document.getElementById('tool-chat').onclick = () => setTool('chat');
-document.getElementById('tool-image').onclick = () => setTool('image');
+imageCheckbox.addEventListener('change', refreshPlaceholder);
+refreshPlaceholder();
 
 // ---- composer ---------------------------------------------------------
 const textarea = document.getElementById('prompt');
@@ -645,9 +636,13 @@ document.getElementById('composer').onsubmit = async (e) => {
     currentId = (await cr.json()).conversation_id;
   }
 
-  // Snapshot the tool at submit time. Flipping the toggle mid-flight
-  // shouldn't change what this turn is.
-  const submitTool = currentTool;
+  // Snapshot the checkbox state at submit time. Mid-stream toggling
+  // shouldn't change what this turn is. Then immediately auto-clear
+  // the checkbox so the NEXT submit defaults back to chat — image is
+  // intentionally opt-in per-turn to avoid stale sticky-image mode.
+  const submitTool = imageCheckbox.checked ? 'image' : 'chat';
+  imageCheckbox.checked = false;
+  refreshPlaceholder();
 
   // Append the user message optimistically so it shows up right away.
   const pane = document.getElementById('chat-pane');

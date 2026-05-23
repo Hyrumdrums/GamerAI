@@ -28,6 +28,7 @@ from shared.auth import API_TOKEN, AUTH_ENABLED, is_public_path
 from shared.config import (
     CANARY_INTERVAL_SECONDS,
     CANARY_PENDING,
+    IMAGE_REWRITE_PENDING,
     CANARY_SCORE_WINDOW,
     IDEMPOTENCY_TTL_SECONDS,
     JOB_PARTIALS,
@@ -175,6 +176,223 @@ _FORCED_NEGATIVE_PROMPT = os.getenv(
     "nsfw, nude, naked, topless, partially nude, bare skin, "
     "sexual, sexually suggestive, explicit, lingerie, underwear",
 )
+
+
+# ---------- image-prompt rewrite (context-aware) ----------
+# When a user submits an image inside an existing conversation, their
+# new request often references prior turns ("draw some corn" → image →
+# "I wanted it wrapped in bacon"). Sending "wrapped in bacon" to
+# sd.cpp produces a strip of bacon. The rewrite pipeline runs a hidden
+# chat job through Ollama that combines the recent conversation with
+# the new request and produces a self-contained image prompt
+# ("corn wrapped in bacon"). The image worker never sees the original
+# request, only the rewritten one. Side-effects: ~5s latency added to
+# any image-with-context submission; one extra chat job billed to the
+# submitter. Skipped when: no conversation, empty conversation, no
+# chat workers online.
+_REWRITE_HISTORY_LIMIT = 6
+
+
+def _format_rewrite_history(prior_messages) -> str:
+    """Build a short text snippet representing recent conversation
+    state for the rewriter. Limited to the most recent
+    ``_REWRITE_HISTORY_LIMIT`` non-empty / non-pending messages so the
+    chat model isn't asked to digest 200 turns. Image-bubble
+    placeholders (``[image: foo]``) are rewritten as
+    ``[generated image: foo]`` so the model understands what the
+    assistant did instead of seeing the prompt repeated verbatim."""
+    relevant = [
+        m for m in prior_messages
+        if (m["text"] or "").strip() and m["status"] != "pending"
+    ]
+    recent = relevant[-_REWRITE_HISTORY_LIMIT:]
+    lines = []
+    for m in recent:
+        role_label = "User" if m["role"] == "user" else "Assistant"
+        text = (m["text"] or "").strip()
+        if m["role"] == "assistant" and text.startswith("[image:"):
+            inner = text[len("[image:"):].rstrip("]").strip()
+            text = f"[generated image: {inner}]"
+        lines.append(f"{role_label}: {text}")
+    return "\n".join(lines)
+
+
+def _build_rewrite_meta_prompt(history: str, user_prompt: str) -> str:
+    return (
+        "You rewrite image generation prompts using conversation context.\n\n"
+        "CONTEXT (recent turns):\n"
+        f"{history}\n\n"
+        f"NEW IMAGE REQUEST: {user_prompt}\n\n"
+        "If the new request stands alone (a complete subject), output "
+        "it unchanged. If it's a modification or refinement of a "
+        "previous image request (e.g. \"make it bigger\", "
+        "\"wrapped in bacon\", \"but blue\"), combine it with the "
+        "prior subject to make a complete image prompt.\n\n"
+        "Output ONLY the final image prompt — no preamble, no quotes, "
+        "no explanation. One short sentence.\n\n"
+        "FINAL PROMPT:"
+    )
+
+
+def _clean_rewritten_prompt(raw: Optional[str], fallback: str) -> str:
+    """Defensive cleanup on model output: trim, strip wrapping quotes,
+    strip echoed headers, take only the first line, and refuse on
+    suspiciously empty / oversized output by falling back to the
+    original prompt. We'd rather render the user's exact words than a
+    confused model's verbose ramble."""
+    if not raw:
+        return fallback
+    s = raw.strip()
+    for header in ("FINAL PROMPT:", "Final prompt:", "Rewritten:", "Output:"):
+        if s.lower().startswith(header.lower()):
+            s = s[len(header):].strip()
+            break
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ('"', "'"):
+        s = s[1:-1].strip()
+    if "\n" in s:
+        s = s.split("\n", 1)[0].strip()
+    if not s or len(s) > 500:
+        return fallback
+    return s
+
+
+def _chat_worker_available_for_rewrite() -> bool:
+    """Is any chat-capable worker heartbeating recently? Without one,
+    the rewrite chat job would sit on the queue forever and the user
+    would never get their image, so we skip the rewrite step entirely
+    and fall back to the raw prompt."""
+    now = time.time()
+    heartbeats = r.hgetall(WORKER_HEARTBEATS) or {}
+    for worker_id, _raw in heartbeats.items():
+        ts, _ = _read_heartbeat(worker_id)
+        if not ts or (now - ts) > WORKER_TIMEOUT_SECONDS:
+            continue
+        if _worker_advertises_tool(worker_id, "chat"):
+            return True
+    return False
+
+
+def _conversation_has_prior_context(prior_messages) -> bool:
+    """A conversation has 'context' for rewrite purposes iff there's at
+    least one prior completed message in it (any role). An empty
+    conversation or one with only the just-inserted pending pair has
+    nothing for the rewriter to work with — skip and use the raw
+    prompt. This check runs BEFORE the new user+pending-assistant pair
+    is appended in /generate, so ``prior_messages`` is the pre-insert
+    snapshot."""
+    return any(
+        (m["text"] or "").strip() and m["status"] != "pending"
+        for m in prior_messages
+    )
+
+
+def _enqueue_chat_rewrite_for_image(
+    image_job_id: str,
+    image_envelope: dict,
+    original_prompt: str,
+    history: str,
+    submitted_by: Optional[str],
+    submitted_at: float,
+) -> str:
+    """Enqueue the hidden chat rewrite job, store the linkage in
+    Redis, and return the rewrite job_id. The actual image dispatch
+    happens later, in /jobs/complete, when the rewrite returns.
+
+    Linkage Redis HSET happens BEFORE the queue push so a fast worker
+    that completes the rewrite job in microseconds can't race ahead of
+    the linkage write and find no dispatch instructions."""
+    rewrite_job_id = str(uuid.uuid4())
+    meta_prompt = _build_rewrite_meta_prompt(history, original_prompt)
+    rewrite_envelope = {
+        "job_id": rewrite_job_id,
+        "prompt": meta_prompt,
+        # No `model` — worker uses its default chat model. No
+        # `conversation_id` — this job is invisible to the chat UI.
+        "submitted_at": submitted_at,
+        "tool": "chat",
+    }
+    db.insert_job(
+        rewrite_job_id,
+        meta_prompt,
+        None,
+        submitted_at,
+        submitted_by,
+        conversation_id=None,
+        tool="chat",
+    )
+    r.hset(
+        IMAGE_REWRITE_PENDING,
+        rewrite_job_id,
+        json.dumps({
+            "image_job_id": image_job_id,
+            "image_envelope": image_envelope,
+            "original_prompt": original_prompt,
+        }),
+    )
+    r.rpush(job_queue_for("chat"), json.dumps(rewrite_envelope))
+    log.info(
+        "image prompt rewrite enqueued",
+        extra={
+            "event": "rewrite_enqueued",
+            "rewrite_job_id": rewrite_job_id,
+            "image_job_id": image_job_id,
+        },
+    )
+    return rewrite_job_id
+
+
+def _dispatch_image_after_rewrite(
+    rewrite_job_id: str,
+    link: dict,
+    rewritten_text: Optional[str],
+) -> None:
+    """Called from /jobs/complete when the rewrite chat job finishes.
+    Plugs the cleaned rewritten text into the stored image envelope,
+    flips the image job row out of 'awaiting_rewrite', and RPUSHes the
+    image onto the real image queue.
+
+    Skipped (with the link still cleaned up) when the image job is
+    no longer in 'awaiting_rewrite' status — covers the cancel-while-
+    rewriting race (user clicked Cancel after we enqueued the rewrite
+    but before it completed) and the conversation-was-purged race
+    (image job row deleted while in flight). Without this guard we'd
+    push an image onto the queue that no one is watching anymore.
+
+    Always deletes the link entry so a stale duplicate completion (or
+    a future replay) can't re-trigger dispatch."""
+    image_job_id = link["image_job_id"]
+    image_envelope = link["image_envelope"]
+    original = link["original_prompt"]
+    try:
+        image_row = db.get_job(image_job_id)
+        if image_row is None or image_row["status"] != "awaiting_rewrite":
+            r.hdel(IMAGE_REWRITE_PENDING, rewrite_job_id)
+            log.info(
+                "image rewrite finished but image job no longer awaiting "
+                "rewrite — skipping dispatch",
+                extra={
+                    "event": "rewrite_dispatch_skipped",
+                    "rewrite_job_id": rewrite_job_id,
+                    "image_job_id": image_job_id,
+                    "image_status": image_row["status"] if image_row else "missing",
+                },
+            )
+            return
+        final_prompt = _clean_rewritten_prompt(rewritten_text, original)
+        image_envelope["prompt"] = final_prompt
+        db.set_job_pending_with_prompt(image_job_id, final_prompt)
+        r.rpush(job_queue_for("image"), json.dumps(image_envelope))
+        log.info(
+            "image dispatched after rewrite",
+            extra={
+                "event": "rewrite_dispatched",
+                "rewrite_job_id": rewrite_job_id,
+                "image_job_id": image_job_id,
+                "rewrite_was_used": final_prompt != original,
+            },
+        )
+    finally:
+        r.hdel(IMAGE_REWRITE_PENDING, rewrite_job_id)
 
 
 def _combine_negative_prompt(user_negative: Optional[str]) -> str:
@@ -920,6 +1138,21 @@ def generate(req: GenerateRequest, request: Request):
         if params.steps is not None:
             image_env["steps"] = max(1, min(50, int(params.steps)))
         job["image"] = image_env
+    # Decide whether this image job should go through the context-
+    # aware rewrite pipeline. Skipped when:
+    # - it's not an image job (chat jobs never rewrite)
+    # - no conversation_id (no history to draw on)
+    # - conversation is empty (first turn — nothing to refine against)
+    # - no chat worker online to do the rewrite (avoid stranding the
+    #   image behind a rewrite job that no one will pick up)
+    needs_rewrite = (
+        tool == "image"
+        and conversation_id is not None
+        and prior
+        and _conversation_has_prior_context(prior)
+        and _chat_worker_available_for_rewrite()
+    )
+
     # Store the ORIGINAL user message (not the prepended worker-prompt)
     # so /jobs/complete can replay only the new turn into the
     # conversation history.
@@ -931,6 +1164,7 @@ def generate(req: GenerateRequest, request: Request):
         submitted_by,
         conversation_id=conversation_id,
         tool=tool,
+        status=("awaiting_rewrite" if needs_rewrite else "pending"),
     )
     # Persist the user turn and an empty pending assistant turn now,
     # not at /jobs/complete time. This means: (a) a client that
@@ -969,7 +1203,20 @@ def generate(req: GenerateRequest, request: Request):
         # when title is NULL/empty) so it's safe to call here even
         # though the message is now persisted earlier than before.
         db.set_conversation_title(conversation_id, req.prompt[:80].strip())
-    r.rpush(job_queue_for(tool), json.dumps(job))
+    if needs_rewrite:
+        # Hand the image envelope to the rewrite pipeline. It enqueues
+        # a hidden chat job; the image goes on the real queue later,
+        # in /jobs/complete's rewrite-dispatch handler.
+        _enqueue_chat_rewrite_for_image(
+            image_job_id=job_id,
+            image_envelope=job,
+            original_prompt=req.prompt,
+            history=_format_rewrite_history(prior),
+            submitted_by=submitted_by,
+            submitted_at=submitted_at,
+        )
+    else:
+        r.rpush(job_queue_for(tool), json.dumps(job))
     idem.remember(idem_key, job_id)
     log.info(
         "queued job",
@@ -1577,6 +1824,49 @@ def complete(req: JobCompleteRequest, request: Request):
             },
         )
         return {"ok": True, "earnings": 0.0}
+
+    # Image-prompt rewrite: this completion is a hidden chat job whose
+    # only purpose is to produce a context-aware rewrite of a queued
+    # image job's prompt. Dispatching happens BEFORE the rest of the
+    # complete flow runs, so the image lands on the image queue at the
+    # earliest moment after the rewrite text is available. The rewrite
+    # job itself then falls through to the normal chat-completion path
+    # so the worker gets paid for its compute (it really did inference
+    # work) and the rewrite job's ledger row is recorded normally.
+    rewrite_link_raw = r.hget(IMAGE_REWRITE_PENDING, req.job_id)
+    if rewrite_link_raw:
+        try:
+            link = json.loads(rewrite_link_raw)
+        except json.JSONDecodeError:
+            link = None
+        if link:
+            rewritten = req.text if req.status == "complete" else None
+            try:
+                _dispatch_image_after_rewrite(req.job_id, link, rewritten)
+            except Exception as exc:
+                log.warning(
+                    "image-rewrite dispatch failed; falling back to raw prompt",
+                    extra={
+                        "event": "rewrite_dispatch_failed",
+                        "rewrite_job_id": req.job_id,
+                        "error": str(exc),
+                    },
+                )
+                # Best-effort recovery: push the image envelope with
+                # the original prompt so the user still gets SOMETHING
+                # rather than a stuck pending bubble.
+                try:
+                    fallback_env = link.get("image_envelope") or {}
+                    fallback_env["prompt"] = link.get("original_prompt", "")
+                    image_job_id = link.get("image_job_id")
+                    if image_job_id:
+                        db.set_job_pending_with_prompt(
+                            image_job_id, fallback_env["prompt"],
+                        )
+                    r.rpush(job_queue_for("image"), json.dumps(fallback_env))
+                except Exception:
+                    pass
+                r.hdel(IMAGE_REWRITE_PENDING, req.job_id)
 
     # Look up the original job row so we can branch image vs. chat
     # before touching earnings + storage.

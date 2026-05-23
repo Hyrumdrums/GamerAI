@@ -117,3 +117,14 @@ WORKER_CAPABILITIES = "worker_capabilities"
 # as canaries. Coordinator consults this on /jobs/complete to recognize
 # canary results; workers never see this key.
 CANARY_PENDING = "canary_pending"
+
+# Redis hash mapping rewrite_chat_job_id -> JSON({image_job_id,
+# image_envelope, original_prompt}). Set by /generate when an image
+# job needs context-aware prompt rewriting (image submit inside a
+# conversation that already has prior turns); consumed by
+# /jobs/complete when the rewrite job lands — at which point the
+# coordinator plugs the rewritten text into the stored image envelope
+# and RPUSHes it onto the real image queue. The link entry is deleted
+# after dispatch (or after a fallback-to-raw error path) so a stale
+# rewrite_chat_job_id never leaks into the next request.
+IMAGE_REWRITE_PENDING = "image_rewrite_pending"

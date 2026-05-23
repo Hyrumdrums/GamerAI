@@ -38,12 +38,10 @@
 
     <form class="composer" id="composer">
       <div class="tool-row">
-        <div class="tool-toggle" role="tablist" aria-label="Tool">
-          <button type="button" id="tool-chat" class="tool-btn active"
-                  role="tab" aria-selected="true">Chat</button>
-          <button type="button" id="tool-image" class="tool-btn"
-                  role="tab" aria-selected="false">Image</button>
-        </div>
+        <label class="image-toggle">
+          <input type="checkbox" id="tool-image-cb">
+          <span>Generate as image</span>
+        </label>
       </div>
       <div class="composer-inner">
         <textarea id="prompt" placeholder="Message GamerAI..." rows="1"></textarea>

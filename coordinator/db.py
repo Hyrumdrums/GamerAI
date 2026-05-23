@@ -278,17 +278,30 @@ class DB:
         submitted_by_member_id: Optional[str] = None,
         conversation_id: Optional[str] = None,
         tool: str = "chat",
+        status: str = "pending",
     ) -> None:
         with self._lock:
             self._conn.execute(
                 "INSERT OR REPLACE INTO jobs "
                 "(job_id, prompt, model, status, submitted_at, attempts, "
                 "submitted_by_member_id, conversation_id, tool) "
-                "VALUES (?, ?, ?, 'pending', ?, 0, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)",
                 (
-                    job_id, prompt, model, submitted_at,
+                    job_id, prompt, model, status, submitted_at,
                     submitted_by_member_id, conversation_id, tool,
                 ),
+            )
+
+    def set_job_pending_with_prompt(self, job_id: str, prompt: str) -> None:
+        """Used by the image-prompt rewrite pipeline: when the rewrite
+        chat job completes, overwrite the awaiting-rewrite image job's
+        prompt with the rewritten text and flip its status to 'pending'
+        so it shows up as a normal queued job to /result and the reaper.
+        Idempotent: a missing job_id just no-ops."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE jobs SET prompt=?, status='pending' WHERE job_id=?",
+                (prompt, job_id),
             )
 
     def mark_job_running(self, job_id: str, worker_id: str, started_at: float) -> None:
