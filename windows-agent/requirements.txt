@@ -8,5 +8,12 @@ pyinstaller==6.10.0
 # Search mode: DuckDuckGo client + readability extractor. Both are
 # pure-Python and pip-installable so they bundle cleanly into the
 # pyinstaller --onefile build that ships to contributors.
-ddgs==9.14.4
+#
+# ddgs is pinned to 9.14.3 (the last release before 9.14.4 added a
+# transitive `httpx[brotli,http2,socks]>=0.28.1` dep). We're stuck on
+# httpx==0.27.2 elsewhere in the project and don't need DDG's bigger
+# httpx extras — 9.14.3 routes through `primp` (their Rust HTTP
+# client) and keeps the resolver happy with the rest of the project.
+# Same .text() API as 9.14.4 so the agent code is unchanged.
+ddgs==9.14.3
 trafilatura==2.0.0

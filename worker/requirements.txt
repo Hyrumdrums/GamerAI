@@ -2,6 +2,8 @@ redis==5.0.8
 httpx==0.27.2
 # Search mode (tool=search): DuckDuckGo client + readability extractor.
 # The dockerized worker mirrors the windows-agent's capability so dev
-# and tests don't have to skip search routing.
-ddgs==9.14.4
+# and tests don't have to skip search routing. Pinned to 9.14.3 to
+# stay below the 9.14.4 httpx>=0.28.1 dep that conflicts with the
+# project's httpx==0.27.2 pin (see windows-agent/requirements.txt).
+ddgs==9.14.3
 trafilatura==2.0.0
