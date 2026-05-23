@@ -291,6 +291,22 @@ class DB:
             )
         except sqlite3.OperationalError:
             pass
+        # Email uniqueness — load-bearing for the deferred email-based
+        # password reset path. Two members sharing an email makes
+        # "reset to alice@example.com" ambiguous; the cheapest moment
+        # to enforce it is at signup, before there's anything to
+        # backfill. Case-insensitive via LOWER() so casing on display
+        # is preserved but two rows with the same logical email
+        # collide. Partial (WHERE email IS NOT NULL) so the existing
+        # seeded-admin row (NULL email until they run set-email) and
+        # any future system rows aren't forced to carry an address.
+        try:
+            self._conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_members_email "
+                "ON members(LOWER(email)) WHERE email IS NOT NULL"
+            )
+        except sqlite3.OperationalError:
+            pass
         # Per-member additional bearer tokens — added with the agent-
         # pairing slice. ``members.token_hash`` stays as the (single)
         # web-session credential rotated by /login. ``member_tokens``
@@ -577,6 +593,43 @@ class DB:
                 (username,),
             )
             return cur.fetchone()
+
+    def get_member_by_email(self, email: str) -> Optional[sqlite3.Row]:
+        """Case-insensitive email lookup. Used by the set-email CLI to
+        report collisions before the unique-index INSERT does."""
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM members WHERE LOWER(email)=LOWER(?)",
+                (email,),
+            )
+            return cur.fetchone()
+
+    def set_member_email(self, member_id: str, email: str) -> tuple[bool, Optional[str]]:
+        """Set or update a member's email. Returns ``(True, None)`` on
+        success; ``(False, "email_taken")`` if the address is in use by
+        another member (case-insensitive). Wrapped in BEGIN/COMMIT so
+        the collision check and the UPDATE are atomic."""
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = self._conn.execute(
+                    "SELECT member_id FROM members "
+                    "WHERE LOWER(email)=LOWER(?) AND member_id<>?",
+                    (email, member_id),
+                )
+                clash = cur.fetchone()
+                if clash is not None:
+                    self._conn.execute("ROLLBACK")
+                    return False, "email_taken"
+                self._conn.execute(
+                    "UPDATE members SET email=? WHERE member_id=?",
+                    (email, member_id),
+                )
+                self._conn.execute("COMMIT")
+                return True, None
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
 
     def set_member_credentials(
         self,
@@ -880,6 +933,15 @@ class DB:
                     if clash is not None:
                         self._conn.execute("ROLLBACK")
                         return None, "username_taken"
+                if invitee_email:
+                    clash = self._conn.execute(
+                        "SELECT member_id FROM members "
+                        "WHERE LOWER(email)=LOWER(?)",
+                        (invitee_email,),
+                    ).fetchone()
+                    if clash is not None:
+                        self._conn.execute("ROLLBACK")
+                        return None, "email_taken"
 
                 self._conn.execute(
                     "INSERT INTO members (member_id, email, role, parent_member_id, "

@@ -156,6 +156,42 @@ def cmd_set_credentials(args: argparse.Namespace) -> None:
     print("password set; sign in at /login")
 
 
+def cmd_set_email(args: argparse.Namespace) -> None:
+    """Set or update a member's email. Keyed by username so the admin
+    can update their own (or anyone's) email without first fetching the
+    current bearer — useful for the founding admin who has no email on
+    their seeded row, and as the recovery prep step before email-based
+    reset ships."""
+    db = DB()
+    row = db.get_member_by_username(args.username)
+    if row is None:
+        print(
+            f"error: no member with username {args.username!r}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if row["revoked_at"] is not None:
+        print("error: that member is revoked", file=sys.stderr)
+        sys.exit(2)
+    email = (args.email or "").strip()
+    if not email or "@" not in email:
+        print("error: --email must be a valid address", file=sys.stderr)
+        sys.exit(2)
+    ok, reason = db.set_member_email(row["member_id"], email)
+    if not ok:
+        if reason == "email_taken":
+            print(
+                f"error: {email!r} is already in use by another member",
+                file=sys.stderr,
+            )
+        else:
+            print(f"error: {reason or 'unknown'}", file=sys.stderr)
+        sys.exit(2)
+    print(f"member_id={row['member_id']}")
+    print(f"username={args.username}")
+    print(f"email={email}")
+
+
 def cmd_revoke(args: argparse.Namespace) -> None:
     db = DB()
     ok = db.revoke_member_by_token_hash(
@@ -328,6 +364,21 @@ def _build_parser() -> argparse.ArgumentParser:
     p_revoke = sub.add_parser("revoke", help="revoke a member by their token")
     p_revoke.add_argument("--token", required=True)
     p_revoke.set_defaults(fn=cmd_revoke)
+
+    p_se = sub.add_parser(
+        "set-email",
+        help="set or update a member's email (recovery channel for "
+             "future email-based password reset)",
+    )
+    p_se.add_argument(
+        "--username", required=True,
+        help="member to update (case-insensitive)",
+    )
+    p_se.add_argument(
+        "--email", required=True,
+        help="email address; must be unique among members (case-insensitive)",
+    )
+    p_se.set_defaults(fn=cmd_set_email)
 
     p_sc = sub.add_parser(
         "set-credentials",

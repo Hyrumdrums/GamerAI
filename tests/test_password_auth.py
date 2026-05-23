@@ -334,6 +334,68 @@ class PasswordAuthTests(unittest.TestCase):
         )
         self.assertEqual(new.status_code, 200)
 
+    # ------------------------------------------------------------------
+    # admin CLI: set-email
+    # ------------------------------------------------------------------
+    def _make_admin_with_username(self, username: str) -> None:
+        coordinator_admin.main([
+            "set-credentials",
+            "--token", ADMIN_TOKEN,
+            "--username", username,
+            "--password", "correct-horse-battery",
+        ])
+
+    def test_set_email_assigns_address_to_existing_member(self):
+        self._make_admin_with_username("rootadmin")
+        coordinator_admin.main([
+            "set-email",
+            "--username", "rootadmin",
+            "--email", "admin@example.com",
+        ])
+        row = self.db.get_member_by_username("rootadmin")
+        self.assertEqual(row["email"], "admin@example.com")
+
+    def test_set_email_rejects_unknown_username(self):
+        with self.assertRaises(SystemExit):
+            coordinator_admin.main([
+                "set-email",
+                "--username", "ghost",
+                "--email", "x@example.com",
+            ])
+
+    def test_set_email_rejects_obviously_invalid(self):
+        self._make_admin_with_username("rootadmin")
+        with self.assertRaises(SystemExit):
+            coordinator_admin.main([
+                "set-email",
+                "--username", "rootadmin",
+                "--email", "not-an-email",
+            ])
+
+    def test_set_email_rejects_duplicate_across_members(self):
+        self._make_admin_with_username("rootadmin")
+        coordinator_admin.main([
+            "set-email",
+            "--username", "rootadmin",
+            "--email", "shared@example.com",
+        ])
+        # Make a contributor and try to give them the same email.
+        contributor_token = _make_contributor(self.client)
+        member = member_auth.lookup_member_by_token(self.db, contributor_token)
+        # Need to give them a username so set-email can find them.
+        self.db.set_member_credentials(
+            member_id=member.member_id,
+            username="contrib1",
+            password_hash=None,
+            when=__import__("time").time(),
+        )
+        with self.assertRaises(SystemExit):
+            coordinator_admin.main([
+                "set-email",
+                "--username", "contrib1",
+                "--email", "Shared@Example.com",  # different case, same address
+            ])
+
     def test_admin_seed_skips_when_other_admin_exists(self):
         """Once the founding admin claims u/p their primary token has
         been rotated, so a coordinator restart would otherwise re-seed

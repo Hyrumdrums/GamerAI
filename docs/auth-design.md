@@ -48,6 +48,58 @@ The "why" is the load-bearing part; if a future you (or future me)
 forgets the reasoning, the temptation is to grab the simple fix and
 re-introduce the original failure mode.
 
+### Password recovery — current state and end state
+
+**Today (no email service):** there is no self-service recovery. A
+member who forgets their password contacts their host out of band;
+the host revokes the member row and reissues a fresh invite under
+the same email. The friend redeems, picks a new password, and is
+back in. Conversation history is lost (`purge_conversation` runs on
+revoke). For friends-and-family beta this is acceptable but lossy —
+and it doesn't rescue the host themselves losing access, since the
+admin / a root contributor has no host above them.
+
+**Email collected at signup is the mitigation.** Username +
+**required** + **unique** email are persisted on every member
+row from the redemption flow. The `members.email` partial unique
+index (case-insensitive) is what makes "reset to alice@example.com"
+unambiguous — without uniqueness, two members with the same address
+collapse the reset target. Cost of enforcing later, after
+inconsistent rows accumulate, is high; cost of enforcing at signup
+is one partial index.
+
+**Why this matters for the pyramid:** the network is a tree —
+Alice → Bob → Carol — and a stuck account at any depth is a dead
+node. A locked-out Bob means Carol's "Your host" link points at a
+ghost AND her recovery escalation is broken (her host can't be
+reached to revoke + reissue). Without an email recovery channel
+that goes around the host, deep-tree contributors are fragile.
+
+**End state (when email service is wired):**
+
+1. **Self-service email reset** — standard form: enter email, click
+   the magic link, set new password. Sender will be Postmark / SES /
+   Resend / similar; not yet picked.
+2. **Host-attested recovery** — the right shape for the "email
+   bounces too" edge case, and the long-term answer that ties
+   recovery back into the social graph that's the whole point of
+   the network. The host, who already vouched for the invitee at
+   signup, can attest "yes that's still Bob, accept this recovery
+   request" — gated by the host's own active session, logged on
+   the invitee's account history, with the host's own role and
+   tier providing the audit trail. Combined with email reset,
+   this means a stuck account is recoverable iff *either* the
+   email works *or* the host is reachable.
+3. **Bounce monitoring** — once email is sending, flag rows whose
+   reset attempts bounce; surface them on the admin dashboard so a
+   silently-dead recovery channel doesn't go undetected for months.
+
+The host-attested path is the load-bearing piece for the
+pyramid: it's what keeps Carol recoverable when Bob is unreachable
+*and* her own email has rotted. Don't ship email reset without it,
+or we'll have replaced "host-only recovery" with "email-only
+recovery" — different single point of failure, same fragility.
+
 ### Host-can-send-password-reset-link
 
 **What was considered:** the host could press a button on their

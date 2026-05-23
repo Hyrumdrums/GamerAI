@@ -122,10 +122,11 @@ class WebUISmokeTests(unittest.TestCase):
         # this today is the CLI, which we don't want to exec here.
         token = member_auth.generate_token()
         type(self)._contrib_seq += 1
-        member_id = f"mem_webui_contrib_{type(self)._contrib_seq}"
+        seq = type(self)._contrib_seq
+        member_id = f"mem_webui_contrib_{seq}"
         self.db.create_member(
             member_id=member_id,
-            email="alice@example.com",
+            email=f"alice{seq}@example.com",
             role="contributor",
             parent_member_id=None,
             token_hash=member_auth.hash_token(token),
@@ -149,7 +150,8 @@ class WebUISmokeTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         body = resp.text
         self.assertIn("You've been invited", body)
-        self.assertIn("alice@example.com", body)
+        self.assertIn("alice", body)
+        self.assertIn("@example.com", body)
         self.assertIn("200 tokens/day", body)
         # The form posts back to the same URL.
         self.assertIn(f'<form method="POST"', body)
@@ -482,7 +484,8 @@ class WebUISmokeTests(unittest.TestCase):
         body = resp.text
         self.assertIn("Members", body)
         self.assertIn("admin", body)         # the admin seed row
-        self.assertIn("alice@example.com", body)  # the contributor row
+        self.assertIn("alice", body)
+        self.assertIn("@example.com", body)  # the contributor row
         self.assertIn("contributor", body)
 
     def test_admin_invites_page_renders(self):

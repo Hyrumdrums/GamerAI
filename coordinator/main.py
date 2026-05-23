@@ -3488,6 +3488,15 @@ def accept_invite(code: str, req: InviteAcceptRequest):
                 status_code=409,
                 detail=f"username {username!r} is already taken",
             )
+        if failure == "email_taken":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"that email is already claimed by another GamerAI "
+                    "account — sign in with your existing one, or pick a "
+                    "different email"
+                ),
+            )
         # Distinguish missing vs unredeemable for the redemption page.
         existing = db.get_invite_by_code(code)
         if existing is None:

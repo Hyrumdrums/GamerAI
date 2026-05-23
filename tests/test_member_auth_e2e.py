@@ -395,6 +395,41 @@ class MemberAuthE2ETests(unittest.TestCase):
         second = self.client.post(f"/invites/{code2}/accept", json=second_payload)
         self.assertEqual(second.status_code, 409)
 
+    def test_accept_rejects_duplicate_email(self):
+        """Email uniqueness is load-bearing for the future email-based
+        password-reset path. Two members with the same email makes
+        'reset to alice@example.com' ambiguous; the cheapest enforcement
+        is at signup."""
+        _, contributor_token = self._make_contributor()
+        code1 = self._create_invite(contributor_token)
+        code2 = self._create_invite(contributor_token)
+        first = self.client.post(
+            f"/invites/{code1}/accept",
+            json=self._accept_payload(invitee_email="dup@example.com"),
+        )
+        self.assertEqual(first.status_code, 200)
+        second = self.client.post(
+            f"/invites/{code2}/accept",
+            json=self._accept_payload(invitee_email="dup@example.com"),
+        )
+        self.assertEqual(second.status_code, 409)
+        self.assertIn("already claimed", second.json()["detail"])
+
+    def test_accept_email_collision_is_case_insensitive(self):
+        _, contributor_token = self._make_contributor()
+        code1 = self._create_invite(contributor_token)
+        code2 = self._create_invite(contributor_token)
+        first = self.client.post(
+            f"/invites/{code1}/accept",
+            json=self._accept_payload(invitee_email="Mixed.Case@Example.COM"),
+        )
+        self.assertEqual(first.status_code, 200)
+        second = self.client.post(
+            f"/invites/{code2}/accept",
+            json=self._accept_payload(invitee_email="mixed.case@example.com"),
+        )
+        self.assertEqual(second.status_code, 409)
+
     def test_accept_is_one_shot(self):
         _, contributor_token = self._make_contributor()
         code = self._create_invite(contributor_token)
