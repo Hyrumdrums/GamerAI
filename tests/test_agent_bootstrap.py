@@ -51,11 +51,51 @@ class ConfigBootstrapTests(unittest.TestCase):
     def test_defaults_present(self):
         cfg = agent.Config.load(None)
         self.assertTrue(cfg.bootstrap_enabled)
-        self.assertEqual(cfg.bootstrap_model, "llama3.2:1b")
+        # v1.1.26: chat default upgraded from 1B → 3B so the
+        # image-prompt rewrite pipeline can actually interpret intent.
+        self.assertEqual(cfg.bootstrap_model, "llama3.2:3b")
         self.assertEqual(cfg.bootstrap_ollama_url, "http://localhost:11434")
         # Default mirror_base is None → caller should fall back to
         # coordinator_url. Verified separately below.
         self.assertIsNone(cfg.bootstrap_mirror_base_url)
+
+    def test_legacy_chat_model_auto_migrates(self):
+        # v1.1.26: existing installs that have llama3.2:1b in their
+        # config.json get auto-upgraded on first load to the new
+        # default, and the migration is persisted so it doesn't run
+        # again. Catches the "operator has to hand-edit config.json
+        # to get the upgrade" footgun.
+        import json
+        import tempfile
+        from pathlib import Path
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False,
+        ) as f:
+            json.dump(
+                {
+                    "coordinator_url": "https://x",
+                    "polling_interval_seconds": 5,
+                    "earnings_print_minutes": 10,
+                    "idle": {
+                        "min_input_idle_seconds": 60,
+                        "max_cpu_percent": 30,
+                        "cpu_sample_seconds": 2,
+                    },
+                    "bootstrap": {"model": "llama3.2:1b"},
+                },
+                f,
+            )
+            cfg_path = Path(f.name)
+        try:
+            cfg = agent.Config.load(cfg_path)
+            self.assertEqual(cfg.bootstrap_model, "llama3.2:3b")
+            # Migration persisted to disk — next load reads the new
+            # value without needing the migrator.
+            with open(cfg_path) as f:
+                on_disk = json.load(f)
+            self.assertEqual(on_disk["bootstrap"]["model"], "llama3.2:3b")
+        finally:
+            cfg_path.unlink()
 
     def test_user_overrides_merge(self, tmp_path=None):
         import json, tempfile

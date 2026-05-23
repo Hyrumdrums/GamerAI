@@ -45,7 +45,7 @@ IS_WINDOWS = platform.system() == "Windows"
 # the moment it starts. The CI-generated version.txt (short-sha +
 # build timestamp) is still what the self-updater diffs against;
 # AGENT_VERSION is just the human-facing label.
-AGENT_VERSION = "1.1.25"
+AGENT_VERSION = "1.1.26"
 
 # ---------------------------------------------------------------------------
 # Idle detection
@@ -1221,7 +1221,17 @@ DEFAULTS = {
         # model. Best-effort: on failure the agent still runs and
         # returns mock inference (preserves pre-bootstrap behavior).
         "enabled": True,
-        "model": "llama3.2:1b",
+        # v1.1.26 default. Previously llama3.2:1b — the 1B was a "dev
+        # default" that turned out to be too small for the
+        # context-aware image-prompt rewrite job to interpret intent
+        # ("Yes" → use the assistant's last suggestion) reliably. 3B
+        # is ~3x slower per token but still well under a second per
+        # response on modest hardware and produces dramatically better
+        # rewrites. Existing v1.1.x configs that still carry the old
+        # 1B value are auto-upgraded by ``_migrate_legacy_chat_model``
+        # in ``Config.load_from_disk`` so users don't have to hand-
+        # edit their config.json.
+        "model": "llama3.2:3b",
         "ollama_url": "http://localhost:11434",
         "mirror_base_url": None,  # null = use coordinator_url
         # Image-generation bootstrap. Best-effort: failure leaves the
@@ -1277,6 +1287,26 @@ class Config:
             with open(path, "r", encoding="utf-8") as f:
                 user = json.load(f)
             _deep_merge(data, user)
+            # One-shot migrations of the on-disk config. Currently:
+            # the v1.1.x legacy default llama3.2:1b → 3.2:3b. Writes
+            # back to disk so the migration runs at most once.
+            if _migrate_legacy_chat_model(data):
+                try:
+                    with open(path, "w", encoding="utf-8") as f:
+                        json.dump(data, f, indent=2)
+                    print(
+                        "config migration: bootstrap.model upgraded "
+                        "from 'llama3.2:1b' to 'llama3.2:3b' "
+                        "(v1.1.26 default — better at interpreting "
+                        f"image-rewrite intent). Edit {path} to "
+                        "override.",
+                        flush=True,
+                    )
+                except OSError:
+                    # Best effort: agent still runs against the
+                    # migrated in-memory value, but the migration
+                    # will re-attempt the rewrite on next startup.
+                    pass
         idle = data["idle"]
         power = data.get("power", DEFAULTS["power"])
         update = data.get("update", DEFAULTS["update"])
@@ -1300,7 +1330,7 @@ class Config:
                 update.get("check_interval_hours", 6)
             ),
             bootstrap_enabled=bool(bootstrap.get("enabled", True)),
-            bootstrap_model=str(bootstrap.get("model", "llama3.2:1b")),
+            bootstrap_model=str(bootstrap.get("model", "llama3.2:3b")),
             bootstrap_ollama_url=str(
                 bootstrap.get("ollama_url", "http://localhost:11434")
             ).rstrip("/"),
@@ -1323,6 +1353,33 @@ def _deep_merge(into: dict, src: dict) -> None:
             _deep_merge(into[k], v)
         else:
             into[k] = v
+
+
+# v1.1.x legacy chat-model default. Carried in every installer-created
+# config.json from pre-v1.1.26; auto-upgraded by
+# _migrate_legacy_chat_model on first load of v1.1.26+.
+_LEGACY_CHAT_MODEL = "llama3.2:1b"
+_CURRENT_CHAT_MODEL = "llama3.2:3b"
+
+
+def _migrate_legacy_chat_model(data: dict) -> bool:
+    """One-shot migration: if the loaded config still carries the
+    v1.1.x default llama3.2:1b under bootstrap.model, upgrade it to
+    the v1.1.26 default llama3.2:3b in-place and return True. The
+    caller persists ``data`` back to disk so the migration runs at
+    most once.
+
+    The 1B model was a 'dev default' that turned out too small for
+    the image-prompt rewrite step's intent inference. 3B is the
+    smallest size where 'yes/that one/use the assistant's
+    suggestion' agreement detection works reliably."""
+    bs = data.get("bootstrap")
+    if not isinstance(bs, dict):
+        return False
+    if bs.get("model") == _LEGACY_CHAT_MODEL:
+        bs["model"] = _CURRENT_CHAT_MODEL
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -2501,7 +2558,12 @@ def run_inference(
     the model's chat template is applied (proper multi-turn behavior).
     Single-shot prompts keep the legacy ``/api/generate`` path."""
     ollama_url = os.getenv("OLLAMA_URL")
-    use_model = model or os.getenv("MODEL") or "llama3.2:1b"
+    # Hardcoded fallback matches the v1.1.26 bootstrap default so a
+    # caller that passes model=None still gets the model the agent
+    # actually has loaded. In normal operation the caller threads
+    # cfg.bootstrap_model in (see process_one), so this fallback
+    # mainly catches misconfigured manual invocations.
+    use_model = model or os.getenv("MODEL") or "llama3.2:3b"
     if not ollama_url:
         time.sleep(0.5)
         text = f"[mock] {prompt[:200]}"
@@ -3070,9 +3132,19 @@ def process_one(
                     job_id, duration,
                 )
         else:
+            # Model resolution precedence:
+            #  1. cfg.model — operator's explicit pin in config.json
+            #     (usually None)
+            #  2. job.get("model") — coordinator's per-job pin
+            #     (None for the rewrite job; set for retried-with-
+            #     model-pinned conversations)
+            #  3. cfg.bootstrap_model — what the agent actually has
+            #     loaded in Ollama. The right default; without this
+            #     the rewrite job would fall through to run_inference's
+            #     hardcoded backstop on misconfigured installs.
             result = run_inference(
                 prompt,
-                cfg.model or job.get("model"),
+                cfg.model or job.get("model") or cfg.bootstrap_model,
                 log,
                 messages=job.get("messages"),
                 on_partial=lambda text: coord.partial(
