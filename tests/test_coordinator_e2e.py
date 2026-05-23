@@ -492,5 +492,333 @@ class ImageGenerationTests(unittest.TestCase):
         self.assertIn("chat model", resp.json()["detail"])
 
 
+class ClaimTokenEnforcementTests(unittest.TestCase):
+    """The token-gated complete/partial path is the load-bearing
+    correctness guarantee added in v1.1.23 — it stops a stale (reaper-
+    requeued) worker from clobbering whoever the coordinator has now
+    handed the job to. These tests pin the exact 410 contract."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.client = TestClient(coordinator_main.app)
+        cls.r = _FAKE
+        cls.db = coordinator_main.db
+
+    def setUp(self):
+        self.r.flushall()
+        self.db._conn.executescript(
+            "DELETE FROM jobs; DELETE FROM workers; DELETE FROM earnings;"
+        )
+
+    def _submit_and_pop(self, worker_id: str) -> str:
+        job_id = self.client.post(
+            "/generate", json={"prompt": "claim me"},
+        ).json()["job_id"]
+        self.client.post("/register", json={"worker_id": worker_id})
+        return job_id
+
+    def test_jobs_next_returns_claim_token_atomically(self):
+        worker_id = "wkr-atomic"
+        job_id = self._submit_and_pop(worker_id)
+        nxt = self.client.post(
+            "/jobs/next", json={"worker_id": worker_id, "tool": "chat"},
+        ).json()
+        self.assertEqual(nxt["job"]["job_id"], job_id)
+        self.assertIn("claim_token", nxt)
+        self.assertTrue(nxt["claim_token"])
+        # JOB_PROCESSING records the token so /complete can verify.
+        meta = json.loads(self.r.hget("job_processing", job_id))
+        self.assertEqual(meta["claim_token"], nxt["claim_token"])
+        self.assertEqual(meta["worker_id"], worker_id)
+
+    def test_complete_without_token_after_claim_returns_410(self):
+        worker_id = "wkr-notoken"
+        job_id = self._submit_and_pop(worker_id)
+        # Claim via the legacy path so the processing record carries a
+        # token, then submit a /complete that doesn't echo it.
+        self.client.post(
+            "/jobs/claim", json={"worker_id": worker_id, "job_id": job_id},
+        )
+        resp = self.client.post(
+            "/jobs/complete",
+            json=_job_complete_payload(worker_id, job_id),
+        )
+        self.assertEqual(resp.status_code, 410, resp.text)
+        # 410 detail carries the structured reason so the agent can
+        # distinguish this from a transport failure.
+        detail = resp.json()["detail"]
+        self.assertEqual(detail["reason"], "claim_token_mismatch")
+
+    def test_complete_with_wrong_token_returns_410(self):
+        worker_id = "wkr-wrong"
+        job_id = self._submit_and_pop(worker_id)
+        self.client.post(
+            "/jobs/claim", json={"worker_id": worker_id, "job_id": job_id},
+        )
+        resp = self.client.post(
+            "/jobs/complete",
+            json=_job_complete_payload(
+                worker_id, job_id, claim_token="not-the-real-token",
+            ),
+        )
+        self.assertEqual(resp.status_code, 410)
+        self.assertEqual(resp.json()["detail"]["reason"], "claim_token_mismatch")
+
+    def test_complete_for_unclaimed_job_returns_410(self):
+        # No /jobs/next, no /jobs/claim — the job is on the queue but
+        # nobody owns it. /complete must refuse rather than silently
+        # accept a forged result.
+        worker_id = "wkr-orphan"
+        job_id = self._submit_and_pop(worker_id)
+        resp = self.client.post(
+            "/jobs/complete",
+            json=_job_complete_payload(worker_id, job_id),
+        )
+        self.assertEqual(resp.status_code, 410)
+        self.assertEqual(resp.json()["detail"]["reason"], "no_active_claim")
+
+    def test_complete_from_non_claimant_returns_410(self):
+        # wA owns the claim; wB tries to complete pretending to be wA.
+        # _require_worker_owner is dev-mode-permissive (no auth here),
+        # so we test only the claim-ownership gate.
+        worker_a = "wkr-a"
+        worker_b = "wkr-b"
+        job_id = self._submit_and_pop(worker_a)
+        self.client.post("/register", json={"worker_id": worker_b})
+        claim = self.client.post(
+            "/jobs/claim", json={"worker_id": worker_a, "job_id": job_id},
+        ).json()
+        # wB attempts complete with wA's token. _verify_claim_or_410
+        # spots the worker_id mismatch before the token check.
+        resp = self.client.post(
+            "/jobs/complete",
+            json=_job_complete_payload(
+                worker_b, job_id, claim_token=claim["claim_token"],
+            ),
+        )
+        self.assertEqual(resp.status_code, 410)
+        self.assertEqual(resp.json()["detail"]["reason"], "claim_owned_by_other_worker")
+
+    def test_atomic_claim_complete_round_trip(self):
+        # Happy path via the new atomic /jobs/next: the returned
+        # claim_token is sufficient on /complete, no extra /claim
+        # round-trip needed.
+        worker_id = "wkr-roundtrip"
+        job_id = self._submit_and_pop(worker_id)
+        nxt = self.client.post(
+            "/jobs/next", json={"worker_id": worker_id, "tool": "chat"},
+        ).json()
+        comp = self.client.post(
+            "/jobs/complete",
+            json=_job_complete_payload(
+                worker_id, job_id, tokens=4, claim_token=nxt["claim_token"],
+            ),
+        )
+        self.assertEqual(comp.status_code, 200, comp.text)
+        self.assertGreater(comp.json()["earnings"], 0)
+
+
+class ReaperExtensionTests(unittest.TestCase):
+    """The reaper used to unconditionally requeue any job whose
+    deadline had passed. With v1.1.23 the contract is: extend if the
+    claimant is still heartbeating with the matching job_id, requeue
+    only on actual silence or wrong-job. This is what lets a 60s
+    DreamShaper image generation finish without being yanked."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.client = TestClient(coordinator_main.app)
+        cls.r = _FAKE
+        cls.db = coordinator_main.db
+
+    def setUp(self):
+        self.r.flushall()
+        self.db._conn.executescript(
+            "DELETE FROM jobs; DELETE FROM workers; DELETE FROM earnings;"
+        )
+
+    def _claimed_job(self, worker_id: str) -> str:
+        job_id = self.client.post(
+            "/generate", json={"prompt": "reap me"},
+        ).json()["job_id"]
+        self.client.post("/register", json={"worker_id": worker_id})
+        self.r.lpop("job_queue")  # mimic worker pop
+        self.client.post(
+            "/jobs/claim", json={"worker_id": worker_id, "job_id": job_id},
+        )
+        # Force the deadline into the past so the reaper has something
+        # to decide on.
+        meta = json.loads(self.r.hget("job_processing", job_id))
+        meta["deadline"] = time.time() - 60
+        self.r.hset("job_processing", job_id, json.dumps(meta))
+        return job_id
+
+    def test_extends_deadline_when_claimant_heartbeating_matching_job(self):
+        worker_id = "wkr-busy"
+        job_id = self._claimed_job(worker_id)
+        # Fresh heartbeat carrying the right job_id — simulates a
+        # healthy long-running inference.
+        self.client.post(
+            "/heartbeat",
+            json={"worker_id": worker_id, "status": "busy", "job_id": job_id},
+        )
+        Reaper(self.r, self.db)._tick()
+        # Job stays in flight, deadline pushed forward.
+        self.assertEqual(self.r.llen("job_queue"), 0)
+        self.assertEqual(self.r.hlen("job_processing"), 1)
+        meta = json.loads(self.r.hget("job_processing", job_id))
+        self.assertGreater(meta["deadline"], time.time())
+
+    def test_requeues_when_claimant_silent(self):
+        worker_id = "wkr-silent"
+        job_id = self._claimed_job(worker_id)
+        # No heartbeat from this worker, or only a very old one. Write
+        # a stale heartbeat directly so the reaper sees it as expired.
+        self.r.hset(
+            "worker_heartbeats",
+            worker_id,
+            json.dumps({"ts": time.time() - 3600, "job_id": job_id}),
+        )
+        Reaper(self.r, self.db)._tick()
+        # Job back on the queue, processing hash cleared.
+        self.assertEqual(self.r.llen("job_queue"), 1)
+        self.assertEqual(self.r.hlen("job_processing"), 0)
+
+    def test_requeues_when_heartbeat_on_different_job(self):
+        # Worker is alive but moved on to another job (e.g., crashed
+        # and restarted, then picked something else up). The stale
+        # job_id in JOB_PROCESSING should requeue, not extend.
+        worker_id = "wkr-wandered"
+        job_id = self._claimed_job(worker_id)
+        self.client.post(
+            "/heartbeat",
+            json={
+                "worker_id": worker_id,
+                "status": "busy",
+                "job_id": "some-other-job-id",
+            },
+        )
+        Reaper(self.r, self.db)._tick()
+        self.assertEqual(self.r.llen("job_queue"), 1)
+        self.assertEqual(self.r.hlen("job_processing"), 0)
+
+    def test_requeue_routes_to_correct_tool_queue(self):
+        # An image-tool job that times out must land back on the
+        # image queue, not the chat queue — otherwise chat-only
+        # workers would pick it up and 503 the user immediately.
+        worker_id = "wkr-img-reap"
+        self.client.post(
+            "/register",
+            json={
+                "worker_id": worker_id,
+                "capabilities": {"tools": ["chat", "image"]},
+            },
+        )
+        job_id = self.client.post(
+            "/generate", json={"prompt": "a cat", "tool": "image"},
+        ).json()["job_id"]
+        self.r.lpop("job_queue:image")
+        self.client.post(
+            "/jobs/claim", json={"worker_id": worker_id, "job_id": job_id},
+        )
+        meta = json.loads(self.r.hget("job_processing", job_id))
+        meta["deadline"] = time.time() - 60
+        self.r.hset("job_processing", job_id, json.dumps(meta))
+        # Worker is silent — no heartbeat written.
+        Reaper(self.r, self.db)._tick()
+        self.assertEqual(self.r.llen("job_queue:image"), 1)
+        self.assertEqual(self.r.llen("job_queue"), 0)
+
+
+class CancelEndpointTests(unittest.TestCase):
+    """/jobs/cancel is the soft-cancel sibling to the new UI button.
+    The contract: mark the job terminal, drop JOB_PROCESSING so the
+    worker's eventual /complete 410s, idempotent for already-terminal
+    jobs."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.client = TestClient(coordinator_main.app)
+        cls.r = _FAKE
+        cls.db = coordinator_main.db
+
+    def setUp(self):
+        self.r.flushall()
+        self.db._conn.executescript(
+            "DELETE FROM jobs; DELETE FROM workers; DELETE FROM earnings;"
+        )
+
+    def test_cancel_marks_job_cancelled_and_pops_processing(self):
+        worker_id = "wkr-cancel-1"
+        job_id = self.client.post(
+            "/generate", json={"prompt": "cancel me"},
+        ).json()["job_id"]
+        self.client.post("/register", json={"worker_id": worker_id})
+        self.client.post(
+            "/jobs/claim", json={"worker_id": worker_id, "job_id": job_id},
+        )
+        # Sanity: in-flight before cancel.
+        self.assertEqual(self.r.hlen("job_processing"), 1)
+        cancel = self.client.post("/jobs/cancel", json={"job_id": job_id})
+        self.assertEqual(cancel.status_code, 200, cancel.text)
+        self.assertEqual(cancel.json()["status"], "cancelled")
+        # Processing hash cleared; result shows cancelled status.
+        self.assertEqual(self.r.hlen("job_processing"), 0)
+        result = self.client.get(f"/result/{job_id}").json()
+        self.assertEqual(result["status"], "cancelled")
+
+    def test_workers_late_complete_after_cancel_is_410(self):
+        # Mimic the race the agent has to handle: worker finishes
+        # inference seconds after the user clicked Cancel. The
+        # coordinator must reject so the worker skips local credit.
+        worker_id = "wkr-late"
+        job_id = self.client.post(
+            "/generate", json={"prompt": "late"},
+        ).json()["job_id"]
+        self.client.post("/register", json={"worker_id": worker_id})
+        claim = self.client.post(
+            "/jobs/claim", json={"worker_id": worker_id, "job_id": job_id},
+        ).json()
+        self.client.post("/jobs/cancel", json={"job_id": job_id})
+        # Worker's /complete carries a token that USED to be valid
+        # but the processing record is gone.
+        resp = self.client.post(
+            "/jobs/complete",
+            json=_job_complete_payload(
+                worker_id, job_id, claim_token=claim["claim_token"],
+            ),
+        )
+        self.assertEqual(resp.status_code, 410, resp.text)
+        self.assertEqual(resp.json()["detail"]["reason"], "no_active_claim")
+
+    def test_cancel_is_idempotent_on_already_terminal_job(self):
+        # Cancelling a completed job is a 200 no-op, not 404 — so a
+        # double-click from a flaky network doesn't surface an error.
+        worker_id = "wkr-done"
+        job_id = self.client.post(
+            "/generate", json={"prompt": "finished"},
+        ).json()["job_id"]
+        self.client.post("/register", json={"worker_id": worker_id})
+        claim = self.client.post(
+            "/jobs/claim", json={"worker_id": worker_id, "job_id": job_id},
+        ).json()
+        self.client.post(
+            "/jobs/complete",
+            json=_job_complete_payload(
+                worker_id, job_id, claim_token=claim["claim_token"],
+            ),
+        )
+        cancel = self.client.post("/jobs/cancel", json={"job_id": job_id})
+        self.assertEqual(cancel.status_code, 200)
+        self.assertTrue(cancel.json().get("already_terminal"))
+        # Status stays 'complete' — cancel doesn't rewrite finished work.
+        result = self.client.get(f"/result/{job_id}").json()
+        self.assertEqual(result["status"], "complete")
+
+    def test_cancel_unknown_job_returns_404(self):
+        resp = self.client.post("/jobs/cancel", json={"job_id": "no-such-job"})
+        self.assertEqual(resp.status_code, 404)
+
+
 if __name__ == "__main__":
     unittest.main()
