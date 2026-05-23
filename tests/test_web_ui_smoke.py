@@ -254,6 +254,80 @@ class WebUISmokeTests(unittest.TestCase):
         self.assertEqual(second.status_code, 409)
         self.assertIn("already taken", second.text)
 
+    # ------------------------------------------------------------------
+    # u/p login page
+    # ------------------------------------------------------------------
+    def test_login_page_shows_username_and_password_fields(self):
+        # No session cookie — anonymous browse.
+        self.web.cookies.clear()
+        resp = self.web.get("/login")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.text
+        self.assertIn('name="username"', body)
+        self.assertIn('name="password"', body)
+        # Token fallback still available but tucked under a <details>.
+        self.assertIn("Sign in with a bearer token instead", body)
+
+    def test_login_with_valid_username_and_password_sets_cookie(self):
+        # Bob redeems an invite to get an account with credentials.
+        _, code = self._make_contributor_and_invite()
+        accept_data = self._accept_form(
+            username="bobpwlogin",
+            password="correct-horse-battery",
+            password_confirm="correct-horse-battery",
+        )
+        self.web.post(
+            f"/invite/{code}", data=accept_data, follow_redirects=False,
+        )
+        # Clear cookies so /login is exercised, not the existing session.
+        self.web.cookies.clear()
+        resp = self.web.post(
+            "/login",
+            data={
+                "username": "bobpwlogin",
+                "password": "correct-horse-battery",
+            },
+            follow_redirects=False,
+        )
+        self.assertEqual(resp.status_code, 303)
+        self.assertIn(client_web.SESSION_COOKIE, resp.cookies)
+        self.assertTrue(
+            resp.cookies[client_web.SESSION_COOKIE].startswith("gai_")
+        )
+
+    def test_login_with_wrong_password_re_renders_form(self):
+        _, code = self._make_contributor_and_invite()
+        self.web.post(
+            f"/invite/{code}",
+            data=self._accept_form(
+                username="bobpwwrong",
+                password="correct-horse-battery",
+                password_confirm="correct-horse-battery",
+            ),
+            follow_redirects=False,
+        )
+        self.web.cookies.clear()
+        resp = self.web.post(
+            "/login",
+            data={"username": "bobpwwrong", "password": "nope"},
+            follow_redirects=False,
+        )
+        self.assertEqual(resp.status_code, 401)
+        self.assertIn("didn't match", resp.text)
+        # Username is preserved across the re-render so the user only
+        # has to retype the password.
+        self.assertIn('value="bobpwwrong"', resp.text)
+
+    def test_login_token_fallback_still_works_for_admin(self):
+        self.web.cookies.clear()
+        resp = self.web.post(
+            "/login/token",
+            data={"token": ADMIN_TOKEN},
+            follow_redirects=False,
+        )
+        self.assertEqual(resp.status_code, 303)
+        self.assertIn(client_web.SESSION_COOKIE, resp.cookies)
+
     def test_invite_accept_without_tos_checkbox_is_rejected(self):
         """If a user posts without checking the box (e.g. via devtools
         manipulation), the web layer bounces them back rather than
@@ -323,25 +397,28 @@ class WebUISmokeTests(unittest.TestCase):
         resp = anon.get("/login")
         self.assertEqual(resp.status_code, 200)
         self.assertIn("Sign in", resp.text)
+        # Both forms are present: u/p as the primary, token as the
+        # collapsible fallback.
+        self.assertIn('name="username"', resp.text)
+        self.assertIn('name="password"', resp.text)
         self.assertIn('name="token"', resp.text)
 
-    def test_login_with_valid_token_sets_cookie_and_redirects(self):
+    def test_login_token_fallback_with_valid_token_sets_cookie(self):
         anon = TestClient(client_web.app, follow_redirects=False)
         resp = anon.post(
-            "/login",
+            "/login/token",
             data={"token": ADMIN_TOKEN, "next": "/"},
         )
         self.assertEqual(resp.status_code, 303)
         self.assertEqual(resp.headers["location"], "/")
-        # Cookie is set on the response.
         set_cookie = resp.headers.get("set-cookie", "")
         self.assertIn(client_web.SESSION_COOKIE, set_cookie)
         self.assertIn("HttpOnly", set_cookie)
 
-    def test_login_with_invalid_token_re_renders_form_401(self):
+    def test_login_token_fallback_with_invalid_token_re_renders_401(self):
         anon = TestClient(client_web.app, follow_redirects=False)
         resp = anon.post(
-            "/login",
+            "/login/token",
             data={"token": "gai_definitely-not-valid", "next": "/"},
         )
         self.assertEqual(resp.status_code, 401)

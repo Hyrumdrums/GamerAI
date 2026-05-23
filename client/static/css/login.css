@@ -1,3 +1,25 @@
 .page { max-width: 420px; }
-input[type=password] { font-family: var(--mono); margin-bottom: .75rem; }
+form .label { display: block; margin-top: .75rem; margin-bottom: .25rem;
+              color: var(--muted); font-size: .85rem; }
+form input[type=text],
+form input[type=password] { display: block; width: 100%; margin-bottom: .5rem; }
+input[type=password] { font-family: inherit; }
 .hint { color: var(--muted); font-size: .9rem; margin-top: 1rem; }
+.alert-err {
+  background: #fde7e7; border: 1px solid #e9a4a4; color: #8a1f1f;
+  border-radius: var(--radius); padding: .6rem .8rem; margin: .5rem 0 1rem;
+  font-size: .92rem;
+}
+.token-fallback {
+  margin-top: 1.5rem;
+  border-top: 1px solid var(--border, #ddd);
+  padding-top: 1rem;
+}
+.token-fallback summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: .9rem;
+}
+.token-fallback input[type=password] {
+  font-family: var(--mono);
+}

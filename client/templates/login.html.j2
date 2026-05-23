@@ -8,20 +8,41 @@
 <div class="page">
   <h1>GamerAI</h1>
   <div class="muted" style="margin-bottom:1.5rem">
-    Sign in with your bearer token to start a session.
+    Sign in with the username and password you set when you accepted
+    your invite.
   </div>
   {% if error %}
   <div class="alert-err">{{ error }}</div>
   {% endif %}
   <form method="POST" action="/login">
     <input type="hidden" name="next" value="{{ next_path }}">
-    <input type="password" name="token" placeholder="gai_&lt;your token&gt;"
-           autocomplete="off" autofocus required>
+    <label class="label" for="username">Username</label>
+    <input id="username" name="username" type="text"
+           value="{{ username|default('', true) }}"
+           autocomplete="username"
+           autofocus required>
+
+    <label class="label" for="password">Password</label>
+    <input id="password" name="password" type="password"
+           autocomplete="current-password" required>
+
     <button type="submit">Sign in</button>
   </form>
   <div class="hint">
-    No token? Ask the contributor who invited you for a fresh invite link,
-    or read the <a href="/tos">community terms</a>.
+    No account? Ask the host who invited you for a fresh invite link.
   </div>
+  <details class="token-fallback">
+    <summary>Sign in with a bearer token instead</summary>
+    <div class="muted" style="margin-top:.5rem">
+      For admins migrating from token-only auth, or for CLI/API users.
+      Friends should ignore this option.
+    </div>
+    <form method="POST" action="/login/token">
+      <input type="hidden" name="next" value="{{ next_path }}">
+      <input type="password" name="token" placeholder="gai_&lt;your token&gt;"
+             autocomplete="off" required>
+      <button type="submit">Sign in with token</button>
+    </form>
+  </details>
 </div>
 {% endblock %}
