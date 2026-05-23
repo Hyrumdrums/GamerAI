@@ -445,7 +445,10 @@ class WebUISmokeTests(unittest.TestCase):
             follow_redirects=False,
         )
         self.assertEqual(resp.status_code, 401)
-        self.assertIn("didn't match", resp.text)
+        # Jinja's HTML autoescape may render the apostrophe as &#39; on
+        # some MarkupSafe versions; assert on the surrounding words instead.
+        self.assertIn("Username or password", resp.text)
+        self.assertIn("Double-check", resp.text)
         # Username is preserved across the re-render so the user only
         # has to retype the password.
         self.assertIn('value="bobpwwrong"', resp.text)

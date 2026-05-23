@@ -415,6 +415,36 @@ class MemberAuthE2ETests(unittest.TestCase):
         self.assertEqual(second.status_code, 409)
         self.assertIn("already claimed", second.json()["detail"])
 
+    def test_revoking_a_member_frees_their_email_and_username(self):
+        """Revoked rows must not squat on identity slots — otherwise a
+        mistakenly-revoked account leaks its email forever (the footgun
+        the founder hit on 2026-05-23 with a stray test contributor
+        blocking their own admin email)."""
+        _, contributor_token = self._make_contributor()
+        code1 = self._create_invite(contributor_token)
+        first = self.client.post(
+            f"/invites/{code1}/accept",
+            json=self._accept_payload(
+                username="recycleme",
+                invitee_email="recycle@example.com",
+            ),
+        ).json()
+        # Now revoke the freshly-created invitee.
+        ok = self.db.revoke_member_by_token_hash(
+            member_auth.hash_token(first["token"]), time.time(),
+        )
+        self.assertTrue(ok)
+        # A fresh invitee should be able to claim the same username + email.
+        code2 = self._create_invite(contributor_token)
+        second = self.client.post(
+            f"/invites/{code2}/accept",
+            json=self._accept_payload(
+                username="recycleme",
+                invitee_email="recycle@example.com",
+            ),
+        )
+        self.assertEqual(second.status_code, 200, second.text)
+
     def test_accept_email_collision_is_case_insensitive(self):
         _, contributor_token = self._make_contributor()
         code1 = self._create_invite(contributor_token)

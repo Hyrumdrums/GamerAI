@@ -284,29 +284,35 @@ class DB:
                 self._conn.execute(ddl)
             except sqlite3.OperationalError:
                 pass
-        try:
-            self._conn.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_members_username "
-                "ON members(username) WHERE username IS NOT NULL"
-            )
-        except sqlite3.OperationalError:
-            pass
-        # Email uniqueness — load-bearing for the deferred email-based
-        # password reset path. Two members sharing an email makes
-        # "reset to alice@example.com" ambiguous; the cheapest moment
-        # to enforce it is at signup, before there's anything to
-        # backfill. Case-insensitive via LOWER() so casing on display
-        # is preserved but two rows with the same logical email
-        # collide. Partial (WHERE email IS NOT NULL) so the existing
-        # seeded-admin row (NULL email until they run set-email) and
-        # any future system rows aren't forced to carry an address.
-        try:
-            self._conn.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_members_email "
-                "ON members(LOWER(email)) WHERE email IS NOT NULL"
-            )
-        except sqlite3.OperationalError:
-            pass
+        # Username + email uniqueness. Both indexes intentionally
+        # *exclude* revoked rows: a revoked member shouldn't squat on
+        # the username or email forever, otherwise every revoke leaks
+        # an identity slot (e.g. "I revoked the test contributor I
+        # made by mistake; now I can't reclaim that email" — exactly
+        # the footgun the user hit on 2026-05-23). Lookups in
+        # get_member_by_username / get_member_by_email and the
+        # collision checks in accept_invite_atomic mirror this filter
+        # so the runtime behavior matches the index semantics.
+        #
+        # DROP + CREATE on every startup rather than IF NOT EXISTS so
+        # an upgrade from the earlier (revoked-aware-less) version of
+        # this index picks up the new WHERE clause without manual
+        # intervention. Both DROPs are no-ops if the index isn't there
+        # yet (legacy installs without the auth slice at all).
+        for ddl in (
+            "DROP INDEX IF EXISTS idx_members_username",
+            "DROP INDEX IF EXISTS idx_members_email",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_members_username "
+            "ON members(LOWER(username)) "
+            "WHERE username IS NOT NULL AND revoked_at IS NULL",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_members_email "
+            "ON members(LOWER(email)) "
+            "WHERE email IS NOT NULL AND revoked_at IS NULL",
+        ):
+            try:
+                self._conn.execute(ddl)
+            except sqlite3.OperationalError:
+                pass
         # Per-member additional bearer tokens — added with the agent-
         # pairing slice. ``members.token_hash`` stays as the (single)
         # web-session credential rotated by /login. ``member_tokens``
@@ -595,11 +601,13 @@ class DB:
             return cur.fetchone()
 
     def get_member_by_email(self, email: str) -> Optional[sqlite3.Row]:
-        """Case-insensitive email lookup. Used by the set-email CLI to
-        report collisions before the unique-index INSERT does."""
+        """Case-insensitive email lookup. Skips revoked rows so a
+        revoked member doesn't squat on the address forever — matches
+        the partial unique index semantics."""
         with self._lock:
             cur = self._conn.execute(
-                "SELECT * FROM members WHERE LOWER(email)=LOWER(?)",
+                "SELECT * FROM members "
+                "WHERE LOWER(email)=LOWER(?) AND revoked_at IS NULL",
                 (email,),
             )
             return cur.fetchone()
@@ -607,14 +615,17 @@ class DB:
     def set_member_email(self, member_id: str, email: str) -> tuple[bool, Optional[str]]:
         """Set or update a member's email. Returns ``(True, None)`` on
         success; ``(False, "email_taken")`` if the address is in use by
-        another member (case-insensitive). Wrapped in BEGIN/COMMIT so
-        the collision check and the UPDATE are atomic."""
+        another *active* member (case-insensitive). Revoked rows are
+        not considered collisions — same rule as the partial unique
+        index. Wrapped in BEGIN/COMMIT so the collision check and the
+        UPDATE are atomic."""
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 cur = self._conn.execute(
                     "SELECT member_id FROM members "
-                    "WHERE LOWER(email)=LOWER(?) AND member_id<>?",
+                    "WHERE LOWER(email)=LOWER(?) AND member_id<>? "
+                    "AND revoked_at IS NULL",
                     (email, member_id),
                 )
                 clash = cur.fetchone()
@@ -924,10 +935,15 @@ class DB:
                     self._conn.execute("ROLLBACK")
                     return None, "not_redeemable"
 
+                # Both collision checks filter out revoked rows — same
+                # rule as the partial unique index. Lets a recycled
+                # email/username come back after the original holder
+                # is revoked.
                 if username:
                     clash = self._conn.execute(
                         "SELECT member_id FROM members "
-                        "WHERE LOWER(username)=LOWER(?)",
+                        "WHERE LOWER(username)=LOWER(?) "
+                        "AND revoked_at IS NULL",
                         (username,),
                     ).fetchone()
                     if clash is not None:
@@ -936,7 +952,8 @@ class DB:
                 if invitee_email:
                     clash = self._conn.execute(
                         "SELECT member_id FROM members "
-                        "WHERE LOWER(email)=LOWER(?)",
+                        "WHERE LOWER(email)=LOWER(?) "
+                        "AND revoked_at IS NULL",
                         (invitee_email,),
                     ).fetchone()
                     if clash is not None:
