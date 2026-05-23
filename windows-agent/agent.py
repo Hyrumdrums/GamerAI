@@ -45,7 +45,7 @@ IS_WINDOWS = platform.system() == "Windows"
 # the moment it starts. The CI-generated version.txt (short-sha +
 # build timestamp) is still what the self-updater diffs against;
 # AGENT_VERSION is just the human-facing label.
-AGENT_VERSION = "1.1.28"
+AGENT_VERSION = "1.2.0"
 
 # ---------------------------------------------------------------------------
 # Idle detection
@@ -4278,36 +4278,43 @@ def main(argv: Optional[list[str]] = None) -> int:
             daemon=True,
         ).start()
 
-    # First-run token UX: tray mode hides the console at startup, so
-    # the existing input("token: ") prompt would block invisibly. If
-    # we know we'll need to prompt (no token in env/config/state),
-    # fire a toast and unhide the console first. We re-hide after a
-    # successful coordinator registration below.
+    # First-run pairing UX. The legacy path here was "show a 'paste
+    # your token' prompt" — but the user already has a sign-in on the
+    # web side, so the friendly path is to open their browser to the
+    # pairing confirm page and let them click "Pair this PC". Token
+    # gets minted on the server, polled by the agent, persisted to
+    # state.json. Zero copy-paste, zero "where do I find this URL."
+    #
+    # Tray mode pre-unhides the console so the contributor sees the
+    # pairing URL + progress dots even if the default browser open
+    # fails silently. The console stays open until pairing succeeds
+    # or times out.
     have_token = bool(cfg.api_token or state.get("api_token"))
     auto_unhidden_for_token = False
-    if tray_active and not have_token:
-        _toast(
-            "GamerAI Agent needs your token",
-            "The console will open — paste the token from your invite page.",
-            icon_path=_tray_icon_path(),
-        )
-        _show_console(console_hwnd)
-        auto_unhidden_for_token = True
-    # background=False: we always have a console available (hidden or
-    # visible). The deprecated truly-headless path no longer exists.
-    token = resolve_api_token(cfg.api_token, state, background=False)
-    if not token:
-        msg = (
-            "no api_token configured. "
-            "edit %APPDATA%\\GamerAI\\state.json and set \"api_token\", "
-            "or run the agent in the foreground once and paste your token."
-            if IS_WINDOWS else
-            "no api_token configured. Set $API_TOKEN or edit ~/.gamerai/state.json"
-        )
-        log.error(msg)
-        sys.stderr.write(msg + "\n")
-        return 2
-    cfg.api_token = token
+    if not have_token:
+        if tray_active:
+            _toast(
+                "GamerAI Agent needs to pair this PC",
+                "Opening your browser to confirm pairing under your account.",
+                icon_path=_tray_icon_path(),
+            )
+            _show_console(console_hwnd)
+            auto_unhidden_for_token = True
+        token = run_pair_flow(cfg.coordinator_url, state)
+        if not token:
+            msg = (
+                "pairing didn't complete. Open the agent console and "
+                "run `agent --pair` to try again, or paste a bearer "
+                "token into %APPDATA%\\GamerAI\\state.json manually."
+                if IS_WINDOWS else
+                "pairing didn't complete. Run `agent --pair` to try again."
+            )
+            log.error(msg)
+            sys.stderr.write(msg + "\n")
+            return 2
+        cfg.api_token = token
+    else:
+        cfg.api_token = cfg.api_token or state.get("api_token")
 
     log.info(
         "GamerAI agent v%s (build %s) starting on %s — worker_id=%s",

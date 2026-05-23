@@ -1,12 +1,21 @@
 ; Inno Setup script for the GamerAI Windows agent.
 ; Build agent.exe first (see build.bat), then compile this with Inno Setup 6.
 ;
-;   ISCC.exe installer.iss
+;   ISCC.exe installer.iss /DMyAppVersion=1.1.29
+;
+; CI passes /DMyAppVersion=<value-of-AGENT_VERSION-in-agent.py> so the
+; installer banner, Add/Remove Programs DisplayVersion, and output
+; filename all track the agent binary's real version. Manual local
+; builds without -D fall back to the placeholder below — the banner
+; will read "0.0.0-dev" which is the visible signal that this is a
+; dev build and not a CI artifact.
 ;
 ; Output: Output\GamerAI-Agent-Setup.exe
 
 #define MyAppName "GamerAI Agent"
-#define MyAppVersion "0.1.0"
+#ifndef MyAppVersion
+  #define MyAppVersion "0.0.0-dev"
+#endif
 #define MyAppPublisher "GamerAI"
 #define MyAppURL "https://example.com/gamerai"
 #define MyAppExeName "agent.exe"
@@ -33,7 +42,12 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
-Name: "startupicon"; Description: "Run on Windows startup (tray mode)"; GroupDescription: "Startup:"; Flags: unchecked
+; Startup is intentionally default-checked. The agent's value to the
+; network is "online when idle"; an install that never runs is dead
+; weight. Friction-respecting: the box is uncheckable for users who
+; want strict opt-in, and the agent re-prompts on first run if the
+; box was unchecked at install (see resolve_api_token / pair flow).
+Name: "startupicon"; Description: "Run on Windows startup (recommended — the agent only contributes while running)"; GroupDescription: "Startup:"
 
 [Files]
 Source: "dist\agent.exe"; DestDir: "{app}"; Flags: ignoreversion
@@ -54,4 +68,23 @@ Name: "{userstartup}\{#MyAppName}";         Filename: "{app}\{#MyAppExeName}"; P
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName} now"; Flags: postinstall skipifsilent nowait
 
 [UninstallDelete]
-Type: filesandordirs; Name: "{userappdata}\GamerAI\logs"
+; Wipe everything the agent writes outside Inno's install manifest so
+; "uninstall" actually means uninstall:
+;
+; - %APPDATA%\GamerAI\  — state.json (bearer token!), config.json,
+;                        sd\ (downloaded models, can be ~1.5 GB),
+;                        logs\.
+;   Leaving state.json behind on a machine that's being sold or handed
+;   off would leak a working credential. Worth wiping unconditionally.
+;
+; - %LOCALAPPDATA%\GamerAI\ — update staging, boot/trace logs.
+;
+; - Auto-updater stash files in the install dir — the in-place
+;   updater leaves agent.exe.previous / agent.exe.may12-stale /
+;   config.json.bak-* siblings next to the live agent.exe. They're
+;   not in Inno's install manifest so Inno doesn't touch them; without
+;   these patterns ~48 MB of stale binaries linger in Program Files.
+Type: filesandordirs; Name: "{userappdata}\GamerAI"
+Type: filesandordirs; Name: "{localappdata}\GamerAI"
+Type: files;          Name: "{app}\agent.exe.*"
+Type: files;          Name: "{app}\config.json.bak-*"

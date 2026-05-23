@@ -90,11 +90,22 @@ jobs:
       - name: Compile installer.iss
         working-directory: windows-agent
         run: |
+          # Extract AGENT_VERSION from agent.py — single source of
+          # truth for the version string. Without this, installer.iss
+          # used a hardcoded placeholder ("0.1.0") that never tracked
+          # the real binary, and Add/Remove Programs lied indefinitely.
+          $line = Select-String -Path agent.py -Pattern '^AGENT_VERSION\s*=\s*"([^"]+)"'
+          if (-not $line) {
+            Write-Error "AGENT_VERSION not found in agent.py"
+            exit 1
+          }
+          $agentVersion = $line.Matches[0].Groups[1].Value
+          Write-Host "Compiling installer at version $agentVersion"
           $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) {
             $iscc = "C:\Program Files\Inno Setup 6\ISCC.exe"
           }
-          & "$iscc" installer.iss
+          & "$iscc" "/DMyAppVersion=$agentVersion" installer.iss
           if (-not (Test-Path "Output\GamerAI-Agent-Setup.exe")) {
             Write-Error "GamerAI-Agent-Setup.exe was not produced"
             exit 1
