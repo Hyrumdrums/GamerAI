@@ -739,18 +739,27 @@ def generate(req: GenerateRequest, request: Request):
         # the old build.
         job["messages"] = worker_messages
     if tool == "image":
-        # Image-only knobs. Clamp width/height to sane bounds (multiple
-        # of 64 in [256, 1536]) so a malicious or buggy client can't
-        # ask the worker to spend 10 minutes on an 8K image. sd.cpp
-        # itself also requires multiples of 64.
+        # Image-only knobs. Only include fields the user explicitly
+        # pinned so the worker can fall through to the model's sidecar
+        # defaults (steps / sampler / cfg) for everything else. Hard
+        # defaults here silently override LCM-tuned sidecars and cost
+        # 3-4× per job — see the v1.1.24 fix.
         params = req.image or _default_image_params()
-        job["image"] = {
-            "width": _clamp_image_dim(params.width),
-            "height": _clamp_image_dim(params.height),
-            "steps": max(1, min(50, int(params.steps))),
+        image_env: dict = {
             "seed": params.seed,
             "negative_prompt": params.negative_prompt,
         }
+        # Clamp width/height to sane bounds (multiple of 64 in [256,
+        # 1536]) so a malicious or buggy client can't ask the worker
+        # to spend 10 minutes on an 8K image. sd.cpp itself also
+        # requires multiples of 64.
+        if params.width is not None:
+            image_env["width"] = _clamp_image_dim(params.width)
+        if params.height is not None:
+            image_env["height"] = _clamp_image_dim(params.height)
+        if params.steps is not None:
+            image_env["steps"] = max(1, min(50, int(params.steps)))
+        job["image"] = image_env
     # Store the ORIGINAL user message (not the prepended worker-prompt)
     # so /jobs/complete can replay only the new turn into the
     # conversation history.

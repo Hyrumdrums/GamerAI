@@ -5,13 +5,18 @@ from pydantic import BaseModel, Field
 
 
 class ImageParams(BaseModel):
-    """Optional per-image-job knobs. Defaults are set to match the
-    default model's recommendation (see model_registry.IMAGE_CATALOG)
-    so a UI that sends `{tool: "image"}` with no params still produces
-    a sensible image."""
-    width: int = 512
-    height: int = 512
-    steps: int = 20
+    """Optional per-image-job knobs.
+
+    All fields are Optional so the worker's per-model sidecar defaults
+    (steps / cfg / sampler / size) can win when the UI doesn't pin a
+    value. A hard default here (the old ``steps: int = 20``) silently
+    overrode the sidecar's LCM-tuned ``default_steps=8`` and made every
+    image job take ~3-4× longer than it needed to. Only fields the user
+    explicitly pinned should land in the job envelope; the rest fall
+    through to the agent's ``load_sd_model_defaults`` lookup."""
+    width: Optional[int] = None
+    height: Optional[int] = None
+    steps: Optional[int] = None
     seed: Optional[int] = None
     negative_prompt: Optional[str] = None
 

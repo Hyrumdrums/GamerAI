@@ -371,12 +371,51 @@ class ImageGenerationTests(unittest.TestCase):
         self.assertEqual(self.r.llen("job_queue:image"), 1)
         envelope = json.loads(self.r.lpop("job_queue:image"))
         self.assertEqual(envelope["tool"], "image")
-        # Image params default to 512x512 / 20 steps.
-        self.assertEqual(envelope["image"]["width"], 512)
-        self.assertEqual(envelope["image"]["height"], 512)
-        self.assertEqual(envelope["image"]["steps"], 20)
+        # When the UI doesn't pin per-job knobs, the coordinator no
+        # longer bakes hard defaults into the envelope — the worker
+        # falls through to the model's sidecar (LCM-tuned for
+        # dreamshaper8 at steps=8). steps/width/height should NOT be
+        # in the envelope at all.
+        self.assertNotIn("width", envelope["image"])
+        self.assertNotIn("height", envelope["image"])
+        self.assertNotIn("steps", envelope["image"])
         # Default image model auto-selected (model_registry.DEFAULT_IMAGE_MODEL).
         self.assertEqual(envelope["model"], "dreamshaper8")
+
+    def test_image_generate_passes_through_explicit_overrides(self):
+        # When the UI pins values, the coordinator DOES emit them so
+        # the worker uses the user's choice — and clamps to sane
+        # bounds.
+        resp = self.client.post(
+            "/generate",
+            json={
+                "prompt": "explicit",
+                "tool": "image",
+                "image": {"width": 768, "height": 768, "steps": 12},
+            },
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        envelope = json.loads(self.r.lpop("job_queue:image"))
+        self.assertEqual(envelope["image"]["width"], 768)
+        self.assertEqual(envelope["image"]["height"], 768)
+        self.assertEqual(envelope["image"]["steps"], 12)
+
+    def test_image_steps_clamped_when_overridden(self):
+        # A buggy client sending steps=9999 is still capped to 50 so a
+        # contributor's machine doesn't burn ten minutes on one image.
+        resp = self.client.post(
+            "/generate",
+            json={
+                "prompt": "huge",
+                "tool": "image",
+                "image": {"steps": 9999, "width": 99999, "height": 99999},
+            },
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        envelope = json.loads(self.r.lpop("job_queue:image"))
+        self.assertEqual(envelope["image"]["steps"], 50)
+        self.assertLessEqual(envelope["image"]["width"], 1536)
+        self.assertLessEqual(envelope["image"]["height"], 1536)
 
     def test_image_generate_rejects_denylist(self):
         # Picks a denylist phrase the unit test asserts continues to
