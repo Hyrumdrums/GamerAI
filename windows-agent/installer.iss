@@ -36,6 +36,12 @@ SolidCompression=yes
 WizardStyle=modern
 PrivilegesRequired=lowest
 UninstallDisplayIcon={app}\{#MyAppExeName}
+; Tell Inno to use Restart Manager to detect agent.exe held open by
+; the tray instance and ask it to close cleanly before install or
+; uninstall. RM-aware apps get a friendly shutdown signal; non-aware
+; apps get a brute-force taskkill fallback in [UninstallRun] below.
+CloseApplications=force
+RestartApplications=no
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -68,16 +74,29 @@ Name: "{userstartup}\{#MyAppName}";         Filename: "{app}\{#MyAppExeName}"; P
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName} now"; Flags: postinstall skipifsilent nowait
 
 [UninstallRun]
-; Retire the agent's bearer with the coordinator BEFORE Inno deletes
-; agent.exe. Without this, state.json still works as a credential
-; against the coordinator until someone manually revokes it server-
-; side — even an "Add or remove programs" uninstall would leave a
-; live token on disk. Best-effort: the agent exits 0 on any network
-; failure, so an offline / coordinator-down uninstall never blocks.
-; runhidden suppresses the console window. waituntilterminated keeps
-; the (~2-3 s) network call ahead of [UninstallDelete] so the file
-; that the agent reads exists when we call it.
+; Step 1: retire the agent's bearer with the coordinator BEFORE Inno
+; deletes agent.exe. Without this, state.json still works as a
+; credential against the coordinator until someone manually revokes
+; it server-side — even an "Add or remove programs" uninstall would
+; leave a live token on disk. Best-effort: the agent exits 0 on any
+; network failure, so an offline / coordinator-down uninstall never
+; blocks. runhidden suppresses the console window. waituntilterminated
+; keeps the (~2-3 s) network call ahead of [UninstallDelete] so the
+; file that the agent reads exists when we call it.
+;
+; The --unpair branch in agent.py:main bypasses the single-instance
+; check, so this runs successfully even when the tray instance is
+; still alive and holding the IPC socket.
 Filename: "{app}\{#MyAppExeName}"; Parameters: "--unpair"; Flags: runhidden waituntilterminated; RunOnceId: "unpair"
+
+; Step 2: kill any running agent.exe processes — including the tray
+; instance that's likely still alive when the user uninstalls without
+; closing first. Without this, the tray agent keeps heartbeating
+; with a now-revoked token (401 spam) until the user reboots or
+; manually ends the task. taskkill /F because the tray instance
+; doesn't always respond to WM_CLOSE. Best-effort: '|| exit 0' so a
+; "no process found" exit code doesn't fail the uninstall.
+Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM {#MyAppExeName} /T"; Flags: runhidden waituntilterminated; RunOnceId: "killtray"
 
 [UninstallDelete]
 ; Wipe everything the agent writes outside Inno's install manifest so
