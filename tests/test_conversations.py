@@ -499,6 +499,50 @@ class ChatMessagesBuilderTests(_BaseE2E):
             ],
         )
 
+    def test_scrubs_citations_from_prior_assistant_content(self):
+        # Real bug: a prior search-grounded assistant turn contains
+        # [1][2] citation markers. When we hand the conversation to a
+        # follow-up search summarizer, those markers collide with the
+        # new system message's [1][2] (which refer to a different
+        # set of sources entirely). The model squints at the conflict
+        # and panic-recants its own prior answer ("my new [1] doesn't
+        # back the old [1] claim, I must have been wrong"). The fix
+        # is to scrub citation markers from prior assistant content
+        # before handing the history to ANY model.
+        _build_chat_messages = self.coord_main._build_chat_messages
+        prior = [
+            {"role": "user", "text": "Kevin O'Leary Utah data center",
+             "status": "complete"},
+            {"role": "assistant",
+             "text": "$70B project [1]. Opposition continues [2, 3].",
+             "status": "complete"},
+        ]
+        out = _build_chat_messages(prior, "for sure it's happening?")
+        # Assistant content has the markers stripped but the prose
+        # is intact — the human-readable rendering still has them
+        # (stored at the message-row level), only the model handoff
+        # is sanitized.
+        asst = [m for m in out if m["role"] == "assistant"][0]
+        self.assertNotIn("[1]", asst["content"])
+        self.assertNotIn("[2, 3]", asst["content"])
+        self.assertIn("$70B project", asst["content"])
+        self.assertIn("Opposition continues", asst["content"])
+
+    def test_does_not_scrub_user_content(self):
+        # User-typed text isn't a citation context — bracketed
+        # numbers in a user message (e.g. quoting a research paper)
+        # should survive unchanged. Only assistant turns produce
+        # citation markers we need to defuse.
+        _build_chat_messages = self.coord_main._build_chat_messages
+        prior = [
+            {"role": "user",
+             "text": "from the abstract: 'we found [1] that LLMs ...'",
+             "status": "complete"},
+        ]
+        out = _build_chat_messages(prior, "go on")
+        user_msg = [m for m in out if m["role"] == "user"][0]
+        self.assertIn("[1]", user_msg["content"])
+
 
 class StreamingPersistenceTests(_BaseE2E):
     """Pending-at-enqueue + /jobs/partial + finalize-in-place. These

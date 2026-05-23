@@ -202,7 +202,14 @@ def _format_rewrite_history(prior_messages) -> str:
     chat model isn't asked to digest 200 turns. Image-bubble
     placeholders (``[image: foo]``) are rewritten as
     ``[generated image: foo]`` so the model understands what the
-    assistant did instead of seeing the prompt repeated verbatim."""
+    assistant did instead of seeing the prompt repeated verbatim.
+
+    Citation markers from prior search-grounded answers are scrubbed
+    so the classifier reads clean prose — a 1-3B model squinting at
+    a transcript full of ``[1][2]`` markers tends to treat the
+    conversation as already-resolved and over-classify as
+    NO_SEARCH, which is the exact misfire that motivates the
+    enclosing rewrite pipeline."""
     relevant = [
         m for m in prior_messages
         if (m["text"] or "").strip() and m["status"] != "pending"
@@ -215,6 +222,8 @@ def _format_rewrite_history(prior_messages) -> str:
         if m["role"] == "assistant" and text.startswith("[image:"):
             inner = text[len("[image:"):].rstrip("]").strip()
             text = f"[generated image: {inner}]"
+        elif m["role"] == "assistant":
+            text = _scrub_citations(text)
         lines.append(f"{role_label}: {text}")
     return "\n".join(lines)
 
@@ -466,35 +475,65 @@ def _build_search_query_meta_prompt(history: str, user_prompt: str) -> str:
         "RECENT CONVERSATION:\n"
         f"{history}\n\n"
         f"NEW USER MESSAGE: {user_prompt}\n\n"
+        "HARD RULES (check these FIRST, before anything else):\n"
+        "  - If the new message contains a question mark \"?\", you "
+        "MUST output a query. NEVER NO_SEARCH. No exceptions.\n"
+        "  - If the new message expresses doubt or asks for "
+        "verification, output a query. NEVER NO_SEARCH.\n"
+        "\n"
+        "WORKED EXAMPLES (study these — the model that came before "
+        "you kept misclassifying these and we keep getting bug "
+        "reports):\n"
+        "\n"
+        "  History: User asked about Kevin O'Leary's Utah data center;\n"
+        "    assistant answered with project details.\n"
+        "  New message: \"for sure it's happening?\"\n"
+        "  Decision: QUERY (user is verifying — search for confirmation)\n"
+        "  Output: kevin oleary utah data center confirmed status\n"
+        "\n"
+        "  History: User asked about SVB collapse; assistant gave a\n"
+        "    rundown.\n"
+        "  New message: \"really?\"\n"
+        "  Decision: QUERY (verification, not a closure)\n"
+        "  Output: SVB silicon valley bank collapse confirmed\n"
+        "\n"
+        "  History: User asked about the latest iPhone; assistant\n"
+        "    described it.\n"
+        "  New message: \"are you sure that's the latest?\"\n"
+        "  Decision: QUERY (verification with a question mark)\n"
+        "  Output: latest iPhone model 2026\n"
+        "\n"
+        "  History: User asked about NBA scores; assistant answered.\n"
+        "  New message: \"thanks!\"\n"
+        "  Decision: NO_SEARCH (flat ack, no question, no doubt)\n"
+        "  Output: NO_SEARCH\n"
+        "\n"
+        "  History: User asked about banking news; assistant answered.\n"
+        "  New message: \"what about Europe?\"\n"
+        "  Decision: QUERY (drill-in follow-up)\n"
+        "  Output: european banking news today\n"
+        "\n"
         "Default is QUERY — most messages in search mode want a "
         "search. Only output NO_SEARCH when the message is a pure "
         "acknowledgment with no question, no doubt, and no request "
         "for more information.\n\n"
-        "A. NO_SEARCH cases (rare). Flat acks with nothing else:\n"
+        "Categories:\n"
+        "A. NO_SEARCH (rare). Flat acks with nothing else:\n"
         "   \"thanks\", \"thanks!\", \"ok\", \"got it\", \"cool\", "
         "\"interesting\", \"nice\", \"wow\", \"haha\", \"sounds good\".\n"
-        "   Output:\n"
-        "     NO_SEARCH\n"
-        "   Do NOT add any other text.\n\n"
-        "B. QUERY cases. EVERYTHING below is a query — do NOT classify "
-        "these as NO_SEARCH even though they're short:\n"
+        "B. QUERY (default). Everything else, including:\n"
         "   - Verification: \"for sure?\", \"really?\", \"are you "
         "sure?\", \"is that right?\", \"is it though?\", \"actually?\". "
-        "These mean \"double-check by searching again\" — they're "
-        "the OPPOSITE of NO_SEARCH.\n"
+        "These are the OPPOSITE of NO_SEARCH.\n"
         "   - Drill-in: \"tell me more\", \"more examples?\", \"any "
         "specifics?\", \"go deeper\".\n"
         "   - Follow-up: \"what about Europe?\", \"try again\", \"and "
         "the cost?\", \"the timeline?\".\n"
-        "   - Anything containing a question mark: ALWAYS a query.\n"
         "   - Any standalone topic: \"SVB collapse 2023\", \"latest "
         "iPhone reviews\".\n\n"
         "Query craft rules (only after you've decided to QUERY):\n"
-        "  1. Fragment depending on context (e.g. \"try again\", "
-        "\"what about Europe?\"): use the prior topic to fill in the "
-        "subject. \"try again\" after a news search → \"different "
-        "recent news event\"; \"for sure?\" after a project-status "
-        "search → \"<that project name> confirmed status update\".\n"
+        "  1. Fragment depending on context: use the prior topic to "
+        "fill in the subject (see worked examples above).\n"
         "  2. Clear standalone question or topic: tighten into "
         "keywords. Drop \"can you tell me\" / \"I'm curious about\".\n"
         "  3. Latest/newest? Add \"today\", \"latest\", or the "
@@ -1668,7 +1707,20 @@ def _build_chat_messages(prior_messages, new_user_text: str) -> list[dict]:
     conversation rows plus the new user turn. Pending/empty assistant
     rows from a previous-failed-but-not-yet-retried turn are skipped so
     the model doesn't see a stray empty-assistant message in the middle
-    of the history."""
+    of the history.
+
+    Citation markers (``[1]``, ``[2, 3]``) are scrubbed from prior
+    assistant content. They're meaningful to the human reader of a
+    rendered bubble (paired with the Sources strip) but actively
+    confusing when handed back to a model as conversation context —
+    the new search step's system message also numbers sources [1]
+    [2]..., creating a namespace collision where ``[1]`` in the
+    history points to a different source than ``[1]`` in the new
+    system prompt. Small models squint at the conflict and
+    panic-recant ("my new [1] doesn't back the old [1] claim, so I
+    was wrong before, sorry"). Real bug, observed in manual testing
+    after the chat-reroute citation scrub already shipped — the
+    summarizer needed the same treatment."""
     out: list[dict] = []
     for m in prior_messages:
         role = m["role"]
@@ -1678,6 +1730,8 @@ def _build_chat_messages(prior_messages, new_user_text: str) -> list[dict]:
             continue
         if role == "assistant" and (status != "complete" or not text):
             continue
+        if role == "assistant":
+            text = _scrub_citations(text)
         out.append({"role": role, "content": text})
     out.append({"role": "user", "content": (new_user_text or "").strip()})
     return out
