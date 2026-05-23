@@ -46,10 +46,21 @@
     # expose on the public domain.
     @web_ui path /
     @web_ui_login path /login
+    # Bearer-token fallback form on the login page POSTs here (the
+    # primary u/p form posts to /login above). Without an explicit
+    # route the fallback would fall through to the coordinator
+    # default and 401.
+    @web_ui_login_token path /login/token
     @web_ui_logout path /logout
     @web_ui_api path /api/*
     @web_ui_dashboard path /dashboard
     @web_ui_admin path /admin/*
+    # Per-member account page + the browser-side agent-pair handoff
+    # both live on the client container. Without these the requests
+    # fall through to the coordinator default and 401 (the coord has
+    # no /account or /agent/pair routes).
+    @web_ui_account path /account /account/*
+    @web_ui_agent_pair path /agent/pair /agent/pair/*
     # Vendored JS (marked + DOMPurify) — referenced by both the chat
     # UI (client:8080) and the ToS page (served by coordinator:8000,
     # which has its own copy). We route to the client since both
@@ -59,6 +70,9 @@
         reverse_proxy client:8080
     }
     handle @web_ui_login {
+        reverse_proxy client:8080
+    }
+    handle @web_ui_login_token {
         reverse_proxy client:8080
     }
     handle @web_ui_logout {
@@ -71,6 +85,12 @@
         reverse_proxy client:8080
     }
     handle @web_ui_admin {
+        reverse_proxy client:8080
+    }
+    handle @web_ui_account {
+        reverse_proxy client:8080
+    }
+    handle @web_ui_agent_pair {
         reverse_proxy client:8080
     }
     handle @web_ui_static {
