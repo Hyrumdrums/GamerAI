@@ -394,6 +394,46 @@ debugging today, useless for compliance or analysis later.
 **Fix:** ship to a hosted log store (Grafana Loki, Better Stack,
 Axiom) when we add monitoring.
 
+### 🟡 Coordinator logs contain raw user prompts
+
+The search-rewrite debug instrumentation (added 2026-05-23 after the
+Kevin O'Leary panic-recant bug needed an SSH+SQLite dump to
+diagnose) logs the user's `original_prompt`, the classifier's
+`rewrite_output`, the `parsed_value`, and the `final_query` — each
+truncated to 200 chars but still containing arbitrary user input.
+These hit `docker logs gamerai-coordinator` and are tailable by
+anyone with root on the VPS (today: the dev workstation + Claude
+when running deploy.sh via SSH).
+
+What's exposed in plain text right now:
+- The user's literal prompt for every search submission
+- A short window of the LLM's rewrite output (also user-derived)
+- The final search query sent to DDG / Bing / etc.
+
+The chat-job paths log only metadata (`job_id`, tokens, durations),
+not message bodies, so the exposure is specifically the search
+debug instrumentation.
+
+**Fix path, in order:**
+1. Configure Docker log rotation on the VPS so logs don't grow
+   unbounded — current default is "until restart," which leaks
+   weeks of prompts in worst case. Add `daemon.json` settings:
+   `log-driver: json-file`, `max-size: 10m`, `max-file: 3`. One-time
+   change on the bootstrap script.
+2. Add a `LOG_PROMPTS=false` env switch on the coordinator that
+   demotes the search-rewrite debug fields to an opt-in. Default
+   to true while we're actively debugging the small-model rewrite
+   reliability, flip to false once the pipeline is stable.
+3. When we ship to a hosted log store (see preceding gap), pick one
+   with field-level redaction so we can keep the IDs but drop the
+   prompt content from archived logs.
+
+**Trigger to revisit:** any of: first external user lands; first
+prompt that's medical / legal / financial / explicit in nature; ToS
+clause about not storing prompt content (we don't have one yet —
+see "🟡 Stored prompt history is plaintext at rest" above for the
+related on-disk story).
+
 ### ~~🟢 No CI / CD~~ — done
 
 Resolved. `.github/workflows/ci.yml` runs the unittest suite,

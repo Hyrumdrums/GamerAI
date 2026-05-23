@@ -107,6 +107,43 @@ infrastructure.
 
 ---
 
+## Watching prod logs during manual testing
+
+The search-mode rewrite pipeline has a few moving parts (classifier →
+parser → dispatcher → DDG → summarizer). When something looks wrong
+in the UI, the fastest diagnosis path is to tail the structured
+coordinator logs while you reproduce.
+
+```bash
+tools/watch-search-logs.sh                  # tail forever
+tools/watch-search-logs.sh --since 5m       # backfill recent history
+tools/watch-search-logs.sh --filter all     # show every line, not just search
+```
+
+Output is pretty-printed JSON colored by event. Each search submission
+produces a `search_rewrite_enqueued` → `search_rewrite_parsed` →
+(`search_rewrite_dispatched` | `search_rewrite_classified_skip` |
+`search_rewrite_skip_overridden`) trail, with `original_prompt`,
+`rewrite_output`, `decision`, and `final_query` inlined.
+
+**Privacy heads-up:** those log lines contain user-typed prompts (and
+the LLM-paraphrased query that came out of the classifier), truncated
+to 200 chars each. See `docs/project-gaps.md` →
+*"Coordinator logs contain raw user prompts"* for the rotation /
+opt-out story.
+
+For an already-finished job, the per-job snapshot is one HTTP call:
+
+```bash
+curl -H "Authorization: Bearer $ADMIN_TOKEN" \
+  https://ai.dallinlayton.com/api/admin/debug/job/<job_id>
+```
+
+Returns the DB row, JOB_RESULTS payload, pending rewrite linkage,
+and the matched rewrite chat job with its parsed decision.
+
+---
+
 ## Connecting workers
 
 External gamer machines (anywhere on the internet) point their agent at
