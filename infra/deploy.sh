@@ -36,4 +36,11 @@ docker compose \
   "${PROFILE_ARGS[@]}" \
   up -d --build
 
+# Caddy bind-mounts a *file* (infra/Caddyfile) rather than a directory.
+# `git pull` replaces the file by rename, which orphans the inode the
+# Caddy container is mounted against — the container keeps serving the
+# pre-pull config even after `docker compose up --build`. Restart it
+# unconditionally so Caddyfile edits actually land.
+docker restart gamerai-caddy >/dev/null
+
 echo "[gamerai] redeploy complete."
