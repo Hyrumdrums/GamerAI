@@ -1904,6 +1904,139 @@ class SearchRewriteSkipDispatchTests(_BaseE2E):
         # Linkage cleaned up.
         self.assertEqual(self.r.hlen("search_rewrite_pending"), 0)
 
+    def test_question_mark_guardrail_overrides_skip(self):
+        # Real bug caught in manual testing: "for sure it's happening?"
+        # was a verification follow-up but the small classifier model
+        # squinted at it as a closure and emitted NO_SEARCH. The chat
+        # reroute then panic-recanted the prior search-grounded
+        # answer. The "?" guardrail force-overrides any skip
+        # classification when the user's prompt contains a question
+        # mark; we'd rather run a literal-prompt search than drop a
+        # real question on the floor.
+        _, t = self._make_member(email="srskip3@x.com")
+        wid = self._make_search_capable_worker(t)
+        cid = self._seed_conversation_with_one_turn(t)
+        gr = self.client.post(
+            "/generate",
+            json={
+                "prompt": "for sure it's happening?", "tool": "search",
+                "conversation_id": cid,
+            },
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        search_job_id = gr.json()["job_id"]
+        self.r.lpop("job_queue")
+        rewrite_job_id = list(
+            self.r.hgetall("search_rewrite_pending").keys()
+        )[0]
+        claim = self.client.post(
+            "/jobs/claim",
+            json={"worker_id": wid, "job_id": rewrite_job_id},
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        # Classifier (incorrectly) outputs NO_SEARCH. Guardrail must
+        # rescue us by falling back to the original prompt as the
+        # search query.
+        self.client.post(
+            "/jobs/complete",
+            json={
+                "worker_id": wid, "job_id": rewrite_job_id,
+                "text": "NO_SEARCH",
+                "model": "llama3.2:1b",
+                "prompt_tokens": 50, "completion_tokens": 2,
+                "duration_seconds": 0.5, "status": "complete",
+                "claim_token": claim.json()["claim_token"],
+            },
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        # Search queue HAS the job (skip was overridden).
+        self.assertEqual(self.r.llen("job_queue:search"), 1)
+        env = json.loads(self.r.lindex("job_queue:search", 0))
+        # Falls back to the original user prompt as the query — we
+        # don't have a clean rewrite to use.
+        self.assertEqual(env["prompt"], "for sure it's happening?")
+        # No auto-disable marker (the override means search did run).
+        self.assertEqual(self.r.hlen("search_auto_disabled"), 0)
+        # Chat queue is empty (no reroute happened).
+        self.assertEqual(self.r.llen("job_queue"), 0)
+
+    def test_no_search_path_scrubs_citation_markers(self):
+        # Companion fix: when we DO take the NO_SEARCH path, scrub
+        # [1][2] citation markers from prior assistant turns. Without
+        # this, the chat model sees citations it can't back up and
+        # panic-recants the previous answer.
+        _, t = self._make_member(email="srskip4@x.com")
+        wid = self._make_search_capable_worker(t)
+        conv = self.client.post(
+            "/conversations", json={},
+            headers={"Authorization": f"Bearer {t}"},
+        ).json()
+        cid = conv["conversation_id"]
+        suffix = uuid.uuid4().hex[:8]
+        # Seed a search-grounded assistant turn that includes
+        # citation markers and a Sources line — mimics what a real
+        # search turn would persist.
+        self.db.append_message(
+            message_id=f"msg_scrub_{suffix}_u", conversation_id=cid, seq=0,
+            role="user", text="news on kevin oleary utah data center",
+        )
+        self.db.append_message(
+            message_id=f"msg_scrub_{suffix}_a", conversation_id=cid, seq=1,
+            role="assistant",
+            text="Kevin O'Leary announced a $70B project [1]. Local "
+                 "opposition continues [2, 3].",
+            status="complete",
+        )
+        gr = self.client.post(
+            "/generate",
+            json={
+                "prompt": "thanks", "tool": "search",
+                "conversation_id": cid,
+            },
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        search_job_id = gr.json()["job_id"]
+        # Drive the rewrite to NO_SEARCH.
+        self.r.lpop("job_queue")
+        rewrite_job_id = list(
+            self.r.hgetall("search_rewrite_pending").keys()
+        )[0]
+        claim = self.client.post(
+            "/jobs/claim",
+            json={"worker_id": wid, "job_id": rewrite_job_id},
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        self.client.post(
+            "/jobs/complete",
+            json={
+                "worker_id": wid, "job_id": rewrite_job_id,
+                "text": "NO_SEARCH",
+                "model": "llama3.2:1b",
+                "prompt_tokens": 50, "completion_tokens": 2,
+                "duration_seconds": 0.5, "status": "complete",
+                "claim_token": claim.json()["claim_token"],
+            },
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        # The rerouted chat envelope on the chat queue should have
+        # the citation markers scrubbed from the prior assistant turn.
+        chat_envs = []
+        while True:
+            raw = self.r.lpop("job_queue")
+            if not raw:
+                break
+            chat_envs.append(json.loads(raw))
+        self.assertEqual(len(chat_envs), 1, chat_envs)
+        msgs = chat_envs[0].get("messages") or []
+        asst = [m for m in msgs if m["role"] == "assistant"]
+        self.assertTrue(asst, msgs)
+        body = asst[0]["content"]
+        # Citation markers are gone, prose stays.
+        self.assertNotIn("[1]", body)
+        self.assertNotIn("[2, 3]", body)
+        self.assertIn("Kevin O'Leary", body)
+        self.assertIn("$70B", body)
+
     def test_search_was_skipped_surfaces_on_complete(self):
         # End-to-end: NO_SEARCH → chat worker completes → /result
         # returns search_was_skipped: true so the client knows to flip

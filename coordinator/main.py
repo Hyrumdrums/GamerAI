@@ -466,28 +466,39 @@ def _build_search_query_meta_prompt(history: str, user_prompt: str) -> str:
         "RECENT CONVERSATION:\n"
         f"{history}\n\n"
         f"NEW USER MESSAGE: {user_prompt}\n\n"
-        "Decision rules:\n\n"
-        "A. If the user is wrapping up or just reacting — \"thanks\", "
-        "\"cool!\", \"that's interesting\", \"ok\", \"got it\", \"haha\", "
-        "\"nice\", \"wow\" — they don't want another search. Output:\n"
-        "  NO_SEARCH\n"
-        "Do NOT add any other text.\n\n"
-        "B. If the user is asking for more information, drilling in, "
-        "or starting a new topic, craft a query. Follow these query "
-        "rules:\n"
+        "Default is QUERY — most messages in search mode want a "
+        "search. Only output NO_SEARCH when the message is a pure "
+        "acknowledgment with no question, no doubt, and no request "
+        "for more information.\n\n"
+        "A. NO_SEARCH cases (rare). Flat acks with nothing else:\n"
+        "   \"thanks\", \"thanks!\", \"ok\", \"got it\", \"cool\", "
+        "\"interesting\", \"nice\", \"wow\", \"haha\", \"sounds good\".\n"
+        "   Output:\n"
+        "     NO_SEARCH\n"
+        "   Do NOT add any other text.\n\n"
+        "B. QUERY cases. EVERYTHING below is a query — do NOT classify "
+        "these as NO_SEARCH even though they're short:\n"
+        "   - Verification: \"for sure?\", \"really?\", \"are you "
+        "sure?\", \"is that right?\", \"is it though?\", \"actually?\". "
+        "These mean \"double-check by searching again\" — they're "
+        "the OPPOSITE of NO_SEARCH.\n"
+        "   - Drill-in: \"tell me more\", \"more examples?\", \"any "
+        "specifics?\", \"go deeper\".\n"
+        "   - Follow-up: \"what about Europe?\", \"try again\", \"and "
+        "the cost?\", \"the timeline?\".\n"
+        "   - Anything containing a question mark: ALWAYS a query.\n"
+        "   - Any standalone topic: \"SVB collapse 2023\", \"latest "
+        "iPhone reviews\".\n\n"
+        "Query craft rules (only after you've decided to QUERY):\n"
         "  1. Fragment depending on context (e.g. \"try again\", "
-        "\"what about Europe?\", \"more examples?\"): use the prior "
-        "topic to fill in the missing subject. \"try again\" after "
-        "a news search becomes a query for a different recent news "
-        "event; \"what about Europe?\" after banking becomes "
-        "\"recent banking news Europe\".\n"
-        "  2. Clear standalone question or topic (e.g. \"SVB collapse "
-        "2023\", \"latest iPhone reviews\"): tighten into keywords. "
-        "Drop conversational filler like \"can you tell me\" / "
-        "\"I'm curious about\".\n"
-        "  3. If asking for the latest/newest, add \"today\", "
-        "\"latest\", or the current year. Don't invent a specific "
-        "date.\n"
+        "\"what about Europe?\"): use the prior topic to fill in the "
+        "subject. \"try again\" after a news search → \"different "
+        "recent news event\"; \"for sure?\" after a project-status "
+        "search → \"<that project name> confirmed status update\".\n"
+        "  2. Clear standalone question or topic: tighten into "
+        "keywords. Drop \"can you tell me\" / \"I'm curious about\".\n"
+        "  3. Latest/newest? Add \"today\", \"latest\", or the "
+        "current year. Don't invent a specific date.\n"
         "  4. Keep it SHORT (typically 3-8 words).\n\n"
         "Output format:\n"
         "- One line.\n"
@@ -623,6 +634,23 @@ def _clean_rewritten_search_query(raw: Optional[str], fallback: str) -> str:
     return s
 
 
+_CITATION_PATTERN = re.compile(r"\s*\[\d+(?:\s*,\s*\d+)*\]")
+
+
+def _scrub_citations(text: str) -> str:
+    """Strip ``[1]``, ``[2]``, ``[1, 2]``-style citation markers from
+    an assistant message body. Used when we reroute a search job to
+    the chat queue (NO_SEARCH classification): the original chat
+    model produced citations backed by sources, but the chat reroute
+    won't have those sources, and a small model seeing dangling
+    citation markers tends to recant ("I made an error, I don't have
+    sources for that"). Scrubbing leaves the prose intact and the
+    follow-up has a clean context to respond from."""
+    if not text:
+        return text
+    return _CITATION_PATTERN.sub("", text).strip()
+
+
 def _dispatch_search_after_rewrite(
     rewrite_job_id: str,
     link: dict,
@@ -671,16 +699,51 @@ def _dispatch_search_after_rewrite(
 
         decision, value = _parse_search_rewrite_output(rewritten_text)
 
+        # Hard guardrail: a question is never a closure. If the user's
+        # original prompt contains a "?", we ignore a SKIP decision
+        # and force a query. This catches a real failure observed in
+        # manual testing where "for sure it's happening?" (a follow-
+        # up VERIFICATION question) was misclassified as NO_SEARCH —
+        # the chat reroute then panic-recanted the prior search-
+        # grounded answer. Meta-prompt fix is also in place; the
+        # guardrail is belt-and-suspenders.
+        if decision == "skip" and "?" in (original or ""):
+            log.info(
+                "search rewrite skip overridden by ? guardrail",
+                extra={
+                    "event": "search_rewrite_skip_overridden",
+                    "rewrite_job_id": rewrite_job_id,
+                    "search_job_id": search_job_id,
+                },
+            )
+            decision = "error"  # fall through to original-prompt path
+            value = None
+
         if decision == "skip":
             # Reverse-detection branch: reroute as plain chat. Strip
             # the search-specific fields so the worker treats it as a
-            # normal chat job with the conversation history. The
-            # SEARCH_AUTO_DISABLED marker tells /jobs/complete to
-            # signal the client back so it auto-toggles the box off.
+            # normal chat job with the conversation history.
+            #
+            # Citation markers in prior assistant turns are scrubbed
+            # — without sources to back them up, a small chat model
+            # will see "[1][2]" and panic-recant ("I made an error,
+            # I don't have sources for that claim"). The actual
+            # information in the prior turn is fine to keep; just
+            # the citation hooks need to go. Caught in manual testing
+            # by the "for sure it's happening?" → recanted-prior-
+            # answer failure.
             chat_envelope = dict(search_envelope)
             chat_envelope.pop("search", None)
             chat_envelope["tool"] = "chat"
             chat_envelope["prompt"] = original
+            if chat_envelope.get("messages"):
+                chat_envelope["messages"] = [
+                    {
+                        "role": m["role"],
+                        "content": _scrub_citations(m.get("content", "")),
+                    }
+                    for m in chat_envelope["messages"]
+                ]
             db.set_job_pending_with_prompt(search_job_id, original)
             r.hset(SEARCH_AUTO_DISABLED, search_job_id, "1")
             r.rpush(job_queue_for("chat"), json.dumps(chat_envelope))
