@@ -190,16 +190,24 @@ class ConversationCreateRequest(BaseModel):
 
 
 class InviteAcceptRequest(BaseModel):
-    """Optional info the redeemer may attach when accepting.
+    """The redeemer's chosen credentials. The invite code itself is the
+    one-shot redemption credential and lives in the URL path; this body
+    is what the new member's account will be configured with.
 
-    The invite code itself is in the URL path, not this body.
+    ``username`` and ``password`` create a u/p login the friend can use
+    going forward — no bearer token paste, no email service in the loop.
+    ``invitee_email`` is required for recognizability (the host needs to
+    know which friend just accepted) and is also where any future
+    email-based password reset will go.
 
-    ``tos_accepted`` must be true for the redemption to succeed —
-    the redemption page submits it as part of the form. The flag is
-    here (not coerced server-side) so a programmatic redeemer cannot
-    bypass the click-through accidentally.
+    ``tos_accepted`` must be true for the redemption to succeed — the
+    redemption page submits it as part of the form. The flag is here
+    (not coerced server-side) so a programmatic redeemer cannot bypass
+    the click-through accidentally.
     """
-    invitee_email: Optional[str] = None
+    username: str
+    password: str
+    invitee_email: str
     tos_accepted: bool = False
 
 

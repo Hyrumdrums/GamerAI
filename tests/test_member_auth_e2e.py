@@ -267,6 +267,24 @@ class MemberAuthE2ETests(unittest.TestCase):
     def _admin_headers(self):
         return {"Authorization": f"Bearer {ADMIN_TOKEN}"}
 
+    _accept_seq = 0
+
+    @classmethod
+    def _accept_payload(cls, **overrides) -> dict:
+        """Build a redeem payload that satisfies the post-u/p contract
+        (username + password + invitee_email all required) and yields a
+        fresh username per call so concurrent tests in the suite can't
+        collide on the unique index."""
+        cls._accept_seq += 1
+        body = {
+            "username": f"invitee{cls._accept_seq:04d}",
+            "password": "correct-horse-battery",
+            "invitee_email": "bob@example.com",
+            "tos_accepted": True,
+        }
+        body.update(overrides)
+        return body
+
     def _make_contributor(self) -> tuple[str, str]:
         token = self._create_member_via_cli(
             "create-member", "--role", "contributor"
@@ -295,7 +313,7 @@ class MemberAuthE2ETests(unittest.TestCase):
         _, contributor_token = self._make_contributor()
         code = self._create_invite(contributor_token)
         accept = self.client.post(
-            f"/invites/{code}/accept", json={"tos_accepted": True}
+            f"/invites/{code}/accept", json=self._accept_payload()
         ).json()
         invitee_token = accept["token"]
         resp = self.client.post(
@@ -322,15 +340,14 @@ class MemberAuthE2ETests(unittest.TestCase):
     def test_accept_invite_mints_invitee_member(self):
         _, contributor_token = self._make_contributor()
         code = self._create_invite(contributor_token)
+        payload = self._accept_payload()
         # Public — no auth header.
-        resp = self.client.post(
-            f"/invites/{code}/accept",
-            json={"invitee_email": "bob@example.com", "tos_accepted": True},
-        )
-        self.assertEqual(resp.status_code, 200)
+        resp = self.client.post(f"/invites/{code}/accept", json=payload)
+        self.assertEqual(resp.status_code, 200, resp.text)
         body = resp.json()
         self.assertTrue(body["token"].startswith("gai_"))
         self.assertEqual(body["role"], "invitee")
+        self.assertEqual(body["username"], payload["username"])
         self.assertEqual(body["daily_quota_tokens"], 100)
 
         # The new token actually works.
@@ -339,14 +356,55 @@ class MemberAuthE2ETests(unittest.TestCase):
         ).json()
         self.assertEqual(me["role"], "invitee")
         self.assertEqual(me["email"], "bob@example.com")
+        self.assertEqual(me["username"], payload["username"])
+        self.assertTrue(me["has_password"])
         self.assertEqual(me["daily_quota_tokens"], 100)
+
+        # The new member can also log in via u/p.
+        login = self.client.post(
+            "/login",
+            json={
+                "username": payload["username"],
+                "password": payload["password"],
+            },
+        )
+        self.assertEqual(login.status_code, 200, login.text)
+
+    def test_accept_rejects_missing_username(self):
+        _, contributor_token = self._make_contributor()
+        code = self._create_invite(contributor_token)
+        payload = self._accept_payload(username="ab")  # too short
+        resp = self.client.post(f"/invites/{code}/accept", json=payload)
+        self.assertEqual(resp.status_code, 400)
+
+    def test_accept_rejects_weak_password(self):
+        _, contributor_token = self._make_contributor()
+        code = self._create_invite(contributor_token)
+        payload = self._accept_payload(password="short")
+        resp = self.client.post(f"/invites/{code}/accept", json=payload)
+        self.assertEqual(resp.status_code, 400)
+
+    def test_accept_rejects_duplicate_username(self):
+        _, contributor_token = self._make_contributor()
+        code1 = self._create_invite(contributor_token)
+        code2 = self._create_invite(contributor_token)
+        payload = self._accept_payload(username="sharedname")
+        first = self.client.post(f"/invites/{code1}/accept", json=payload)
+        self.assertEqual(first.status_code, 200)
+        second_payload = self._accept_payload(username="sharedname")
+        second = self.client.post(f"/invites/{code2}/accept", json=second_payload)
+        self.assertEqual(second.status_code, 409)
 
     def test_accept_is_one_shot(self):
         _, contributor_token = self._make_contributor()
         code = self._create_invite(contributor_token)
-        first = self.client.post(f"/invites/{code}/accept", json={"tos_accepted": True})
+        first = self.client.post(
+            f"/invites/{code}/accept", json=self._accept_payload()
+        )
         self.assertEqual(first.status_code, 200)
-        second = self.client.post(f"/invites/{code}/accept", json={"tos_accepted": True})
+        second = self.client.post(
+            f"/invites/{code}/accept", json=self._accept_payload()
+        )
         self.assertEqual(second.status_code, 410)
         self.assertIn("accepted", second.json()["detail"])
 
@@ -357,7 +415,9 @@ class MemberAuthE2ETests(unittest.TestCase):
             f"/invites/{code}/revoke", headers=self._admin_headers()
         )
         self.assertEqual(rev.status_code, 200)
-        resp = self.client.post(f"/invites/{code}/accept", json={"tos_accepted": True})
+        resp = self.client.post(
+            f"/invites/{code}/accept", json=self._accept_payload()
+        )
         self.assertEqual(resp.status_code, 410)
 
     def test_accept_after_expiry_is_rejected(self):
@@ -374,7 +434,9 @@ class MemberAuthE2ETests(unittest.TestCase):
             daily_quota_tokens=100,
             expires_at=time.time() - 3600,
         )
-        resp = self.client.post(f"/invites/{code}/accept", json={"tos_accepted": True})
+        resp = self.client.post(
+            f"/invites/{code}/accept", json=self._accept_payload()
+        )
         self.assertEqual(resp.status_code, 410)
         self.assertIn("expired", resp.json()["detail"])
 
@@ -412,7 +474,7 @@ class MemberAuthE2ETests(unittest.TestCase):
         _, contributor_token = self._make_contributor()
         code = self._create_invite(contributor_token, daily_quota_tokens=20)
         token = self.client.post(
-            f"/invites/{code}/accept", json={"tos_accepted": True}
+            f"/invites/{code}/accept", json=self._accept_payload()
         ).json()["token"]
         resp = self.client.post(
             "/generate",
@@ -425,7 +487,7 @@ class MemberAuthE2ETests(unittest.TestCase):
         _, contributor_token = self._make_contributor()
         code = self._create_invite(contributor_token, daily_quota_tokens=5)
         accept = self.client.post(
-            f"/invites/{code}/accept", json={"tos_accepted": True}
+            f"/invites/{code}/accept", json=self._accept_payload()
         ).json()
         invitee_token = accept["token"]
         invitee_member = member_auth.lookup_member_by_token(

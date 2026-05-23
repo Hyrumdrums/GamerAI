@@ -114,19 +114,22 @@ Notes:
 1. They open `https://ai.dallinlayton.com/invite/<code>` — public, no auth
    needed.
 2. The redemption page shows who invited them, their daily cap, the ToS
-   excerpt, and an "I accept the terms" checkbox
-   (template: `client/templates/redeem.html.j2`).
-3. They check the box, optionally enter an email, click **Accept and get my
-   token**. Coordinator calls `POST /invites/{code}/accept`
-   (`coordinator/main.py:1358`), atomically mints a new `members` row, and
-   returns the raw `gai_<64 hex>` token in the response.
-4. The success page shows the token **once**, with a Copy button
-   (`client/templates/redeem_done.html.j2`). The token is not recoverable
-   after this page closes.
-5. They paste the token at `/login` and they're in.
+   excerpt, and a form that collects **username + email + password +
+   confirm + ToS checkbox** (template: `client/templates/redeem.html.j2`).
+3. They fill it in and click **Create my account**. The web layer posts
+   to the coordinator's `POST /invites/{code}/accept`, which atomically
+   mints a new `members` row (username, argon2 password hash, fresh
+   bearer token) and returns the token to the web layer.
+4. The web layer drops the token in the `gai_session` HttpOnly cookie
+   and 303-redirects to `/`. The token is never shown — friends should
+   never have to copy-paste.
+5. From then on the tester signs in at `/login` with their username +
+   password. The session cookie carries the bearer for every request.
 
 Walk a tester through it once before launching at a wider group. If they
-close the success page without copying, you have to revoke + re-issue.
+forget their password, see the recovery note in `docs/auth-design.md` —
+host-can-reset-link is deliberately deferred until an email service is
+wired up.
 
 ---
 

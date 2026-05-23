@@ -30,21 +30,54 @@
       <li><strong>Best-effort service.</strong> Things can break, timeouts
         happen, and answers can be wrong. Don't use this for anything that costs
         money or harms people if it fails.</li>
+      <li><strong>Your host vouches for you.</strong> They can adjust your
+        daily cap or revoke your access. Email-based password reset is
+        coming later — for now, pick a password you'll remember.</li>
       <li><strong>Be a good neighbor.</strong> No abuse, no scraping, no
         illegal content. We'll remove members who break trust.</li>
     </ul>
     <a href="/tos" target="_blank">Read the full terms</a>
   </div>
 
+  {% if error %}
+  <div class="alert-err">{{ error }}</div>
+  {% endif %}
+
   <form method="POST">
-    <label for="email" class="label">Your email (optional, helps the inviter recognize you)</label>
-    <input id="email" name="invitee_email" type="email" placeholder="you@example.com">
+    <label for="username" class="label">Pick a username</label>
+    <input id="username" name="username" type="text"
+           value="{{ username }}"
+           autocomplete="username"
+           pattern="[A-Za-z0-9_.\-]{3,32}"
+           minlength="3" maxlength="32"
+           placeholder="e.g. alex_h"
+           required autofocus>
+
+    <label for="email" class="label">Email</label>
+    <input id="email" name="invitee_email" type="email"
+           value="{{ email }}"
+           autocomplete="email"
+           placeholder="you@example.com"
+           required>
+
+    <label for="password" class="label">Password (at least 8 characters)</label>
+    <input id="password" name="password" type="password"
+           autocomplete="new-password"
+           minlength="8"
+           required>
+
+    <label for="password_confirm" class="label">Confirm password</label>
+    <input id="password_confirm" name="password_confirm" type="password"
+           autocomplete="new-password"
+           minlength="8"
+           required>
+
     <div class="accept-row">
       <input id="tos_accepted" name="tos_accepted" type="checkbox" required>
       <label for="tos_accepted">I've read and accept the
         <a href="/tos" target="_blank">community terms</a>.</label>
     </div>
-    <button id="submit" type="submit" disabled>Accept and get my token</button>
+    <button id="submit" type="submit" disabled>Create my account</button>
   </form>
 </div>
 {% endblock %}

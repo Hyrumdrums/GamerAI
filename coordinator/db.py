@@ -734,18 +734,25 @@ class DB:
         invitee_email: Optional[str],
         accepted_at: float,
         tos_version: Optional[str] = None,
-    ) -> Optional[sqlite3.Row]:
+        username: Optional[str] = None,
+        password_hash: Optional[str] = None,
+    ) -> tuple[Optional[sqlite3.Row], Optional[str]]:
         """Atomic: verify invite is redeemable, mark accepted, insert the
-        new invitee member. Returns the (updated) invite row on success,
-        or None if the invite was missing / expired / already accepted /
-        revoked. All writes happen under the same BEGIN/COMMIT so a
-        second concurrent accept of the same code cannot succeed.
+        new invitee member with username + password set. Returns
+        ``(invite_row, None)`` on success or ``(None, reason)`` on
+        failure where ``reason`` is one of:
 
-        ``tos_version`` is recorded on the new member row so we can
-        track which terms version each invitee accepted. ``None`` is
-        permitted for backwards compatibility but the caller should
-        always pass the current version when invoked via the public
-        redemption flow."""
+        - ``"not_redeemable"`` — invite missing, expired, revoked, or
+          already accepted.
+        - ``"username_taken"`` — username collides with another member.
+
+        All writes happen under the same BEGIN/COMMIT so a concurrent
+        accept (or a concurrent username claim from /me/username) cannot
+        slip past the uniqueness check.
+
+        ``username`` and ``password_hash`` are optional only for
+        backward compatibility with internal callers; the public
+        redemption flow always provides both."""
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -755,22 +762,33 @@ class DB:
                 row = cur.fetchone()
                 if row is None:
                     self._conn.execute("ROLLBACK")
-                    return None
+                    return None, "not_redeemable"
                 if row["accepted_at"] is not None:
                     self._conn.execute("ROLLBACK")
-                    return None
+                    return None, "not_redeemable"
                 if row["revoked_at"] is not None:
                     self._conn.execute("ROLLBACK")
-                    return None
+                    return None, "not_redeemable"
                 if row["expires_at"] is not None and row["expires_at"] < accepted_at:
                     self._conn.execute("ROLLBACK")
-                    return None
+                    return None, "not_redeemable"
+
+                if username:
+                    clash = self._conn.execute(
+                        "SELECT member_id FROM members "
+                        "WHERE LOWER(username)=LOWER(?)",
+                        (username,),
+                    ).fetchone()
+                    if clash is not None:
+                        self._conn.execute("ROLLBACK")
+                        return None, "username_taken"
 
                 self._conn.execute(
                     "INSERT INTO members (member_id, email, role, parent_member_id, "
                     "token_hash, tier, daily_quota_tokens, created_at, "
-                    "tos_accepted_at, tos_version) "
-                    "VALUES (?, ?, 'invitee', ?, ?, 'BRONZE', ?, ?, ?, ?)",
+                    "tos_accepted_at, tos_version, username, password_hash, "
+                    "password_set_at) "
+                    "VALUES (?, ?, 'invitee', ?, ?, 'BRONZE', ?, ?, ?, ?, ?, ?, ?)",
                     (
                         new_member_id,
                         invitee_email,
@@ -780,6 +798,9 @@ class DB:
                         accepted_at,
                         accepted_at,  # tos_accepted_at — checkbox was required at submit
                         tos_version,
+                        username,
+                        password_hash,
+                        accepted_at if password_hash else None,
                     ),
                 )
                 self._conn.execute(
@@ -793,7 +814,7 @@ class DB:
                 )
                 fresh = cur.fetchone()
                 self._conn.execute("COMMIT")
-                return fresh
+                return fresh, None
             except Exception:
                 self._conn.execute("ROLLBACK")
                 raise

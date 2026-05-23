@@ -123,10 +123,27 @@ class TosEndpointTests(_BaseE2E):
 
 
 class InviteAcceptRequiresTosTests(_BaseE2E):
+    _accept_seq = 0
+
+    @classmethod
+    def _payload(cls, **overrides) -> dict:
+        cls._accept_seq += 1
+        body = {
+            "username": f"tosbob{cls._accept_seq:04d}",
+            "password": "correct-horse-battery",
+            "invitee_email": "bob@x.com",
+            "tos_accepted": True,
+        }
+        body.update(overrides)
+        return body
+
     def test_accept_without_tos_is_rejected(self):
         _, ctoken = self._make_contributor()
         code = self._create_invite(ctoken)
-        resp = self.client.post(f"/invites/{code}/accept", json={})  # tos_accepted defaults to False
+        resp = self.client.post(
+            f"/invites/{code}/accept",
+            json=self._payload(tos_accepted=False),
+        )
         self.assertEqual(resp.status_code, 400)
         self.assertIn("ToS", resp.json()["detail"])
 
@@ -134,8 +151,7 @@ class InviteAcceptRequiresTosTests(_BaseE2E):
         _, ctoken = self._make_contributor(email="alice+tos@example.com")
         code = self._create_invite(ctoken)
         resp = self.client.post(
-            f"/invites/{code}/accept",
-            json={"tos_accepted": True, "invitee_email": "bob@x.com"},
+            f"/invites/{code}/accept", json=self._payload(),
         )
         self.assertEqual(resp.status_code, 200, resp.text)
         body = resp.json()

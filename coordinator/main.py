@@ -3336,7 +3336,10 @@ def invite_details(code: str):
 @app.post("/invites/{code}/accept")
 def accept_invite(code: str, req: InviteAcceptRequest):
     """Public: Bob redeems his invite. One-shot — the same code cannot
-    be accepted twice. Returns the new bearer token exactly once.
+    be accepted twice. Creates the invitee member with their chosen
+    username + password and returns a session token so the redemption
+    page can sign them in immediately (no token paste, no email
+    service in the loop).
 
     The redemption page collects an explicit ToS-accepted checkbox;
     the field is required here so a programmatic redeemer cannot
@@ -3350,20 +3353,42 @@ def accept_invite(code: str, req: InviteAcceptRequest):
                 "(see /tos)."
             ),
         )
+    email = (req.invitee_email or "").strip()
+    if not email:
+        raise HTTPException(
+            status_code=400, detail="email is required",
+        )
+    try:
+        username = member_auth.validate_username(req.username)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    try:
+        password = member_auth.validate_password(req.password)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
     now = time.time()
     new_member_id = "mem_" + uuid.uuid4().hex[:12]
     raw_token = member_auth.generate_token()
     token_hash = member_auth.hash_token(raw_token)
+    password_hash = member_auth.hash_password(password)
 
-    invite_row = db.accept_invite_atomic(
+    invite_row, failure = db.accept_invite_atomic(
         code=code,
         new_member_id=new_member_id,
         new_token_hash=token_hash,
-        invitee_email=req.invitee_email,
+        invitee_email=email,
         accepted_at=now,
         tos_version=TOS_VERSION,
+        username=username,
+        password_hash=password_hash,
     )
     if invite_row is None:
+        if failure == "username_taken":
+            raise HTTPException(
+                status_code=409,
+                detail=f"username {username!r} is already taken",
+            )
         # Distinguish missing vs unredeemable for the redemption page.
         existing = db.get_invite_by_code(code)
         if existing is None:
@@ -3378,6 +3403,7 @@ def accept_invite(code: str, req: InviteAcceptRequest):
     return {
         "member_id": new_member_id,
         "token": raw_token,
+        "username": username,
         "role": "invitee",
         "parent_member_id": invite_row["contributor_member_id"],
         "daily_quota_tokens": invite_row["daily_quota_tokens"],

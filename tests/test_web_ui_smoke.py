@@ -101,10 +101,18 @@ class WebUISmokeTests(unittest.TestCase):
             "DELETE FROM invites; "
             "DELETE FROM members WHERE role <> 'admin';"
         )
+        # The invite-accept flow now sets a fresh session cookie when
+        # auto-logging the new member in — that would otherwise clobber
+        # the admin cookie set in setUpClass and break later tests in
+        # the same suite. Reset to admin every test.
+        self.web.cookies.clear()
+        self.web.cookies.set(client_web.SESSION_COOKIE, ADMIN_TOKEN)
 
     # ------------------------------------------------------------------
     # helpers — bootstrap a contributor + invite via the coordinator
     # ------------------------------------------------------------------
+    _contrib_seq = 0
+
     def _make_contributor_and_invite(self, **invite_kwargs) -> tuple[str, str]:
         """Returns (contributor_token, invite_code). Both built via the
         coordinator's HTTP surface so this test file has no direct DB
@@ -113,7 +121,8 @@ class WebUISmokeTests(unittest.TestCase):
         # Mint a contributor by direct DB write — the only path that does
         # this today is the CLI, which we don't want to exec here.
         token = member_auth.generate_token()
-        member_id = "mem_webui_contrib"
+        type(self)._contrib_seq += 1
+        member_id = f"mem_webui_contrib_{type(self)._contrib_seq}"
         self.db.create_member(
             member_id=member_id,
             email="alice@example.com",
@@ -162,58 +171,98 @@ class WebUISmokeTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 410)
         self.assertIn("revoked", resp.text)
 
-    def test_invite_accept_renders_token(self):
-        _, code = self._make_contributor_and_invite()
-        resp = self.web.post(
-            f"/invite/{code}",
-            data={"invitee_email": "bob@example.com", "tos_accepted": "on"},
-        )
-        self.assertEqual(resp.status_code, 200)
-        body = resp.text
-        self.assertIn("Welcome to GamerAI", body)
-        self.assertIn("gai_", body)  # the new bearer token
-        self.assertIn("member_id", body)
+    _accept_counter = 0
 
-    def test_invite_accept_page_links_to_installer(self):
-        """Regression guard: the post-accept page must show the
-        Windows-agent installer download link, otherwise the onboarding
-        path silently degrades to 'go figure out where to download it'."""
+    @classmethod
+    def _accept_form(cls, **overrides) -> dict:
+        cls._accept_counter += 1
+        data = {
+            "username": f"bobwebui{cls._accept_counter:04d}",
+            "password": "correct-horse-battery",
+            "password_confirm": "correct-horse-battery",
+            "invitee_email": "bob@example.com",
+            "tos_accepted": "on",
+        }
+        data.update(overrides)
+        return data
+
+    def test_invite_accept_auto_logs_in(self):
         _, code = self._make_contributor_and_invite()
-        resp = self.web.post(f"/invite/{code}", data={"tos_accepted": "on"})
-        self.assertEqual(resp.status_code, 200)
-        body = resp.text
-        self.assertIn("/download/GamerAI-Agent-Setup.exe", body)
-        self.assertIn("/download/agent.exe", body)
-        # The copy-token button must be present so non-developer recruits
-        # don't have to fight a triple-click select.
-        self.assertIn('id="copy"', body)
+        # follow_redirects=False — we want to see the 303 + cookie ourselves.
+        resp = self.web.post(
+            f"/invite/{code}", data=self._accept_form(),
+            follow_redirects=False,
+        )
+        self.assertEqual(resp.status_code, 303, resp.text)
+        self.assertEqual(resp.headers["location"], "/")
+        # The session cookie was stamped with a fresh bearer.
+        self.assertIn(client_web.SESSION_COOKIE, resp.cookies)
+        self.assertTrue(
+            resp.cookies[client_web.SESSION_COOKIE].startswith("gai_")
+        )
 
     def test_invite_accept_410_after_one_shot(self):
         _, code = self._make_contributor_and_invite()
-        first = self.web.post(f"/invite/{code}", data={"tos_accepted": "on"})
-        self.assertEqual(first.status_code, 200)
-        second = self.web.post(f"/invite/{code}", data={"tos_accepted": "on"})
+        first = self.web.post(
+            f"/invite/{code}", data=self._accept_form(),
+            follow_redirects=False,
+        )
+        self.assertEqual(first.status_code, 303)
+        second = self.web.post(
+            f"/invite/{code}", data=self._accept_form(),
+            follow_redirects=False,
+        )
         self.assertEqual(second.status_code, 410)
         self.assertIn("accepted", second.text)
 
-    def test_invite_accept_without_email_works(self):
-        # Bob is allowed to redeem without filling in his email.
+    def test_invite_accept_requires_email(self):
         _, code = self._make_contributor_and_invite()
         resp = self.web.post(
             f"/invite/{code}",
-            data={"invitee_email": "", "tos_accepted": "on"},
+            data=self._accept_form(invitee_email=""),
+            follow_redirects=False,
         )
-        self.assertEqual(resp.status_code, 200)
-        self.assertIn("gai_", resp.text)
+        # The coordinator returns 400 ("email is required") and the
+        # client re-renders the form with the error inline.
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("email is required", resp.text)
+
+    def test_invite_accept_mismatched_passwords_re_renders_form(self):
+        _, code = self._make_contributor_and_invite()
+        resp = self.web.post(
+            f"/invite/{code}",
+            data=self._accept_form(password_confirm="something-else"),
+            follow_redirects=False,
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("Passwords didn", resp.text)
+
+    def test_invite_accept_duplicate_username_re_renders_form(self):
+        _, code1 = self._make_contributor_and_invite()
+        _, code2 = self._make_contributor_and_invite()
+        first = self.web.post(
+            f"/invite/{code1}",
+            data=self._accept_form(username="taken1234"),
+            follow_redirects=False,
+        )
+        self.assertEqual(first.status_code, 303)
+        second = self.web.post(
+            f"/invite/{code2}",
+            data=self._accept_form(username="taken1234"),
+            follow_redirects=False,
+        )
+        self.assertEqual(second.status_code, 409)
+        self.assertIn("already taken", second.text)
 
     def test_invite_accept_without_tos_checkbox_is_rejected(self):
         """If a user posts without checking the box (e.g. via devtools
-        manipulation), the web layer should bounce them back rather
-        than silently submitting tos_accepted=false to the coordinator."""
+        manipulation), the web layer bounces them back rather than
+        silently submitting tos_accepted=false to the coordinator."""
         _, code = self._make_contributor_and_invite()
+        data = self._accept_form()
+        del data["tos_accepted"]
         resp = self.web.post(
-            f"/invite/{code}",
-            data={"invitee_email": "bob@example.com"},  # no tos_accepted
+            f"/invite/{code}", data=data, follow_redirects=False,
         )
         self.assertEqual(resp.status_code, 400)
         self.assertIn("terms must be accepted", resp.text)
@@ -246,8 +295,13 @@ class WebUISmokeTests(unittest.TestCase):
         # Bob accepts.
         self.web.post(
             f"/invite/{code}",
-            data={"invitee_email": "bob@example.com", "tos_accepted": "on"},
+            data=self._accept_form(),
+            follow_redirects=False,
         )
+        # That auto-login stamped Bob's session cookie into the shared
+        # TestClient; restore admin to view the admin page.
+        self.web.cookies.clear()
+        self.web.cookies.set(client_web.SESSION_COOKIE, ADMIN_TOKEN)
         resp = self.web.get("/admin/invites")
         self.assertEqual(resp.status_code, 200)
         body = resp.text
