@@ -1,0 +1,182 @@
+{% extends "base.html.j2" %}
+{% block title %}Account — GamerAI{% endblock %}
+{% block extra_css %}
+<link rel="stylesheet" href="/static/css/account.css">
+{% endblock %}
+
+{% block topbar %}
+<div class="topbar">
+  <div class="brand">GamerAI · account</div>
+  <div class="topbar-actions">
+    <a href="/" class="hide-mobile">← chat</a>
+    {% if me.role == 'admin' %}
+    <a href="/dashboard" class="hide-mobile">admin</a>
+    {% endif %}
+    <a href="/logout">sign out</a>
+  </div>
+</div>
+{% endblock %}
+
+{% block content %}
+<div class="page">
+  {% if flash %}
+  <div class="flash">{{ flash }}</div>
+  {% endif %}
+
+  <section class="card">
+    <h1>Account</h1>
+    <div class="kv">
+      <div class="k">Username</div>
+      <div class="v">{{ me.username or '(not set)' }}</div>
+      <div class="k">Email</div>
+      <div class="v">{{ me.email or '(none)' }}</div>
+      <div class="k">Role</div>
+      <div class="v">{{ me.role }}</div>
+      <div class="k">Tier</div>
+      <div class="v">{{ me.tier }}</div>
+      <div class="k">Daily cap</div>
+      <div class="v">
+        {% if me.daily_quota_tokens is not none %}
+          {{ me.daily_quota_tokens }} tokens/day
+        {% else %}
+          unlimited
+        {% endif %}
+      </div>
+    </div>
+
+    <h2>Change password</h2>
+    <form method="POST" action="/account/password" class="stacked">
+      {% if me.has_password %}
+      <label class="label" for="current_password">Current password</label>
+      <input id="current_password" name="current_password" type="password"
+             autocomplete="current-password" required>
+      {% else %}
+      <input type="hidden" name="current_password" value="">
+      <div class="muted">You don't have a password set yet — pick one below
+        and you'll be able to sign in with your username from now on.</div>
+      {% endif %}
+
+      <label class="label" for="new_password">New password</label>
+      <input id="new_password" name="new_password" type="password"
+             autocomplete="new-password" minlength="8" required>
+
+      <label class="label" for="new_password_confirm">Confirm new password</label>
+      <input id="new_password_confirm" name="new_password_confirm" type="password"
+             autocomplete="new-password" minlength="8" required>
+
+      <button type="submit">Update password</button>
+    </form>
+  </section>
+
+  {% if me.host %}
+  <section class="card">
+    <h2>Your host</h2>
+    <div class="kv">
+      <div class="k">Username</div>
+      <div class="v">{{ me.host.username or '(none)' }}</div>
+      <div class="k">Email</div>
+      <div class="v">{{ me.host.email or '(not shared)' }}</div>
+      <div class="k">Tier</div>
+      <div class="v">{{ me.host.tier }}</div>
+    </div>
+    <p class="muted">
+      Your host vouched for you on the network. They can adjust your
+      daily cap or revoke your access. Email-based password reset is on
+      hold until we wire up an email service — for now, pick a password
+      you'll remember.
+    </p>
+  </section>
+  {% endif %}
+
+  <section class="card">
+    <h2>Friends</h2>
+    {% if can_invite %}
+    <p class="muted">People you've invited. Copy an open invite link to
+      share with someone over your preferred channel — we don't send
+      emails yet.</p>
+
+    <form method="POST" action="/account/invites" class="inline-form">
+      <label class="label" for="invitee_email">Email (optional, helps you recognize them)</label>
+      <input id="invitee_email" name="invitee_email" type="email" placeholder="friend@example.com">
+      <label class="label" for="daily_quota_tokens">Daily cap (tokens; blank = unlimited)</label>
+      <input id="daily_quota_tokens" name="daily_quota_tokens" type="number" min="0">
+      <label class="label" for="expires_hours">Expires in (hours; blank = never)</label>
+      <input id="expires_hours" name="expires_hours" type="number" min="0" step="0.5">
+      <button type="submit">Create invite</button>
+    </form>
+
+    {% if friends.open_invites %}
+    <h3>Open invites</h3>
+    <table class="friends-table">
+      <thead>
+        <tr><th>For</th><th>Cap</th><th>State</th><th>Link</th><th></th></tr>
+      </thead>
+      <tbody>
+        {% for inv in friends.open_invites %}
+        <tr>
+          <td>{{ inv.invitee_email or '—' }}</td>
+          <td>{% if inv.daily_quota_tokens is not none %}{{ inv.daily_quota_tokens }}{% else %}∞{% endif %}</td>
+          <td>{{ inv.state }}</td>
+          <td>
+            <button class="copy-link" type="button"
+                    data-href="/invite/{{ inv.code }}">copy link</button>
+          </td>
+          <td>
+            {% if inv.state == 'open' %}
+            <form method="POST" action="/account/invites/{{ inv.code }}/revoke" class="inline">
+              <button type="submit" class="danger">revoke</button>
+            </form>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+
+    {% if friends.accepted %}
+    <h3>Accepted invitees</h3>
+    <table class="friends-table">
+      <thead>
+        <tr><th>Username</th><th>Email</th><th>Cap</th><th>Tier</th><th>State</th></tr>
+      </thead>
+      <tbody>
+        {% for f in friends.accepted %}
+        <tr>
+          <td>{{ f.username or '(no username)' }}</td>
+          <td>{{ f.email or '—' }}</td>
+          <td>{% if f.daily_quota_tokens is not none %}{{ f.daily_quota_tokens }}{% else %}∞{% endif %}</td>
+          <td>{{ f.tier }}</td>
+          <td>{% if f.revoked_at %}revoked{% else %}active{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+
+    {% if not friends.open_invites and not friends.accepted %}
+    <p class="muted">No invites yet. Use the form above to send one.</p>
+    {% endif %}
+    {% else %}
+    <p class="muted">
+      Inviting friends is a host privilege. Run a GamerAI agent to
+      become a host and unlock invite slots when the tier engine ships
+      (Phase 3b.i — see roadmap).
+    </p>
+    {% endif %}
+  </section>
+
+  <section class="card">
+    <h2>This PC</h2>
+    <p class="muted">
+      Agent pairing isn't wired up yet — when it lands, the agent
+      you've installed will show up here with its last-seen time and
+      an "unpair" button.
+    </p>
+  </section>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script src="/static/js/account.js"></script>
+{% endblock %}

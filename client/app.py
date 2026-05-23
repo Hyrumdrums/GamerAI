@@ -25,7 +25,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
-from client.routes import admin_ui, api, auth, chat, invites
+from client.routes import account, admin_ui, api, auth, chat, invites
 
 app = FastAPI(title="GamerAI Web UI")
 
@@ -41,5 +41,6 @@ if _STATIC_DIR.is_dir():
 app.include_router(auth.router)
 app.include_router(chat.router)
 app.include_router(invites.router)
+app.include_router(account.router)
 app.include_router(admin_ui.router)
 app.include_router(api.router)

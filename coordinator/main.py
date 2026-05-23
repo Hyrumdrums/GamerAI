@@ -2798,6 +2798,25 @@ def workers():
     return {"workers": out}
 
 
+def _host_summary(parent_member_id: Optional[str]) -> Optional[dict]:
+    """Display-safe summary of an invitee's host. Returns None when
+    there's no parent (admin and root contributors). The summary is the
+    only PII reveal here and matches what the redemption page already
+    shows the invitee at signup."""
+    if parent_member_id is None:
+        return None
+    row = db.get_member(parent_member_id)
+    if row is None:
+        return None
+    keys = row.keys()
+    return {
+        "member_id": row["member_id"],
+        "username": row["username"] if "username" in keys else None,
+        "email": row["email"],
+        "tier": row["tier"],
+    }
+
+
 @app.get("/me")
 def me(request: Request):
     """Identity + quota for the caller. When auth is disabled (no API_TOKEN
@@ -2813,6 +2832,7 @@ def me(request: Request):
         "email": member.email,
         "role": member.role,
         "parent_member_id": member.parent_member_id,
+        "host": _host_summary(member.parent_member_id),
         "tier": member.tier,
         "daily_quota_tokens": member.daily_quota_tokens,
         "username": member.username,
@@ -2826,6 +2846,58 @@ def me(request: Request):
             "needs_reaccept": member.tos_version != TOS_VERSION,
         },
     }
+
+
+@app.get("/me/friends")
+def my_friends(request: Request):
+    """Account-page Friends section: everyone the caller has invited.
+    Combines the open/expired/revoked invite list (not yet claimed) with
+    the accepted-member list (claimed). One round trip serves both
+    states so the UI doesn't have to stitch them.
+
+    Restricted to authenticated callers. The data is the caller's own
+    sub-tree; nothing leaks across members."""
+    member = getattr(request.state, "member", None)
+    if member is None:
+        if not AUTH_ENABLED:
+            # Dev mode without API_TOKEN — return empty so the UI can
+            # render without special-casing.
+            return {"open_invites": [], "accepted": []}
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+    now = time.time()
+    invites = db.list_invites_by_contributor(member.member_id)
+    open_invites = []
+    for r in invites:
+        state = _invite_state(r, now)
+        if state in ("accepted",):
+            continue
+        open_invites.append({
+            "code": r["code"],
+            "state": state,
+            "daily_quota_tokens": r["daily_quota_tokens"],
+            "invitee_email": r["invitee_email"],
+            "expires_at": r["expires_at"],
+            "created_at": r["created_at"],
+        })
+
+    accepted = []
+    for row in db.list_members():
+        if row["parent_member_id"] != member.member_id:
+            continue
+        keys = row.keys()
+        accepted.append({
+            "member_id": row["member_id"],
+            "username": row["username"] if "username" in keys else None,
+            "email": row["email"],
+            "daily_quota_tokens": row["daily_quota_tokens"],
+            "tier": row["tier"],
+            "revoked_at": row["revoked_at"],
+            "created_at": row["created_at"],
+            "last_active_at": row["last_active_at"],
+        })
+
+    return {"open_invites": open_invites, "accepted": accepted}
 
 
 @app.post("/login")

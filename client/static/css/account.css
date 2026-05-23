@@ -1,0 +1,54 @@
+.page { max-width: 720px; }
+.card {
+  background: var(--card-bg, #fff);
+  border: 1px solid var(--border, #e0e0e0);
+  border-radius: var(--radius, 8px);
+  padding: 1.1rem 1.25rem;
+  margin-bottom: 1.25rem;
+}
+.card h1 { margin-top: 0; }
+.card h2 { margin-top: 1.25rem; font-size: 1.1rem; }
+.card h3 { margin-top: 1rem; font-size: 1rem; color: var(--muted, #666); }
+.kv {
+  display: grid;
+  grid-template-columns: minmax(120px, max-content) 1fr;
+  gap: .35rem .9rem;
+  margin-bottom: 1rem;
+}
+.k { color: var(--muted, #666); font-size: .9rem; }
+.v { font-weight: 500; }
+form.stacked .label,
+form.inline-form .label {
+  display: block; margin-top: .5rem; margin-bottom: .25rem;
+  color: var(--muted, #666); font-size: .85rem;
+}
+form.stacked input,
+form.inline-form input {
+  display: block; width: 100%; padding: .4rem .5rem;
+  margin-bottom: .5rem;
+}
+form.inline-form { display: block; margin-bottom: 1rem; }
+form.inline { display: inline; }
+button.danger {
+  background: #fde7e7; color: #8a1f1f;
+  border: 1px solid #e9a4a4;
+}
+button.copy-link {
+  background: transparent; border: 1px solid var(--border, #ccc);
+  padding: .2rem .5rem; font-size: .85rem; cursor: pointer;
+}
+.flash {
+  background: #e8f4ff; border: 1px solid #a7c8ec; color: #1c4a78;
+  border-radius: var(--radius, 8px);
+  padding: .55rem .75rem; margin-bottom: 1rem;
+}
+table.friends-table {
+  width: 100%; border-collapse: collapse; margin: .5rem 0 1rem;
+  font-size: .92rem;
+}
+table.friends-table th,
+table.friends-table td {
+  text-align: left; padding: .35rem .5rem;
+  border-bottom: 1px solid var(--border, #e0e0e0);
+}
+table.friends-table th { color: var(--muted, #666); font-weight: 600; }

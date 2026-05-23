@@ -30,8 +30,9 @@ async function init() {
     const r = await fetch('/api/me');
     if (!r.ok) { location.href = '/login'; return; }
     me = await r.json();
-    document.getElementById('who').textContent =
-      `${me.email || me.member_id || 'signed in'} · ${me.role || 'member'}`;
+    const whoEl = document.getElementById('who');
+    whoEl.textContent = me.username || me.email || me.member_id || 'signed in';
+    whoEl.href = '/account';
     if (me.role === 'admin') {
       document.getElementById('adminlink').hidden = false;
     }

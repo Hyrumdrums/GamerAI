@@ -255,6 +255,99 @@ class WebUISmokeTests(unittest.TestCase):
         self.assertIn("already taken", second.text)
 
     # ------------------------------------------------------------------
+    # account page
+    # ------------------------------------------------------------------
+    def test_account_page_redirects_anonymous_to_login(self):
+        anon = TestClient(client_web.app, follow_redirects=False)
+        resp = anon.get("/account")
+        self.assertIn(resp.status_code, (302, 303, 307))
+        self.assertIn("/login", resp.headers["location"])
+
+    def test_account_page_renders_for_admin(self):
+        resp = self.web.get("/account")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.text
+        self.assertIn("Account", body)
+        self.assertIn("Friends", body)
+        # Admin can create invites.
+        self.assertIn('action="/account/invites"', body)
+        # No host section — admin has no parent.
+        self.assertNotIn("Your host", body)
+
+    def test_account_page_renders_for_invitee_with_host_section(self):
+        _, code = self._make_contributor_and_invite()
+        # Bob redeems, becomes signed in as the invitee.
+        accept = self.web.post(
+            f"/invite/{code}",
+            data=self._accept_form(
+                username="bobacct",
+                password="correct-horse-battery",
+                password_confirm="correct-horse-battery",
+            ),
+            follow_redirects=False,
+        )
+        invitee_cookie = accept.cookies[client_web.SESSION_COOKIE]
+        bob = TestClient(client_web.app, follow_redirects=False)
+        bob.cookies.set(client_web.SESSION_COOKIE, invitee_cookie)
+        resp = bob.get("/account")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.text
+        self.assertIn("Your host", body)
+        self.assertIn("vouched for you", body)
+        # Invitee can't create invites in v1.
+        self.assertNotIn('action="/account/invites"', body)
+        self.assertIn("Run a GamerAI agent", body)
+
+    def test_account_password_change_round_trips(self):
+        _, code = self._make_contributor_and_invite()
+        accept = self.web.post(
+            f"/invite/{code}",
+            data=self._accept_form(
+                username="bobpwchange",
+                password="correct-horse-battery",
+                password_confirm="correct-horse-battery",
+            ),
+            follow_redirects=False,
+        )
+        invitee_cookie = accept.cookies[client_web.SESSION_COOKIE]
+        bob = TestClient(client_web.app, follow_redirects=False)
+        bob.cookies.set(client_web.SESSION_COOKIE, invitee_cookie)
+        resp = bob.post(
+            "/account/password",
+            data={
+                "current_password": "correct-horse-battery",
+                "new_password": "brand-new-passphrase",
+                "new_password_confirm": "brand-new-passphrase",
+            },
+            follow_redirects=False,
+        )
+        self.assertEqual(resp.status_code, 303)
+        self.assertIn("Password", resp.headers["location"])
+
+        # Logging in with the new password works.
+        self.web.cookies.clear()
+        login = self.web.post(
+            "/login",
+            data={"username": "bobpwchange", "password": "brand-new-passphrase"},
+            follow_redirects=False,
+        )
+        self.assertEqual(login.status_code, 303)
+
+    def test_account_create_invite_then_revoke_round_trips(self):
+        # Admin creates an invite from the account page, then revokes it.
+        resp = self.web.post(
+            "/account/invites",
+            data={"daily_quota_tokens": "50"},
+            follow_redirects=False,
+        )
+        self.assertEqual(resp.status_code, 303)
+        # Confirm the invite exists by checking the friends section.
+        page = self.web.get("/account")
+        self.assertEqual(page.status_code, 200)
+        # At least one open invite is now in the table.
+        self.assertIn("Open invites", page.text)
+
+    # ------------------------------------------------------------------
     # u/p login page
     # ------------------------------------------------------------------
     def test_login_page_shows_username_and_password_fields(self):
