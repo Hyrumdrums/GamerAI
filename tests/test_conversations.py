@@ -1579,6 +1579,43 @@ class SearchQueryRewriteTests(_BaseE2E):
         env = json.loads(self.r.lindex("job_queue:search", 0))
         self.assertEqual(env["prompt"], "try again")
 
+    def test_rewrite_envelope_uses_chat_template(self):
+        # The 3B classifier was unreliable when fed the meta-prompt
+        # as a raw /api/generate completion (it'd drift into chat-
+        # style apologies). Switching to /api/chat with system+user
+        # split is what restores it. The envelope must carry a
+        # messages[] array with a system message and a user message
+        # so the worker routes via /api/chat. The legacy `prompt`
+        # field is still populated for backward compat but must NOT
+        # be the load-bearing path.
+        _, t = self._make_member(email="srrwchat@x.com")
+        self._make_search_capable_worker(t)
+        cid = self._seed_conversation_with_one_turn(t)
+        gr = self.client.post(
+            "/generate",
+            json={
+                "prompt": "try again", "tool": "search",
+                "conversation_id": cid,
+            },
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        self.assertEqual(gr.status_code, 200, gr.text)
+        env = json.loads(self.r.lindex("job_queue", 0))
+        # messages[] present with system + user split.
+        self.assertIn("messages", env)
+        roles = [m["role"] for m in env["messages"]]
+        self.assertEqual(roles, ["system", "user"])
+        # System message holds the rules + worked examples (stable).
+        self.assertIn("routing classifier", env["messages"][0]["content"])
+        self.assertIn("HARD RULES", env["messages"][0]["content"])
+        # User message holds the per-call context + the new prompt.
+        self.assertIn("try again", env["messages"][1]["content"])
+        self.assertIn("News A", env["messages"][1]["content"])
+        # Legacy prompt field still set so a pre-chat-template worker
+        # can still run the job (just on /api/generate, which is the
+        # mode we're moving away from).
+        self.assertTrue(env.get("prompt"))
+
     def test_search_with_context_enqueues_rewrite(self):
         # Happy path: conversation has prior context AND a chat-
         # capable worker is online → rewrite chat job is enqueued
@@ -1792,6 +1829,129 @@ class SearchQueryCleanerUnitTests(_BaseE2E):
         self.assertEqual(clean(None, "orig"), "orig")
         # 200-char cap — anything longer is the model writing prose.
         self.assertEqual(clean("x" * 250, "orig"), "orig")
+
+
+class AdminDebugJobEndpointTests(_BaseE2E):
+    """v1.1.28: /admin/debug/job/{job_id} dumps a job's full pipeline
+    state (DB row, JOB_RESULTS payload, pending rewrite linkage,
+    matched rewrite chat job + its parsed decision). Admin-only.
+    Built so the next search-rewrite regression takes minutes to
+    diagnose instead of an SSH-and-dump-SQLite dance."""
+
+    def setUp(self):
+        self.r.delete(
+            "job_queue", "job_queue:search",
+            "search_rewrite_pending", "job_results",
+        )
+
+    def test_non_admin_gets_403(self):
+        _, t = self._make_member(email="dbgnonadmin@x.com")
+        # Insert a job we own so the auth gate, not a 404, is what
+        # rejects.
+        gr = self.client.post(
+            "/generate",
+            json={"prompt": "x", "tool": "chat"},
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        job_id = gr.json()["job_id"]
+        r = self.client.get(
+            f"/admin/debug/job/{job_id}",
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        self.assertEqual(r.status_code, 403)
+
+    def test_unknown_job_returns_404(self):
+        r = self.client.get(
+            "/admin/debug/job/no-such-id",
+            headers=self._admin_headers(),
+        )
+        self.assertEqual(r.status_code, 404)
+
+    def test_admin_sees_full_pipeline_state(self):
+        # End-to-end: a search job triggers a rewrite, rewrite
+        # completes, search dispatches. The admin endpoint should
+        # find the matched rewrite chat job and report its parsed
+        # decision so debugging is one HTTP call away.
+        _, t = self._make_member(email="dbgadmin@x.com")
+        # Worker that satisfies _ensure_live_worker_or_503 + rewrite
+        # availability checks.
+        worker_id = f"wkr-dbg-{uuid.uuid4().hex[:6]}"
+        self.client.post(
+            "/register",
+            json={
+                "worker_id": worker_id,
+                "capabilities": {"tools": ["chat", "search"]},
+            },
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        self.client.post(
+            "/heartbeat", json={"worker_id": worker_id, "status": "idle"},
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        conv = self.client.post(
+            "/conversations", json={},
+            headers={"Authorization": f"Bearer {t}"},
+        ).json()
+        cid = conv["conversation_id"]
+        suffix = uuid.uuid4().hex[:8]
+        self.db.append_message(
+            message_id=f"msg_dbg_{suffix}_u", conversation_id=cid, seq=0,
+            role="user", text="prior topic",
+        )
+        self.db.append_message(
+            message_id=f"msg_dbg_{suffix}_a", conversation_id=cid, seq=1,
+            role="assistant", text="prior assistant response",
+            status="complete",
+        )
+        gr = self.client.post(
+            "/generate",
+            json={
+                "prompt": "follow up?", "tool": "search",
+                "conversation_id": cid,
+            },
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        search_job_id = gr.json()["job_id"]
+        # Complete the rewrite job with a usable query.
+        self.r.lpop("job_queue")
+        rewrite_job_id = list(
+            self.r.hgetall("search_rewrite_pending").keys()
+        )[0]
+        claim = self.client.post(
+            "/jobs/claim",
+            json={"worker_id": worker_id, "job_id": rewrite_job_id},
+            headers=self._admin_headers(),
+        )
+        self.client.post(
+            "/jobs/complete",
+            json={
+                "worker_id": worker_id, "job_id": rewrite_job_id,
+                "text": "prior topic latest update",
+                "model": "llama3.2:1b",
+                "prompt_tokens": 100, "completion_tokens": 4,
+                "duration_seconds": 0.5, "status": "complete",
+                "claim_token": claim.json()["claim_token"],
+            },
+            headers=self._admin_headers(),
+        )
+        # Admin pulls the debug record.
+        d = self.client.get(
+            f"/admin/debug/job/{search_job_id}",
+            headers=self._admin_headers(),
+        )
+        self.assertEqual(d.status_code, 200, d.text)
+        body = d.json()
+        # Search job dict.
+        self.assertEqual(body["job"]["job_id"], search_job_id)
+        self.assertEqual(body["job"]["tool"], "search")
+        # Matched rewrite chat job, with its parsed decision.
+        self.assertIsNotNone(body["rewrite_job"], body)
+        self.assertEqual(body["rewrite_job"]["job_id"], rewrite_job_id)
+        self.assertEqual(body["rewrite_parsed"]["decision"], "query")
+        self.assertIn(
+            "prior topic latest update",
+            body["rewrite_parsed"]["value"],
+        )
 
 
 class SearchRewriteParserTests(_BaseE2E):

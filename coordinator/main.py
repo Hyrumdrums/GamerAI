@@ -69,6 +69,34 @@ from shared.models import (
 
 # ---------- structured logging ----------
 class JsonFormatter(logging.Formatter):
+    # Allowlist of extras that get pulled out of log records and into
+    # the JSON line. Add a key here when you want a new structured
+    # field to survive into the prod logs — without this, `extra=`
+    # values are silently dropped by Python's logging module. Keep
+    # the list short: large payloads (e.g. full prompts) should be
+    # truncated at the callsite, not here.
+    _EXTRAS = (
+        "job_id",
+        "worker_id",
+        "event",
+        # Search-rewrite debug fields. Added 2026-05-23 after a
+        # diagnosis cycle required SSHing into prod and dumping the
+        # SQLite jobs table to see what the classifier was outputting.
+        "rewrite_job_id",
+        "search_job_id",
+        "original_prompt",
+        "rewrite_output",
+        "decision",
+        "parsed_value",
+        "final_query",
+        "rewrite_was_used",
+        "history_chars",
+        "search_status",
+        "image_job_id",
+        "image_status",
+        "error",
+    )
+
     def format(self, record: logging.LogRecord) -> str:
         payload = {
             "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
@@ -77,7 +105,7 @@ class JsonFormatter(logging.Formatter):
             "logger": record.name,
             "message": record.getMessage(),
         }
-        for k in ("job_id", "worker_id", "event"):
+        for k in self._EXTRAS:
             v = getattr(record, k, None)
             if v is not None:
                 payload[k] = v
@@ -453,99 +481,91 @@ def _dispatch_image_after_rewrite(
         r.hdel(IMAGE_REWRITE_PENDING, rewrite_job_id)
 
 
-def _build_search_query_meta_prompt(history: str, user_prompt: str) -> str:
-    """Meta-prompt: small chat model reads recent conversation + the
-    new user message and emits EITHER a focused search query OR the
-    literal sentinel ``NO_SEARCH`` when the user has clearly closed
-    the search thread.
+def _build_search_query_meta_prompt(history: str, user_prompt: str) -> tuple[str, str]:
+    """Return ``(system_message, user_message)`` for the routing
+    classifier. We feed Ollama via /api/chat (messages[]) instead of
+    /api/generate (raw prompt) so the small chat model's instruction-
+    tuning chat template kicks in and the model treats this as
+    "follow instructions" instead of "continue text".
+
+    The drift from /api/generate was killing reliability — manual
+    testing of "for sure it's happening?" / "really?" / "For sure?"
+    on three consecutive turns produced three different failure
+    modes (NO_SEARCH sentinel for the wrong reason, panic recant
+    text, and a verbatim echo of the user prompt) when the same
+    instructions were sent as a single completion prompt. Splitting
+    rules+examples into the system slot and the per-call data into
+    the user slot is the standard fix.
 
     Examples that motivated the design:
     - User: "news"           → "today's top news headlines"
     - User: "try again"      + prior news topic → "different recent news event"
     - User: "That's cool!"   + prior Boring Co topic → NO_SEARCH
     - User: "thanks!"        + any context       → NO_SEARCH
-
-    Same intent-reading shape as the image rewriter so a 1-3B model
-    can handle it."""
-    return (
-        "You're a routing classifier for a web-search assistant. The "
-        "user has SEARCH MODE on. For each new user message, decide "
-        "whether it actually needs a fresh web search, and if so, "
-        "craft a focused query.\n\n"
+    - User: "for sure?"      + prior project topic → "<project> confirmed"
+    """
+    system = (
+        "You are a STRICT routing classifier for a web-search "
+        "assistant. Your ONLY job is to output one of two things:\n"
+        "  (a) the literal token NO_SEARCH, or\n"
+        "  (b) a short web-search query (3-8 keywords).\n"
+        "Nothing else. No explanations. No apologies. No prose. No "
+        "quoted answers to the user. You are not the user-facing "
+        "assistant — you are a classifier whose output goes into a "
+        "search engine.\n\n"
+        "HARD RULES (apply FIRST):\n"
+        "  1. If the new user message contains \"?\" → output a "
+        "query. NEVER NO_SEARCH.\n"
+        "  2. If the new user message expresses doubt, verification, "
+        "or asks for confirmation → output a query. NEVER NO_SEARCH.\n"
+        "  3. Default is QUERY. Only output NO_SEARCH for a pure ack "
+        "with NO question and NO doubt.\n\n"
+        "QUERY CRAFT:\n"
+        "- Fragment that depends on prior context: use the prior "
+        "topic to fill in the missing subject.\n"
+        "- Standalone topic: tighten into keywords. Drop conversational "
+        "filler.\n"
+        "- Latest/newest? Add \"today\" / \"latest\" / the current year.\n"
+        "- 3-8 keywords. No quotes. No labels.\n\n"
+        "WORKED EXAMPLES:\n\n"
+        "Example 1 — verification of a prior topic:\n"
+        "  RECENT CONVERSATION:\n"
+        "  User: Kevin O'Leary Utah data center news\n"
+        "  Assistant: A $70B project has been announced...\n"
+        "  NEW USER MESSAGE: for sure it's happening?\n"
+        "  OUTPUT: kevin oleary utah data center confirmed status\n\n"
+        "Example 2 — short doubt:\n"
+        "  RECENT CONVERSATION:\n"
+        "  User: SVB collapse rundown\n"
+        "  Assistant: Silicon Valley Bank failed in March 2023...\n"
+        "  NEW USER MESSAGE: really?\n"
+        "  OUTPUT: SVB silicon valley bank collapse confirmed\n\n"
+        "Example 3 — pure ack:\n"
+        "  RECENT CONVERSATION:\n"
+        "  User: NBA scores yesterday\n"
+        "  Assistant: Lakers beat the Suns 110-102...\n"
+        "  NEW USER MESSAGE: thanks!\n"
+        "  OUTPUT: NO_SEARCH\n\n"
+        "Example 4 — drill-in:\n"
+        "  RECENT CONVERSATION:\n"
+        "  User: banking news today\n"
+        "  Assistant: Major US banks reported earnings...\n"
+        "  NEW USER MESSAGE: what about Europe?\n"
+        "  OUTPUT: european banking news today\n\n"
+        "Example 5 — verification with question mark:\n"
+        "  RECENT CONVERSATION:\n"
+        "  User: latest iPhone\n"
+        "  Assistant: The iPhone 17 was released...\n"
+        "  NEW USER MESSAGE: are you sure that's the latest?\n"
+        "  OUTPUT: latest iPhone model 2026\n"
+    )
+    user = (
         "RECENT CONVERSATION:\n"
         f"{history}\n\n"
         f"NEW USER MESSAGE: {user_prompt}\n\n"
-        "HARD RULES (check these FIRST, before anything else):\n"
-        "  - If the new message contains a question mark \"?\", you "
-        "MUST output a query. NEVER NO_SEARCH. No exceptions.\n"
-        "  - If the new message expresses doubt or asks for "
-        "verification, output a query. NEVER NO_SEARCH.\n"
-        "\n"
-        "WORKED EXAMPLES (study these — the model that came before "
-        "you kept misclassifying these and we keep getting bug "
-        "reports):\n"
-        "\n"
-        "  History: User asked about Kevin O'Leary's Utah data center;\n"
-        "    assistant answered with project details.\n"
-        "  New message: \"for sure it's happening?\"\n"
-        "  Decision: QUERY (user is verifying — search for confirmation)\n"
-        "  Output: kevin oleary utah data center confirmed status\n"
-        "\n"
-        "  History: User asked about SVB collapse; assistant gave a\n"
-        "    rundown.\n"
-        "  New message: \"really?\"\n"
-        "  Decision: QUERY (verification, not a closure)\n"
-        "  Output: SVB silicon valley bank collapse confirmed\n"
-        "\n"
-        "  History: User asked about the latest iPhone; assistant\n"
-        "    described it.\n"
-        "  New message: \"are you sure that's the latest?\"\n"
-        "  Decision: QUERY (verification with a question mark)\n"
-        "  Output: latest iPhone model 2026\n"
-        "\n"
-        "  History: User asked about NBA scores; assistant answered.\n"
-        "  New message: \"thanks!\"\n"
-        "  Decision: NO_SEARCH (flat ack, no question, no doubt)\n"
-        "  Output: NO_SEARCH\n"
-        "\n"
-        "  History: User asked about banking news; assistant answered.\n"
-        "  New message: \"what about Europe?\"\n"
-        "  Decision: QUERY (drill-in follow-up)\n"
-        "  Output: european banking news today\n"
-        "\n"
-        "Default is QUERY — most messages in search mode want a "
-        "search. Only output NO_SEARCH when the message is a pure "
-        "acknowledgment with no question, no doubt, and no request "
-        "for more information.\n\n"
-        "Categories:\n"
-        "A. NO_SEARCH (rare). Flat acks with nothing else:\n"
-        "   \"thanks\", \"thanks!\", \"ok\", \"got it\", \"cool\", "
-        "\"interesting\", \"nice\", \"wow\", \"haha\", \"sounds good\".\n"
-        "B. QUERY (default). Everything else, including:\n"
-        "   - Verification: \"for sure?\", \"really?\", \"are you "
-        "sure?\", \"is that right?\", \"is it though?\", \"actually?\". "
-        "These are the OPPOSITE of NO_SEARCH.\n"
-        "   - Drill-in: \"tell me more\", \"more examples?\", \"any "
-        "specifics?\", \"go deeper\".\n"
-        "   - Follow-up: \"what about Europe?\", \"try again\", \"and "
-        "the cost?\", \"the timeline?\".\n"
-        "   - Any standalone topic: \"SVB collapse 2023\", \"latest "
-        "iPhone reviews\".\n\n"
-        "Query craft rules (only after you've decided to QUERY):\n"
-        "  1. Fragment depending on context: use the prior topic to "
-        "fill in the subject (see worked examples above).\n"
-        "  2. Clear standalone question or topic: tighten into "
-        "keywords. Drop \"can you tell me\" / \"I'm curious about\".\n"
-        "  3. Latest/newest? Add \"today\", \"latest\", or the "
-        "current year. Don't invent a specific date.\n"
-        "  4. Keep it SHORT (typically 3-8 words).\n\n"
-        "Output format:\n"
-        "- One line.\n"
-        "- Either the literal token NO_SEARCH or the query itself.\n"
-        "- No quotes around the query. No labels like \"Query:\" / "
-        "\"Search:\". No commentary.\n\n"
         "OUTPUT:"
     )
+    return (system, user)
 
 
 # Sentinel returned by _parse_search_rewrite_output when the classifier
@@ -603,16 +623,32 @@ def _enqueue_chat_rewrite_for_search(
     knows which dispatcher to call without inspecting the original
     job's tool field."""
     rewrite_job_id = str(uuid.uuid4())
-    meta_prompt = _build_search_query_meta_prompt(history, original_prompt)
+    system_msg, user_msg = _build_search_query_meta_prompt(
+        history, original_prompt,
+    )
+    # The worker prefers messages[] when present (routes to Ollama
+    # /api/chat with the model's chat template applied) and falls
+    # back to `prompt` for legacy clients / single-shot generations.
+    # Both fields are populated for backward-compatibility, but the
+    # chat path is the load-bearing one — without the chat template,
+    # a 3B model treats this as "continue text" and produces weird
+    # output (panic recants, verbatim echoes, etc.). The persisted
+    # DB row stores the concatenated text as the canonical prompt
+    # for ledger / admin debug purposes.
+    persisted_prompt = system_msg + "\n\n---\n\n" + user_msg
     rewrite_envelope = {
         "job_id": rewrite_job_id,
-        "prompt": meta_prompt,
+        "prompt": user_msg,  # legacy fallback only
+        "messages": [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ],
         "submitted_at": submitted_at,
         "tool": "chat",
     }
     db.insert_job(
         rewrite_job_id,
-        meta_prompt,
+        persisted_prompt,
         None,
         submitted_at,
         submitted_by,
@@ -635,6 +671,10 @@ def _enqueue_chat_rewrite_for_search(
             "event": "search_rewrite_enqueued",
             "rewrite_job_id": rewrite_job_id,
             "search_job_id": search_job_id,
+            # Content logging — without these, diagnosis required
+            # SSHing into prod and dumping the SQLite jobs table.
+            "original_prompt": (original_prompt or "")[:200],
+            "history_chars": len(history or ""),
         },
     )
     return rewrite_job_id
@@ -737,6 +777,23 @@ def _dispatch_search_after_rewrite(
             return
 
         decision, value = _parse_search_rewrite_output(rewritten_text)
+        # Always log the raw rewrite output + parsed decision so any
+        # future regression is diagnosable from logs alone — the prior
+        # Kevin O'Leary bug required SSHing into prod and dumping the
+        # SQLite jobs table to figure out the classifier was
+        # producing panic recants instead of NO_SEARCH or a query.
+        log.info(
+            "search rewrite parsed",
+            extra={
+                "event": "search_rewrite_parsed",
+                "rewrite_job_id": rewrite_job_id,
+                "search_job_id": search_job_id,
+                "original_prompt": (original or "")[:200],
+                "rewrite_output": (rewritten_text or "")[:200],
+                "decision": decision,
+                "parsed_value": (value or "")[:200] if value else None,
+            },
+        )
 
         # Hard guardrail: a question is never a closure. If the user's
         # original prompt contains a "?", we ignore a SKIP decision
@@ -753,6 +810,7 @@ def _dispatch_search_after_rewrite(
                     "event": "search_rewrite_skip_overridden",
                     "rewrite_job_id": rewrite_job_id,
                     "search_job_id": search_job_id,
+                    "original_prompt": (original or "")[:200],
                 },
             )
             decision = "error"  # fall through to original-prompt path
@@ -792,6 +850,7 @@ def _dispatch_search_after_rewrite(
                     "event": "search_rewrite_classified_skip",
                     "rewrite_job_id": rewrite_job_id,
                     "search_job_id": search_job_id,
+                    "original_prompt": (original or "")[:200],
                 },
             )
             return
@@ -811,6 +870,9 @@ def _dispatch_search_after_rewrite(
                 "rewrite_job_id": rewrite_job_id,
                 "search_job_id": search_job_id,
                 "rewrite_was_used": final_query != original,
+                "original_prompt": (original or "")[:200],
+                "final_query": (final_query or "")[:200],
+                "decision": decision,
             },
         )
     finally:
@@ -3245,6 +3307,116 @@ def revoke_invite(code: str, request: Request):
 
 
 # ---------- admin ----------
+@app.get("/admin/debug/job/{job_id}")
+def admin_debug_job(job_id: str, request: Request):
+    """Admin-only: dump everything we know about a job's pipeline
+    state, especially for search-rewrite debugging. Returns:
+
+    - The DB job row (prompt, status, tool, result, etc.)
+    - For a search job: any associated rewrite chat job — its own DB
+      row + the parser decision (re-parsed from the stored output so
+      we don't have to ship the dispatcher's runtime decision through
+      another channel).
+    - JOB_RESULTS payload (sources, search_was_skipped, image_path)
+    - Any live pending-rewrite linkage (still in flight)
+    - The Redis claim / processing state
+
+    Built to make ANOTHER debug cycle for search regressions take
+    minutes instead of the SSH-and-dump-SQLite dance that diagnosed
+    the prior Kevin-O'Leary panic-recant bug."""
+    member = getattr(request.state, "member", None)
+    if AUTH_ENABLED and (member is None or member.role != "admin"):
+        raise HTTPException(status_code=403, detail="admin only")
+
+    job_row = db.get_job(job_id)
+    if job_row is None:
+        raise HTTPException(status_code=404, detail="job not found")
+
+    def _row_to_dict(row):
+        if row is None:
+            return None
+        return {k: row[k] for k in row.keys()}
+
+    job_dict = _row_to_dict(job_row)
+
+    # JOB_RESULTS — the final Redis payload the polling client reads.
+    results_raw = r.hget(JOB_RESULTS, job_id)
+    results_payload = None
+    if results_raw:
+        try:
+            results_payload = json.loads(results_raw)
+        except json.JSONDecodeError:
+            results_payload = {"_raw": results_raw}
+
+    # Find the rewrite chat job linked to this search/image, if any.
+    # The linkage hash stores rewrite_job_id → {search_job_id|image_
+    # job_id, envelope, original}; we scan for an entry where the
+    # target job_id matches. Small hash (a few entries at most), so
+    # O(n) is fine.
+    pending_rewrite_link = None
+    for hash_key in (SEARCH_REWRITE_PENDING, IMAGE_REWRITE_PENDING):
+        for rid, link_raw in (r.hgetall(hash_key) or {}).items():
+            try:
+                link = json.loads(link_raw)
+            except json.JSONDecodeError:
+                continue
+            target_id = link.get("search_job_id") or link.get("image_job_id")
+            if target_id == job_id:
+                pending_rewrite_link = {
+                    "kind": hash_key,
+                    "rewrite_job_id": rid,
+                    "original_prompt": link.get("original_prompt"),
+                }
+                break
+        if pending_rewrite_link:
+            break
+
+    # Find the COMPLETED rewrite chat job that produced this search
+    # job's current prompt. We don't store the linkage long-term
+    # (it's deleted from SEARCH_REWRITE_PENDING after dispatch), so
+    # this is a best-effort search through recent chat jobs that
+    # have this job's conversation context. For now we just look up
+    # the immediate prior rewrite-shaped chat job from the same
+    # submission window.
+    rewrite_job_dict = None
+    rewrite_parsed = None
+    if job_row["tool"] == "search":
+        # Heuristic: a rewrite chat job submitted within 2s of this
+        # search by the same submitter, with the meta-prompt
+        # signature in its prompt field. Cheap and deterministic
+        # for the recent-history case the user actually wants to
+        # debug. We dip directly into the DB connection since this
+        # query exists only for the debug surface; not worth a
+        # promoted db.* method.
+        rows = db._conn.execute(
+            "SELECT * FROM jobs WHERE submitted_by_member_id IS ? "
+            "AND tool = 'chat' AND submitted_at BETWEEN ? AND ? "
+            "ORDER BY submitted_at DESC LIMIT 8",
+            (
+                job_row["submitted_by_member_id"],
+                job_row["submitted_at"] - 2.0,
+                job_row["submitted_at"] + 2.0,
+            ),
+        ).fetchall()
+        for c in rows:
+            prompt = c["prompt"] or ""
+            if "routing classifier" in prompt:
+                rewrite_job_dict = _row_to_dict(c)
+                rewrite_parsed = _parse_search_rewrite_output(c["result"])
+                break
+
+    return {
+        "job": job_dict,
+        "job_results": results_payload,
+        "pending_rewrite_link": pending_rewrite_link,
+        "rewrite_job": rewrite_job_dict,
+        "rewrite_parsed": (
+            {"decision": rewrite_parsed[0], "value": rewrite_parsed[1]}
+            if rewrite_parsed else None
+        ),
+    }
+
+
 @app.get("/admin/members")
 def admin_list_members(request: Request):
     """Admin-only roster. Returns enough to manage the network: id,
