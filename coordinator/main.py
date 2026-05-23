@@ -220,16 +220,23 @@ _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 # without the docker layer) so the rest of the code path is unaffected.
 _NSFW_THRESHOLD = float(os.getenv("NSFW_THRESHOLD", "0.5"))
 _NSFW_BLOCKED_CLASSES = frozenset({
-    # NudeNet v3 class names — the explicit-anatomy detections we
-    # categorically refuse. Suggestive-but-clothed categories
-    # ("FEMALE_BREAST_COVERED", "BUTTOCKS_COVERED", "BELLY_EXPOSED")
-    # are deliberately NOT in this set — the system is allowed to
-    # render swimsuits and bare midriffs.
+    # NudeNet v3 class names. The bar here is "family-friendly" — a
+    # 6-year-old should be able to look over the requester's shoulder
+    # without surprises. That means we go past the just-genitalia
+    # set into shirtlessness and bare-midriff territory:
     "FEMALE_BREAST_EXPOSED",
     "FEMALE_GENITALIA_EXPOSED",
     "MALE_GENITALIA_EXPOSED",
     "BUTTOCKS_EXPOSED",
     "ANUS_EXPOSED",
+    "MALE_BREAST_EXPOSED",   # shirtless males — not family-friendly default
+    "BELLY_EXPOSED",         # bare midriff / crop-top — same standard
+    # COVERED variants (FEMALE_BREAST_COVERED, BUTTOCKS_COVERED, etc.)
+    # are deliberately NOT in the block set. NudeNet fires those on
+    # any clothed body part visible through fabric — adding them
+    # would block ~80% of normal pictures of people. Other EXPOSED
+    # categories (FEET_EXPOSED, ARMPITS_EXPOSED) are normal family
+    # content (sandals, sleeveless shirts) and stay permitted.
 })
 _nudenet_detector = None  # lazy-loaded singleton
 _nudenet_load_attempted = False
