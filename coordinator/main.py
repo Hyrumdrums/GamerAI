@@ -1314,24 +1314,68 @@ def _issue_claim(worker_id: str, job_id: str, original: Optional[dict]) -> tuple
     return claim_token, deadline
 
 
+# Upper bound for /jobs/next long-poll wait time, enforced server-side
+# so a misconfigured worker can't pin a coordinator request thread for
+# minutes. Caddy's reverse-proxy has generous default timeouts but we
+# don't want to depend on that — 30s also keeps the response window
+# inside any aggressive intermediate proxy / load balancer defaults.
+MAX_LONGPOLL_SECONDS = 30.0
+
+
 @app.post("/jobs/next")
 def next_job(req: JobNextRequest, request: Request):
-    """HTTP-only job pickup for remote agents (e.g. the Windows gamer install).
-    Pops one job from the per-tool queue, atomically issues a claim, and
-    returns both the job and the ``claim_token`` the worker must echo
-    back on /jobs/complete and /jobs/partial. Folding claim into the
-    pickup means there is no in-between state where a job is popped but
+    """HTTP job pickup for remote agents (e.g. the Windows gamer install).
+    Pops one job, atomically issues a claim, and returns both the job
+    and the ``claim_token`` the worker must echo back on subsequent
+    /jobs/complete and /jobs/partial. Folding claim into the pickup
+    means there is no in-between state where a job is popped but
     unclaimed.
 
-    ``tool`` defaults to "chat" so legacy agents (no tool field in their
-    /jobs/next body) keep pulling chat jobs. Image-capable agents call
-    with tool="image" so they don't accidentally drain the chat queue
-    and stall it for the chat-only workers."""
+    ``wait > 0`` switches the handler to long-poll mode (BLPOP). The
+    worker call blocks for up to ``wait`` seconds (capped at
+    MAX_LONGPOLL_SECONDS) until a job lands on any of the requested
+    queues, then returns immediately. This drops job-dispatch latency
+    from "0-5s polling gap" to "one network round-trip" — the worker
+    is already blocking on Redis when /generate enqueues, and BLPOP
+    wakes it up the moment the LPUSH completes.
+
+    ``tools=[...]`` lets a multi-tool worker BLPOP across both chat
+    and image queues in one call. Legacy single-tool agents (and the
+    in-VPS worker.py) pass ``tool=X`` and ``wait=0`` and get the
+    classic immediate-LPOP behavior unchanged."""
     _require_worker_owner(request, req.worker_id)
-    tool = (req.tool or "chat").lower()
-    raw = r.lpop(job_queue_for(tool))
-    if not raw:
+    # Resolve the queue list. tools (list) wins when provided so a
+    # v1.1.25+ agent's long-poll request takes precedence over its
+    # legacy single-tool field; otherwise fall back to ``tool``.
+    if req.tools:
+        tools = [t.lower() for t in req.tools if t]
+    else:
+        tools = [(req.tool or "chat").lower()]
+    if not tools:
         return {"job": None}
+    queues = [job_queue_for(t) for t in tools]
+
+    wait = max(0.0, min(float(req.wait or 0.0), MAX_LONGPOLL_SECONDS))
+
+    raw: Optional[str] = None
+    if wait > 0:
+        # BLPOP returns (key, value) tuple or None on timeout. With
+        # multiple keys it scans them in argument order and pops from
+        # the first non-empty one — so passing the agent-preferred
+        # queue order (last_tool first, then the rest) preserves the
+        # warm-model affinity the legacy two-LPOP-loop had.
+        result = r.blpop(queues, timeout=int(round(wait)))
+        if not result:
+            return {"job": None}
+        _, raw = result
+    else:
+        for q in queues:
+            raw = r.lpop(q)
+            if raw is not None:
+                break
+        if raw is None:
+            return {"job": None}
+
     try:
         job = json.loads(raw)
     except json.JSONDecodeError:

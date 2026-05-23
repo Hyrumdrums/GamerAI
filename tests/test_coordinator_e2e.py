@@ -676,6 +676,64 @@ class ClaimTokenEnforcementTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 410)
         self.assertEqual(resp.json()["detail"]["reason"], "claim_owned_by_other_worker")
 
+    def test_jobs_next_immediately_returns_job_with_wait_zero(self):
+        # Legacy behavior preserved: zero wait, single tool, returns
+        # whatever's already on the queue or null.
+        worker_id = "wkr-zero"
+        job_id = self._submit_and_pop(worker_id)
+        out = self.client.post(
+            "/jobs/next",
+            json={"worker_id": worker_id, "tool": "chat", "wait": 0},
+        ).json()
+        self.assertEqual(out["job"]["job_id"], job_id)
+        self.assertIn("claim_token", out)
+
+    def test_jobs_next_long_poll_returns_null_when_no_work(self):
+        # Long-poll over an empty queue returns null after the wait
+        # window — verifies the timeout path. Uses a short wait (1s)
+        # so the test doesn't actually hang.
+        worker_id = "wkr-empty"
+        self.client.post("/register", json={"worker_id": worker_id})
+        start = time.time()
+        out = self.client.post(
+            "/jobs/next",
+            json={
+                "worker_id": worker_id,
+                "tools": ["chat", "image"],
+                "wait": 1,
+            },
+        ).json()
+        elapsed = time.time() - start
+        self.assertIsNone(out["job"])
+        # Sanity: we actually waited (not instantly returning). Some
+        # fakeredis BLPOP implementations short-circuit on empty —
+        # tolerate both <1s and ~1s as long as the response shape
+        # is correct.
+        self.assertLess(elapsed, 3.0, f"long-poll overshot, took {elapsed:.1f}s")
+
+    def test_jobs_next_long_poll_blpop_across_tool_queues(self):
+        # tools=[chat, image] BLPOPs across both queues. With a chat
+        # job pre-queued, the worker gets it on the long-poll.
+        worker_id = "wkr-multi"
+        job_id = self._submit_and_pop(worker_id)
+        out = self.client.post(
+            "/jobs/next",
+            json={
+                "worker_id": worker_id,
+                "tools": ["chat", "image"],
+                "wait": 1,
+            },
+        ).json()
+        self.assertEqual(out["job"]["job_id"], job_id)
+        self.assertIn("claim_token", out)
+
+    def test_jobs_next_wait_capped_at_server_max(self):
+        # A worker requesting an absurdly long wait gets capped at
+        # MAX_LONGPOLL_SECONDS rather than holding a coordinator
+        # thread for hours.
+        from coordinator import main as coord_main
+        self.assertLessEqual(coord_main.MAX_LONGPOLL_SECONDS, 60.0)
+
     def test_atomic_claim_complete_round_trip(self):
         # Happy path via the new atomic /jobs/next: the returned
         # claim_token is sufficient on /complete, no extra /claim

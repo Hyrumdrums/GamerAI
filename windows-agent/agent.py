@@ -45,7 +45,7 @@ IS_WINDOWS = platform.system() == "Windows"
 # the moment it starts. The CI-generated version.txt (short-sha +
 # build timestamp) is still what the self-updater diffs against;
 # AGENT_VERSION is just the human-facing label.
-AGENT_VERSION = "1.1.24"
+AGENT_VERSION = "1.1.25"
 
 # ---------------------------------------------------------------------------
 # Idle detection
@@ -1478,6 +1478,16 @@ def setup_logging(headless: bool = False) -> logging.Logger:
 # cadence one-for-one.
 HEARTBEAT_INTERVAL_SECONDS = 5.0
 
+# How long the main loop blocks inside /jobs/next per tick. The
+# background heartbeat thread keeps the worker visible to the
+# coordinator throughout this window, so we're not constrained by
+# WORKER_TIMEOUT_SECONDS. 25s is a balance between (a) holding the
+# coordinator's request thread for a reasonable bound and (b)
+# letting the user-activity check fire often enough that "stop
+# taking new jobs" still happens within ~25s of the user coming
+# back. Capped server-side at MAX_LONGPOLL_SECONDS = 30s.
+LONG_POLL_WAIT_SECONDS = 25.0
+
 
 class Coordinator:
     def __init__(
@@ -1637,31 +1647,43 @@ class Coordinator:
                 pass
 
     # ---------- job lifecycle ----------
-    def next_job(self, tool: str = "chat") -> Optional[dict]:
-        """Pull the next job for *tool*. Defaults to chat for the legacy
-        single-queue path; an image-capable worker calls this twice
-        (chat, then image) per main-loop tick so it serves both queues
-        without starving either.
+    def next_job(
+        self,
+        tool: str = "chat",
+        tools: Optional[list[str]] = None,
+        wait: float = 0.0,
+    ) -> Optional[dict]:
+        """Pull the next job.
 
-        The returned dict (if any) includes a ``claim_token`` minted by
-        the coordinator at pickup; the caller must thread it back to
+        - ``tools=[...] + wait=N`` long-polls (BLPOP) over the listed
+          per-tool queues for up to N seconds, in the order given so
+          the warm-model preference (last_tool first) is preserved.
+          This is the v1.1.25+ default and what cuts dispatch latency
+          from "0-5s polling gap" to "one network round-trip."
+        - ``tool=X + wait=0`` keeps the legacy single-queue zero-wait
+          behavior for callers that want it.
+
+        The returned dict (if any) carries the per-claim token under
+        ``_claim_token`` — the caller must thread it back to
         ``complete`` / ``partial`` / ``abandon`` so a re-dispatched
         job's original worker can't clobber the new claimant's work."""
-        out = self._post(
-            "/jobs/next",
-            {"worker_id": self.worker_id, "tool": tool},
-            timeout=10,
-        )
+        body: dict = {"worker_id": self.worker_id}
+        if tools:
+            body["tools"] = tools
+        else:
+            body["tool"] = tool
+        if wait > 0:
+            body["wait"] = wait
+        # Network timeout: cover the wait window plus a buffer for the
+        # actual request round-trip. With wait=0 the legacy 10s budget
+        # is plenty.
+        network_timeout = wait + 5.0 if wait > 0 else 10.0
+        out = self._post("/jobs/next", body, timeout=network_timeout)
         if not out:
             return None
         job = out.get("job")
         if not job:
             return None
-        # Stash the claim_token on the job dict so process_one can
-        # pluck it out without changing the surrounding flow. The
-        # coordinator's response shape is ``{"job": {...},
-        # "claim_token": "..."}``; we hoist the token onto the job
-        # for easier downstream access.
         token = out.get("claim_token")
         if token:
             job["_claim_token"] = token
@@ -2936,8 +2958,12 @@ def main_loop(
             just_drained_job_id = processed_job_id
         if once and did_work:
             return
-        if not did_work:
-            time.sleep(cfg.polling_interval)
+        # No post-process_one sleep: process_one's long-poll inside
+        # /jobs/next already blocked for LONG_POLL_WAIT_SECONDS when
+        # there was no work, so the next loop tick can dive straight
+        # back in. The user-active branch above still uses
+        # cfg.polling_interval — that's a check cadence, not a wait
+        # for jobs.
 
 
 def _ordered_queues(
@@ -2969,13 +2995,16 @@ def process_one(
 ) -> tuple[bool, Optional[str]]:
     """Pop, claim, run, complete one job. Returns (did_work, job_id).
     The job_id is captured so the main loop can reference it in the
-    next iteration's drain-visibility log line."""
+    next iteration's drain-visibility log line.
+
+    Uses long-poll: the coordinator BLPOPs across the agent's tool
+    queues for LONG_POLL_WAIT_SECONDS, so when /generate enqueues a
+    job we wake up within one network round-trip rather than waiting
+    for the next polling interval. Returns ``(False, None)`` when the
+    window expires with no work — main loop falls through without an
+    additional sleep (the wait already happened)."""
     queue_order = _ordered_queues(tools, state.get("last_tool"))
-    job = None
-    for q in queue_order:
-        job = coord.next_job(tool=q)
-        if job:
-            break
+    job = coord.next_job(tools=queue_order, wait=LONG_POLL_WAIT_SECONDS)
     if not job:
         return False, None
     job_id = job.get("job_id")

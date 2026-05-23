@@ -112,12 +112,28 @@ class JobClaimRequest(BaseModel):
 
 
 class JobNextRequest(BaseModel):
-    """Worker pulls the next job from a queue. ``tool`` selects which
-    per-tool Redis queue to LPOP. Defaults to "chat" so legacy agents
-    (no tool field) keep pulling chat jobs. Image-capable agents call
-    with tool="image" to pull from job_queue:image."""
+    """Worker pulls the next job from a queue.
+
+    Three call shapes, in order of preference:
+
+    1. ``tools=[...] + wait=N`` — long-poll over multiple per-tool
+       queues for up to N seconds via Redis BLPOP. The coordinator
+       returns the first job to land on any of them, or null after
+       the timeout. This is what v1.1.25+ agents use; it drops the
+       job-dispatch latency from 0-5s to ~10ms because the worker is
+       already blocking on Redis when the job is enqueued.
+    2. ``tool=X`` (single) — legacy zero-wait LPOP on one queue.
+       Pre-v1.1.25 agents and the in-VPS mock worker still send this
+       shape; it stays supported so we don't have to flag-day the
+       protocol.
+    3. ``tools=[...]`` with ``wait=0`` — multi-queue immediate try,
+       picks from each queue in list order until one is non-empty.
+       Useful for testing.
+    """
     worker_id: str
     tool: str = "chat"
+    tools: Optional[List[str]] = None
+    wait: float = 0.0
 
 
 class JobCompleteRequest(BaseModel):
