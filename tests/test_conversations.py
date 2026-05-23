@@ -1146,5 +1146,60 @@ class ImagePromptRewriteTests(_BaseE2E):
         self.assertEqual(self.db.get_job(image_job_id)["status"], "cancelled")
 
 
+class RewriteHelperUnitTests(_BaseE2E):
+    """Unit-level tests for the rewrite helpers, in isolation from the
+    /generate + /jobs/complete plumbing. Lives alongside the
+    integration tests because the helpers live in coordinator.main."""
+
+    def test_clean_preserves_multi_sentence_output(self):
+        # sd.cpp does fine with multi-sentence prompts; the cleaner
+        # used to truncate to the first line and threw away the rich
+        # description the intent-aware meta-prompt now asks for.
+        clean = self.coord_main._clean_rewritten_prompt
+        raw = (
+            "A standard-sized can of corn with a brown and tan label.\n"
+            "The label reads Green Giant in bold lettering.\n"
+            "Sitting upright on a store shelf."
+        )
+        out = clean(raw, fallback="orig")
+        self.assertIn("brown and tan label", out)
+        self.assertIn("Green Giant", out)
+        self.assertIn("store shelf", out)
+
+    def test_clean_strips_echoed_headers(self):
+        clean = self.coord_main._clean_rewritten_prompt
+        for header in ("PROMPT:", "FINAL PROMPT:", "Image:", "Rewritten:"):
+            out = clean(f"{header} a red apple", fallback="orig")
+            self.assertEqual(out, "a red apple", f"header={header!r}")
+
+    def test_clean_strips_wrapping_quotes(self):
+        clean = self.coord_main._clean_rewritten_prompt
+        self.assertEqual(
+            clean('"a red apple"', fallback="orig"), "a red apple",
+        )
+
+    def test_clean_falls_back_on_empty_or_oversized(self):
+        clean = self.coord_main._clean_rewritten_prompt
+        self.assertEqual(clean("", "orig"), "orig")
+        self.assertEqual(clean(None, "orig"), "orig")
+        # Over 500 chars → fall back rather than ship a runaway
+        # ramble to sd.cpp.
+        self.assertEqual(clean("x" * 600, "orig"), "orig")
+
+    def test_meta_prompt_carries_intent_rules(self):
+        # The meta-prompt has to teach a 1-3B model how to interpret
+        # follow-ups; the worked examples are the load-bearing part.
+        # Smoke-check that the four intent rules survive future edits.
+        build = self.coord_main._build_rewrite_meta_prompt
+        prompt = build("User: hi\nAssistant: hi", "yes")
+        lower = prompt.lower()
+        self.assertIn("yes", lower)         # rule 1: agreement
+        self.assertIn("make it bigger", lower)  # rule 2: modification
+        self.assertIn("from scratch", lower)    # rule 3: new subject
+        self.assertIn("fragment", lower)        # rule 4: combine fragment
+        self.assertIn("user: hi", lower)        # history is inlined
+        self.assertIn("new user message: yes", lower)  # new request is inlined
+
+
 if __name__ == "__main__":
     unittest.main()

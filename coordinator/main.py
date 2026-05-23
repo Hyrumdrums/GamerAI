@@ -218,39 +218,86 @@ def _format_rewrite_history(prior_messages) -> str:
 
 
 def _build_rewrite_meta_prompt(history: str, user_prompt: str) -> str:
+    # The rewriter has to infer intent, not just splice tokens — the
+    # "Canned corn → 'Yes' → Label Green Giant" failure showed up
+    # because the previous version literally told the model to
+    # "combine" the new request with the prior subject. Real-world
+    # follow-ups are more varied: agreement with a prior assistant
+    # suggestion, redirection, modification, fresh standalone. Each
+    # gets its own paragraph in the instructions plus a worked
+    # example so a 1-3B chat model can actually pick the right move.
     return (
-        "You rewrite image generation prompts using conversation context.\n\n"
-        "CONTEXT (recent turns):\n"
+        "You craft image-generation prompts from conversational context.\n\n"
+        "RECENT CONVERSATION:\n"
         f"{history}\n\n"
-        f"NEW IMAGE REQUEST: {user_prompt}\n\n"
-        "If the new request stands alone (a complete subject), output "
-        "it unchanged. If it's a modification or refinement of a "
-        "previous image request (e.g. \"make it bigger\", "
-        "\"wrapped in bacon\", \"but blue\"), combine it with the "
-        "prior subject to make a complete image prompt.\n\n"
-        "Output ONLY the final image prompt — no preamble, no quotes, "
-        "no explanation. One short sentence.\n\n"
-        "FINAL PROMPT:"
+        f"NEW USER MESSAGE: {user_prompt}\n\n"
+        "Decide what image the user wants, then write a clear visual "
+        "prompt for the image generator. Follow these intent-reading "
+        "rules:\n\n"
+        "1. If the user says \"yes\", \"ok\", \"that one\", \"do it\", "
+        "or similar agreement and the assistant's MOST RECENT message "
+        "contains a visual description or image suggestion: write a "
+        "prompt that captures the SUBSTANCE of that description "
+        "(subject, setting, visible details). Do not just echo a "
+        "short label — pull out the actual visual content the "
+        "assistant described.\n"
+        "2. If the user says something like \"make it bigger\", \"but "
+        "blue\", \"wrapped in bacon\", \"on a beach instead\": that's "
+        "a modification of the most recent image. Combine the prior "
+        "subject with the new detail.\n"
+        "3. If the user describes a NEW subject from scratch (e.g. "
+        "\"a sunset over the ocean\"): use it as-is, ignore prior "
+        "context.\n"
+        "4. If the user gives a fragment that depends on prior "
+        "context (e.g. \"with a label\" after \"canned corn\"): "
+        "combine.\n\n"
+        "Style requirements for your output prompt:\n"
+        "- 1-3 sentences. Be concrete and visual: name the subject, "
+        "the setting, key features, materials, lighting. Length "
+        "should match how much context the user gave you — short "
+        "if they gave little, rich if they gave a lot.\n"
+        "- Skip storytelling, brand disclaimers, refusals, or "
+        "meta-commentary. Just describe the image.\n"
+        "- Do not wrap in quotes. Do not include labels like "
+        "\"PROMPT:\" or \"Image:\". Output the prompt only.\n\n"
+        "PROMPT:"
     )
 
 
 def _clean_rewritten_prompt(raw: Optional[str], fallback: str) -> str:
     """Defensive cleanup on model output: trim, strip wrapping quotes,
-    strip echoed headers, take only the first line, and refuse on
-    suspiciously empty / oversized output by falling back to the
-    original prompt. We'd rather render the user's exact words than a
-    confused model's verbose ramble."""
+    strip echoed headers, collapse internal blank lines, and refuse
+    on suspiciously empty / oversized output by falling back to the
+    original prompt.
+
+    Multi-line output is preserved (sd.cpp accepts multi-sentence
+    prompts and the richer ones produce better images) — the previous
+    first-line-only cut was throwing away the descriptive detail the
+    intent-aware meta-prompt is now asking the model to produce."""
     if not raw:
         return fallback
     s = raw.strip()
-    for header in ("FINAL PROMPT:", "Final prompt:", "Rewritten:", "Output:"):
-        if s.lower().startswith(header.lower()):
-            s = s[len(header):].strip()
+    # Strip any echoed header the model parrots back from the
+    # meta-prompt. Loop so e.g. "PROMPT:\nFINAL PROMPT:" gets fully
+    # peeled.
+    for _ in range(3):
+        stripped = False
+        for header in (
+            "PROMPT:", "FINAL PROMPT:", "Final prompt:",
+            "Rewritten:", "Rewritten prompt:", "Output:",
+            "Image:", "IMAGE PROMPT:",
+        ):
+            if s.lower().startswith(header.lower()):
+                s = s[len(header):].strip()
+                stripped = True
+                break
+        if not stripped:
             break
     if len(s) >= 2 and s[0] == s[-1] and s[0] in ('"', "'"):
         s = s[1:-1].strip()
-    if "\n" in s:
-        s = s.split("\n", 1)[0].strip()
+    # Collapse runs of blank lines but keep paragraph structure —
+    # sd.cpp parses the whole string, not just line one.
+    s = re.sub(r"\n\s*\n+", "\n", s).strip()
     if not s or len(s) > 500:
         return fallback
     return s
