@@ -88,3 +88,8 @@ Type: filesandordirs; Name: "{userappdata}\GamerAI"
 Type: filesandordirs; Name: "{localappdata}\GamerAI"
 Type: files;          Name: "{app}\agent.exe.*"
 Type: files;          Name: "{app}\config.json.bak-*"
+; Best-effort removal of the install dir itself once its files are
+; gone. A locked Explorer handle on %LOCALAPPDATA%\Programs\GamerAI
+; Agent\ has previously left it as a stale empty dir; dirifempty
+; deletes it if no handle is squatting, no-ops otherwise.
+Type: dirifempty;     Name: "{app}"

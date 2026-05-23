@@ -45,7 +45,7 @@ IS_WINDOWS = platform.system() == "Windows"
 # the moment it starts. The CI-generated version.txt (short-sha +
 # build timestamp) is still what the self-updater diffs against;
 # AGENT_VERSION is just the human-facing label.
-AGENT_VERSION = "1.2.0"
+AGENT_VERSION = "1.2.1"
 
 # ---------------------------------------------------------------------------
 # Idle detection
@@ -210,6 +210,68 @@ def _schedule_delayed_hide(hwnd: int, delay_seconds: float = 10.0) -> None:
             pass
     threading.Thread(
         target=_hide_later, name="gamerai-welcome-hide", daemon=True,
+    ).start()
+
+
+def _schedule_post_pair_hide(hwnd: int, log: "logging.Logger | None" = None) -> None:
+    """First-run-after-pairing UX: print "press any key to hide" and
+    block (on a daemon thread) until the user acknowledges, then hide
+    the console. The agent is fully running in the background while
+    we wait — heartbeat, job polling, everything — so the user is
+    looking at a live, reassuring console while they decide they're
+    done watching it.
+
+    Falls back to the welcome-banner-style fixed 30 s delay if msvcrt
+    isn't available (non-Windows dev runs) or if stdin isn't a TTY
+    (output redirected). Either way the console eventually disappears.
+
+    Distinct from _schedule_delayed_hide (post-update welcome banner,
+    fixed 10 s) — this one is interactive and only fires when the user
+    just paired."""
+    if not (IS_WINDOWS and hwnd):
+        return
+
+    def _wait_then_hide():
+        # Give /register + first heartbeat ~3 s to land so the log
+        # lines settle before we print the prompt — otherwise the
+        # "press any key" line scrolls off the top before the user
+        # reads it.
+        time.sleep(3.0)
+        try:
+            sys.stdout.write(
+                "\n"
+                "------------------------------------------------------------\n"
+                "  Pairing complete. Agent is online and serving the network.\n"
+                "  Press any key to send this console to the tray.\n"
+                "  (Right-click the tray icon to bring it back any time.)\n"
+                "------------------------------------------------------------\n"
+            )
+            sys.stdout.flush()
+        except Exception:
+            pass
+        try:
+            import msvcrt  # type: ignore[import-not-found]
+            # Block until a keypress. msvcrt.getch is a blocking read
+            # against the real console buffer, so a hidden console
+            # won't satisfy it — the user has to actually focus this
+            # window and press a key.
+            msvcrt.getch()
+        except Exception:
+            # No msvcrt (dev run on non-Windows) or stdin yanked from
+            # under us — fall back to a longer fixed delay so the
+            # console doesn't linger forever.
+            time.sleep(30.0)
+        try:
+            ctypes.windll.user32.ShowWindow(hwnd, SW_HIDE)
+            if log is not None:
+                log.info("console hidden after first-run pair confirmation")
+        except Exception:
+            pass
+
+    threading.Thread(
+        target=_wait_then_hide,
+        name="gamerai-post-pair-hide",
+        daemon=True,
     ).start()
 
 
@@ -4420,15 +4482,21 @@ def main(argv: Optional[list[str]] = None) -> int:
     coord.start_heartbeat()
 
     # Registration succeeded. If we forcibly unhid the console for the
-    # first-run token prompt, hide it again now and fire a confirmation
-    # toast so the user knows the agent is online.
+    # first-run pairing flow, fire a toast and queue the
+    # press-any-key-to-hide prompt so the user can verify the agent
+    # is alive before sending it to the tray.
+    #
+    # auto_unhidden_for_token is True only when we just paired (the
+    # first-run path), so subsequent agent launches skip this whole
+    # block and go straight to silent tray mode — the existing
+    # default behavior.
     if auto_unhidden_for_token:
         _toast(
             "GamerAI Agent online",
             f"Token saved. Worker {worker_id[:8]}… connected.",
             icon_path=_tray_icon_path(),
         )
-        _hide_console(console_hwnd)
+        _schedule_post_pair_hide(console_hwnd, log)
 
     # Self-update background thread. Runs in BOTH background and
     # foreground modes now — a contributor running agent.exe by
