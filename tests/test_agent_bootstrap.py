@@ -332,5 +332,107 @@ class SearchInferenceTests(unittest.TestCase):
         self.assertEqual(order[0], "search")
 
 
+class SearchBackendRotationTests(unittest.TestCase):
+    """Cover the multi-backend fallback in _ddg_search. The rotation
+    is what gives us the 8× per-contributor capacity multiplier from
+    the project-gaps math; if a regression silently disabled the
+    fallback, we'd hit DDG's rate limit at 1/8 of the documented
+    ceiling without realizing it."""
+
+    def setUp(self):
+        # Cache between tests is process-global; clear so a previous
+        # test's hit doesn't short-circuit the rotation we're verifying.
+        if agent._search_cache is not None:
+            agent._search_cache.clear()
+
+    def _fake_ddgs_with_outcomes(self, outcomes):
+        """Build a fake DDGS class whose .text() returns the next
+        outcome each call. Each outcome is either a list (results)
+        or an Exception (raise it)."""
+        calls = []
+
+        class FakeDDGS:
+            def __init__(self, *a, **kw):
+                pass
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+            def text(self, query, max_results=5, backend=None, **kw):
+                calls.append(backend)
+                outcome = outcomes.pop(0)
+                if isinstance(outcome, Exception):
+                    raise outcome
+                return outcome
+        return FakeDDGS, calls
+
+    def test_falls_through_to_next_backend_on_ratelimit(self):
+        # First backend ratelimited → second succeeds. The function
+        # returns the second backend's results.
+        try:
+            from ddgs.exceptions import RatelimitException
+        except ImportError:
+            RatelimitException = Exception
+        FakeDDGS, calls = self._fake_ddgs_with_outcomes([
+            RatelimitException("ddg blocked"),
+            [{"title": "B", "href": "https://b.com", "body": "ok"}],
+        ])
+        import ddgs as ddgs_mod
+        with mock.patch.object(ddgs_mod, "DDGS", FakeDDGS):
+            hits = agent._ddg_search("anything", max_results=3)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["href"], "https://b.com")
+        # First call went to "duckduckgo"; second backend got tried.
+        self.assertEqual(calls[0], agent._SEARCH_BACKENDS[0])
+        self.assertEqual(calls[1], agent._SEARCH_BACKENDS[1])
+
+    def test_falls_through_on_empty_results(self):
+        # Backend returns empty (e.g. DDG returned 0 hits) → try next.
+        # Not fatal; an empty list is a signal that this backend
+        # doesn't have anything useful, not that all backends failed.
+        FakeDDGS, calls = self._fake_ddgs_with_outcomes([
+            [],
+            [{"title": "C", "href": "https://c.com", "body": "yes"}],
+        ])
+        import ddgs as ddgs_mod
+        with mock.patch.object(ddgs_mod, "DDGS", FakeDDGS):
+            hits = agent._ddg_search("foo", max_results=3)
+        self.assertEqual(hits[0]["href"], "https://c.com")
+        self.assertEqual(len(calls), 2)
+
+    def test_all_backends_fail_reraises_last(self):
+        # If every backend throws, surface the last exception so the
+        # worker's run_search_inference can wrap it as a search-failed
+        # error and the user sees a clear message instead of "no
+        # results."
+        FakeDDGS, calls = self._fake_ddgs_with_outcomes(
+            [Exception(f"backend {b} broken")
+             for b in agent._SEARCH_BACKENDS]
+        )
+        import ddgs as ddgs_mod
+        with mock.patch.object(ddgs_mod, "DDGS", FakeDDGS):
+            with self.assertRaises(Exception) as cm:
+                agent._ddg_search("anything", max_results=3)
+        self.assertIn("broken", str(cm.exception))
+        # Every backend got an attempt.
+        self.assertEqual(len(calls), len(agent._SEARCH_BACKENDS))
+
+    def test_cache_short_circuits_repeat_query(self):
+        # Same (query, max_results) within the TTL window must not
+        # call ddgs again — that's the whole point of the cache.
+        FakeDDGS, calls = self._fake_ddgs_with_outcomes([
+            [{"title": "X", "href": "https://x.com", "body": "ok"}],
+        ])
+        import ddgs as ddgs_mod
+        with mock.patch.object(ddgs_mod, "DDGS", FakeDDGS):
+            agent._ddg_search("popular", max_results=5)
+            # Second call: should hit cache, not the fake DDGS (which
+            # would IndexError because we only queued one outcome).
+            second = agent._ddg_search("popular", max_results=5)
+        self.assertEqual(second[0]["href"], "https://x.com")
+        # Only the first call reached the rotation.
+        self.assertEqual(len(calls), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

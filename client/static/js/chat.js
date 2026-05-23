@@ -606,6 +606,17 @@ async function streamIntoBubble(jobId, wrap, statusEl, startMs, messageId) {
         if (res.sources && res.sources.length) {
           renderSources(wrap, res.sources);
         }
+        // Reverse-detection: if the rewrite classifier decided this
+        // follow-up didn't need a search ("That's cool!" after a news
+        // thread), the server rerouted to plain chat and set
+        // search_was_skipped. Auto-uncheck the box so the next turn
+        // defaults to chat — the user clearly winded down the search
+        // topic and our sticky-mode bet should give up gracefully.
+        if (res.search_was_skipped) {
+          searchCheckbox.checked = false;
+          searchModeByConv.set(currentId, false);
+          refreshComposerUI();
+        }
         if (statusEl && startMs) {
           const dt = ((Date.now() - startMs) / 1000).toFixed(1);
           let label;

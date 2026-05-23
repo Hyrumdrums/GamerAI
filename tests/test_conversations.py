@@ -1750,5 +1750,227 @@ class SearchQueryCleanerUnitTests(_BaseE2E):
         self.assertEqual(clean("x" * 250, "orig"), "orig")
 
 
+class SearchRewriteParserTests(_BaseE2E):
+    """v1.1.28 reverse-detection: _parse_search_rewrite_output decides
+    whether the rewrite chat job output means 'no search needed' or
+    'here's a search query'. The classifier is the load-bearing piece
+    of the reverse-detection feature — if it misfires, the user
+    either keeps getting irrelevant searches (false negative) or
+    loses search mode prematurely (false positive)."""
+
+    def test_no_search_sentinel_classifies_as_skip(self):
+        parse = self.coord_main._parse_search_rewrite_output
+        self.assertEqual(parse("NO_SEARCH")[0], "skip")
+        self.assertEqual(parse(" no_search ")[0], "skip")
+        self.assertEqual(parse("NoSearch")[0], "skip")
+
+    def test_echoed_header_then_no_search_still_skips(self):
+        # A model that helpfully echoes "OUTPUT: NO_SEARCH" must still
+        # classify — the parser strips the header before checking.
+        parse = self.coord_main._parse_search_rewrite_output
+        self.assertEqual(parse("OUTPUT: NO_SEARCH")[0], "skip")
+        self.assertEqual(parse("Output:\nNO_SEARCH")[0], "skip")
+
+    def test_no_search_with_trailing_commentary_still_skips(self):
+        # First-line containment is enough — the rewriter sometimes
+        # adds a trailing reason which we discard.
+        parse = self.coord_main._parse_search_rewrite_output
+        self.assertEqual(
+            parse("NO_SEARCH (user is just thanking)")[0], "skip",
+        )
+
+    def test_a_real_query_classifies_as_query(self):
+        parse = self.coord_main._parse_search_rewrite_output
+        kind, val = parse("recent banking news Europe")
+        self.assertEqual(kind, "query")
+        self.assertEqual(val, "recent banking news Europe")
+
+    def test_empty_or_none_classifies_as_error(self):
+        # The dispatcher uses 'error' to fall back to the original
+        # prompt, never to skip — better to ship a literal search
+        # than silently drop the user's request.
+        parse = self.coord_main._parse_search_rewrite_output
+        self.assertEqual(parse("")[0], "error")
+        self.assertEqual(parse(None)[0], "error")
+
+
+class SearchRewriteSkipDispatchTests(_BaseE2E):
+    """v1.1.28 reverse-detection: when the rewrite chat job emits
+    NO_SEARCH, the dispatcher reroutes the original search job to the
+    chat queue (not the search queue) and sets the SEARCH_AUTO_DISABLED
+    marker so /jobs/complete can signal the client to flip off the
+    sticky search box.
+
+    Motivating user transcript: search mode on, user says 'That's
+    cool!' after a Boring-Company search thread. Current behavior
+    fires another DDG query for 'That's cool!' and returns Aaliyah-
+    song-tier results. Reverse detection drops the search, returns a
+    plain chat reply, and turns the box off for the next turn."""
+
+    def _make_search_capable_worker(self, token: str) -> str:
+        worker_id = f"wkr-sk-{uuid.uuid4().hex[:6]}"
+        self.client.post(
+            "/register",
+            json={
+                "worker_id": worker_id,
+                "capabilities": {"tools": ["chat", "search"]},
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.client.post(
+            "/heartbeat", json={"worker_id": worker_id, "status": "idle"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        return worker_id
+
+    def setUp(self):
+        self.r.delete(
+            "job_queue", "job_queue:search",
+            "search_rewrite_pending", "search_auto_disabled",
+        )
+
+    def _seed_conversation_with_one_turn(self, t: str) -> str:
+        conv = self.client.post(
+            "/conversations", json={},
+            headers={"Authorization": f"Bearer {t}"},
+        ).json()
+        cid = conv["conversation_id"]
+        suffix = uuid.uuid4().hex[:8]
+        self.db.append_message(
+            message_id=f"msg_skipseed_{suffix}_u", conversation_id=cid, seq=0,
+            role="user", text="news on the boring company",
+        )
+        self.db.append_message(
+            message_id=f"msg_skipseed_{suffix}_a", conversation_id=cid, seq=1,
+            role="assistant",
+            text="The Boring Company is...",
+            status="complete",
+        )
+        return cid
+
+    def test_no_search_reroutes_to_chat_queue(self):
+        _, t = self._make_member(email="srskip1@x.com")
+        wid = self._make_search_capable_worker(t)
+        cid = self._seed_conversation_with_one_turn(t)
+        gr = self.client.post(
+            "/generate",
+            json={
+                "prompt": "That's cool!", "tool": "search",
+                "conversation_id": cid,
+            },
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        search_job_id = gr.json()["job_id"]
+        # Pop the rewrite chat job, then complete it with NO_SEARCH.
+        self.r.lpop("job_queue")
+        rewrite_job_id = list(
+            self.r.hgetall("search_rewrite_pending").keys()
+        )[0]
+        claim = self.client.post(
+            "/jobs/claim",
+            json={"worker_id": wid, "job_id": rewrite_job_id},
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        self.client.post(
+            "/jobs/complete",
+            json={
+                "worker_id": wid, "job_id": rewrite_job_id,
+                "text": "NO_SEARCH",
+                "model": "llama3.2:1b",
+                "prompt_tokens": 50, "completion_tokens": 2,
+                "duration_seconds": 0.5, "status": "complete",
+                "claim_token": claim.json()["claim_token"],
+            },
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        # Search queue empty — we DROPPED the search entirely.
+        self.assertEqual(self.r.llen("job_queue:search"), 0)
+        # Chat queue has the rerouted job.
+        self.assertEqual(self.r.llen("job_queue"), 1)
+        rerouted = json.loads(self.r.lindex("job_queue", 0))
+        self.assertEqual(rerouted["tool"], "chat")
+        self.assertEqual(rerouted["prompt"], "That's cool!")
+        # No search-specific fields leaked into the chat envelope.
+        self.assertNotIn("search", rerouted)
+        # Marker present so /jobs/complete can signal the client.
+        self.assertEqual(
+            self.r.hget("search_auto_disabled", search_job_id), "1",
+        )
+        # Search job row flipped out of awaiting_rewrite so /result
+        # doesn't get stuck waiting on a search that's never coming.
+        self.assertEqual(
+            self.db.get_job(search_job_id)["status"], "pending",
+        )
+        # Linkage cleaned up.
+        self.assertEqual(self.r.hlen("search_rewrite_pending"), 0)
+
+    def test_search_was_skipped_surfaces_on_complete(self):
+        # End-to-end: NO_SEARCH → chat worker completes → /result
+        # returns search_was_skipped: true so the client knows to flip
+        # the sticky toggle off.
+        _, t = self._make_member(email="srskip2@x.com")
+        wid = self._make_search_capable_worker(t)
+        cid = self._seed_conversation_with_one_turn(t)
+        gr = self.client.post(
+            "/generate",
+            json={
+                "prompt": "Thanks!", "tool": "search",
+                "conversation_id": cid,
+            },
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        search_job_id = gr.json()["job_id"]
+        # Rewrite returns NO_SEARCH → chat envelope on chat queue.
+        self.r.lpop("job_queue")
+        rewrite_job_id = list(
+            self.r.hgetall("search_rewrite_pending").keys()
+        )[0]
+        claim_r = self.client.post(
+            "/jobs/claim",
+            json={"worker_id": wid, "job_id": rewrite_job_id},
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        self.client.post(
+            "/jobs/complete",
+            json={
+                "worker_id": wid, "job_id": rewrite_job_id,
+                "text": "NO_SEARCH",
+                "model": "llama3.2:1b",
+                "prompt_tokens": 50, "completion_tokens": 2,
+                "duration_seconds": 0.5, "status": "complete",
+                "claim_token": claim_r.json()["claim_token"],
+            },
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        # Now the chat worker picks up the rerouted job.
+        self.r.lpop("job_queue")
+        claim_c = self.client.post(
+            "/jobs/claim",
+            json={"worker_id": wid, "job_id": search_job_id},
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        self.client.post(
+            "/jobs/complete",
+            json={
+                "worker_id": wid, "job_id": search_job_id,
+                "text": "You're welcome!",
+                "model": "llama3.2:1b",
+                "prompt_tokens": 50, "completion_tokens": 3,
+                "duration_seconds": 0.5, "status": "complete",
+                "claim_token": claim_c.json()["claim_token"],
+            },
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        # /result carries the flag for the client.
+        res = self.client.get(
+            f"/result/{search_job_id}",
+            headers={"Authorization": f"Bearer {t}"},
+        ).json()
+        self.assertTrue(res.get("search_was_skipped"))
+        # Marker hash cleaned up after surfacing — second poll of the
+        # same job ID shouldn't keep re-flipping the client's checkbox.
+        self.assertEqual(self.r.hlen("search_auto_disabled"), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

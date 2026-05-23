@@ -17,3 +17,6 @@ pyinstaller==6.10.0
 # Same .text() API as 9.14.4 so the agent code is unchanged.
 ddgs==9.14.3
 trafilatura==2.0.0
+# Tiny in-process TTL cache for duplicate search queries on the same
+# worker. Pure-Python, ~30KB, bundles cleanly into pyinstaller.
+cachetools==5.5.2

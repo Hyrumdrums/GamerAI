@@ -7,3 +7,5 @@ httpx==0.27.2
 # project's httpx==0.27.2 pin (see windows-agent/requirements.txt).
 ddgs==9.14.3
 trafilatura==2.0.0
+# In-process TTL cache for duplicate search queries on the same worker.
+cachetools==5.5.2

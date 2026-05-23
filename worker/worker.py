@@ -267,10 +267,54 @@ SEARCH_PAGE_CHAR_CAP = 2500
 SEARCH_FETCH_TIMEOUT = 6.0
 
 
+# Backend rotation order. ddgs ships several free backends — each has
+# its own rate-limit pool, so falling through on RatelimitException
+# or empty results multiplies per-IP capacity. Same list as the
+# windows-agent so dev/test and prod behave identically.
+_SEARCH_BACKENDS = (
+    "duckduckgo", "mojeek", "brave", "bing", "yahoo", "startpage",
+)
+# In-process TTL cache for duplicate queries on the same worker.
+_SEARCH_CACHE_TTL = 600  # 10 min
+_SEARCH_CACHE_MAX = 512
+try:
+    from cachetools import TTLCache
+    _search_cache: "TTLCache | None" = TTLCache(
+        maxsize=_SEARCH_CACHE_MAX, ttl=_SEARCH_CACHE_TTL,
+    )
+except ImportError:
+    _search_cache = None  # Cache silently disabled.
+
+
 def _ddg_search(query: str, max_results: int = SEARCH_RESULT_COUNT) -> list[dict]:
+    cache_key = (query, max_results)
+    if _search_cache is not None and cache_key in _search_cache:
+        return list(_search_cache[cache_key])
     from ddgs import DDGS
-    with DDGS() as ddg:
-        return ddg.text(query, max_results=max_results) or []
+    try:
+        from ddgs.exceptions import RatelimitException
+    except ImportError:
+        RatelimitException = Exception
+    last_err: Optional[Exception] = None
+    for backend in _SEARCH_BACKENDS:
+        try:
+            with DDGS() as ddg:
+                hits = ddg.text(
+                    query, max_results=max_results, backend=backend,
+                ) or []
+            if hits:
+                if _search_cache is not None:
+                    _search_cache[cache_key] = list(hits)
+                return hits
+        except RatelimitException as e:
+            last_err = e
+            continue
+        except Exception as e:
+            last_err = e
+            continue
+    if last_err is not None:
+        raise last_err
+    return []
 
 
 def _fetch_and_extract(url: str, http: httpx.Client) -> str:

@@ -2678,14 +2678,79 @@ def _search_deps_available(log: logging.Logger) -> bool:
         return False
 
 
+# Backend rotation order. ddgs 9.14.3 ships with eight free backends —
+# each has its own rate-limit pool, so falling through on
+# RatelimitException or an empty result multiplies our per-contributor
+# capacity ~8×. Order matters: cheapest+most-reliable first, exotic
+# last. DuckDuckGo first because that's what the user asked for; the
+# others are de-facto failover.
+_SEARCH_BACKENDS = (
+    "duckduckgo", "mojeek", "brave", "bing", "yahoo", "startpage",
+)
+# In-process TTL cache for search results. A single worker handling
+# back-to-back follow-ups on the same topic ("news on elon" → "what
+# about boring company?" → "more on boring company") shouldn't burn
+# fresh DDG calls when the queries overlap. cachetools is a pure-
+# Python dep (~30KB) that bundles into pyinstaller without fuss.
+_SEARCH_CACHE_TTL = 600  # 10 min
+_SEARCH_CACHE_MAX = 512
+try:
+    from cachetools import TTLCache
+    _search_cache: "TTLCache | None" = TTLCache(
+        maxsize=_SEARCH_CACHE_MAX, ttl=_SEARCH_CACHE_TTL,
+    )
+except ImportError:
+    _search_cache = None  # Cache silently disabled — search still works.
+
+
 def _ddg_search(query: str, max_results: int = SEARCH_RESULT_COUNT) -> list[dict]:
-    """Run a DuckDuckGo text search and return the raw hits. Imported
-    lazily so an agent build without the ddgs wheel installed can still
-    serve chat/image jobs — only search jobs will fail at this point,
-    with a clean error surface (see run_search_inference)."""
+    """Run a web search and return the raw hits, falling through a
+    rotating list of free backends on rate-limit / empty results.
+
+    Imported lazily so an agent build without the ddgs wheel installed
+    can still serve chat/image jobs — only search jobs will fail at
+    this point, with a clean error surface (see run_search_inference).
+
+    Cache: same (query, max_results) hit within _SEARCH_CACHE_TTL
+    seconds skips the network entirely. Misses populate the cache
+    with whichever backend's hits we ended up using."""
+    cache_key = (query, max_results)
+    if _search_cache is not None and cache_key in _search_cache:
+        return list(_search_cache[cache_key])
+
     from ddgs import DDGS
-    with DDGS() as ddg:
-        return ddg.text(query, max_results=max_results) or []
+    try:
+        from ddgs.exceptions import RatelimitException
+    except ImportError:
+        RatelimitException = Exception  # older ddgs builds
+
+    last_err: Optional[Exception] = None
+    for backend in _SEARCH_BACKENDS:
+        try:
+            with DDGS() as ddg:
+                hits = ddg.text(
+                    query, max_results=max_results, backend=backend,
+                ) or []
+            if hits:
+                if _search_cache is not None:
+                    _search_cache[cache_key] = list(hits)
+                return hits
+            # Empty results from one backend isn't fatal — DDG occasionally
+            # returns 0 hits for a query Bing happily answers, and vice
+            # versa. Try the next.
+        except RatelimitException as e:
+            last_err = e
+            continue
+        except Exception as e:
+            # A backend-specific scrape break (HTML shape changed, 403,
+            # network blip) shouldn't take the whole search down. Log
+            # would be nice but we have no logger in scope; the caller
+            # raises a clean RuntimeError when ALL backends fail.
+            last_err = e
+            continue
+    if last_err is not None:
+        raise last_err
+    return []
 
 
 def _fetch_and_extract(url: str, timeout: float = SEARCH_FETCH_TIMEOUT) -> str:

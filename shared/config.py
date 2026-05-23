@@ -139,3 +139,11 @@ IMAGE_REWRITE_PENDING = "image_rewrite_pending"
 # only (no rewrite on first-turn searches — same skip-paths as
 # image rewrite). Consumed by /jobs/complete; deleted after dispatch.
 SEARCH_REWRITE_PENDING = "search_rewrite_pending"
+# Reverse-detection marker. When the rewrite chat job classifies a
+# follow-up as "not search-worthy" (a closure like "thanks" / "that's
+# cool!" after a search thread), the dispatcher reroutes the job to
+# the chat queue AND sets this flag so the eventual /jobs/complete
+# can stamp `search_was_skipped: true` on the result. The client
+# uses that flag to auto-uncheck the search box and reset the sticky
+# state for the conversation. Cleaned up on /jobs/complete.
+SEARCH_AUTO_DISABLED = "search_auto_disabled"

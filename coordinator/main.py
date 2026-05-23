@@ -30,6 +30,7 @@ from shared.config import (
     CANARY_PENDING,
     IMAGE_REWRITE_PENDING,
     SEARCH_REWRITE_PENDING,
+    SEARCH_AUTO_DISABLED,
     CANARY_SCORE_WINDOW,
     IDEMPOTENCY_TTL_SECONDS,
     JOB_PARTIALS,
@@ -445,47 +446,96 @@ def _dispatch_image_after_rewrite(
 
 def _build_search_query_meta_prompt(history: str, user_prompt: str) -> str:
     """Meta-prompt: small chat model reads recent conversation + the
-    new user message and emits a focused DDG search query. Same intent-
-    reading shape as the image rewriter (`_build_rewrite_meta_prompt`)
-    so a 1-3B model can handle it, but tuned for SEARCH-engine queries
-    instead of image descriptions.
+    new user message and emits EITHER a focused search query OR the
+    literal sentinel ``NO_SEARCH`` when the user has clearly closed
+    the search thread.
 
-    The user's transcript that motivated this:
-      User: "news"            (DDG returned the Wikipedia "News" page)
-      User: "try again"       (DDG returned Aaliyah song lyrics)
-    Both are unrecoverable as literal queries; only "try again given
-    the prior topic was news" produces a usable query."""
+    Examples that motivated the design:
+    - User: "news"           → "today's top news headlines"
+    - User: "try again"      + prior news topic → "different recent news event"
+    - User: "That's cool!"   + prior Boring Co topic → NO_SEARCH
+    - User: "thanks!"        + any context       → NO_SEARCH
+
+    Same intent-reading shape as the image rewriter so a 1-3B model
+    can handle it."""
     return (
-        "You craft web search queries from conversational context.\n\n"
+        "You're a routing classifier for a web-search assistant. The "
+        "user has SEARCH MODE on. For each new user message, decide "
+        "whether it actually needs a fresh web search, and if so, "
+        "craft a focused query.\n\n"
         "RECENT CONVERSATION:\n"
         f"{history}\n\n"
         f"NEW USER MESSAGE: {user_prompt}\n\n"
-        "Decide what the user actually wants to search for, then "
-        "write a single concise search query a web search engine "
-        "(like Google or DuckDuckGo) will handle well. Follow these "
-        "intent-reading rules:\n\n"
-        "1. If the new message is a fragment that only makes sense "
-        "with prior context (e.g. \"try again\", \"more like that\", "
-        "\"any specific examples?\", \"what about Europe?\"): use the "
-        "prior topic to fill in the missing subject. \"try again\" "
-        "after a news search becomes a query for a different recent "
-        "news event; \"what about Europe?\" after banking becomes "
+        "Decision rules:\n\n"
+        "A. If the user is wrapping up or just reacting — \"thanks\", "
+        "\"cool!\", \"that's interesting\", \"ok\", \"got it\", \"haha\", "
+        "\"nice\", \"wow\" — they don't want another search. Output:\n"
+        "  NO_SEARCH\n"
+        "Do NOT add any other text.\n\n"
+        "B. If the user is asking for more information, drilling in, "
+        "or starting a new topic, craft a query. Follow these query "
+        "rules:\n"
+        "  1. Fragment depending on context (e.g. \"try again\", "
+        "\"what about Europe?\", \"more examples?\"): use the prior "
+        "topic to fill in the missing subject. \"try again\" after "
+        "a news search becomes a query for a different recent news "
+        "event; \"what about Europe?\" after banking becomes "
         "\"recent banking news Europe\".\n"
-        "2. If the new message is a clear standalone question or "
-        "topic (e.g. \"SVB collapse 2023\", \"latest iPhone reviews\"): "
-        "tighten it into search-engine keywords. Drop conversational "
-        "filler like \"can you tell me\" or \"I'm curious about\".\n"
-        "3. If the user is asking for the latest / newest of "
-        "something, add a recency keyword (\"today\", \"latest\", or "
-        "the current year). Don't invent a specific date.\n"
-        "4. Keep the query SHORT (typically 3-8 words). Search "
-        "engines work better with keywords than full sentences.\n\n"
-        "Output requirements:\n"
-        "- One line. No quotes around the query. No labels like "
-        "\"Query:\" or \"Search:\". Just the query itself.\n"
-        "- Do not refuse or add commentary about the user's intent.\n\n"
-        "QUERY:"
+        "  2. Clear standalone question or topic (e.g. \"SVB collapse "
+        "2023\", \"latest iPhone reviews\"): tighten into keywords. "
+        "Drop conversational filler like \"can you tell me\" / "
+        "\"I'm curious about\".\n"
+        "  3. If asking for the latest/newest, add \"today\", "
+        "\"latest\", or the current year. Don't invent a specific "
+        "date.\n"
+        "  4. Keep it SHORT (typically 3-8 words).\n\n"
+        "Output format:\n"
+        "- One line.\n"
+        "- Either the literal token NO_SEARCH or the query itself.\n"
+        "- No quotes around the query. No labels like \"Query:\" / "
+        "\"Search:\". No commentary.\n\n"
+        "OUTPUT:"
     )
+
+
+# Sentinel returned by _parse_search_rewrite_output when the classifier
+# says no search is needed. Constant rather than magic string so the
+# dispatcher and the tests can refer to the same value.
+SEARCH_REWRITE_NO_SEARCH = "__no_search__"
+
+
+def _parse_search_rewrite_output(raw: Optional[str]) -> tuple[str, Optional[str]]:
+    """Parse the rewrite chat job's output into one of:
+    - ("skip", None) — the model decided no search is needed
+    - ("query", "<cleaned query>") — the model produced a query
+    - ("error", None) — output was empty / nonsense; caller should
+      fall back to the original prompt
+
+    Splitting parse from clean lets the dispatcher branch on intent
+    without smuggling sentinels through the existing clean function."""
+    if not raw:
+        return ("error", None)
+    s = raw.strip()
+    # Strip any echoed header so "OUTPUT: NO_SEARCH" also classifies.
+    for _ in range(3):
+        stripped = False
+        for header in (
+            "OUTPUT:", "Output:", "QUERY:", "Query:", "Search query:",
+            "Search:", "FINAL QUERY:", "Rewritten query:",
+        ):
+            if s.lower().startswith(header.lower()):
+                s = s[len(header):].strip()
+                stripped = True
+                break
+        if not stripped:
+            break
+    # NO_SEARCH detection — first-line, case-insensitive. We accept
+    # the sentinel anywhere on the first line so "NO_SEARCH (the user
+    # is just thanking me)" still classifies as skip.
+    first_line = s.split("\n", 1)[0].strip().upper()
+    if first_line.startswith("NO_SEARCH") or first_line == "NOSEARCH":
+        return ("skip", None)
+    return ("query", s)
 
 
 def _enqueue_chat_rewrite_for_search(
@@ -579,19 +629,34 @@ def _dispatch_search_after_rewrite(
     rewritten_text: Optional[str],
 ) -> None:
     """Called from /jobs/complete when a search-rewrite chat job
-    finishes. Same shape as `_dispatch_image_after_rewrite` — plug
-    the cleaned rewritten text into the stored search envelope, flip
-    the search job out of `awaiting_rewrite`, RPUSH onto the search
-    queue. Skips the dispatch (still cleans the link) if the search
-    job is no longer awaiting_rewrite — the cancel-while-rewriting
-    and conversation-purged races."""
+    finishes. Plumbs three outcomes:
+
+    a) The classifier says NO_SEARCH (user message was a closure like
+       "thanks" / "that's cool!"). We DROP the search step entirely,
+       reroute the job to the chat queue with the conversation
+       context intact, and record a marker so /jobs/complete can
+       stamp `search_was_skipped: true` on the result. The client
+       uses that to auto-uncheck the search box and reset the
+       sticky-mode state for this conversation.
+
+    b) The classifier produced a query. Plug it into the stored
+       search envelope, flip the job out of `awaiting_rewrite`,
+       RPUSH onto the search queue. Same shape as
+       `_dispatch_image_after_rewrite`.
+
+    c) Parse error / empty rewrite. Fall back to the user's original
+       prompt, send to the search queue. Conservative — better to
+       give the user a literal-prompt search than a stuck bubble.
+
+    Skips entirely (still cleans the link) if the search job is no
+    longer awaiting_rewrite — the cancel-while-rewriting and
+    conversation-purged races."""
     search_job_id = link["search_job_id"]
     search_envelope = link["search_envelope"]
     original = link["original_prompt"]
     try:
         search_row = db.get_job(search_job_id)
         if search_row is None or search_row["status"] != "awaiting_rewrite":
-            r.hdel(SEARCH_REWRITE_PENDING, rewrite_job_id)
             log.info(
                 "search rewrite finished but search job no longer awaiting "
                 "rewrite — skipping dispatch",
@@ -603,7 +668,37 @@ def _dispatch_search_after_rewrite(
                 },
             )
             return
-        final_query = _clean_rewritten_search_query(rewritten_text, original)
+
+        decision, value = _parse_search_rewrite_output(rewritten_text)
+
+        if decision == "skip":
+            # Reverse-detection branch: reroute as plain chat. Strip
+            # the search-specific fields so the worker treats it as a
+            # normal chat job with the conversation history. The
+            # SEARCH_AUTO_DISABLED marker tells /jobs/complete to
+            # signal the client back so it auto-toggles the box off.
+            chat_envelope = dict(search_envelope)
+            chat_envelope.pop("search", None)
+            chat_envelope["tool"] = "chat"
+            chat_envelope["prompt"] = original
+            db.set_job_pending_with_prompt(search_job_id, original)
+            r.hset(SEARCH_AUTO_DISABLED, search_job_id, "1")
+            r.rpush(job_queue_for("chat"), json.dumps(chat_envelope))
+            log.info(
+                "search disabled by classifier — rerouted to chat",
+                extra={
+                    "event": "search_rewrite_classified_skip",
+                    "rewrite_job_id": rewrite_job_id,
+                    "search_job_id": search_job_id,
+                },
+            )
+            return
+
+        # Query or fall-back-to-original.
+        if decision == "query":
+            final_query = _clean_rewritten_search_query(value, original)
+        else:
+            final_query = original
         search_envelope["prompt"] = final_query
         db.set_job_pending_with_prompt(search_job_id, final_query)
         r.rpush(job_queue_for("search"), json.dumps(search_envelope))
@@ -1649,6 +1744,12 @@ def result(job_id: str):
         "submitted_by_member_id": submitted_by,
         "image_path": image_path,
         "sources": None,
+        # search_was_skipped is a one-shot client signal and only
+        # lives on JOB_RESULTS while the result is fresh. By the time
+        # we're on this DB-fallback path (post-eviction), the client
+        # has long since acted on it (or missed it). Defaulting to
+        # null is harmless.
+        "search_was_skipped": False,
         "done": status in ("complete", "error"),
     }
 
@@ -2261,6 +2362,12 @@ def complete(req: JobCompleteRequest, request: Request):
         # for a feature that's about "now I see the answer with its
         # links" rather than long-term archive.
         payload["sources"] = req.sources
+    # Reverse-detection signal. If the rewrite classifier rerouted
+    # this job from search → chat ("That's cool!"-style closure), the
+    # dispatcher set a marker in SEARCH_AUTO_DISABLED. Surface it on
+    # the result so the client auto-unchecks the sticky search box.
+    if r.hdel(SEARCH_AUTO_DISABLED, req.job_id):
+        payload["search_was_skipped"] = True
     r.hset(JOB_RESULTS, req.job_id, json.dumps(payload))
     r.hdel(JOB_PROCESSING, req.job_id)
     r.hdel(JOB_PARTIALS, req.job_id)

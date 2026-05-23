@@ -581,6 +581,49 @@ spend, key, usage trend, or limits.
 **Fix:** post Phase 2b. Currently irrelevant — there are no
 customers.
 
+### 🟢 Search mode rides free `ddgs` — runway is huge but not infinite
+
+The search tool routes through `ddgs` (formerly `duckduckgo-search`),
+which is a scraping client, not an official API. No key, no quota
+tier, no SLA. Every DDG call comes from the **worker's** IP, not
+the coordinator's, so the rate-limit math benefits from the
+distributed contributor fleet.
+
+The agent uses **backend rotation** (`duckduckgo, mojeek, brave, bing,
+yahoo, startpage`) plus a **per-worker 10-minute TTL cache**
+(`cachetools`), so the effective ceiling is:
+
+```
+≈ N_contributors × N_backends × ~30 q/min/IP
+≈ N_contributors × 180–240 q/min
+```
+
+Stage estimates:
+- **Today (1 contributor):** ~240 q/min sustained → ~50 active
+  searchers. Not close to the wall.
+- **Early growth (10 contributors):** ~2,400 q/min → ~500 active
+  searchers.
+- **Scaling pain (~1,000 contributors):** ~240,000 q/min → ~50,000
+  active searchers. The free runway ends here, not before.
+
+**When we migrate:** Brave Search API is the most LLM-friendly paid
+option (~$3-5/1000 queries; generous free tier of 2,000/mo). Drop-in
+replacement for the `_ddg_search` call. Tavily is the agent-native
+alternative if we want returned summaries instead of raw hits.
+
+**Watch for, before the wall:**
+- A single hot worker getting slammed by the coordinator's warm-
+  routing for search. Mitigation: weighted-random routing for
+  `tool=search` instead of last-tool affinity. Cheap fix when
+  symptoms appear.
+- DDG / Bing HTML shape changes breaking ddgs. The maintainers chase
+  this with point releases; we'd need to bump the pin promptly.
+
+**Skipped infra options (with reasoning):**
+- Self-hosted SearXNG → too heavy to bundle; requires a sidecar.
+- Public free proxy lists → unreliable + untrusted exit nodes.
+- Tor as fallback → our multi-IP fleet already IS the proxy network.
+
 ---
 
 ## 4. Engineering hygiene
