@@ -49,10 +49,16 @@ class JobPartialRequest(BaseModel):
     """Worker push during streaming. ``text`` is the full accumulated
     output so far (not a delta), so the coordinator can do a simple
     replacement write. A retried worker's first partial therefore
-    correctly overwrites any leftover text from the original attempt."""
+    correctly overwrites any leftover text from the original attempt.
+
+    ``claim_token`` is the per-claim secret issued by /jobs/next (or
+    /jobs/claim). Coordinator rejects partials whose token doesn't
+    match the current in-flight claim — the only path that lets a
+    stale worker overwrite a re-dispensed job."""
     worker_id: str
     job_id: str
     text: str
+    claim_token: Optional[str] = None
 
 
 class WorkerCapabilities(BaseModel):
@@ -82,11 +88,22 @@ class WorkerIdent(BaseModel):
 class HeartbeatRequest(BaseModel):
     worker_id: str
     status: str = Field(default="idle")  # idle | busy | offline
+    # When the worker is mid-job, the job_id it claims to be processing.
+    # The reaper uses this to distinguish "worker silent" (requeue) from
+    # "worker still alive and on the right job" (extend the deadline),
+    # so a long image generation isn't falsely yanked out from under a
+    # healthy worker.
+    job_id: Optional[str] = None
 
 
 class JobClaimRequest(BaseModel):
     worker_id: str
     job_id: str
+    # Echo of the per-claim token (only checked by /jobs/abandon — the
+    # other claim endpoints have dedicated request types). Optional so
+    # /jobs/claim itself, which mints the token, can keep using this
+    # type.
+    claim_token: Optional[str] = None
 
 
 class JobNextRequest(BaseModel):
@@ -112,6 +129,12 @@ class JobCompleteRequest(BaseModel):
     # validates the PNG header, writes to /data/images/<job_id>.png,
     # and stamps the message's image_path. Empty/absent on chat jobs.
     image_b64: Optional[str] = None
+    # Per-claim secret issued at job pickup. Coordinator returns 410
+    # when this doesn't match the current claim — the case where the
+    # reaper has already requeued the job and another worker is on
+    # it. Optional in the schema so legacy clients fail with a clear
+    # 410 rather than a 422 validation error.
+    claim_token: Optional[str] = None
 
 
 class InviteCreateRequest(BaseModel):
@@ -146,6 +169,14 @@ class InviteAcceptRequest(BaseModel):
     """
     invitee_email: Optional[str] = None
     tos_accepted: bool = False
+
+
+class JobCancelRequest(BaseModel):
+    """Member-initiated cancel. The caller's session identifies the
+    submitter; the coordinator verifies ownership of the job before
+    marking it cancelled. The worker (if still processing) discovers
+    the cancellation when its /jobs/complete returns 410."""
+    job_id: str
 
 
 class JobRecord(BaseModel):

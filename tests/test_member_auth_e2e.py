@@ -232,11 +232,12 @@ class MemberAuthE2ETests(unittest.TestCase):
         )
         # Pop the job (mimic worker BLPOP).
         self.assertIsNotNone(self.r.lpop("job_queue"))
-        self.client.post(
+        claim_resp = self.client.post(
             "/jobs/claim",
             json={"worker_id": worker_id, "job_id": job_id},
             headers=admin_headers,
         )
+        claim_token = claim_resp.json()["claim_token"]
         complete_resp = self.client.post(
             "/jobs/complete",
             json={
@@ -248,6 +249,7 @@ class MemberAuthE2ETests(unittest.TestCase):
                 "completion_tokens": 9,
                 "duration_seconds": 0.1,
                 "status": "complete",
+                "claim_token": claim_token,
             },
             headers=admin_headers,
         )

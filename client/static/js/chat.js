@@ -185,6 +185,12 @@ function messageEl(role, text, opts = {}) {
   wrap.className = 'msg ' + role;
   wrap.dataset.role = role;
   if (opts.message_id) wrap.dataset.messageId = opts.message_id;
+  // Tag the bubble with the tool kind so the stuck-job UX can pick a
+  // sensible "this is taking longer than normal" threshold — chat
+  // streams visibly, image is opaque until the PNG arrives, so each
+  // gets its own no-progress budget.
+  if (opts.pending_kind === 'image') wrap.dataset.tool = 'image';
+  else if (opts.tool) wrap.dataset.tool = opts.tool;
   const r = document.createElement('div');
   r.className = 'role';
   r.textContent = role;
@@ -286,6 +292,17 @@ async function retryMessage(messageId, btn) {
 // when partials arrive faster than this rate the typewriter just
 // matches arrival (no artificial slowdown).
 const TYPEWRITER_CHARS_PER_SECOND = 90;
+// Stuck-job thresholds: how long to wait with zero progress before
+// surfacing the "this may be taking longer than normal" notice with
+// a Cancel button. Chat normally streams within a second or two so
+// 60s of dead air is suspicious; image is opaque until the PNG
+// finishes generating, so we give it 5min before warning. The
+// warning itself doesn't cancel anything — the worker keeps grinding
+// and may still finish — it just gives the user an opt-in escape
+// hatch, per project policy that the reaper extends deadlines
+// indefinitely on healthy heartbeats.
+const STUCK_MS_CHAT = 60_000;
+const STUCK_MS_IMAGE = 300_000;
 // Minimum chars revealed per animation frame, so we don't get stuck
 // at sub-pixel advance on a 60fps display when CPS is low. 1 char/
 // frame at 60fps = 60 cps floor, plenty for readability.
@@ -368,6 +385,60 @@ async function streamIntoBubble(jobId, wrap, statusEl, startMs, messageId) {
     rafId = requestAnimationFrame(typewriterTick);
   }
 
+  // Stuck-job UX state. ``lastProgressMs`` is the wall-clock of the
+  // last time we saw any progress (text or partial bytes). Once the
+  // gap exceeds the per-tool threshold, the wrap grows a "may be
+  // taking longer than normal" notice with a Cancel button. The
+  // notice goes away if progress resumes (typewriter advances, server
+  // returns text). Cancel POSTs /api/cancel/{jobId} and lets the
+  // existing polling loop discover the terminal 'cancelled' status.
+  let lastProgressMs = Date.now();
+  let stuckNoticeShown = false;
+  let cancelRequested = false;
+  const isImage = wrap.dataset.tool === 'image';
+  const stuckThresholdMs = isImage ? STUCK_MS_IMAGE : STUCK_MS_CHAT;
+
+  function clearStuckNotice() {
+    if (!stuckNoticeShown) return;
+    const node = wrap.querySelector('.stuck-notice');
+    if (node) node.remove();
+    stuckNoticeShown = false;
+  }
+
+  function showStuckNotice() {
+    if (stuckNoticeShown || cancelRequested) return;
+    stuckNoticeShown = true;
+    const notice = document.createElement('div');
+    notice.className = 'stuck-notice';
+    const txt = document.createElement('span');
+    txt.className = 'stuck-text';
+    txt.textContent = isImage
+      ? 'Image generation is taking longer than normal. Something may be wrong, or your worker just needs more time.'
+      : 'This is taking longer than normal. Something may be wrong, or your worker just needs more time.';
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'cancel-btn';
+    btn.textContent = 'Cancel';
+    btn.onclick = async () => {
+      if (cancelRequested) return;
+      cancelRequested = true;
+      btn.disabled = true;
+      btn.textContent = 'Cancelling…';
+      try {
+        await fetch('/api/cancel/' + jobId, { method: 'POST' });
+      } catch (e) {
+        // Network failure here is OK — coordinator may still have
+        // cancelled before the response was returned. If not, the
+        // user can refresh and try again. We don't surface the
+        // error because the polling loop will see the terminal
+        // status either way.
+      }
+    };
+    notice.appendChild(txt);
+    notice.appendChild(btn);
+    wrap.appendChild(notice);
+  }
+
   let finalRes = null;
   try {
     while (true) {
@@ -377,14 +448,30 @@ async function streamIntoBubble(jobId, wrap, statusEl, startMs, messageId) {
       try {
         res = await fetch('/api/result/' + jobId).then(r => r.json());
       } catch (e) {
+        // Network blip — don't reset the progress clock (a wedged
+        // network shouldn't suppress the stuck warning), just keep
+        // polling. The threshold check below still fires.
+        if (Date.now() - lastProgressMs > stuckThresholdMs) {
+          showStuckNotice();
+        }
         continue;
       }
-      if (res.text && res.text.length > target.length) {
+      const progressed = res.text && res.text.length > target.length;
+      if (progressed) {
         target = res.text;
+        lastProgressMs = Date.now();
+        clearStuckNotice();
         startTypewriter();
+      } else if (Date.now() - lastProgressMs > stuckThresholdMs) {
+        showStuckNotice();
       }
-      if (res.done || res.status === 'complete' || res.status === 'error') {
+      const terminal = res.done
+        || res.status === 'complete'
+        || res.status === 'error'
+        || res.status === 'cancelled';
+      if (terminal) {
         finalRes = res;
+        clearStuckNotice();
         // Take the final server text as the authoritative target and
         // let the typewriter finish revealing.
         if (res.text) target = res.text;
@@ -393,7 +480,14 @@ async function streamIntoBubble(jobId, wrap, statusEl, startMs, messageId) {
         if (rafId !== null) {
           await finalizePromise;
         }
-        if (res.status === 'error') {
+        if (res.status === 'cancelled') {
+          // The user cancelled (or someone with the same session
+          // cancelled in another tab). Render as a soft, non-retryable
+          // bubble — no error styling, no retry button.
+          bubble.classList.remove('error');
+          bubble.classList.add('cancelled');
+          bubble.textContent = res.text || 'Cancelled.';
+        } else if (res.status === 'error') {
           bubble.classList.add('error');
           bubble.textContent = res.text || res.error || 'Generation failed.';
           const mid = wrap.dataset.messageId;
@@ -412,15 +506,17 @@ async function streamIntoBubble(jobId, wrap, statusEl, startMs, messageId) {
         }
         if (statusEl && startMs) {
           const dt = ((Date.now() - startMs) / 1000).toFixed(1);
-          statusEl.textContent =
-            res.status === 'error'
-              ? `failed in ${dt}s`
-              : `done in ${dt}s · ${res.completion_tokens || 0} tokens · ${res.worker_id || 'unknown worker'}`;
+          let label;
+          if (res.status === 'cancelled') label = `cancelled after ${dt}s`;
+          else if (res.status === 'error') label = `failed in ${dt}s`;
+          else label = `done in ${dt}s · ${res.completion_tokens || 0} tokens · ${res.worker_id || 'unknown worker'}`;
+          statusEl.textContent = label;
         }
         return finalRes;
       }
     }
   } finally {
+    clearStuckNotice();
     if (rafId !== null) cancelAnimationFrame(rafId);
     if (activeStream === myToken) {
       activeStream = null;

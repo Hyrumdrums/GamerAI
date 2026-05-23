@@ -111,6 +111,26 @@ body { display: flex; flex-direction: column; }
 .retry-btn:hover:not(:disabled) { background: #fdecec; }
 .retry-btn:disabled { cursor: not-allowed; color: #999; border-color: #ddd; background: var(--surface); }
 
+.stuck-notice {
+  margin-top: .5rem; padding: .5rem .75rem; font-size: .85rem;
+  background: #fff8e1; color: #8a6500; border: 1px solid #f0d178;
+  border-radius: var(--radius);
+  display: flex; flex-wrap: wrap; gap: .5rem .75rem; align-items: center;
+}
+.stuck-notice .stuck-text { flex: 1; min-width: 12rem; }
+.stuck-notice .cancel-btn {
+  padding: .3rem .65rem; font-size: .85rem; cursor: pointer;
+  background: var(--surface); color: #8a6500; border: 1px solid #d3b87a;
+  border-radius: var(--radius); width: auto;
+}
+.stuck-notice .cancel-btn:hover:not(:disabled) { background: #fdf4d6; }
+.stuck-notice .cancel-btn:disabled { cursor: not-allowed; color: #999; }
+
+.msg.assistant .bubble.cancelled {
+  background: #f4f4f4; color: var(--muted); font-style: italic;
+}
+.msg.assistant .bubble.cancelled::before { content: "⊘ "; color: var(--muted); }
+
 @media (min-width: 640px) {
   .sidebar {
     position: static; transform: none; box-shadow: none;

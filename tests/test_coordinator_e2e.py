@@ -24,6 +24,7 @@ import tempfile
 import time
 import unittest
 import uuid
+from typing import Optional
 
 # 1. Test-only env. Must be set BEFORE coordinator imports so module-level
 #    code reads the right values.
@@ -53,8 +54,14 @@ from coordinator import main as coordinator_main  # noqa: E402
 from coordinator.scheduler import Reaper  # noqa: E402
 
 
-def _job_complete_payload(worker_id: str, job_id: str, *, tokens: int = 7) -> dict:
-    return {
+def _job_complete_payload(
+    worker_id: str,
+    job_id: str,
+    *,
+    tokens: int = 7,
+    claim_token: Optional[str] = None,
+) -> dict:
+    payload: dict = {
         "worker_id": worker_id,
         "job_id": job_id,
         "text": "[mock] hello",
@@ -64,6 +71,9 @@ def _job_complete_payload(worker_id: str, job_id: str, *, tokens: int = 7) -> di
         "duration_seconds": 0.1,
         "status": "complete",
     }
+    if claim_token is not None:
+        payload["claim_token"] = claim_token
+    return payload
 
 
 class CoordinatorE2ETests(unittest.TestCase):
@@ -121,11 +131,17 @@ class CoordinatorE2ETests(unittest.TestCase):
         job = json.loads(raw)
         self.assertEqual(job["job_id"], job_id)
 
-        self.assertEqual(self.client.post("/jobs/claim",
-            json={"worker_id": worker_id, "job_id": job_id}).status_code, 200)
+        claim = self.client.post(
+            "/jobs/claim",
+            json={"worker_id": worker_id, "job_id": job_id},
+        )
+        self.assertEqual(claim.status_code, 200)
+        claim_token = claim.json()["claim_token"]
         complete = self.client.post(
             "/jobs/complete",
-            json=_job_complete_payload(worker_id, job_id, tokens=11),
+            json=_job_complete_payload(
+                worker_id, job_id, tokens=11, claim_token=claim_token,
+            ),
         )
         self.assertEqual(complete.status_code, 200)
         self.assertGreater(complete.json()["earnings"], 0)
@@ -394,9 +410,10 @@ class ImageGenerationTests(unittest.TestCase):
         ).json()
         self.assertIsNotNone(nxt["job"])
         self.assertEqual(nxt["job"]["job_id"], job_id)
-        self.client.post(
-            "/jobs/claim", json={"worker_id": worker_id, "job_id": job_id},
-        )
+        # /jobs/next atomically claims now — its response carries the
+        # claim_token directly. (A separate /jobs/claim would just
+        # overwrite this with a fresh token.)
+        claim_token = nxt["claim_token"]
         comp = self.client.post(
             "/jobs/complete",
             json={
@@ -409,6 +426,7 @@ class ImageGenerationTests(unittest.TestCase):
                 "duration_seconds": 1.2,
                 "status": "complete",
                 "image_b64": self._MOCK_PNG_B64,
+                "claim_token": claim_token,
             },
         )
         self.assertEqual(comp.status_code, 200, comp.text)
@@ -439,13 +457,11 @@ class ImageGenerationTests(unittest.TestCase):
             "/generate", json={"prompt": "a cat", "tool": "image"},
         )
         job_id = gr.json()["job_id"]
-        self.client.post(
+        nxt = self.client.post(
             "/jobs/next",
             json={"worker_id": worker_id, "tool": "image"},
-        )
-        self.client.post(
-            "/jobs/claim", json={"worker_id": worker_id, "job_id": job_id},
-        )
+        ).json()
+        claim_token = nxt["claim_token"]
         # Send bytes that aren't a PNG (the magic header is missing).
         import base64
         not_a_png = base64.b64encode(b"<html>nope</html>").decode("ascii")
@@ -461,6 +477,7 @@ class ImageGenerationTests(unittest.TestCase):
                 "duration_seconds": 1.0,
                 "status": "complete",
                 "image_b64": not_a_png,
+                "claim_token": claim_token,
             },
         )
         self.assertEqual(comp.status_code, 400)

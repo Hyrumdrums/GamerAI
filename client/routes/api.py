@@ -41,6 +41,21 @@ async def proxy_result(job_id: str, request: Request):
     return JSONResponse(r.json(), status_code=r.status_code)
 
 
+@router.post("/cancel/{job_id}")
+async def proxy_cancel(job_id: str, request: Request):
+    """Member-initiated cancel. The coordinator marks the job
+    cancelled and the worker's eventual /complete gets 410'd, so
+    even though the worker keeps grinding the result is dropped."""
+    bearer = require_session_bearer(request)
+    async with coordinator_client._client(bearer=bearer) as c:
+        r = await c.post("/jobs/cancel", json={"job_id": job_id}, timeout=10)
+    try:
+        body = r.json()
+    except ValueError:
+        body = {"detail": r.text}
+    return JSONResponse(body, status_code=r.status_code)
+
+
 @router.get("/images/{name}")
 async def proxy_image(name: str, request: Request):
     """Forward a generated PNG with the session's bearer. The browser

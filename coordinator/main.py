@@ -55,6 +55,7 @@ from shared.models import (
     HeartbeatRequest,
     InviteAcceptRequest,
     InviteCreateRequest,
+    JobCancelRequest,
     JobClaimRequest,
     JobCompleteRequest,
     JobNextRequest,
@@ -391,8 +392,42 @@ else:
 
 
 # ---------- helpers ----------
+def _read_heartbeat(worker_id: str) -> tuple[float, Optional[str]]:
+    """Return (last_ts, current_job_id) for ``worker_id``.
+
+    WORKER_HEARTBEATS stores a JSON envelope ``{"ts": float, "job_id":
+    str|null}`` so the reaper can distinguish "worker silent" from
+    "worker still on the right job." Falls back to (ts, None) if the
+    stored value is a bare float — covers the upgrade window where
+    pre-rollout entries linger until the next heartbeat overwrites
+    them."""
+    raw = r.hget(WORKER_HEARTBEATS, worker_id)
+    if not raw:
+        return 0.0, None
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            ts = float(data.get("ts", 0) or 0)
+            job_id = data.get("job_id")
+            return ts, job_id if isinstance(job_id, str) else None
+    except (json.JSONDecodeError, ValueError, TypeError):
+        pass
+    try:
+        return float(raw), None
+    except (ValueError, TypeError):
+        return 0.0, None
+
+
+def _write_heartbeat(worker_id: str, ts: float, job_id: Optional[str]) -> None:
+    r.hset(
+        WORKER_HEARTBEATS,
+        worker_id,
+        json.dumps({"ts": ts, "job_id": job_id}),
+    )
+
+
 def _worker_status(worker_id: str, now: float) -> str:
-    last = float(r.hget(WORKER_HEARTBEATS, worker_id) or 0)
+    last, _ = _read_heartbeat(worker_id)
     if not last or (now - last) > WORKER_TIMEOUT_SECONDS:
         return "offline"
     return r.hget(WORKER_STATUS, worker_id) or "idle"
@@ -437,11 +472,9 @@ def _ensure_live_worker_or_503(tool: str = "chat") -> None:
         return
     now = time.time()
     heartbeats = r.hgetall(WORKER_HEARTBEATS) or {}
-    for worker_id, ts in heartbeats.items():
-        try:
-            if (now - float(ts)) > WORKER_TIMEOUT_SECONDS:
-                continue
-        except (TypeError, ValueError):
+    for worker_id, _raw in heartbeats.items():
+        ts, _ = _read_heartbeat(worker_id)
+        if not ts or (now - ts) > WORKER_TIMEOUT_SECONDS:
             continue
         if _worker_advertises_tool(worker_id, tool):
             return
@@ -1014,7 +1047,7 @@ def register(req: WorkerIdent, request: Request):
         )
 
     r.sadd(WORKER_REGISTRY, req.worker_id)
-    r.hset(WORKER_HEARTBEATS, req.worker_id, now)
+    _write_heartbeat(req.worker_id, now, None)
     r.hset(WORKER_STATUS, req.worker_id, "idle")
     if req.capabilities is not None:
         r.hset(
@@ -1033,17 +1066,93 @@ def register(req: WorkerIdent, request: Request):
 def heartbeat(req: HeartbeatRequest, request: Request):
     _require_worker_owner(request, req.worker_id)
     now = time.time()
-    r.hset(WORKER_HEARTBEATS, req.worker_id, now)
+    # ``job_id`` is what the worker claims to currently be processing.
+    # The reaper reads it on its next tick to decide whether an
+    # in-flight job is still in the hands of its rightful claimant
+    # (extend the deadline) or has actually gone silent (requeue).
+    _write_heartbeat(req.worker_id, now, req.job_id)
     r.hset(WORKER_STATUS, req.worker_id, req.status)
     db.upsert_worker(req.worker_id, req.status, now)
     return {"ok": True}
 
 
+def _verify_claim_or_410(
+    job_id: str,
+    worker_id: str,
+    claim_token: Optional[str],
+) -> dict:
+    """Verify the caller still holds the current claim for ``job_id``.
+
+    Returns the parsed JOB_PROCESSING meta on success. On mismatch raises
+    410 Gone with a structured reason so the worker can log it and
+    bail without crediting local state — this is the protocol path for
+    "the reaper requeued your job and someone else picked it up."
+
+    A missing JOB_PROCESSING entry means either (a) the job was
+    cancelled, or (b) the job already completed. Either way the
+    completer's work is irrelevant and we 410. The completer is
+    expected to drop the result on the floor; the user-visible state
+    came from whoever finished first (or from the cancel marker)."""
+    raw = r.hget(JOB_PROCESSING, job_id)
+    if raw is None:
+        raise HTTPException(
+            status_code=410,
+            detail={"reason": "no_active_claim",
+                    "message": "job is no longer in flight (cancelled or already completed)"},
+        )
+    try:
+        meta = json.loads(raw)
+    except json.JSONDecodeError:
+        meta = {}
+    if meta.get("worker_id") != worker_id:
+        raise HTTPException(
+            status_code=410,
+            detail={"reason": "claim_owned_by_other_worker",
+                    "message": "another worker holds the current claim"},
+        )
+    expected = meta.get("claim_token")
+    if expected and claim_token != expected:
+        raise HTTPException(
+            status_code=410,
+            detail={"reason": "claim_token_mismatch",
+                    "message": "your claim has expired; the job was reassigned"},
+        )
+    return meta
+
+
+def _issue_claim(worker_id: str, job_id: str, original: Optional[dict]) -> tuple[str, float]:
+    """Record a claim for ``worker_id`` on ``job_id`` and return
+    ``(claim_token, deadline)``. The token is the per-claim secret a
+    completer/partialer must echo back; a re-dispense after the reaper
+    requeues this job will mint a fresh token, so the original worker's
+    eventual /complete trips a 410 instead of clobbering the new
+    claimant's work."""
+    now = time.time()
+    deadline = now + JOB_TIMEOUT_SECONDS
+    claim_token = uuid.uuid4().hex
+    r.hset(
+        JOB_PROCESSING,
+        job_id,
+        json.dumps({
+            "worker_id": worker_id,
+            "deadline": deadline,
+            "job": original,
+            "claim_token": claim_token,
+        }),
+    )
+    r.hset(WORKER_STATUS, worker_id, "busy")
+    db.mark_job_running(job_id, worker_id, now)
+    return claim_token, deadline
+
+
 @app.post("/jobs/next")
 def next_job(req: JobNextRequest, request: Request):
     """HTTP-only job pickup for remote agents (e.g. the Windows gamer install).
-    Pops one job from the per-tool queue and returns it; the agent should
-    immediately POST /jobs/claim with the returned job_id.
+    Pops one job from the per-tool queue, atomically issues a claim, and
+    returns both the job and the ``claim_token`` the worker must echo
+    back on /jobs/complete and /jobs/partial. Folding claim into the
+    pickup means there is no in-between state where a job is popped but
+    unclaimed.
 
     ``tool`` defaults to "chat" so legacy agents (no tool field in their
     /jobs/next body) keep pulling chat jobs. Image-capable agents call
@@ -1058,24 +1167,31 @@ def next_job(req: JobNextRequest, request: Request):
         job = json.loads(raw)
     except json.JSONDecodeError:
         return {"job": None}
+    job_id = job.get("job_id")
+    claim_token, deadline = _issue_claim(req.worker_id, job_id, job)
     log.info(
         "job dispensed",
         extra={
             "event": "job_dispensed",
-            "job_id": job.get("job_id"),
+            "job_id": job_id,
             "worker_id": req.worker_id,
         },
     )
-    return {"job": job}
+    log.info(
+        "job claimed",
+        extra={"event": "job_claimed", "job_id": job_id, "worker_id": req.worker_id},
+    )
+    return {"job": job, "claim_token": claim_token, "deadline": deadline}
 
 
 @app.post("/jobs/claim")
 def claim(req: JobClaimRequest, request: Request):
-    """Worker reports it has claimed a job. Coordinator records processing entry + DB row."""
+    """Legacy claim path for the in-VPS worker (which pops jobs from
+    Redis directly with BLPOP and then calls /jobs/claim). Remote agents
+    use the atomic /jobs/next path instead. Returns the ``claim_token``
+    the worker must include on subsequent /jobs/complete and
+    /jobs/partial calls."""
     _require_worker_owner(request, req.worker_id)
-    now = time.time()
-    deadline = now + JOB_TIMEOUT_SECONDS
-
     # find original job payload — best-effort, used only for requeue on timeout
     raw = r.hget(JOB_RESULTS, req.job_id)
     original = None
@@ -1083,19 +1199,12 @@ def claim(req: JobClaimRequest, request: Request):
         row = db.get_job(req.job_id)
         if row:
             original = _job_row_to_envelope(row)
-
-    r.hset(
-        JOB_PROCESSING,
-        req.job_id,
-        json.dumps({"worker_id": req.worker_id, "deadline": deadline, "job": original}),
-    )
-    r.hset(WORKER_STATUS, req.worker_id, "busy")
-    db.mark_job_running(req.job_id, req.worker_id, now)
+    claim_token, deadline = _issue_claim(req.worker_id, req.job_id, original)
     log.info(
         "job claimed",
         extra={"event": "job_claimed", "job_id": req.job_id, "worker_id": req.worker_id},
     )
-    return {"ok": True, "deadline": deadline}
+    return {"ok": True, "deadline": deadline, "claim_token": claim_token}
 
 
 @app.post("/jobs/abandon")
@@ -1119,6 +1228,17 @@ def abandon(req: JobClaimRequest, request: Request):
         meta = json.loads(raw)
     except json.JSONDecodeError:
         meta = {}
+    # Token gate — a stale agent whose claim was already requeued and
+    # reassigned must not be able to requeue a SECOND copy via abandon.
+    expected_token = meta.get("claim_token")
+    if expected_token and req.claim_token and req.claim_token != expected_token:
+        raise HTTPException(
+            status_code=410,
+            detail={"reason": "claim_token_mismatch",
+                    "message": "your claim has expired; abandon is a no-op"},
+        )
+    if meta.get("worker_id") != req.worker_id:
+        return {"ok": True, "requeued": False, "reason": "not the current claimant"}
     original = meta.get("job")
     if original is None:
         row = db.get_job(req.job_id)
@@ -1161,23 +1281,16 @@ def partial(req: JobPartialRequest, request: Request):
     filters them out.
     """
     _require_worker_owner(request, req.worker_id)
-    # Verify this worker actually holds the claim — same gating as
-    # /jobs/complete, prevents one worker from clobbering another's
-    # in-flight job's text.
-    raw = r.hget(JOB_PROCESSING, req.job_id)
-    if raw is None:
-        # Job already completed or never claimed by anyone — accept
-        # silently rather than 404, since this is a fire-and-forget
-        # path and the worker may be a few ms behind a finalize.
-        return {"ok": True, "stale": True}
     try:
-        meta = json.loads(raw)
-    except json.JSONDecodeError:
-        meta = {}
-    if meta.get("worker_id") != req.worker_id:
-        raise HTTPException(
-            status_code=403, detail="not the current claimant",
-        )
+        _verify_claim_or_410(req.job_id, req.worker_id, req.claim_token)
+    except HTTPException as exc:
+        # Fire-and-forget partial: a stale partial dropping out as 410
+        # is harmless (the worker will see the matching 410 on its
+        # /complete and act there). But surface the 410 anyway so the
+        # worker can log it.
+        if exc.status_code == 410:
+            return {"ok": True, "stale": True}
+        raise
     text = req.text or ""
     r.hset(JOB_PARTIALS, req.job_id, text)
     msg = db.get_message_by_job(req.job_id)
@@ -1190,6 +1303,17 @@ def partial(req: JobPartialRequest, request: Request):
 def complete(req: JobCompleteRequest, request: Request):
     """Worker submits result. Coordinator writes Redis result, earnings, SQLite row."""
     _require_worker_owner(request, req.worker_id)
+    # Canaries are issued straight into JOB_PROCESSING but the canary
+    # path predates claim tokens — skip the gate for those so the
+    # canary scheduler doesn't have to thread a token through. Real
+    # jobs always carry one.
+    canary_id = r.hget(CANARY_PENDING, req.job_id)
+    if canary_id is None:
+        # 410 here propagates back to the worker so it knows the
+        # result isn't being accepted — agent code interprets this
+        # as "lost the race / cancelled" and skips local earnings
+        # credit.
+        _verify_claim_or_410(req.job_id, req.worker_id, req.claim_token)
     now = time.time()
     tokens = int(req.completion_tokens or 0)
 
@@ -1198,7 +1322,6 @@ def complete(req: JobCompleteRequest, request: Request):
     # is told "ok" the same way as a real job — we don't surface canary
     # status, because doing so would let a malicious worker special-case
     # canary handling and pass every check.
-    canary_id = r.hget(CANARY_PENDING, req.job_id)
     if canary_id:
         canary_row = db.get_canary(canary_id)
         matched = (
@@ -1421,6 +1544,90 @@ def complete(req: JobCompleteRequest, request: Request):
         },
     )
     return {"ok": True, "earnings": earnings}
+
+
+@app.post("/jobs/cancel")
+def cancel_job(req: JobCancelRequest, request: Request):
+    """Member-initiated cancellation. The worker (if still processing)
+    discovers the cancellation when its /jobs/complete returns 410 —
+    we don't have a worker-side push channel, so the contract is "the
+    worker's eventual result is dropped on the floor."
+
+    Idempotent: cancelling an already-terminal job is a 200 no-op so
+    a double-click from a flaky network can't 404 the second click."""
+    row = db.get_job(req.job_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="job not found")
+
+    # Ownership: the submitter (or admin) can cancel. Auth-off mode
+    # permits everything (dev/test) — same shape as the conversation
+    # owner check.
+    if AUTH_ENABLED:
+        member = getattr(request.state, "member", None)
+        if member is None:
+            raise HTTPException(status_code=401, detail="unauthorized")
+        submitted_by = (
+            row["submitted_by_member_id"]
+            if "submitted_by_member_id" in row.keys() else None
+        )
+        if (
+            submitted_by is not None
+            and submitted_by != member.member_id
+            and member.role != "admin"
+        ):
+            raise HTTPException(status_code=404, detail="job not found")
+
+    # Idempotency: already terminal → no-op. We do this AFTER the
+    # ownership check so a guess at someone else's job_id still gets
+    # 404, not "already complete."
+    current_status = row["status"]
+    if current_status in ("complete", "error", "cancelled"):
+        return {"ok": True, "already_terminal": True, "status": current_status}
+
+    now = time.time()
+    user_message = "Cancelled by you."
+    payload = {
+        "job_id": req.job_id,
+        "status": "cancelled",
+        "worker_id": row["worker_id"],
+        "model": row["model"],
+        "text": user_message,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "earnings": 0.0,
+        "duration_seconds": 0.0,
+        "error": "cancelled",
+    }
+    r.hset(JOB_RESULTS, req.job_id, json.dumps(payload))
+    # Remove JOB_PROCESSING so the worker's eventual /complete sees no
+    # active claim and returns 410. Also blow away any stale partials.
+    r.hdel(JOB_PROCESSING, req.job_id)
+    r.hdel(JOB_PARTIALS, req.job_id)
+    db.mark_job_complete(
+        job_id=req.job_id,
+        worker_id=row["worker_id"] or "",
+        model=row["model"] or "",
+        text=user_message,
+        prompt_tokens=0,
+        completion_tokens=0,
+        earnings=0.0,
+        duration_seconds=0.0,
+        completed_at=now,
+        status="cancelled",
+        error="cancelled by user",
+    )
+    msg = db.get_message_by_job(req.job_id)
+    if msg is not None:
+        db.finalize_message(
+            message_id=msg["message_id"],
+            text=user_message,
+            status="error",
+        )
+    log.info(
+        "job cancelled",
+        extra={"event": "job_cancelled", "job_id": req.job_id},
+    )
+    return {"ok": True, "status": "cancelled"}
 
 
 # ---------- observability ----------

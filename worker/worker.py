@@ -250,18 +250,27 @@ def process_job(r: redis.Redis, http: httpx.Client, job: dict, last_job_finished
     job_id = job["job_id"]
     started = time.time()
     log.info("claimed", extra={"event": "claimed", "job_id": job_id})
-    post(http, "/jobs/claim", {"worker_id": WORKER_ID, "job_id": job_id})
+    # Capture the claim_token the coordinator mints at /jobs/claim. We
+    # thread it through partial/complete so the coordinator can reject
+    # a stale completer (e.g. the reaper requeued and another worker
+    # has since picked the job up). The in-VPS worker BLPOPs jobs
+    # straight from Redis rather than going through /jobs/next, so
+    # /jobs/claim is still its first network contact with the
+    # coordinator for the job.
+    claim_resp = post(
+        http, "/jobs/claim",
+        {"worker_id": WORKER_ID, "job_id": job_id},
+    )
+    claim_token: Optional[str] = (claim_resp or {}).get("claim_token")
 
     def push_partial(text: str) -> None:
         # Fire-and-forget: a dropped partial isn't worth retrying since
         # the next one carries the full text anyway, and the final
         # /jobs/complete is the source of truth.
-        post(
-            http,
-            "/jobs/partial",
-            {"worker_id": WORKER_ID, "job_id": job_id, "text": text},
-            timeout=3,
-        )
+        body = {"worker_id": WORKER_ID, "job_id": job_id, "text": text}
+        if claim_token is not None:
+            body["claim_token"] = claim_token
+        post(http, "/jobs/partial", body, timeout=3)
 
     try:
         maybe_simulate_cold_start(last_job_finished)
@@ -274,21 +283,19 @@ def process_job(r: redis.Redis, http: httpx.Client, job: dict, last_job_finished
             messages=job.get("messages"),
         )
         duration = round(time.time() - started, 3)
-        post(
-            http,
-            "/jobs/complete",
-            {
-                "worker_id": WORKER_ID,
-                "job_id": job_id,
-                "text": result["text"],
-                "model": result["model"],
-                "prompt_tokens": result["prompt_tokens"],
-                "completion_tokens": result["completion_tokens"],
-                "duration_seconds": duration,
-                "status": "complete",
-            },
-            timeout=30,
-        )
+        complete_body = {
+            "worker_id": WORKER_ID,
+            "job_id": job_id,
+            "text": result["text"],
+            "model": result["model"],
+            "prompt_tokens": result["prompt_tokens"],
+            "completion_tokens": result["completion_tokens"],
+            "duration_seconds": duration,
+            "status": "complete",
+        }
+        if claim_token is not None:
+            complete_body["claim_token"] = claim_token
+        post(http, "/jobs/complete", complete_body, timeout=30)
         log.info(
             "complete tokens=%d duration=%.2fs",
             result["completion_tokens"],
@@ -298,22 +305,20 @@ def process_job(r: redis.Redis, http: httpx.Client, job: dict, last_job_finished
     except Exception as e:
         duration = round(time.time() - started, 3)
         log.exception("job failed: %s", e, extra={"event": "error", "job_id": job_id})
-        post(
-            http,
-            "/jobs/complete",
-            {
-                "worker_id": WORKER_ID,
-                "job_id": job_id,
-                "text": "",
-                "model": job.get("model") or MODEL,
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "duration_seconds": duration,
-                "status": "error",
-                "error": str(e),
-            },
-            timeout=30,
-        )
+        complete_body = {
+            "worker_id": WORKER_ID,
+            "job_id": job_id,
+            "text": "",
+            "model": job.get("model") or MODEL,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "duration_seconds": duration,
+            "status": "error",
+            "error": str(e),
+        }
+        if claim_token is not None:
+            complete_body["claim_token"] = claim_token
+        post(http, "/jobs/complete", complete_body, timeout=30)
     return time.time()
 
 

@@ -45,7 +45,7 @@ IS_WINDOWS = platform.system() == "Windows"
 # the moment it starts. The CI-generated version.txt (short-sha +
 # build timestamp) is still what the self-updater diffs against;
 # AGENT_VERSION is just the human-facing label.
-AGENT_VERSION = "1.1.22"
+AGENT_VERSION = "1.1.23"
 
 # ---------------------------------------------------------------------------
 # Idle detection
@@ -1468,6 +1468,13 @@ def setup_logging(headless: bool = False) -> logging.Logger:
 # ---------------------------------------------------------------------------
 # Coordinator client
 # ---------------------------------------------------------------------------
+# Background heartbeat cadence. The coordinator marks a worker offline
+# when no heartbeat lands within WORKER_TIMEOUT_SECONDS (15s in prod),
+# so 5s leaves a 3x safety margin and matches the legacy main-loop
+# cadence one-for-one.
+HEARTBEAT_INTERVAL_SECONDS = 5.0
+
+
 class Coordinator:
     def __init__(
         self,
@@ -1481,7 +1488,22 @@ class Coordinator:
         self.log = log
         headers = {"Authorization": f"Bearer {api_token}"} if api_token else {}
         self.http = httpx.Client(timeout=30.0, headers=headers)
+        # ----- background heartbeat state -----
+        # The main thread updates current_status / current_job_id via
+        # set_idle / set_offline / set_busy / clear_busy. A dedicated
+        # daemon thread reads these every HEARTBEAT_INTERVAL_SECONDS
+        # and POSTs /heartbeat, so a long inference call on the main
+        # thread no longer suppresses heartbeats — the symptom that
+        # made worker_offline flap during DreamShaper image jobs and
+        # opened a window where the reaper could (used to) requeue
+        # healthy in-flight work.
+        self._hb_lock = threading.Lock()
+        self._current_status = "idle"
+        self._current_job_id: Optional[str] = None
+        self._hb_stop = threading.Event()
+        self._hb_thread: Optional[threading.Thread] = None
 
+    # ---------- low-level HTTP ----------
     def _post(self, path: str, body: dict, timeout: float = 10.0) -> Optional[dict]:
         try:
             resp = self.http.post(f"{self.base}{path}", json=body, timeout=timeout)
@@ -1490,6 +1512,23 @@ class Coordinator:
         except httpx.HTTPError as e:
             self.log.warning("coordinator %s failed: %s", path, e)
             return None
+
+    def _post_raw(self, path: str, body: dict, timeout: float = 10.0) -> tuple[int, Optional[dict]]:
+        """Like ``_post`` but returns ``(status_code, body)`` so callers
+        can distinguish 410 Gone (claim was reassigned or cancelled —
+        do NOT credit local state) from transport failures (unknown,
+        treat as transient). ``status_code == 0`` signals a transport
+        error (no HTTP response received)."""
+        try:
+            resp = self.http.post(f"{self.base}{path}", json=body, timeout=timeout)
+        except httpx.HTTPError as e:
+            self.log.warning("coordinator %s transport failed: %s", path, e)
+            return 0, None
+        try:
+            data = resp.json()
+        except ValueError:
+            data = None
+        return resp.status_code, data
 
     def _get(self, path: str) -> Optional[dict]:
         try:
@@ -1500,6 +1539,7 @@ class Coordinator:
             self.log.warning("coordinator GET %s failed: %s", path, e)
             return None
 
+    # ---------- registration ----------
     def register(self, capabilities: Optional[dict] = None) -> bool:
         body: dict = {"worker_id": self.worker_id}
         if capabilities:
@@ -1515,48 +1555,179 @@ class Coordinator:
         self.log.error("could not register with coordinator")
         return False
 
-    def heartbeat(self, status: str) -> None:
-        self._post("/heartbeat", {"worker_id": self.worker_id, "status": status}, timeout=5)
+    # ---------- heartbeat: state setters + background thread ----------
+    def set_idle(self) -> None:
+        with self._hb_lock:
+            self._current_status = "idle"
+            self._current_job_id = None
 
+    def set_offline(self) -> None:
+        with self._hb_lock:
+            self._current_status = "offline"
+            self._current_job_id = None
+
+    def set_busy(self, job_id: str) -> None:
+        with self._hb_lock:
+            self._current_status = "busy"
+            self._current_job_id = job_id
+
+    def clear_busy(self) -> None:
+        # Distinct name for the transition out of a job — the main
+        # loop usually wants to follow it with set_idle, but a call
+        # to clear_busy on its own (e.g. error path before deciding
+        # next state) just blanks the job_id without lying about the
+        # current status.
+        with self._hb_lock:
+            self._current_job_id = None
+
+    def _heartbeat_loop(self) -> None:
+        """POST /heartbeat every HEARTBEAT_INTERVAL_SECONDS with the
+        current status + job_id snapshot. Never raises — the coordinator
+        being temporarily unreachable is a logged warning inside
+        ``_post`` and the next tick retries cleanly."""
+        # First beat goes out immediately so a re-register followed by
+        # a long inference doesn't leave the coordinator without a
+        # post-register heartbeat.
+        while not self._hb_stop.is_set():
+            with self._hb_lock:
+                status = self._current_status
+                job_id = self._current_job_id
+            self._post(
+                "/heartbeat",
+                {
+                    "worker_id": self.worker_id,
+                    "status": status,
+                    "job_id": job_id,
+                },
+                timeout=5,
+            )
+            self._hb_stop.wait(HEARTBEAT_INTERVAL_SECONDS)
+
+    def start_heartbeat(self) -> None:
+        if self._hb_thread is not None and self._hb_thread.is_alive():
+            return
+        self._hb_stop.clear()
+        self._hb_thread = threading.Thread(
+            target=self._heartbeat_loop,
+            name="gamerai-heartbeat",
+            daemon=True,
+        )
+        self._hb_thread.start()
+
+    def stop_heartbeat(self, send_offline: bool = True) -> None:
+        """Stop the background thread and (by default) fire one final
+        synchronous offline heartbeat so the coordinator's worker view
+        flips immediately rather than waiting WORKER_TIMEOUT_SECONDS to
+        time out the previous beat."""
+        self._hb_stop.set()
+        if self._hb_thread is not None:
+            self._hb_thread.join(timeout=2.0)
+        if send_offline:
+            try:
+                self._post(
+                    "/heartbeat",
+                    {"worker_id": self.worker_id, "status": "offline", "job_id": None},
+                    timeout=3,
+                )
+            except Exception:
+                pass
+
+    # ---------- job lifecycle ----------
     def next_job(self, tool: str = "chat") -> Optional[dict]:
         """Pull the next job for *tool*. Defaults to chat for the legacy
         single-queue path; an image-capable worker calls this twice
         (chat, then image) per main-loop tick so it serves both queues
-        without starving either."""
+        without starving either.
+
+        The returned dict (if any) includes a ``claim_token`` minted by
+        the coordinator at pickup; the caller must thread it back to
+        ``complete`` / ``partial`` / ``abandon`` so a re-dispatched
+        job's original worker can't clobber the new claimant's work."""
         out = self._post(
             "/jobs/next",
             {"worker_id": self.worker_id, "tool": tool},
             timeout=10,
         )
-        return (out or {}).get("job")
+        if not out:
+            return None
+        job = out.get("job")
+        if not job:
+            return None
+        # Stash the claim_token on the job dict so process_one can
+        # pluck it out without changing the surrounding flow. The
+        # coordinator's response shape is ``{"job": {...},
+        # "claim_token": "..."}``; we hoist the token onto the job
+        # for easier downstream access.
+        token = out.get("claim_token")
+        if token:
+            job["_claim_token"] = token
+        return job
 
-    def claim(self, job_id: str) -> bool:
-        return self._post("/jobs/claim", {"worker_id": self.worker_id, "job_id": job_id}) is not None
+    def complete(
+        self,
+        payload: dict,
+        claim_token: Optional[str] = None,
+    ) -> tuple[bool, Optional[dict]]:
+        """Submit a result. Returns ``(accepted, response)``:
 
-    def complete(self, payload: dict) -> Optional[dict]:
-        return self._post("/jobs/complete", payload, timeout=30)
+        - ``accepted=True``: coordinator accepted the result; caller
+          should credit local earnings/jobs state.
+        - ``accepted=False`` with a logged 410: the claim was
+          superseded (reaper requeued, member cancelled, etc.) — caller
+          must NOT credit local state.
+        - ``accepted=False`` with a transport failure: unknown state.
+          The coordinator may or may not have recorded the result;
+          local state is best left untouched to avoid double-counting
+          if the reaper requeues and another worker also completes."""
+        body = dict(payload)
+        if claim_token is not None:
+            body["claim_token"] = claim_token
+        status, data = self._post_raw("/jobs/complete", body, timeout=30)
+        if status == 200:
+            return True, data
+        if status == 410:
+            reason = ((data or {}).get("detail") or {})
+            reason_code = reason.get("reason") if isinstance(reason, dict) else None
+            self.log.warning(
+                "complete rejected (410 %s) for job %s — skipping local credit",
+                reason_code or "gone", payload.get("job_id"),
+            )
+            return False, data
+        self.log.warning(
+            "complete failed (status=%s) for job %s",
+            status, payload.get("job_id"),
+        )
+        return False, data
 
-    def partial(self, job_id: str, text: str) -> None:
+    def partial(
+        self,
+        job_id: str,
+        text: str,
+        claim_token: Optional[str] = None,
+    ) -> None:
         """Push the accumulated streaming text so far. Fire-and-forget:
         the coordinator overwrites with the latest call (text is the
         FULL accumulated output, not a delta), and a dropped partial
         just means the next one carries the full state. The final
         ``/jobs/complete`` is the source of truth."""
-        self._post(
-            "/jobs/partial",
-            {"worker_id": self.worker_id, "job_id": job_id, "text": text},
-            timeout=3,
-        )
+        body = {"worker_id": self.worker_id, "job_id": job_id, "text": text}
+        if claim_token is not None:
+            body["claim_token"] = claim_token
+        self._post("/jobs/partial", body, timeout=3)
 
-    def abandon(self, job_id: str) -> bool:
+    def abandon(
+        self,
+        job_id: str,
+        claim_token: Optional[str] = None,
+    ) -> bool:
         """Voluntarily return a claimed job to the queue. Used in
         override-drain mode when the user becomes active between
         claim and inference. Coordinator requeues; another worker
         picks it up. Earnings are forfeited."""
-        out = self._post(
-            "/jobs/abandon",
-            {"worker_id": self.worker_id, "job_id": job_id},
-        )
+        body = {"worker_id": self.worker_id, "job_id": job_id}
+        if claim_token is not None:
+            body["claim_token"] = claim_token
+        out = self._post("/jobs/abandon", body)
         return bool((out or {}).get("ok"))
 
     def remote_earnings(self) -> Optional[dict]:
@@ -2694,7 +2865,6 @@ def main_loop(
     should_exit=lambda: False,
     tools: Optional[list[str]] = None,
 ) -> None:
-    last_heartbeat = 0.0
     last_earnings_print = time.time()
     # Periodic heartbeat-in-the-console: the operator wants to glance
     # at the agent window and immediately see status + version. We
@@ -2730,9 +2900,6 @@ def main_loop(
             return
 
         now = time.time()
-        if now - last_heartbeat > 5:
-            coord.heartbeat("idle")
-            last_heartbeat = now
 
         if now - last_earnings_print > cfg.earnings_print_seconds:
             print_earnings(state, log)
@@ -2746,8 +2913,7 @@ def main_loop(
                     reason, just_drained_job_id,
                 )
                 just_drained_job_id = None
-            coord.heartbeat("offline")
-            last_heartbeat = time.time()
+            coord.set_offline()
             emit_status("offline", reason)
             time.sleep(cfg.polling_interval)
             continue
@@ -2756,6 +2922,7 @@ def main_loop(
         # drain message, clear the breadcrumb so the next user-active
         # transition doesn't reference a stale job_id.
         just_drained_job_id = None
+        coord.set_idle()
         emit_status("idle", reason)
 
         did_work, processed_job_id = process_one(
@@ -2810,9 +2977,14 @@ def process_one(
     job_id = job.get("job_id")
     tool = (job.get("tool") or "chat").lower()
     prompt = job.get("prompt", "")
+    # /jobs/next now atomically claims the job and returns a
+    # per-claim secret. Stash it locally so subsequent partial/
+    # complete/abandon calls can prove they're still the rightful
+    # claimant — a 410 on any of these means the reaper requeued
+    # or the user cancelled, in which case we skip local credit.
+    claim_token = job.pop("_claim_token", None)
     log.info("job %s started (tool=%s)", job_id, tool)
-    coord.claim(job_id)
-    coord.heartbeat("busy")
+    coord.set_busy(job_id)
 
     if cfg.override_drain:
         idle_now, reason = is_system_idle(cfg)
@@ -2821,8 +2993,8 @@ def process_one(
                 "override-drain: %s — abandoning job %s (earnings forfeited)",
                 reason, job_id,
             )
-            coord.abandon(job_id)
-            coord.heartbeat("offline")
+            coord.abandon(job_id, claim_token=claim_token)
+            coord.set_offline()
             return False, None
 
     started = time.time()
@@ -2832,7 +3004,7 @@ def process_one(
                 prompt, job, cfg, log,
             )
             duration = round(time.time() - started, 3)
-            out = coord.complete(
+            accepted, out = coord.complete(
                 {
                     "worker_id": coord.worker_id,
                     "job_id": job_id,
@@ -2843,29 +3015,39 @@ def process_one(
                     "duration_seconds": duration,
                     "status": "complete",
                     "image_b64": image_b64,
-                }
+                },
+                claim_token=claim_token,
             )
-            earnings = float((out or {}).get("earnings", 0.0))
-            state["jobs"] = int(state.get("jobs", 0)) + 1
-            state["earnings_usd"] = round(
-                float(state.get("earnings_usd", 0.0)) + earnings, 10,
-            )
-            state["last_tool"] = "image"
-            save_state(state)
-            log.info(
-                "job %s finished (image): $%.8f, %.2fs",
-                job_id, earnings, duration,
-            )
+            if accepted:
+                earnings = float((out or {}).get("earnings", 0.0))
+                state["jobs"] = int(state.get("jobs", 0)) + 1
+                state["earnings_usd"] = round(
+                    float(state.get("earnings_usd", 0.0)) + earnings, 10,
+                )
+                state["last_tool"] = "image"
+                save_state(state)
+                log.info(
+                    "job %s finished (image): $%.8f, %.2fs",
+                    job_id, earnings, duration,
+                )
+            else:
+                log.info(
+                    "job %s (image): %.2fs of work discarded — "
+                    "claim was superseded or cancelled",
+                    job_id, duration,
+                )
         else:
             result = run_inference(
                 prompt,
                 cfg.model or job.get("model"),
                 log,
                 messages=job.get("messages"),
-                on_partial=lambda text: coord.partial(job_id, text),
+                on_partial=lambda text: coord.partial(
+                    job_id, text, claim_token=claim_token,
+                ),
             )
             duration = round(time.time() - started, 3)
-            out = coord.complete(
+            accepted, out = coord.complete(
                 {
                     "worker_id": coord.worker_id,
                     "job_id": job_id,
@@ -2875,18 +3057,26 @@ def process_one(
                     "completion_tokens": result["completion_tokens"],
                     "duration_seconds": duration,
                     "status": "complete",
-                }
+                },
+                claim_token=claim_token,
             )
-            earnings = float((out or {}).get("earnings", 0.0))
-            state["jobs"] = int(state.get("jobs", 0)) + 1
-            state["tokens"] = int(state.get("tokens", 0)) + int(result["completion_tokens"])
-            state["earnings_usd"] = round(float(state.get("earnings_usd", 0.0)) + earnings, 10)
-            state["last_tool"] = "chat"
-            save_state(state)
-            log.info(
-                "job %s finished: %d tokens, $%.8f, %.2fs",
-                job_id, result["completion_tokens"], earnings, duration,
-            )
+            if accepted:
+                earnings = float((out or {}).get("earnings", 0.0))
+                state["jobs"] = int(state.get("jobs", 0)) + 1
+                state["tokens"] = int(state.get("tokens", 0)) + int(result["completion_tokens"])
+                state["earnings_usd"] = round(float(state.get("earnings_usd", 0.0)) + earnings, 10)
+                state["last_tool"] = "chat"
+                save_state(state)
+                log.info(
+                    "job %s finished: %d tokens, $%.8f, %.2fs",
+                    job_id, result["completion_tokens"], earnings, duration,
+                )
+            else:
+                log.info(
+                    "job %s: %d tokens of work discarded — "
+                    "claim was superseded or cancelled",
+                    job_id, result["completion_tokens"],
+                )
     except Exception as e:
         log.exception("job %s failed: %s", job_id, e)
         coord.complete(
@@ -2900,10 +3090,11 @@ def process_one(
                 "duration_seconds": round(time.time() - started, 3),
                 "status": "error",
                 "error": str(e),
-            }
+            },
+            claim_token=claim_token,
         )
     finally:
-        coord.heartbeat("idle")
+        coord.set_idle()
     return True, job_id
 
 
@@ -3666,6 +3857,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         if keep_awake_active:
             keep_awake_end(log)
         return 1
+    # Background heartbeat thread takes over /heartbeat POSTs from the
+    # main loop. While inference is running on the main thread (chat
+    # streams, image gen — sometimes 30–60s on DreamShaper) this thread
+    # keeps the worker visibly alive to the coordinator, so the reaper
+    # never falsely requeues a healthy in-flight job.
+    coord.start_heartbeat()
 
     # Registration succeeded. If we forcibly unhid the console for the
     # first-run token prompt, hide it again now and fire a confirmation
@@ -3755,7 +3952,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         except Exception:
             pass
         try:
-            coord.heartbeat("offline")
+            # Stops the background heartbeat thread and pushes one
+            # final offline beat so the coordinator's /workers view
+            # flips immediately rather than waiting for the timeout.
+            coord.stop_heartbeat(send_offline=True)
         except Exception:
             pass
         if (keep_awake_holder.get("active")

@@ -282,7 +282,16 @@ class ConversationCompleteAppendsTests(_BaseE2E):
         )
         self.assertEqual(sub.status_code, 200, sub.text)
         job_id = sub.json()["job_id"]
-        # Worker reports back.
+        # Claim the job to mint a claim_token. /jobs/complete now
+        # enforces token possession to keep a stale (reaper-requeued)
+        # worker from clobbering the new claimant.
+        claim = self.client.post(
+            "/jobs/claim",
+            json={"worker_id": "w1", "job_id": job_id},
+            headers=self._admin_headers(),
+        )
+        self.assertEqual(claim.status_code, 200, claim.text)
+        claim_token = claim.json()["claim_token"]
         comp = self.client.post(
             "/jobs/complete",
             json={
@@ -294,6 +303,7 @@ class ConversationCompleteAppendsTests(_BaseE2E):
                 "completion_tokens": 7,
                 "duration_seconds": 1.0,
                 "status": "complete",
+                "claim_token": claim_token,
             },
             headers=self._admin_headers(),
         )
@@ -385,12 +395,13 @@ class StreamingPersistenceTests(_BaseE2E):
     are the server-side guarantees that let a client which reloads the
     page mid-stream see its message + the partial answer so far."""
 
-    def _claim(self, job_id: str) -> None:
-        self.client.post(
+    def _claim(self, job_id: str) -> str:
+        resp = self.client.post(
             "/jobs/claim",
             json={"worker_id": "wstream", "job_id": job_id},
             headers=self._admin_headers(),
         )
+        return resp.json()["claim_token"]
 
     def test_generate_persists_pending_message_immediately(self):
         _, t = self._make_member(email="streamy@x.com")
@@ -435,11 +446,14 @@ class StreamingPersistenceTests(_BaseE2E):
             headers={"Authorization": f"Bearer {t}"},
         ).json()
         job_id = gen["job_id"]
-        self._claim(job_id)
+        claim_token = self._claim(job_id)
         for text in ("Hel", "Hello", "Hello!"):
             r = self.client.post(
                 "/jobs/partial",
-                json={"worker_id": "wstream", "job_id": job_id, "text": text},
+                json={
+                    "worker_id": "wstream", "job_id": job_id, "text": text,
+                    "claim_token": claim_token,
+                },
                 headers=self._admin_headers(),
             )
             self.assertEqual(r.status_code, 200, r.text)
@@ -479,7 +493,16 @@ class StreamingPersistenceTests(_BaseE2E):
             json={"worker_id": "wB", "job_id": job_id, "text": "stolen"},
             headers=self._admin_headers(),
         )
-        self.assertEqual(r.status_code, 403)
+        # Partial is fire-and-forget so coordinator absorbs the rejection
+        # as a 200/stale rather than failing the worker — but the
+        # contract is that the text MUST NOT land. Verify both halves.
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertTrue(r.json().get("stale"))
+        res = self.client.get(
+            f"/result/{job_id}",
+            headers={"Authorization": f"Bearer {t}"},
+        ).json()
+        self.assertNotIn("stolen", res.get("text") or "")
 
     def test_complete_finalizes_pending_in_place(self):
         _, t = self._make_member(email="finz@x.com")
@@ -492,10 +515,13 @@ class StreamingPersistenceTests(_BaseE2E):
             "/generate", json={"prompt": "q", "conversation_id": cid},
             headers={"Authorization": f"Bearer {t}"},
         ).json()["job_id"]
-        self._claim(job_id)
+        claim_token = self._claim(job_id)
         self.client.post(
             "/jobs/partial",
-            json={"worker_id": "wstream", "job_id": job_id, "text": "partial..."},
+            json={
+                "worker_id": "wstream", "job_id": job_id, "text": "partial...",
+                "claim_token": claim_token,
+            },
             headers=self._admin_headers(),
         )
         self.client.post(
@@ -505,6 +531,7 @@ class StreamingPersistenceTests(_BaseE2E):
                 "text": "final answer", "model": "llama3.2:1b",
                 "prompt_tokens": 2, "completion_tokens": 3,
                 "duration_seconds": 0.1, "status": "complete",
+                "claim_token": claim_token,
             },
             headers=self._admin_headers(),
         )
@@ -530,7 +557,7 @@ class StreamingPersistenceTests(_BaseE2E):
             "/generate", json={"prompt": "doomed", "conversation_id": cid},
             headers={"Authorization": f"Bearer {t}"},
         ).json()["job_id"]
-        self._claim(job_id)
+        claim_token = self._claim(job_id)
         self.client.post(
             "/jobs/complete",
             json={
@@ -538,6 +565,7 @@ class StreamingPersistenceTests(_BaseE2E):
                 "model": "llama3.2:1b", "prompt_tokens": 0,
                 "completion_tokens": 0, "duration_seconds": 0.05,
                 "status": "error", "error": "model crashed",
+                "claim_token": claim_token,
             },
             headers=self._admin_headers(),
         )
@@ -585,11 +613,12 @@ class RetryEndpointTests(_BaseE2E):
         ).json()
         job_id = gen["job_id"]
         message_id = gen["assistant_message_id"]
-        self.client.post(
+        claim = self.client.post(
             "/jobs/claim",
             json={"worker_id": "wretry", "job_id": job_id},
             headers=self._admin_headers(),
         )
+        claim_token = claim.json()["claim_token"]
         self.client.post(
             "/jobs/complete",
             json={
@@ -597,6 +626,7 @@ class RetryEndpointTests(_BaseE2E):
                 "model": "llama3.2:1b", "prompt_tokens": 0,
                 "completion_tokens": 0, "duration_seconds": 0.05,
                 "status": "error", "error": "boom",
+                "claim_token": claim_token,
             },
             headers=self._admin_headers(),
         )
@@ -651,16 +681,18 @@ class RetryEndpointTests(_BaseE2E):
             headers={"Authorization": f"Bearer {t}"},
         ).json()
         message_id = gen["assistant_message_id"]
-        self.client.post(
+        claim = self.client.post(
             "/jobs/claim", json={"worker_id": "w", "job_id": gen["job_id"]},
             headers=self._admin_headers(),
         )
+        claim_token = claim.json()["claim_token"]
         self.client.post(
             "/jobs/complete",
             json={
                 "worker_id": "w", "job_id": gen["job_id"], "text": "fine",
                 "model": "m", "prompt_tokens": 1, "completion_tokens": 1,
                 "duration_seconds": 0.1, "status": "complete",
+                "claim_token": claim_token,
             },
             headers=self._admin_headers(),
         )

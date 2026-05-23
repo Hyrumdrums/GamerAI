@@ -371,6 +371,14 @@ class WorkerOwnershipTests(_BaseE2E):
             "/generate", json={"prompt": "hi"}, headers=self._admin_headers(),
         )
         jid = sub.json()["job_id"]
+        # Owner must hold a current claim to complete — mint one.
+        claim = self.client.post(
+            "/jobs/claim",
+            json={"worker_id": wid, "job_id": jid},
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        self.assertEqual(claim.status_code, 200, claim.text)
+        claim_token = claim.json()["claim_token"]
         # Complete it as the worker's owner.
         resp = self.client.post(
             "/jobs/complete",
@@ -383,6 +391,7 @@ class WorkerOwnershipTests(_BaseE2E):
                 "completion_tokens": 1,
                 "duration_seconds": 0.0,
                 "status": "complete",
+                "claim_token": claim_token,
             },
             headers={"Authorization": f"Bearer {t}"},
         )
