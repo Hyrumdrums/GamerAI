@@ -369,11 +369,24 @@ async function streamIntoBubble(jobId, wrap, statusEl, startMs, messageId) {
   const ta = document.getElementById('prompt');
   submitBtn.disabled = true;
   ta.disabled = true;
-  // Stick to the bottom only if the user is already near the bottom;
-  // otherwise let them scroll up to re-read prior turns without us
-  // yanking the viewport on every token batch.
-  const isNearBottom = () =>
-    pane.scrollTop + pane.clientHeight >= pane.scrollHeight - 64;
+  // Scroll-pin state. Single boolean updated on every pane scroll
+  // event (user OR programmatic — a programmatic scroll-to-bottom
+  // just re-confirms pinned=true, which is harmless). Replaces the
+  // old per-frame isNearBottom() check, which raced with the
+  // typewriter's 60fps innerHTML rewrites and made it nearly
+  // impossible to scroll up through a long streaming bubble — the
+  // pane reflow would fire faster than the user could drag their
+  // wheel past the 64px threshold.
+  //
+  // Initial state assumes pinned (we want auto-follow at the start
+  // of a new message). The first user scroll-up event flips it; a
+  // user scroll-back-to-bottom flips it back.
+  let isPinnedToBottom = true;
+  const onPaneScroll = () => {
+    const distFromBottom = pane.scrollHeight - pane.scrollTop - pane.clientHeight;
+    isPinnedToBottom = distFromBottom < 32;
+  };
+  pane.addEventListener('scroll', onPaneScroll, { passive: true });
 
   // Typewriter state. ``target`` is the most recent server-side text;
   // ``shownChars`` is how many characters we've revealed so far.
@@ -391,9 +404,8 @@ async function streamIntoBubble(jobId, wrap, statusEl, startMs, messageId) {
 
   function renderShown() {
     if (activeStream !== myToken) return;
-    const stick = isNearBottom();
     setBubbleContent(bubble, 'assistant', target.substring(0, shownChars));
-    if (stick) pane.scrollTop = pane.scrollHeight;
+    if (isPinnedToBottom) pane.scrollTop = pane.scrollHeight;
   }
 
   function typewriterTick(ts) {
@@ -562,6 +574,7 @@ async function streamIntoBubble(jobId, wrap, statusEl, startMs, messageId) {
     }
   } finally {
     clearStuckNotice();
+    pane.removeEventListener('scroll', onPaneScroll);
     if (rafId !== null) cancelAnimationFrame(rafId);
     if (activeStream === myToken) {
       activeStream = null;
