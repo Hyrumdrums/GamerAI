@@ -57,3 +57,9 @@ table.friends-table td {
   border-bottom: 1px solid var(--border, #e0e0e0);
 }
 table.friends-table th { color: var(--muted, #666); font-weight: 600; }
+.card.cta {
+  background: #f0f7ff;
+  border-color: #b9d4f0;
+}
+.card.cta h2 { margin-top: 0; }
+.card.cta .btn { display: inline-block; margin-top: .25rem; }

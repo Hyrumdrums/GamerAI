@@ -287,6 +287,51 @@ class AgentPairingTests(unittest.TestCase):
         r = self.client.post("/agents/pair/unpair")
         self.assertEqual(r.status_code, 401)
 
+    # ------------------------------------------------------------------
+    # /me/machines + /me/machines/<prefix>/unpair
+    # ------------------------------------------------------------------
+    def test_machines_endpoint_lists_paired_agents(self):
+        self._pair_and_get_token()
+        r = self.client.get("/me/machines", headers=self._admin_headers())
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertEqual(len(body["machines"]), 1)
+        m = body["machines"][0]
+        # 12-char prefix, never the raw bearer or full hash.
+        self.assertEqual(len(m["id"]), 12)
+        self.assertIn("agent (paired", m["label"])
+
+    def test_machines_endpoint_empty_when_no_pairs(self):
+        r = self.client.get("/me/machines", headers=self._admin_headers())
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["machines"], [])
+
+    def test_machines_unpair_revokes_credential(self):
+        token = self._pair_and_get_token()
+        m = self.client.get(
+            "/me/machines", headers=self._admin_headers(),
+        ).json()["machines"][0]
+        r = self.client.post(
+            f"/me/machines/{m['id']}/unpair",
+            headers=self._admin_headers(),
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.json()["deleted"])
+        # The paired token no longer authenticates.
+        self.assertEqual(
+            self.client.get(
+                "/me", headers={"Authorization": f"Bearer {token}"},
+            ).status_code,
+            401,
+        )
+
+    def test_machines_unpair_unknown_prefix_404s(self):
+        r = self.client.post(
+            "/me/machines/abc123def456/unpair",
+            headers=self._admin_headers(),
+        )
+        self.assertEqual(r.status_code, 404)
+
 
 if __name__ == "__main__":
     unittest.main()

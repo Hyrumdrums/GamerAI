@@ -625,6 +625,16 @@ quotas.
       polling). Token rotation is per-agent in the `member_tokens`
       table, not a primary-bearer rotate — so pairing an agent doesn't
       kill the user's web session.
+- [x] Agent unpair on uninstall — Inno's `[UninstallRun]` invokes
+      `agent --unpair`, which revokes the bearer server-side via
+      `POST /agents/pair/unpair` before the local file wipe. Plus
+      `taskkill` for the zombie-tray case and full `%APPDATA%\GamerAI`
+      removal via `[UninstallDelete]`. Verified end-to-end in
+      production (1.2.3).
+- [x] /account "Paired machines" section — per-PC list with web-side
+      Unpair button, plus a "Contribute and invite friends" CTA that
+      links to /contribute. Topbar CTA hides itself once
+      `paired_machines_count > 0`.
 - [ ] Tier promotion engine — measures uptime + capability + claimed-
       jobs-per-hour; promotes/demotes contributors across BRONZE →
       PLATINUM nightly.
@@ -637,8 +647,9 @@ quotas.
       is deferred until an email service is wired up — see
       `docs/auth-design.md` for the cascading-takeover threat model).
 - [x] Host account UI — `/account` shows your host (for invitees),
-      your friends list + open invites + revoke (for hosts), and
-      placeholders for "This PC" agent pairing.
+      your friends list + open invites + revoke (for hosts), the
+      paired-machines list with per-PC unpair, and a CTA to
+      `/contribute` for hosts who haven't paired anything yet.
 - [ ] Per-tier per-contributor invite quotas (admin-only invite
       creation in v1; tier-gated slots when the promotion engine
       lands).

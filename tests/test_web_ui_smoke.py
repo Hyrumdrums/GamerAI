@@ -278,6 +278,12 @@ class WebUISmokeTests(unittest.TestCase):
         self.assertIn('action="/account/invites"', body)
         # No host section — admin has no parent.
         self.assertNotIn("Your host", body)
+        # Paired-machines section renders with empty state + a link
+        # to /contribute so a non-contributor admin has a path to
+        # become one.
+        self.assertIn("Paired machines", body)
+        self.assertIn('href="/contribute"', body)
+        self.assertIn("No paired PCs yet", body)
 
     def test_account_page_renders_for_invitee_with_host_section(self):
         _, code = self._make_contributor_and_invite()

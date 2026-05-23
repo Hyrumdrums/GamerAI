@@ -297,20 +297,76 @@ agent polls:  POST /agents/pair/poll {pair_code}
 agent persists token in state.json
 ```
 
+### Agent unpair
+
+Triggered by either the Windows uninstaller (`[UninstallRun] agent.exe
+--unpair`) or a manual run on demand. The order is intentional: hit
+the network first so the credential is revoked even if the local
+wipe fails, then NULL the on-disk copy so a recovered state.json
+holds nothing useful.
+
+```
+agent --unpair  --[POST /agents/pair/unpair]-->  coordinator
+                                                 delete member_tokens row
+                                                 (only matching this bearer's hash —
+                                                  never touches members.token_hash)
+                                                 return {deleted: true|false}
+
+agent then NULLs api_token in state.json
+```
+
+The `[UninstallRun]` step runs **before** Inno's `[UninstallDelete]`,
+so agent.exe still exists when the unpair fires. A second
+`[UninstallRun]` step does `taskkill /F /IM agent.exe /T` to reap the
+tray instance that's usually still alive when a user uninstalls
+without closing first; `[Setup] CloseApplications=force` asks
+Restart Manager first for a friendly close where supported.
+
+### Web-side unpair from /account
+
+The account page's "Paired machines" section lists each row in
+`member_tokens` for the caller (label, paired date, last-used). The
+per-row Unpair button POSTs to `/account/machines/<id>/unpair` →
+`/me/machines/<id>/unpair` on the coordinator → `delete_member_token`.
+The agent on the unpaired PC keeps running until it next tries to
+hit the coordinator, at which point it 401s and stops claiming work.
+
 ## Files of interest
 
 - `coordinator/db.py` — schema + member_tokens helpers
 - `coordinator/member_auth.py` — argon2 wrappers + Member dataclass + lookup
 - `coordinator/main.py` — `/login`, `/me/password`, `/me/friends`,
-  `/agents/pair/*`
-- `coordinator/admin.py` — `set-credentials` CLI (founding-admin bootstrap)
+  `/me/machines`, `/agents/pair/*` (start/info/confirm/poll/unpair)
+- `coordinator/admin.py` — `set-credentials`, `set-email` CLIs
 - `client/routes/auth.py` — `/login`, `/login/token`, `/logout`
 - `client/routes/invites.py` — public `/invite/<code>` redemption
-- `client/routes/account.py` — `/account`, `/agent/pair`
+- `client/routes/account.py` — `/account`, `/account/machines/<id>/unpair`,
+  `/account/invites/*`, `/agent/pair`, `/contribute`
 - `client/templates/redeem.html.j2` — invitee signup form
 - `client/templates/account.html.j2` — host + invitee account view
 - `client/templates/agent_pair.html.j2` — browser-handoff confirm
-- `windows-agent/agent.py` — `--pair` subcommand + `run_pair_flow`
+- `client/templates/contribute.html.j2` — public onboarding pitch +
+  Windows install TL;DR (linked from the topbar CTA and from
+  /account's empty-state)
+- `windows-agent/agent.py` — `--pair`, `--unpair` subcommands;
+  `run_pair_flow`, `run_unpair_flow`
+- `windows-agent/installer.iss` — `[UninstallRun]` invokes
+  `--unpair` then `taskkill`; `[UninstallDelete]` wipes
+  `%APPDATA%\GamerAI` and `%LOCALAPPDATA%\GamerAI`
 - `tests/test_password_auth.py` — u/p, /login, /me/password
-- `tests/test_pairing.py` — agent pairing endpoints
+- `tests/test_pairing.py` — agent pairing + unpair + /me/machines
 - `tests/test_web_ui_smoke.py` — web-side coverage for all of the above
+
+## Production status (as of 1.2.3)
+
+End-to-end verified live on ai.dallinlayton.com:
+
+- Invite redemption → u/p account creation → auto-login (no token reveal)
+- u/p sign-in → session cookie → /me + /account work
+- Per-host invite + friends list on /account (admin-only in v1)
+- Agent first-run auto-pairs via browser handoff (no token-paste anywhere)
+- Paired-machines list on /account with per-row Unpair button
+- Windows uninstall fires `--unpair` → server-side revocation +
+  `taskkill` of zombie tray + full `%APPDATA%\GamerAI` wipe
+- Topbar `Contribute and invite friends` CTA hides itself once a
+  machine is paired (`paired_machines_count > 0` on /me)

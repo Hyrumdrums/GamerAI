@@ -49,6 +49,8 @@ async def account_page(request: Request, flash: Optional[str] = None):
     status, friends = await _coord_get(bearer, "/me/friends")
     if status != 200:
         friends = {"open_invites": [], "accepted": []}
+    machines_status, machines_body = await _coord_get(bearer, "/me/machines")
+    machines = machines_body.get("machines", []) if machines_status == 200 else []
 
     # Friends section is admin-only in v1 (see docs/auth-design.md —
     # tier-gated per-contributor invites come with the 3b.i engine).
@@ -60,9 +62,35 @@ async def account_page(request: Request, flash: Optional[str] = None):
         {
             "me": me,
             "friends": friends,
+            "machines": machines,
             "can_invite": can_invite,
             "flash": flash,
         },
+    )
+
+
+@router.post("/account/machines/{prefix}/unpair")
+async def account_unpair_machine(prefix: str, request: Request):
+    """Web wrapper for /me/machines/<prefix>/unpair. Coordinator scopes
+    the lookup to the caller's member, so a prefix that doesn't match
+    anything they own 404s without leaking other members' state."""
+    bearer = session_bearer(request)
+    me = await identify(bearer) if bearer else None
+    if me is None:
+        return login_redirect("/account")
+    async with coordinator_client._client(bearer=bearer) as c:
+        r = await c.post(f"/me/machines/{prefix}/unpair", timeout=5)
+    if r.status_code == 200:
+        return RedirectResponse(
+            "/account?flash=PC unpaired.", status_code=303,
+        )
+    detail = "couldn't unpair"
+    try:
+        detail = r.json().get("detail", detail)
+    except ValueError:
+        pass
+    return RedirectResponse(
+        f"/account?flash={detail}", status_code=303,
     )
 
 

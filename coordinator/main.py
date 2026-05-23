@@ -2880,6 +2880,59 @@ def me(request: Request):
     }
 
 
+@app.get("/me/machines")
+def my_machines(request: Request):
+    """Account-page "This PC" section: every paired agent attached to
+    this member, with the short hash prefix used as the row id for
+    the per-machine unpair button. Never reveals the raw bearer (we
+    don't have it — we only stored the hash) or even the full hash;
+    the prefix is enough to disambiguate rows in the UI and is what
+    the unpair POST takes as a slug."""
+    member = getattr(request.state, "member", None)
+    if member is None:
+        if not AUTH_ENABLED:
+            return {"machines": []}
+        raise HTTPException(status_code=401, detail="unauthorized")
+    rows = db.list_member_tokens(member.member_id)
+    machines = []
+    for r in rows:
+        full_hash = r["token_hash"]
+        machines.append({
+            # 12-char prefix is enough to disambiguate even tens of
+            # thousands of rows; the full hash isn't a credential
+            # but there's no reason to surface it.
+            "id": full_hash[:12],
+            "label": r["label"] or "agent",
+            "created_at": r["created_at"],
+            "last_used_at": r["last_used_at"],
+        })
+    return {"machines": machines}
+
+
+@app.post("/me/machines/{prefix}/unpair")
+def unpair_my_machine(prefix: str, request: Request):
+    """Revoke a paired machine from the account page. Caller can only
+    unpair machines they own — the lookup is scoped to the caller's
+    member_id, so a prefix that matches another member's row no-ops
+    rather than leaking that the row exists."""
+    member = getattr(request.state, "member", None)
+    if member is None:
+        if not AUTH_ENABLED:
+            return {"deleted": False}
+        raise HTTPException(status_code=401, detail="unauthorized")
+    # Lookup the full hash by scanning the caller's own tokens.
+    # member_tokens for a single member is tiny (one row per paired
+    # PC), so this is cheap.
+    rows = db.list_member_tokens(member.member_id)
+    target = next((r["token_hash"] for r in rows if r["token_hash"].startswith(prefix)), None)
+    if target is None:
+        # 404 leaks no info — the prefix just doesn't match anything
+        # in the caller's scope, whether or not it exists elsewhere.
+        raise HTTPException(status_code=404, detail="machine not found")
+    deleted = db.delete_member_token(member.member_id, target)
+    return {"deleted": deleted}
+
+
 @app.get("/me/friends")
 def my_friends(request: Request):
     """Account-page Friends section: everyone the caller has invited.
