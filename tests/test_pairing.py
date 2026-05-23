@@ -218,6 +218,75 @@ class AgentPairingTests(unittest.TestCase):
         self.assertEqual(me.status_code, 200)
         self.assertEqual(me.json()["member_id"], "mem_admin_seed")
 
+    # ------------------------------------------------------------------
+    # /agents/pair/unpair
+    # ------------------------------------------------------------------
+    def _pair_and_get_token(self) -> str:
+        code = self.client.post("/agents/pair/start").json()["pair_code"]
+        self.client.post(
+            f"/agents/pair/{code}/confirm", headers=self._admin_headers(),
+        )
+        return self.client.post(
+            "/agents/pair/poll", json={"pair_code": code},
+        ).json()["token"]
+
+    def test_unpair_deletes_paired_token_and_revokes_access(self):
+        token = self._pair_and_get_token()
+        # Token works for /me beforehand.
+        self.assertEqual(
+            self.client.get(
+                "/me", headers={"Authorization": f"Bearer {token}"},
+            ).status_code,
+            200,
+        )
+        r = self.client.post(
+            "/agents/pair/unpair",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertTrue(r.json()["deleted"])
+        # Token no longer authenticates anything.
+        self.assertEqual(
+            self.client.get(
+                "/me", headers={"Authorization": f"Bearer {token}"},
+            ).status_code,
+            401,
+        )
+
+    def test_unpair_is_idempotent_after_revocation(self):
+        token = self._pair_and_get_token()
+        first = self.client.post(
+            "/agents/pair/unpair",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(first.status_code, 200)
+        self.assertTrue(first.json()["deleted"])
+        # Second call with the dead bearer — middleware rejects before
+        # the handler runs, so we expect 401. The operational outcome
+        # is the same either way: "the token doesn't work."
+        second = self.client.post(
+            "/agents/pair/unpair",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(second.status_code, 401)
+
+    def test_unpair_leaves_primary_web_token_intact(self):
+        """If someone manually pasted their /login token into the agent
+        and then unpairs, the primary bearer in members.token_hash must
+        stay valid — only member_tokens rows get removed."""
+        r = self.client.post(
+            "/agents/pair/unpair", headers=self._admin_headers(),
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertFalse(r.json()["deleted"])
+        # Admin web session still works.
+        me = self.client.get("/me", headers=self._admin_headers())
+        self.assertEqual(me.status_code, 200)
+
+    def test_unpair_requires_auth(self):
+        r = self.client.post("/agents/pair/unpair")
+        self.assertEqual(r.status_code, 401)
+
 
 if __name__ == "__main__":
     unittest.main()

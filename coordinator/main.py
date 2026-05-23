@@ -3858,6 +3858,44 @@ def agent_pair_confirm(code: str, request: Request):
     return {"ok": True}
 
 
+@app.post("/agents/pair/unpair")
+def agent_pair_unpair(request: Request):
+    """Agent retires its own bearer. Called by the Windows agent
+    during uninstall (and on demand via `agent --unpair`) so the
+    token on disk becomes useless to anyone who later recovers
+    state.json from a sold machine or a backup.
+
+    Only deletes from ``member_tokens`` — never from
+    ``members.token_hash`` — so a member who manually pasted their
+    web session token into the agent isn't accidentally signed out
+    of their browser when the agent unpairs. The normal pairing
+    flow lands in ``member_tokens``, so this is the right
+    behavior for 99% of callers; for the edge case the local
+    state wipe still removes the on-disk copy.
+
+    Idempotent: 200 with ``deleted=False`` if the bearer isn't in
+    ``member_tokens`` (already unpaired, or it's a primary-token
+    paste). The agent doesn't gate uninstall on the response."""
+    member = getattr(request.state, "member", None)
+    if member is None:
+        if not AUTH_ENABLED:
+            return {"deleted": False}
+        raise HTTPException(status_code=401, detail="unauthorized")
+    raw_token = member_auth.parse_bearer(
+        request.headers.get("authorization")
+    )
+    if not raw_token:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    token_hash = member_auth.hash_token(raw_token)
+    deleted = db.delete_member_token(member.member_id, token_hash)
+    if deleted:
+        log.info(
+            "agent unpaired",
+            extra={"event": "agent_unpaired", "worker_id": None},
+        )
+    return {"deleted": deleted}
+
+
 @app.post("/agents/pair/poll")
 def agent_pair_poll(req: AgentPairPollRequest):
     """Agent polls for the user's approval. Public — the agent has no

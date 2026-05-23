@@ -67,6 +67,18 @@ Name: "{userstartup}\{#MyAppName}";         Filename: "{app}\{#MyAppExeName}"; P
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName} now"; Flags: postinstall skipifsilent nowait
 
+[UninstallRun]
+; Retire the agent's bearer with the coordinator BEFORE Inno deletes
+; agent.exe. Without this, state.json still works as a credential
+; against the coordinator until someone manually revokes it server-
+; side — even an "Add or remove programs" uninstall would leave a
+; live token on disk. Best-effort: the agent exits 0 on any network
+; failure, so an offline / coordinator-down uninstall never blocks.
+; runhidden suppresses the console window. waituntilterminated keeps
+; the (~2-3 s) network call ahead of [UninstallDelete] so the file
+; that the agent reads exists when we call it.
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--unpair"; Flags: runhidden waituntilterminated; RunOnceId: "unpair"
+
 [UninstallDelete]
 ; Wipe everything the agent writes outside Inno's install manifest so
 ; "uninstall" actually means uninstall:

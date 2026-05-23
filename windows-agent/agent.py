@@ -45,7 +45,7 @@ IS_WINDOWS = platform.system() == "Windows"
 # the moment it starts. The CI-generated version.txt (short-sha +
 # build timestamp) is still what the self-updater diffs against;
 # AGENT_VERSION is just the human-facing label.
-AGENT_VERSION = "1.2.1"
+AGENT_VERSION = "1.2.2"
 
 # ---------------------------------------------------------------------------
 # Idle detection
@@ -3935,6 +3935,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         "page, wait for the signed-in user to click "
                         "Pair this PC, then save the issued token to "
                         "state.json and exit.")
+    p.add_argument("--unpair", action="store_true",
+                   help="retire this agent's bearer with the coordinator "
+                        "(POST /agents/pair/unpair) and wipe the local "
+                        "api_token from state.json. Invoked automatically "
+                        "by the Windows uninstaller; safe to run "
+                        "manually any time. Best-effort: a network "
+                        "failure logs and exits 0 so it never blocks "
+                        "uninstall.")
     args = p.parse_args(argv)
     # Deprecation alias: --background → --tray. v1.1.12 replaces the
     # silent --background mode with tray + hidden console; existing
@@ -4055,6 +4063,63 @@ def run_pair_flow(
     return None
 
 
+def run_unpair_flow(coordinator_url: str, state: dict) -> int:
+    """Retire this agent's bearer with the coordinator and wipe the
+    local copy. Best-effort: a network failure logs and returns 0 so
+    the Windows uninstaller never blocks on a coordinator outage.
+
+    Order matters: we hit the network first (so the token gets
+    revoked even if the file wipe somehow fails) and clear the local
+    api_token second (so a recovered state.json holds nothing useful
+    even if the network call succeeded).
+    """
+    token = state.get("api_token")
+    if not token:
+        sys.stdout.write("unpair: no api_token in state.json; nothing to do\n")
+        return 0
+    base = coordinator_url.rstrip("/")
+    try:
+        r = httpx.post(
+            f"{base}/agents/pair/unpair",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=5,
+        )
+        if r.status_code == 200:
+            body = r.json() if r.content else {}
+            sys.stdout.write(
+                f"unpair: coordinator revocation ok "
+                f"(deleted={body.get('deleted', 'unknown')})\n"
+            )
+        elif r.status_code == 401:
+            # Token already invalid — nothing to revoke. Treat as
+            # success since the outcome is what we wanted anyway.
+            sys.stdout.write(
+                "unpair: coordinator returned 401 (token already invalid)\n"
+            )
+        else:
+            sys.stdout.write(
+                f"unpair: coordinator returned {r.status_code}; "
+                f"wiping local copy anyway\n"
+            )
+    except httpx.HTTPError as e:
+        # Network down, DNS broken, coordinator unreachable. Don't
+        # block — uninstall should still succeed locally.
+        sys.stdout.write(
+            f"unpair: couldn't reach coordinator ({e}); "
+            f"wiping local copy anyway\n"
+        )
+    # Local wipe always runs, even if the network call failed. A
+    # recovered state.json without an api_token is harmless.
+    state["api_token"] = None
+    try:
+        save_state(state)
+        sys.stdout.write("unpair: local api_token cleared\n")
+    except Exception as e:
+        sys.stderr.write(f"unpair: failed to write state.json: {e}\n")
+        # Still return 0 — best-effort, never block uninstall.
+    return 0
+
+
 def resolve_api_token(
     cfg_token: Optional[str],
     state: dict,
@@ -4159,6 +4224,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         state = load_state()
         token = run_pair_flow(cfg.coordinator_url, state)
         return 0 if token else 2
+    if args.unpair:
+        cfg = Config.load(args.config if args.config.exists() else None)
+        state = load_state()
+        return run_unpair_flow(cfg.coordinator_url, state)
     if args.diagnose:
         # Diagnose loads config but skips logging setup + worker_id
         # allocation. Both write to disk; diagnose must be read-only.
