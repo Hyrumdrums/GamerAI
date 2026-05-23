@@ -340,7 +340,10 @@ This is an MVP. Don't ship it to customers as-is.
   durable replication, no SLO. Workers can disappear mid-job (handled by
   requeue, but customers see latency spikes).
 - **No batching.** One prompt per request. Real systems batch aggressively.
-- **No auth / billing.** Local-only; everyone is trusted.
+- **No billing.** Auth is wired (per-member u/p sign-in + invite flow +
+  agent pairing — see `docs/auth-design.md`), but the paid-customer
+  ledger is Phase 3b.ii. Today everything past sign-up is free for
+  contributors and their invitees.
 - **Token counts are approximated** when Ollama doesn't report them
   (`len(text) // 4`). Production would use the model's actual tokenizer.
 - **No proof-of-work.** The MVP trusts workers to report honest output and
@@ -611,18 +614,34 @@ quotas.
 
 **3b.i — Membership and tier engine**
 
-- [ ] Member token issuance (replaces the single shared API token).
+- [x] Member token issuance (replaces the single shared API token).
       Tokens identify a contributor; coordinator records them on every
       job for tier accounting.
+- [x] Per-member username + password sign-in (argon2 hashes,
+      `POST /login`); invite redemption auto-creates the account and
+      session — see `docs/auth-design.md`.
+- [x] Agent browser-handoff pairing (`agent --pair` opens a confirm
+      URL, the signed-in user approves, agent picks up its token via
+      polling). Token rotation is per-agent in the `member_tokens`
+      table, not a primary-bearer rotate — so pairing an agent doesn't
+      kill the user's web session.
 - [ ] Tier promotion engine — measures uptime + capability + claimed-
       jobs-per-hour; promotes/demotes contributors across BRONZE →
       PLATINUM nightly.
 - [ ] Per-tier quota enforcement on `/generate`. Free quota = sum of
       contributor's own + each invitee's remaining allowance.
-- [ ] Invitee/invite flow — contributor invites by email; sets cap
-      (% of own quota or absolute tokens); revokes/adjusts anytime.
-- [ ] Host admin UI — manage invitees, see your tier, see jobs
-      contributed vs. jobs consumed.
+- [x] Invitee/invite flow — admin or contributor creates an invite
+      from `/account`; sets daily cap + optional expiry; user redeems
+      at `/invite/<code>` with their own username/password. Email
+      collected for recognition but not yet used (host-can-reset-link
+      is deferred until an email service is wired up — see
+      `docs/auth-design.md` for the cascading-takeover threat model).
+- [x] Host account UI — `/account` shows your host (for invitees),
+      your friends list + open invites + revoke (for hosts), and
+      placeholders for "This PC" agent pairing.
+- [ ] Per-tier per-contributor invite quotas (admin-only invite
+      creation in v1; tier-gated slots when the promotion engine
+      lands).
 
 **3b.ii — Paid customer layer**
 
