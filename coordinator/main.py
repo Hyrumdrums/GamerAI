@@ -3367,6 +3367,13 @@ def create_invite(req: InviteCreateRequest, request: Request):
         raise HTTPException(
             status_code=403, detail="only contributors can create invites"
         )
+    invitee_email = (req.invitee_email or "").strip()
+    if not invitee_email or "@" not in invitee_email:
+        raise HTTPException(
+            status_code=400,
+            detail="invitee_email is required (every member needs a "
+                   "recovery address on file)",
+        )
 
     now = time.time()
     expires_at = (
@@ -3379,7 +3386,7 @@ def create_invite(req: InviteCreateRequest, request: Request):
         code=code,
         contributor_member_id=member.member_id,
         daily_quota_tokens=req.daily_quota_tokens,
-        invitee_email=req.invitee_email,
+        invitee_email=invitee_email,
         expires_at=expires_at,
         notes=req.notes,
         created_at=now,

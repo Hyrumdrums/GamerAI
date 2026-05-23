@@ -121,7 +121,13 @@ async def account_create_invite(
     if me is None:
         return login_redirect("/account")
 
-    body: dict = {}
+    email = invitee_email.strip()
+    if not email or "@" not in email:
+        return RedirectResponse(
+            "/account?flash=Friend's email is required.",
+            status_code=303,
+        )
+    body: dict = {"invitee_email": email}
     if daily_quota_tokens.strip():
         try:
             body["daily_quota_tokens"] = int(daily_quota_tokens)
@@ -130,8 +136,6 @@ async def account_create_invite(
                 "/account?flash=Daily quota must be a number.",
                 status_code=303,
             )
-    if invitee_email.strip():
-        body["invitee_email"] = invitee_email.strip()
     if expires_hours.strip():
         try:
             body["expires_hours"] = float(expires_hours)

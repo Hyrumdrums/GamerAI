@@ -292,8 +292,17 @@ class MemberAuthE2ETests(unittest.TestCase):
         member = member_auth.lookup_member_by_token(self.db, token)
         return member.member_id, token
 
+    _invite_seq = 0
+
     def _create_invite(self, contributor_token: str, **kwargs) -> str:
-        body = {"daily_quota_tokens": 100}
+        # invitee_email is required on POST /invites; default to a
+        # per-call unique address so two helper calls in one test
+        # don't collide on the email unique index.
+        type(self)._invite_seq += 1
+        body = {
+            "daily_quota_tokens": 100,
+            "invitee_email": f"invite-target-{type(self)._invite_seq:04d}@example.com",
+        }
         body.update(kwargs)
         resp = self.client.post(
             "/invites",
@@ -318,7 +327,10 @@ class MemberAuthE2ETests(unittest.TestCase):
         invitee_token = accept["token"]
         resp = self.client.post(
             "/invites",
-            json={"daily_quota_tokens": 50},
+            json={
+                "daily_quota_tokens": 50,
+                "invitee_email": "would-be-invitee@example.com",
+            },
             headers={"Authorization": f"Bearer {invitee_token}"},
         )
         self.assertEqual(resp.status_code, 403)

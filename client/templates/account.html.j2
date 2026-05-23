@@ -96,8 +96,9 @@
       emails yet.</p>
 
     <form method="POST" action="/account/invites" class="inline-form">
-      <label class="label" for="invitee_email">Email (optional, helps you recognize them)</label>
-      <input id="invitee_email" name="invitee_email" type="email" placeholder="friend@example.com">
+      <label class="label" for="invitee_email">Friend's email</label>
+      <input id="invitee_email" name="invitee_email" type="email"
+             placeholder="friend@example.com" required>
       <label class="label" for="daily_quota_tokens">Daily cap (tokens; blank = unlimited)</label>
       <input id="daily_quota_tokens" name="daily_quota_tokens" type="number" min="0">
       <label class="label" for="expires_hours">Expires in (hours; blank = never)</label>

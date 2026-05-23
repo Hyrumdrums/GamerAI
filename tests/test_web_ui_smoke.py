@@ -131,7 +131,10 @@ class WebUISmokeTests(unittest.TestCase):
             parent_member_id=None,
             token_hash=member_auth.hash_token(token),
         )
-        body = {"daily_quota_tokens": 200}
+        body = {
+            "daily_quota_tokens": 200,
+            "invitee_email": f"webui-target-{seq}@example.com",
+        }
         body.update(invite_kwargs)
         resp = self.coord.post(
             "/invites",
@@ -376,7 +379,10 @@ class WebUISmokeTests(unittest.TestCase):
         # Admin creates an invite from the account page, then revokes it.
         resp = self.web.post(
             "/account/invites",
-            data={"daily_quota_tokens": "50"},
+            data={
+                "invitee_email": "account-created@example.com",
+                "daily_quota_tokens": "50",
+            },
             follow_redirects=False,
         )
         self.assertEqual(resp.status_code, 303)
@@ -385,6 +391,18 @@ class WebUISmokeTests(unittest.TestCase):
         self.assertEqual(page.status_code, 200)
         # At least one open invite is now in the table.
         self.assertIn("Open invites", page.text)
+
+    def test_account_create_invite_rejects_missing_email(self):
+        resp = self.web.post(
+            "/account/invites",
+            data={"daily_quota_tokens": "50"},  # no invitee_email
+            follow_redirects=False,
+        )
+        self.assertEqual(resp.status_code, 303)
+        # Flash text is URL-encoded with spaces as %20 (the
+        # default RedirectResponse encoding), not +.
+        self.assertIn("Friend", resp.headers["location"])
+        self.assertIn("email%20is%20required", resp.headers["location"])
 
     # ------------------------------------------------------------------
     # u/p login page

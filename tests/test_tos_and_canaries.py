@@ -86,10 +86,16 @@ class _BaseE2E(unittest.TestCase):
         )
         return mem_id, raw
 
+    _invite_seq = 0
+
     def _create_invite(self, contributor_token: str, daily_quota_tokens: int = 100) -> str:
+        type(self)._invite_seq += 1
         resp = self.client.post(
             "/invites",
-            json={"daily_quota_tokens": daily_quota_tokens},
+            json={
+                "daily_quota_tokens": daily_quota_tokens,
+                "invitee_email": f"tos-target-{type(self)._invite_seq:04d}@example.com",
+            },
             headers={"Authorization": f"Bearer {contributor_token}"},
         )
         self.assertEqual(resp.status_code, 200, resp.text)

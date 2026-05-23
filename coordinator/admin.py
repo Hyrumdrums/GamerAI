@@ -214,6 +214,14 @@ def cmd_create_invite(args: argparse.Namespace) -> None:
         print("error: contributor token must belong to a contributor or admin",
               file=sys.stderr)
         sys.exit(2)
+    email = (args.email or "").strip()
+    if not email or "@" not in email:
+        print(
+            "error: --email is required (every member needs a recovery "
+            "address on file)",
+            file=sys.stderr,
+        )
+        sys.exit(2)
     now = time.time()
     expires_at = now + args.expires_hours * 3600.0 if args.expires_hours else None
     code = member_auth.generate_invite_code()
@@ -404,7 +412,11 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
         help="raw bearer of the contributor doing the inviting",
     )
-    p_inv.add_argument("--email", default=None, help="invitee's email (optional)")
+    p_inv.add_argument(
+        "--email", required=True,
+        help="invitee's email (required — every member needs a "
+             "recovery address on file)",
+    )
     p_inv.add_argument(
         "--daily-quota-tokens",
         type=int,
