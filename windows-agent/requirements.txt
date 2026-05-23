@@ -5,3 +5,8 @@ pystray==0.19.5
 Pillow==10.4.0
 winotify==1.1.0; sys_platform == "win32"
 pyinstaller==6.10.0
+# Search mode: DuckDuckGo client + readability extractor. Both are
+# pure-Python and pip-installable so they bundle cleanly into the
+# pyinstaller --onefile build that ships to contributors.
+ddgs==9.14.4
+trafilatura==2.0.0

@@ -865,6 +865,10 @@ _NO_IMAGE_WORKERS_MESSAGE = (
     "No image-capable community members are online right now. "
     "Please try again in a few minutes, or use chat."
 )
+_NO_SEARCH_WORKERS_MESSAGE = (
+    "No search-capable community members are online right now. "
+    "Please try again in a few minutes, or uncheck search."
+)
 
 
 def _worker_advertises_tool(worker_id: str, tool: str) -> bool:
@@ -903,9 +907,12 @@ def _ensure_live_worker_or_503(tool: str = "chat") -> None:
             continue
         if _worker_advertises_tool(worker_id, tool):
             return
-    detail = (
-        _NO_IMAGE_WORKERS_MESSAGE if tool == "image" else _NO_WORKERS_MESSAGE
-    )
+    if tool == "image":
+        detail = _NO_IMAGE_WORKERS_MESSAGE
+    elif tool == "search":
+        detail = _NO_SEARCH_WORKERS_MESSAGE
+    else:
+        detail = _NO_WORKERS_MESSAGE
     raise HTTPException(status_code=503, detail=detail)
 
 
@@ -990,10 +997,22 @@ def generate(req: GenerateRequest, request: Request):
     if not req.prompt or not req.prompt.strip():
         raise HTTPException(status_code=400, detail="prompt required")
     tool = (req.tool or "chat").lower()
-    if tool not in ("chat", "image"):
+    if tool not in ("chat", "image", "search"):
         raise HTTPException(
             status_code=400, detail=f"unknown tool: {tool!r}",
         )
+    # search_mode is validated here so a typo from the UI fails fast
+    # instead of leaking through to the agent (which would silently
+    # default to "fast"). Only checked when the caller actually
+    # selected search.
+    search_mode: Optional[str] = None
+    if tool == "search":
+        search_mode = (req.search_mode or "fast").lower()
+        if search_mode not in ("fast", "comprehensive"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"unknown search_mode: {search_mode!r}",
+            )
 
     # Default the model for image jobs when the caller didn't pick one.
     # Done before STRICT_MODELS validation so the registry check sees a
@@ -1012,9 +1031,13 @@ def generate(req: GenerateRequest, request: Request):
     # with tool="chat") regardless of STRICT_MODELS. Only enforced
     # when the model is in the registry — unknown names slip through
     # the same way validate_or_raise lets them through in lax mode.
+    # Search jobs run on chat models (they post the search results to
+    # the LLM as a system message), so the expected kind is "chat" for
+    # both tool="chat" and tool="search".
+    expected_kind = "chat" if tool in ("chat", "search") else tool
     if req.model and model_registry.is_known(req.model):
         m = model_registry.get(req.model)
-        if m is not None and m.kind != tool:
+        if m is not None and m.kind != expected_kind:
             raise HTTPException(
                 status_code=400,
                 detail=(
@@ -1117,13 +1140,19 @@ def generate(req: GenerateRequest, request: Request):
                 status_code=409,
                 detail="previous turn is still streaming",
             )
-        if tool == "chat":
+        if tool in ("chat", "search"):
+            # Search jobs reuse the chat-style messages envelope so the
+            # worker has the same conversation context to ground the
+            # summary in (handy for follow-ups like "what about in
+            # Europe?"). The worker prepends its own search-results
+            # system message before calling Ollama.
             worker_messages = _build_chat_messages(prior, req.prompt)
         # Conversation may pin a default model; honor it when the call
         # didn't override. For image jobs we DO NOT inherit a
         # chat-conversation's pinned LLM (that would re-trigger the
         # tool/model mismatch above) — only inherit when the pinned
-        # model is in the same kind.
+        # model is in the same kind. Search and chat share the same
+        # underlying model kind, so they can inherit from each other.
         if not req.model and conv_row["model"]:
             pinned = conv_row["model"]
             pinned_kind = (
@@ -1132,7 +1161,7 @@ def generate(req: GenerateRequest, request: Request):
                 and model_registry.get(pinned) is not None
                 else "chat"
             )
-            if pinned_kind == tool:
+            if pinned_kind == expected_kind:
                 req_model = pinned
             else:
                 req_model = model_registry.DEFAULT_IMAGE_MODEL if tool == "image" else None
@@ -1185,6 +1214,10 @@ def generate(req: GenerateRequest, request: Request):
         if params.steps is not None:
             image_env["steps"] = max(1, min(50, int(params.steps)))
         job["image"] = image_env
+    if tool == "search":
+        # search_mode is validated above; carry it through so the agent
+        # can branch fast (snippets) vs comprehensive (fetch + extract).
+        job["search"] = {"mode": search_mode or "fast"}
     # Decide whether this image job should go through the context-
     # aware rewrite pipeline. Skipped when:
     # - it's not an image job (chat jobs never rewrite)
@@ -1318,12 +1351,17 @@ def _job_row_to_envelope(row) -> dict:
         "submitted_at": row["submitted_at"],
         "tool": tool,
     }
-    if tool == "chat":
+    if tool in ("chat", "search"):
         msgs = _rebuild_messages_for_requeue(row)
         if msgs is not None:
             env["messages"] = msgs
     elif tool == "image":
         env["image"] = _default_image_params().model_dump()
+    if tool == "search":
+        # search_mode isn't persisted to the jobs row, so a requeue
+        # after reaper timeout defaults to "fast". Same KISS tradeoff
+        # image-param requeue makes.
+        env["search"] = {"mode": "fast"}
     return env
 
 
@@ -1395,6 +1433,12 @@ def result(job_id: str):
     msg = db.get_message_by_job(job_id)
     if msg is not None and "image_path" in msg.keys():
         image_path = msg["image_path"]
+    # Search jobs also carry a sources[] list when complete (lives only
+    # on JOB_RESULTS — it's render-only data, not stored back to the
+    # jobs row). On the DB-fallback path here there's no JOB_RESULTS
+    # entry to read from, so sources end up null — that's fine because
+    # the client uses the JOB_RESULTS path for fresh completions and
+    # the DB-fallback path only fires after eviction.
     return {
         "job_id": row["job_id"],
         "status": status,
@@ -1409,6 +1453,7 @@ def result(job_id: str):
         "error": row["error"],
         "submitted_by_member_id": submitted_by,
         "image_path": image_path,
+        "sources": None,
         "done": status in ("complete", "error"),
     }
 
@@ -1974,6 +2019,14 @@ def complete(req: JobCompleteRequest, request: Request):
     }
     if image_path:
         payload["image_path"] = image_path
+    if req.sources:
+        # Render-only data: the polling client reads it from
+        # /result/{job_id} and shows it under the bubble. We don't
+        # persist sources to the jobs row — the DB-fallback path on
+        # /result loses them after JOB_RESULTS eviction, which is fine
+        # for a feature that's about "now I see the answer with its
+        # links" rather than long-term archive.
+        payload["sources"] = req.sources
     r.hset(JOB_RESULTS, req.job_id, json.dumps(payload))
     r.hdel(JOB_PROCESSING, req.job_id)
     r.hdel(JOB_PARTIALS, req.job_id)

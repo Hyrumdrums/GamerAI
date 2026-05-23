@@ -1201,5 +1201,176 @@ class RewriteHelperUnitTests(_BaseE2E):
         self.assertIn("new user message: yes", lower)  # new request is inlined
 
 
+class SearchToolTests(_BaseE2E):
+    """v1.1.27: tool=search routes to a dedicated job_queue:search,
+    requires a search-capable worker, accepts a search_mode knob, and
+    surfaces a sources[] list on /result for the bubble-footer renderer."""
+
+    def setUp(self):
+        # Drop any residual queue state between tests so the assertions
+        # on queue length aren't polluted by leftovers from other classes
+        # in this file.
+        self.r.delete("job_queue", "job_queue:image", "job_queue:search")
+
+    def _make_search_worker(self, token: str) -> str:
+        worker_id = f"wkr-srch-{uuid.uuid4().hex[:6]}"
+        # Search-capable worker advertises tools=["chat","search"] so
+        # _ensure_live_worker_or_503(tool="search") finds it. The
+        # heartbeat is what counts; without it the worker is considered
+        # offline by the live-worker gate.
+        self.client.post(
+            "/register",
+            json={
+                "worker_id": worker_id,
+                "capabilities": {"tools": ["chat", "search"]},
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.client.post(
+            "/heartbeat", json={"worker_id": worker_id, "status": "idle"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        return worker_id
+
+    def test_search_routes_to_search_queue(self):
+        _, t = self._make_member(email="srch1@x.com")
+        self._make_search_worker(t)
+        gr = self.client.post(
+            "/generate",
+            json={"prompt": "what is svb", "tool": "search"},
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        self.assertEqual(gr.status_code, 200, gr.text)
+        # Job landed on the search queue, not chat or image.
+        self.assertEqual(self.r.llen("job_queue:search"), 1)
+        self.assertEqual(self.r.llen("job_queue"), 0)
+        self.assertEqual(self.r.llen("job_queue:image"), 0)
+        # Envelope carries the search.mode knob so the worker can
+        # branch fast vs comprehensive without making a second
+        # request.
+        env = json.loads(self.r.lindex("job_queue:search", 0))
+        self.assertEqual(env["tool"], "search")
+        self.assertEqual(env["search"]["mode"], "fast")
+
+    def test_search_mode_comprehensive_carried_in_envelope(self):
+        _, t = self._make_member(email="srch2@x.com")
+        self._make_search_worker(t)
+        gr = self.client.post(
+            "/generate",
+            json={
+                "prompt": "x", "tool": "search",
+                "search_mode": "comprehensive",
+            },
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        self.assertEqual(gr.status_code, 200, gr.text)
+        env = json.loads(self.r.lindex("job_queue:search", 0))
+        self.assertEqual(env["search"]["mode"], "comprehensive")
+
+    def test_search_mode_invalid_rejected_400(self):
+        _, t = self._make_member(email="srch3@x.com")
+        self._make_search_worker(t)
+        gr = self.client.post(
+            "/generate",
+            json={
+                "prompt": "x", "tool": "search",
+                "search_mode": "exhaustive",
+            },
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        self.assertEqual(gr.status_code, 400)
+        # Nothing enqueued — a malformed request must leave the queue
+        # untouched (no orphan job).
+        self.assertEqual(self.r.llen("job_queue:search"), 0)
+
+    def test_search_with_conversation_carries_messages(self):
+        # Search inside a conversation gets the prior turns as
+        # messages[] so a follow-up like "what about Europe?" has
+        # context to disambiguate the query.
+        _, t = self._make_member(email="srch4@x.com")
+        self._make_search_worker(t)
+        conv = self.client.post(
+            "/conversations", json={},
+            headers={"Authorization": f"Bearer {t}"},
+        ).json()
+        cid = conv["conversation_id"]
+        # Seed one completed chat turn so prior history exists.
+        self.db.append_message(
+            message_id="msg_seed1", conversation_id=cid, seq=0,
+            role="user", text="tell me about banking",
+        )
+        self.db.append_message(
+            message_id="msg_seed2", conversation_id=cid, seq=1,
+            role="assistant", text="...", status="complete",
+        )
+        gr = self.client.post(
+            "/generate",
+            json={
+                "prompt": "what about in Europe?",
+                "tool": "search", "search_mode": "fast",
+                "conversation_id": cid,
+            },
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        self.assertEqual(gr.status_code, 200, gr.text)
+        env = json.loads(self.r.lindex("job_queue:search", 0))
+        self.assertIn("messages", env)
+        # Last entry should be the new prompt, prior entries should
+        # carry the seeded history.
+        self.assertEqual(env["messages"][-1]["content"], "what about in Europe?")
+        self.assertTrue(
+            any("banking" in m.get("content", "") for m in env["messages"]),
+            f"prior history not threaded into envelope: {env['messages']!r}",
+        )
+
+    def test_complete_with_sources_surfaces_on_result(self):
+        # End-to-end: enqueue → claim → complete with sources →
+        # /result/{job_id} returns the sources list verbatim for the
+        # client to render under the bubble.
+        _, t = self._make_member(email="srch5@x.com")
+        self._make_search_worker(t)
+        gr = self.client.post(
+            "/generate",
+            json={"prompt": "what is svb", "tool": "search"},
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        job_id = gr.json()["job_id"]
+        # Pop off the queue to simulate the worker BLPOP and claim.
+        self.r.lpop("job_queue:search")
+        claim = self.client.post(
+            "/jobs/claim",
+            json={"worker_id": "wkr-srch-test", "job_id": job_id},
+            headers=self._admin_headers(),
+        )
+        sources_payload = [
+            {"n": 1, "title": "SVB explained",
+             "url": "https://example.com/svb",
+             "domain": "example.com"},
+            {"n": 2, "title": "Bank collapse",
+             "url": "https://news.test/bank",
+             "domain": "news.test"},
+        ]
+        comp = self.client.post(
+            "/jobs/complete",
+            json={
+                "worker_id": "wkr-srch-test", "job_id": job_id,
+                "text": "SVB collapsed in March 2023 [1][2].",
+                "model": "llama3.2:1b",
+                "prompt_tokens": 5, "completion_tokens": 10,
+                "duration_seconds": 1.2, "status": "complete",
+                "sources": sources_payload,
+                "claim_token": claim.json()["claim_token"],
+            },
+            headers=self._admin_headers(),
+        )
+        self.assertEqual(comp.status_code, 200, comp.text)
+        res = self.client.get(
+            f"/result/{job_id}",
+            headers={"Authorization": f"Bearer {t}"},
+        ).json()
+        self.assertEqual(res["status"], "complete")
+        self.assertEqual(res["sources"], sources_payload)
+
+
 if __name__ == "__main__":
     unittest.main()

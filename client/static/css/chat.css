@@ -94,10 +94,14 @@ body { display: flex; flex-direction: column; }
 .typing { display: inline-block; color: var(--muted); font-style: italic; }
 
 .composer { border-top: 1px solid var(--border); padding: .65rem .9rem; background: var(--surface); }
-.tool-row { display: flex; justify-content: flex-start; margin-bottom: .4rem; }
-/* Single one-shot "Generate as image" checkbox. Auto-uncheck after
- * every submit (see chat.js) — image is opt-in per turn, not a sticky
- * mode toggle. */
+.tool-row {
+  display: flex; flex-wrap: wrap; align-items: center;
+  gap: .25rem 1rem; margin-bottom: .4rem;
+}
+/* One-shot "Generate as image" / "Search the web" checkboxes. Auto-
+ * uncheck after every submit (see chat.js) — both are opt-in per turn,
+ * not sticky mode toggles. Image and Search are mutually exclusive;
+ * when one is checked the other is hidden from the row. */
 .image-toggle {
   display: inline-flex; align-items: center; gap: .4rem;
   font-size: .85rem; color: var(--muted); cursor: pointer;
@@ -107,6 +111,38 @@ body { display: flex; flex-direction: column; }
   width: auto; margin: 0; cursor: pointer;
 }
 .image-toggle:hover { color: var(--text); }
+
+/* Fast/comprehensive sub-toggle for search. Only shown when the
+ * Search checkbox is on; defaults to Fast. Inline radio pair matches
+ * the look of the parent checkbox row. */
+.search-mode {
+  display: inline-flex; align-items: center; gap: .75rem;
+  font-size: .8rem; color: var(--muted);
+}
+.search-mode label {
+  display: inline-flex; align-items: center; gap: .25rem; cursor: pointer;
+}
+.search-mode input[type="radio"] { width: auto; margin: 0; cursor: pointer; }
+
+/* Sources strip rendered at the end of a search-answer bubble. Numbered
+ * list of clickable domains so the user can verify citations the
+ * model emitted as [1], [2] inline. */
+.msg .bubble .sources {
+  margin-top: .65rem; padding-top: .45rem;
+  border-top: 1px dashed var(--border);
+  font-size: .8rem; color: var(--muted);
+}
+.msg .bubble .sources-label {
+  text-transform: uppercase; letter-spacing: .05em;
+  font-size: .7rem; margin-bottom: .25rem;
+}
+.msg .bubble .sources ol {
+  margin: 0; padding-left: 1.25rem;
+}
+.msg .bubble .sources a {
+  color: var(--brand); text-decoration: none;
+}
+.msg .bubble .sources a:hover { text-decoration: underline; }
 
 /* Image bubble — assistant rendered as an <img> instead of text. Cap
    the visible width so a 1024x1024 generation doesn't blow out the

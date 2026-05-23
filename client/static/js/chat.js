@@ -234,6 +234,7 @@ function messageEl(role, text, opts = {}) {
   // streams visibly, image is opaque until the PNG arrives, so each
   // gets its own no-progress budget.
   if (opts.pending_kind === 'image') wrap.dataset.tool = 'image';
+  else if (opts.pending_kind === 'search') wrap.dataset.tool = 'search';
   else if (opts.tool) wrap.dataset.tool = opts.tool;
   const r = document.createElement('div');
   r.className = 'role';
@@ -244,11 +245,15 @@ function messageEl(role, text, opts = {}) {
     b.classList.add('error');
     b.textContent = text || 'Generation failed.';
   } else if (opts.status === 'pending' && !text) {
-    // Pending bubble — chat says "thinking…", image says "drawing…"
-    // so the user knows the response shape will be a picture.
-    b.innerHTML = opts.pending_kind === 'image'
-      ? '<span class="typing">drawing…</span>'
-      : '<span class="typing">thinking…</span>';
+    // Pending bubble label by tool kind — image says "drawing…",
+    // search says "searching the web…", chat says "thinking…". The
+    // search label is a deliberate hint that the answer will take a
+    // moment longer than a normal chat reply (DDG + optional fetch
+    // before the model even starts streaming).
+    let typing = 'thinking…';
+    if (opts.pending_kind === 'image') typing = 'drawing…';
+    else if (opts.pending_kind === 'search') typing = 'searching the web…';
+    b.innerHTML = `<span class="typing">${typing}</span>`;
   } else if (opts.image_path) {
     // Persisted image turn — render the PNG bubble. The text field is
     // a "[image: <prompt>]" sentinel from the coordinator so a no-CSS
@@ -347,6 +352,12 @@ const TYPEWRITER_CHARS_PER_SECOND = 90;
 // indefinitely on healthy heartbeats.
 const STUCK_MS_CHAT = 60_000;
 const STUCK_MS_IMAGE = 300_000;
+// Search has a longer pre-stream phase (DDG + optional fetch+extract
+// of 5 pages) before the LLM produces any partials. 2 minutes is
+// generous enough that comprehensive-mode jobs on a slow link don't
+// trip the "may be stuck" warning prematurely, while still bounded
+// enough that a truly hung worker is flagged.
+const STUCK_MS_SEARCH = 120_000;
 // Minimum chars revealed per animation frame, so we don't get stuck
 // at sub-pixel advance on a 60fps display when CPS is low. 1 char/
 // frame at 60fps = 60 cps floor, plenty for readability.
@@ -452,7 +463,10 @@ async function streamIntoBubble(jobId, wrap, statusEl, startMs, messageId) {
   let stuckNoticeShown = false;
   let cancelRequested = false;
   const isImage = wrap.dataset.tool === 'image';
-  const stuckThresholdMs = isImage ? STUCK_MS_IMAGE : STUCK_MS_CHAT;
+  const isSearch = wrap.dataset.tool === 'search';
+  let stuckThresholdMs = STUCK_MS_CHAT;
+  if (isImage) stuckThresholdMs = STUCK_MS_IMAGE;
+  else if (isSearch) stuckThresholdMs = STUCK_MS_SEARCH;
 
   function clearStuckNotice() {
     if (!stuckNoticeShown) return;
@@ -468,9 +482,13 @@ async function streamIntoBubble(jobId, wrap, statusEl, startMs, messageId) {
     notice.className = 'stuck-notice';
     const txt = document.createElement('span');
     txt.className = 'stuck-text';
-    txt.textContent = isImage
-      ? 'Image generation is taking longer than normal. Something may be wrong, or your worker just needs more time.'
-      : 'This is taking longer than normal. Something may be wrong, or your worker just needs more time.';
+    if (isImage) {
+      txt.textContent = 'Image generation is taking longer than normal. Something may be wrong, or your worker just needs more time.';
+    } else if (isSearch) {
+      txt.textContent = 'The web search is taking longer than normal. The page fetches may be slow or your worker may be stuck.';
+    } else {
+      txt.textContent = 'This is taking longer than normal. Something may be wrong, or your worker just needs more time.';
+    }
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'cancel-btn';
@@ -560,6 +578,14 @@ async function streamIntoBubble(jobId, wrap, statusEl, startMs, messageId) {
         } else if (!res.text) {
           setBubbleContent(bubble, 'assistant', '(empty)');
         }
+        // Search jobs come back with a sources[] list. Render it once
+        // here at completion (re-rendering on every partial would
+        // flicker the bubble and the sources don't change mid-stream
+        // anyway — the server side has them in hand before the LLM
+        // starts).
+        if (res.sources && res.sources.length) {
+          renderSources(wrap, res.sources);
+        }
         if (statusEl && startMs) {
           const dt = ((Date.now() - startMs) / 1000).toFixed(1);
           let label;
@@ -583,21 +609,97 @@ async function streamIntoBubble(jobId, wrap, statusEl, startMs, messageId) {
   }
 }
 
-// ---- image toggle (one-shot checkbox) --------------------------------
-// Replaces the old chat/image tab toggle. Checking the box makes the
-// NEXT submit an image generation; after submit the box auto-clears
-// so an accidental sticky-image-mode can't burn 5 contributor jobs in
-// a row. The "image is the unusual case" UX is explicit because of
-// that auto-clear — chat is the default state, image is an opt-in
-// per-turn.
+// ---- image / search toggles (one-shot checkboxes) --------------------
+// Image and Search are mutually exclusive per-turn opt-ins. Both
+// auto-clear after submit so an accidental sticky-mode can't burn a
+// queue of contributor jobs (image) or web-search inferences (search)
+// in a row. Whichever box gets checked HIDES the other so the row
+// reads cleanly — there's no use case for "image of search results"
+// and showing both invites the user to ask for it.
 const imageCheckbox = document.getElementById('tool-image-cb');
-function refreshPlaceholder() {
-  document.getElementById('prompt').placeholder = imageCheckbox.checked
-    ? 'Describe the image you want…'
-    : 'Message GamerAI...';
+const searchCheckbox = document.getElementById('tool-search-cb');
+const imageWrap = document.getElementById('image-toggle-wrap');
+const searchWrap = document.getElementById('search-toggle-wrap');
+const searchModeWrap = document.getElementById('search-mode-wrap');
+
+function refreshComposerUI() {
+  // Visibility: whichever checkbox is checked claims the row alone.
+  imageWrap.hidden = searchCheckbox.checked;
+  searchWrap.hidden = imageCheckbox.checked;
+  // Sub-toggle (fast vs comprehensive) only relevant for search.
+  searchModeWrap.hidden = !searchCheckbox.checked;
+  // Placeholder cues the user about the active mode.
+  const ta = document.getElementById('prompt');
+  if (imageCheckbox.checked) {
+    ta.placeholder = 'Describe the image you want…';
+  } else if (searchCheckbox.checked) {
+    ta.placeholder = 'Search the web for…';
+  } else {
+    ta.placeholder = 'Message GamerAI...';
+  }
 }
-imageCheckbox.addEventListener('change', refreshPlaceholder);
-refreshPlaceholder();
+
+imageCheckbox.addEventListener('change', () => {
+  // Mutually exclusive — checking image clears search and vice versa.
+  if (imageCheckbox.checked) searchCheckbox.checked = false;
+  refreshComposerUI();
+});
+searchCheckbox.addEventListener('change', () => {
+  if (searchCheckbox.checked) imageCheckbox.checked = false;
+  refreshComposerUI();
+});
+refreshComposerUI();
+
+function selectedSearchMode() {
+  // Reads the radio group rather than tracking state — radios are
+  // the source of truth and there are only two of them.
+  const checked = document.querySelector(
+    'input[name="search-mode"]:checked',
+  );
+  return checked ? checked.value : 'fast';
+}
+
+// Renders the numbered sources strip below an assistant bubble. Each
+// entry links to the source URL; we render the domain (not the full
+// URL) so a long URL doesn't blow out the bubble width. The model
+// emits inline [1][2] citations that line up with these numbers.
+function renderSources(wrap, sources) {
+  if (!sources || !sources.length) return;
+  const bubble = wrap.querySelector('.bubble');
+  if (!bubble) return;
+  // Replace any prior sources block (re-render on stream completion).
+  const old = bubble.querySelector('.sources');
+  if (old) old.remove();
+  const box = document.createElement('div');
+  box.className = 'sources';
+  const label = document.createElement('div');
+  label.className = 'sources-label';
+  label.textContent = 'Sources';
+  box.appendChild(label);
+  const ol = document.createElement('ol');
+  for (const s of sources) {
+    const li = document.createElement('li');
+    li.value = s.n || 0;
+    if (s.url) {
+      const a = document.createElement('a');
+      a.href = s.url;
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer';
+      a.textContent = s.title || s.domain || s.url;
+      li.appendChild(a);
+      if (s.domain && s.title && s.domain !== s.title) {
+        const dom = document.createElement('span');
+        dom.textContent = ' — ' + s.domain;
+        li.appendChild(dom);
+      }
+    } else {
+      li.textContent = s.title || '(unknown)';
+    }
+    ol.appendChild(li);
+  }
+  box.appendChild(ol);
+  bubble.appendChild(box);
+}
 
 // ---- composer ---------------------------------------------------------
 const textarea = document.getElementById('prompt');
@@ -638,11 +740,17 @@ document.getElementById('composer').onsubmit = async (e) => {
 
   // Snapshot the checkbox state at submit time. Mid-stream toggling
   // shouldn't change what this turn is. Then immediately auto-clear
-  // the checkbox so the NEXT submit defaults back to chat — image is
-  // intentionally opt-in per-turn to avoid stale sticky-image mode.
-  const submitTool = imageCheckbox.checked ? 'image' : 'chat';
+  // the checkboxes so the NEXT submit defaults back to chat — image
+  // and search are intentionally opt-in per-turn to avoid stale
+  // sticky modes (a left-on search box would burn DDG hits + an LLM
+  // round-trip on every casual message).
+  let submitTool = 'chat';
+  if (imageCheckbox.checked) submitTool = 'image';
+  else if (searchCheckbox.checked) submitTool = 'search';
+  const submitSearchMode = submitTool === 'search' ? selectedSearchMode() : null;
   imageCheckbox.checked = false;
-  refreshPlaceholder();
+  searchCheckbox.checked = false;
+  refreshComposerUI();
 
   // Append the user message optimistically so it shows up right away.
   const pane = document.getElementById('chat-pane');
@@ -659,11 +767,16 @@ document.getElementById('composer').onsubmit = async (e) => {
   textarea.style.height = 'auto';
 
   // Submit + stream.
-  statusEl.textContent = submitTool === 'image' ? 'rendering…' : 'submitting…';
+  if (submitTool === 'image') statusEl.textContent = 'rendering…';
+  else if (submitTool === 'search') statusEl.textContent = 'searching…';
+  else statusEl.textContent = 'submitting…';
   const start = Date.now();
   const body = {prompt, conversation_id: currentId};
   if (submitTool === 'image') {
     body.tool = 'image';
+  } else if (submitTool === 'search') {
+    body.tool = 'search';
+    body.search_mode = submitSearchMode;
   }
   const gr = await fetch('/api/generate', {
     method: 'POST',

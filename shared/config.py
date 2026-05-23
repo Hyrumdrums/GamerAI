@@ -97,9 +97,13 @@ JOB_QUEUE = "job_queue"
 def job_queue_for(tool: str) -> str:
     """Return the Redis list key a job of *tool* should be queued on.
     Image jobs go to a dedicated queue so chat-only workers (the
-    majority of the network) never pick one up and fail."""
+    majority of the network) never pick one up and fail. Search jobs
+    likewise get their own queue — a chat-only agent without the ddgs
+    dependency installed would error out on tool=search."""
     if tool == "image":
         return "job_queue:image"
+    if tool == "search":
+        return "job_queue:search"
     return JOB_QUEUE
 JOB_RESULTS = "job_results"
 JOB_PROCESSING = "job_processing"

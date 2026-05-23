@@ -38,10 +38,18 @@
 
     <form class="composer" id="composer">
       <div class="tool-row">
-        <label class="image-toggle">
+        <label class="image-toggle" id="image-toggle-wrap">
           <input type="checkbox" id="tool-image-cb">
           <span>Generate as image</span>
         </label>
+        <label class="image-toggle" id="search-toggle-wrap">
+          <input type="checkbox" id="tool-search-cb">
+          <span>Search the web</span>
+        </label>
+        <div class="search-mode" id="search-mode-wrap" hidden>
+          <label><input type="radio" name="search-mode" value="fast" checked> Fast</label>
+          <label><input type="radio" name="search-mode" value="comprehensive"> Comprehensive</label>
+        </div>
       </div>
       <div class="composer-inner">
         <textarea id="prompt" placeholder="Message GamerAI..." rows="1"></textarea>

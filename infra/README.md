@@ -76,12 +76,34 @@ curl https://coordinator.example.com/health
 
 ## Re-deploying after a code change
 
-```bash
-sudo /opt/gamerai/infra/deploy.sh
-```
+**The current preferred workflow is push-to-main + a manual deploy.sh.**
+Quick, dirty, works. There is no full push-to-deploy yet.
 
-That's just `git pull && docker compose up -d --build`. You can wire it
-to a GitHub Actions job over SSH if you want push-to-deploy.
+1. Commit and `git push origin main`.
+2. CI auto-publishes any `windows-agent/**` change — the
+   `windows-agent build` workflow rebuilds `agent.exe` + the installer
+   on a Windows runner and SFTPs them to `/var/www/downloads` on this
+   VPS. Already-installed agents see the bumped `version.txt` and
+   self-update (or `update` from the stdin command). Nothing to do.
+3. Coordinator / UI / shared changes are NOT auto-deployed. SSH in and
+   run:
+
+   ```bash
+   sudo /opt/gamerai/infra/deploy.sh
+   ```
+
+   That's just `git pull && docker compose up -d --build`.
+
+End-to-end-test reality check: a feature that bumps the worker tool
+surface (e.g. `tools=["search"]`) will 503 in prod until at least one
+contributor's agent has self-updated to the new build. Force a
+contributor to `update` (or restart it) if you need to validate
+immediately.
+
+If you want a real push-to-deploy for the coordinator, wire the same
+SFTP-style SSH job over to a CI step that runs `deploy.sh`. We haven't
+done it yet because the manual step is rare enough not to justify the
+infrastructure.
 
 ---
 

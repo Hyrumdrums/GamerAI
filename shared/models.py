@@ -24,14 +24,19 @@ class ImageParams(BaseModel):
 class GenerateRequest(BaseModel):
     prompt: str
     model: Optional[str] = None
-    # "chat" (default, legacy) or "image". Image jobs route to a
-    # different Redis queue (job_queue:image) and only image-capable
-    # workers pick them up. Defaulting to "chat" keeps every existing
-    # client (CLI, agent canaries, retry path) working unchanged.
+    # "chat" (default, legacy), "image", or "search". Each tool routes
+    # to its own Redis queue and is only picked up by workers that
+    # advertise the matching capability — chat-only agents never get
+    # handed an image or search job.
     tool: str = "chat"
-    # Image-only knobs. Ignored for tool="chat". When tool="image" and
-    # omitted, the model's defaults are used.
+    # Image-only knobs. Ignored for tool="chat" / "search". When
+    # tool="image" and omitted, the model's defaults are used.
     image: Optional[ImageParams] = None
+    # Search-only knob. "fast" = DDG snippets only (~1s). "comprehensive"
+    # = snippets + fetch & extract the top 5 result pages (~5-8s).
+    # Ignored unless tool=="search". Defaults to fast on the worker
+    # side if unset, so a misconfigured caller still gets a result.
+    search_mode: Optional[str] = None
     # When set, the coordinator loads the prior turns of this
     # conversation, prepends them to the worker-facing prompt, and
     # auto-appends the user message + assistant response back into
@@ -150,6 +155,12 @@ class JobCompleteRequest(BaseModel):
     # validates the PNG header, writes to /data/images/<job_id>.png,
     # and stamps the message's image_path. Empty/absent on chat jobs.
     image_b64: Optional[str] = None
+    # For search jobs: ordered list of citations matching the [1][2]
+    # references in ``text``. Each entry is {"n": int, "title": str,
+    # "url": str, "domain": str}. Coordinator stores these on
+    # JOB_RESULTS so /result/{job_id} can surface them to the client
+    # for the end-of-bubble sources strip. Empty/absent on chat/image.
+    sources: Optional[List[dict]] = None
     # Per-claim secret issued at job pickup. Coordinator returns 410
     # when this doesn't match the current claim — the case where the
     # reaper has already requeued the job and another worker is on

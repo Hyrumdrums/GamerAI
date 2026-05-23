@@ -45,7 +45,7 @@ IS_WINDOWS = platform.system() == "Windows"
 # the moment it starts. The CI-generated version.txt (short-sha +
 # build timestamp) is still what the self-updater diffs against;
 # AGENT_VERSION is just the human-facing label.
-AGENT_VERSION = "1.1.26"
+AGENT_VERSION = "1.1.27"
 
 # ---------------------------------------------------------------------------
 # Idle detection
@@ -2639,6 +2639,228 @@ def run_inference(
 
 
 # ---------------------------------------------------------------------------
+# Search inference (DuckDuckGo + optional fetch/extract + LLM summary)
+# ---------------------------------------------------------------------------
+# Number of DDG hits we ask for and then forward to the LLM as
+# citations. Five is the sweet spot: enough breadth that the model can
+# corroborate a fact across sources, few enough that the prompt fits
+# inside a small chat model's context (~4k tokens including the
+# extracted page bodies in comprehensive mode).
+SEARCH_RESULT_COUNT = 5
+# Hard ceiling on how much extracted text per page we forward to the
+# LLM in comprehensive mode. A long-tail blog post can easily be
+# 20k chars — passing all of it would blow the context window and
+# slow inference dramatically. 2500 chars (~600 tokens) per page ×
+# 5 pages = ~3k token system context, leaving room for history.
+SEARCH_PAGE_CHAR_CAP = 2500
+# Per-page fetch timeout. Trafilatura's fetch_url() default is much
+# longer; a slow page shouldn't be allowed to wedge the whole search
+# job. We accept whichever pages return in time and skip the rest —
+# losing one source out of five is better than missing the deadline.
+SEARCH_FETCH_TIMEOUT = 6.0
+
+
+def _search_deps_available(log: logging.Logger) -> bool:
+    """Probe import of the search-only dependencies (ddgs + trafilatura).
+    Called once at startup to decide whether to advertise the 'search'
+    tool. Logged so a contributor whose pyinstaller build dropped the
+    wheels sees a clear "search not advertised" line in their log."""
+    try:
+        import ddgs  # noqa: F401
+        import trafilatura  # noqa: F401
+        return True
+    except ImportError as e:
+        log.info(
+            "search tool not advertised — missing dep (%s); "
+            "pip install ddgs trafilatura to enable",
+            e,
+        )
+        return False
+
+
+def _ddg_search(query: str, max_results: int = SEARCH_RESULT_COUNT) -> list[dict]:
+    """Run a DuckDuckGo text search and return the raw hits. Imported
+    lazily so an agent build without the ddgs wheel installed can still
+    serve chat/image jobs — only search jobs will fail at this point,
+    with a clean error surface (see run_search_inference)."""
+    from ddgs import DDGS
+    with DDGS() as ddg:
+        return ddg.text(query, max_results=max_results) or []
+
+
+def _fetch_and_extract(url: str, timeout: float = SEARCH_FETCH_TIMEOUT) -> str:
+    """Best-effort fetch + clean-text extraction. Returns '' on any
+    failure (network blip, JS-only page, 403, etc.) — the caller falls
+    back to the DDG snippet for that source so the LLM still has
+    something to cite."""
+    try:
+        import trafilatura
+    except ImportError:
+        return ""
+    try:
+        with httpx.Client(
+            follow_redirects=True,
+            timeout=timeout,
+            headers={
+                # Some sites 403 the default httpx UA; mimic a real
+                # browser so we can extract their public content.
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0 Safari/537.36"
+                ),
+            },
+        ) as c:
+            resp = c.get(url)
+            resp.raise_for_status()
+            html = resp.text
+    except Exception:
+        return ""
+    try:
+        return (trafilatura.extract(html) or "").strip()
+    except Exception:
+        return ""
+
+
+def _build_search_system_prompt(query: str, results: list[dict], mode: str) -> str:
+    """Format the search results as a system message the LLM will use
+    to ground its answer. Same ordering as ``results`` so the [1][2]
+    citations the model emits line up with the sources list the client
+    renders below the bubble. In comprehensive mode each entry also
+    includes the extracted page body (capped); fast mode is snippets
+    only."""
+    lines = [
+        "You are a search assistant. The user has asked a question and the",
+        "system has retrieved fresh web results below. Use them — and only",
+        "them — to answer concisely and accurately.",
+        "",
+        "Rules:",
+        "- Cite sources inline as [1], [2], etc., matching the numbers below.",
+        "- If the results don't contain enough information, say so plainly.",
+        "- Prefer the most specific source for a given claim.",
+        "- Do not invent URLs or facts that aren't in the results.",
+        "",
+        f"User query: {query}",
+        "",
+        "Search results:",
+    ]
+    for i, r in enumerate(results, start=1):
+        title = (r.get("title") or "").strip()
+        url = (r.get("href") or r.get("url") or "").strip()
+        snippet = (r.get("body") or "").strip()
+        lines.append(f"[{i}] {title}")
+        lines.append(f"    URL: {url}")
+        if snippet:
+            lines.append(f"    Snippet: {snippet}")
+        body = (r.get("_extracted") or "").strip() if mode == "comprehensive" else ""
+        if body:
+            lines.append(f"    Body: {body[:SEARCH_PAGE_CHAR_CAP]}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _domain_of(url: str) -> str:
+    """Return ``example.com`` (no scheme, no www., no path) for the
+    bubble-footer source labels. Falls back to the raw URL on any
+    parse error so we still show *something* clickable."""
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(url).hostname or url
+        return host[4:] if host.startswith("www.") else host
+    except Exception:
+        return url
+
+
+def run_search_inference(
+    prompt: str,
+    job: dict,
+    model: Optional[str],
+    log: logging.Logger,
+    on_partial=None,
+) -> dict:
+    """Search + summarize. Runs a DuckDuckGo query, optionally fetches
+    the top pages (comprehensive mode), assembles a citation-aware
+    system prompt, and pipes everything to the local Ollama instance.
+
+    Returns the same shape as ``run_inference`` plus a ``sources``
+    list so the coordinator can stash it on JOB_RESULTS for the
+    client's bubble-footer. Errors propagate up to process_one so the
+    job records as status=error rather than silently masquerading as
+    a complete-but-wrong chat answer."""
+    search_env = job.get("search") or {}
+    mode = (search_env.get("mode") or "fast").lower()
+    if mode not in ("fast", "comprehensive"):
+        mode = "fast"
+
+    log.info("search job: mode=%s query=%r", mode, prompt[:120])
+    try:
+        results = _ddg_search(prompt, max_results=SEARCH_RESULT_COUNT)
+    except Exception as e:
+        # Bubble up — the coordinator records error and the user sees
+        # a clear "search failed" message instead of a fabricated
+        # answer with no grounding.
+        raise RuntimeError(f"web search failed: {e}") from e
+
+    if not results:
+        # 0-results is treated as an error so the UI can prompt the
+        # user to try a different query or uncheck search (matches the
+        # design decision from the kickoff Q&A).
+        raise RuntimeError(
+            "no search results — try a different query or uncheck search"
+        )
+
+    # Comprehensive mode: fetch each source in parallel-ish (serial
+    # for KISS; total budget = SEARCH_RESULT_COUNT * SEARCH_FETCH_TIMEOUT
+    # = ~30s worst case, well inside JOB_TIMEOUT_SECONDS). A failed
+    # fetch leaves the entry without _extracted so the prompt builder
+    # gracefully falls back to the snippet for that source.
+    if mode == "comprehensive":
+        for r in results:
+            url = r.get("href") or r.get("url") or ""
+            if url:
+                r["_extracted"] = _fetch_and_extract(url)
+
+    system_text = _build_search_system_prompt(prompt, results, mode)
+
+    # Reuse the conversation messages[] the coordinator built (if any)
+    # so a follow-up search ("ok but what about in Europe?") keeps the
+    # context. Inject the search-results system message at position 0;
+    # any prior system messages from upstream stay after it so the
+    # search context wins over generic instructions.
+    base_messages = list(job.get("messages") or [])
+    if not base_messages:
+        base_messages = [{"role": "user", "content": prompt}]
+    chat_messages = [{"role": "system", "content": system_text}] + base_messages
+
+    summary = run_inference(
+        prompt=prompt,
+        model=model,
+        log=log,
+        messages=chat_messages,
+        on_partial=on_partial,
+    )
+
+    sources = [
+        {
+            "n": i,
+            "title": (r.get("title") or "").strip()
+                     or _domain_of(r.get("href") or ""),
+            "url": (r.get("href") or r.get("url") or "").strip(),
+            "domain": _domain_of(r.get("href") or r.get("url") or ""),
+        }
+        for i, r in enumerate(results, start=1)
+    ]
+
+    return {
+        "text": summary["text"],
+        "prompt_tokens": summary["prompt_tokens"],
+        "completion_tokens": summary["completion_tokens"],
+        "model": summary["model"],
+        "sources": sources,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Image inference (sd.cpp subprocess)
 # ---------------------------------------------------------------------------
 # How long sd.cpp is allowed to run before we give up. SD 1.5 at 512×512
@@ -3033,16 +3255,20 @@ def _ordered_queues(
 ) -> list[str]:
     """Per-tool poll order for one main-loop tick.
 
-    Defaults to ["chat"]; appends "image" when the agent advertises it.
-    Promotes the agent's *last-served* tool to the front so back-to-
-    back jobs of the same kind keep the model warm in VRAM — a chat
-    streak keeps Ollama hot; an image streak keeps sd.cpp's weights
-    loaded. The flip only happens when the preferred queue is empty
-    AND the other queue has work, so demand-shaped routing still
-    falls out naturally without any coordinator-side state."""
+    Defaults to ["chat"]; appends "image" / "search" when the agent
+    advertises them. Promotes the agent's *last-served* tool to the
+    front so back-to-back jobs of the same kind keep the model warm
+    in VRAM — a chat streak keeps Ollama hot; an image streak keeps
+    sd.cpp's weights loaded; a search streak skips the cold-cache hit
+    on trafilatura's lazy imports. The flip only happens when the
+    preferred queue is empty AND another queue has work, so demand-
+    shaped routing still falls out naturally without any coordinator-
+    side state."""
     available = ["chat"]
     if tools and "image" in tools:
         available.append("image")
+    if tools and "search" in tools:
+        available.append("search")
     if last_tool in available and last_tool != available[0]:
         return [last_tool] + [t for t in available if t != last_tool]
     return available
@@ -3142,27 +3368,43 @@ def process_one(
             #     loaded in Ollama. The right default; without this
             #     the rewrite job would fall through to run_inference's
             #     hardcoded backstop on misconfigured installs.
-            result = run_inference(
-                prompt,
-                cfg.model or job.get("model") or cfg.bootstrap_model,
-                log,
-                messages=job.get("messages"),
-                on_partial=lambda text: coord.partial(
-                    job_id, text, claim_token=claim_token,
-                ),
+            use_model = cfg.model or job.get("model") or cfg.bootstrap_model
+            on_partial = lambda text: coord.partial(  # noqa: E731
+                job_id, text, claim_token=claim_token,
             )
+            if tool == "search":
+                # Search jobs do the DDG fetch + extract first, then
+                # pipe the assembled context through the same Ollama
+                # streaming path so the user sees the summary appear
+                # progressively (the search step itself takes 1-5s and
+                # is logged but not streamed — there's nothing to type
+                # out yet).
+                result = run_search_inference(
+                    prompt, job, use_model, log, on_partial=on_partial,
+                )
+            else:
+                result = run_inference(
+                    prompt,
+                    use_model,
+                    log,
+                    messages=job.get("messages"),
+                    on_partial=on_partial,
+                )
             duration = round(time.time() - started, 3)
+            complete_payload = {
+                "worker_id": coord.worker_id,
+                "job_id": job_id,
+                "text": result["text"],
+                "model": result["model"],
+                "prompt_tokens": result["prompt_tokens"],
+                "completion_tokens": result["completion_tokens"],
+                "duration_seconds": duration,
+                "status": "complete",
+            }
+            if result.get("sources"):
+                complete_payload["sources"] = result["sources"]
             accepted, out = coord.complete(
-                {
-                    "worker_id": coord.worker_id,
-                    "job_id": job_id,
-                    "text": result["text"],
-                    "model": result["model"],
-                    "prompt_tokens": result["prompt_tokens"],
-                    "completion_tokens": result["completion_tokens"],
-                    "duration_seconds": duration,
-                    "status": "complete",
-                },
+                complete_payload,
                 claim_token=claim_token,
             )
             if accepted:
@@ -3170,17 +3412,17 @@ def process_one(
                 state["jobs"] = int(state.get("jobs", 0)) + 1
                 state["tokens"] = int(state.get("tokens", 0)) + int(result["completion_tokens"])
                 state["earnings_usd"] = round(float(state.get("earnings_usd", 0.0)) + earnings, 10)
-                state["last_tool"] = "chat"
+                state["last_tool"] = tool
                 save_state(state)
                 log.info(
-                    "job %s finished: %d tokens, $%.8f, %.2fs",
-                    job_id, result["completion_tokens"], earnings, duration,
+                    "job %s finished (%s): %d tokens, $%.8f, %.2fs",
+                    job_id, tool, result["completion_tokens"], earnings, duration,
                 )
             else:
                 log.info(
-                    "job %s: %d tokens of work discarded — "
+                    "job %s (%s): %d tokens of work discarded — "
                     "claim was superseded or cancelled",
-                    job_id, result["completion_tokens"],
+                    job_id, tool, result["completion_tokens"],
                 )
     except Exception as e:
         log.exception("job %s failed: %s", job_id, e)
@@ -3950,9 +4192,18 @@ def main(argv: Optional[list[str]] = None) -> int:
     # or fell back to mock; image bootstrap is independent (sd.exe +
     # GGUF on disk). Coordinator-side routing uses capabilities.tools
     # to pick the right Redis queue when /jobs/next is called.
+    #
+    # Search piggybacks on the chat capability: it needs the same
+    # local Ollama to synthesize the summary, plus the ddgs +
+    # trafilatura packages from requirements.txt. We probe the import
+    # at startup so an agent built without those wheels (e.g. a
+    # custom pyinstaller spec that excluded them) advertises chat
+    # without search and the coordinator never hands it a search job.
     tools = ["chat"]
     if image_ready:
         tools.append("image")
+    if _search_deps_available(log):
+        tools.append("search")
     capabilities: Optional[dict] = None
     if cfg.bootstrap_enabled and os.getenv("OLLAMA_URL"):
         capabilities = {"models": [cfg.bootstrap_model], "tools": tools}

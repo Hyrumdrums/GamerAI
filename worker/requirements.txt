@@ -1,2 +1,7 @@
 redis==5.0.8
 httpx==0.27.2
+# Search mode (tool=search): DuckDuckGo client + readability extractor.
+# The dockerized worker mirrors the windows-agent's capability so dev
+# and tests don't have to skip search routing.
+ddgs==9.14.4
+trafilatura==2.0.0

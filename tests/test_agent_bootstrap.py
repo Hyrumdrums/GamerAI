@@ -225,5 +225,112 @@ class ModelPresentTests(unittest.TestCase):
             )
 
 
+class SearchInferenceTests(unittest.TestCase):
+    """Cover the worker-side search helpers in isolation: DDG is mocked,
+    Ollama is mocked, so these tests verify the assembly logic without
+    touching the network or a real LLM."""
+
+    def test_domain_strips_www_and_scheme(self):
+        self.assertEqual(agent._domain_of("https://www.example.com/foo"), "example.com")
+        self.assertEqual(agent._domain_of("http://news.test/path?x=1"), "news.test")
+        # Bad input falls through to the raw string rather than raising.
+        self.assertEqual(agent._domain_of(""), "")
+
+    def test_build_system_prompt_includes_citations_and_urls(self):
+        results = [
+            {"title": "Title A", "href": "https://a.com/x", "body": "Snippet A"},
+            {"title": "Title B", "href": "https://b.com/y", "body": "Snippet B"},
+        ]
+        out = agent._build_search_system_prompt("my query", results, "fast")
+        self.assertIn("User query: my query", out)
+        self.assertIn("[1] Title A", out)
+        self.assertIn("URL: https://a.com/x", out)
+        self.assertIn("Snippet A", out)
+        self.assertIn("[2] Title B", out)
+        # Fast mode must NOT embed page bodies (we don't even fetch them),
+        # so the "Body:" key should be absent.
+        self.assertNotIn("Body:", out)
+        # Citation instructions must survive future prompt edits.
+        self.assertIn("Cite sources", out)
+
+    def test_build_system_prompt_comprehensive_includes_body(self):
+        results = [
+            {"title": "T", "href": "https://x.test/p",
+             "body": "snip", "_extracted": "extracted body text" * 10},
+        ]
+        out = agent._build_search_system_prompt("q", results, "comprehensive")
+        self.assertIn("Body:", out)
+        self.assertIn("extracted body text", out)
+        # Body must be capped — passing the entire extracted text would
+        # blow the LLM context window.
+        body_line = [
+            ln for ln in out.split("\n") if ln.strip().startswith("Body:")
+        ][0]
+        # Cap is SEARCH_PAGE_CHAR_CAP plus the "    Body: " prefix.
+        self.assertLessEqual(len(body_line), agent.SEARCH_PAGE_CHAR_CAP + 16)
+
+    def test_run_search_inference_happy_path(self):
+        fake_results = [
+            {"title": "A", "href": "https://a.com/x", "body": "snip A"},
+            {"title": "B", "href": "https://b.com/y", "body": "snip B"},
+        ]
+        fake_summary = {
+            "text": "Answer mentions [1] and [2].",
+            "prompt_tokens": 50, "completion_tokens": 10, "model": "test",
+        }
+        log = mock.MagicMock()
+        job = {"job_id": "j1", "search": {"mode": "fast"}}
+        with mock.patch.object(agent, "_ddg_search", return_value=fake_results), \
+             mock.patch.object(agent, "run_inference", return_value=fake_summary):
+            out = agent.run_search_inference(
+                prompt="what happened?", job=job, model="m", log=log,
+            )
+        self.assertEqual(out["text"], fake_summary["text"])
+        self.assertEqual(out["model"], "test")
+        self.assertEqual(len(out["sources"]), 2)
+        # Source numbers match the [1][2] order the system prompt uses.
+        self.assertEqual(out["sources"][0]["n"], 1)
+        self.assertEqual(out["sources"][0]["url"], "https://a.com/x")
+        self.assertEqual(out["sources"][0]["domain"], "a.com")
+        self.assertEqual(out["sources"][1]["n"], 2)
+        self.assertEqual(out["sources"][1]["domain"], "b.com")
+
+    def test_run_search_inference_zero_results_raises(self):
+        log = mock.MagicMock()
+        with mock.patch.object(agent, "_ddg_search", return_value=[]):
+            with self.assertRaises(RuntimeError) as cm:
+                agent.run_search_inference(
+                    prompt="x", job={"job_id": "j"}, model=None, log=log,
+                )
+        # User-facing string — the error bubbles up to /jobs/complete
+        # and the UI shows it verbatim.
+        self.assertIn("no search results", str(cm.exception))
+
+    def test_run_search_inference_ddg_failure_wraps(self):
+        log = mock.MagicMock()
+        with mock.patch.object(
+            agent, "_ddg_search", side_effect=Exception("boom"),
+        ):
+            with self.assertRaises(RuntimeError) as cm:
+                agent.run_search_inference(
+                    prompt="x", job={"job_id": "j"}, model=None, log=log,
+                )
+        # Wrapped so the worker error log gets a clear "web search
+        # failed" prefix instead of bare exception classes.
+        self.assertIn("web search failed", str(cm.exception))
+
+    def test_ordered_queues_includes_search(self):
+        # When the agent advertises chat + search, /jobs/next should
+        # BLPOP both — otherwise search jobs would sit on the queue
+        # indefinitely.
+        order = agent._ordered_queues(["chat", "search"], last_tool=None)
+        self.assertIn("search", order)
+        self.assertEqual(order[0], "chat")  # chat first by default
+        # Last-served preference flips: a chain of search jobs keeps
+        # the search dependency cache warm in front.
+        order = agent._ordered_queues(["chat", "search"], last_tool="search")
+        self.assertEqual(order[0], "search")
+
+
 if __name__ == "__main__":
     unittest.main()

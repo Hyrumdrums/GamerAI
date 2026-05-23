@@ -27,6 +27,7 @@ from shared.config import (
     OLLAMA_URL,
     POLL_INTERVAL,
     WORKER_ID_OVERRIDE,
+    job_queue_for,
     redis_kwargs,
 )
 
@@ -103,10 +104,39 @@ def post(http: httpx.Client, path: str, body: dict, timeout: float = 5.0) -> Opt
         return None
 
 
+def _search_available() -> bool:
+    """Probe ddgs + trafilatura. Search is opt-in for the docker
+    worker too — the wheels are listed in requirements.txt but a
+    custom build may have stripped them, and we'd rather advertise
+    chat-only than have a search job land here and explode."""
+    try:
+        import ddgs  # noqa: F401
+        import trafilatura  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+WORKER_TOOLS: list[str] = ["chat"]
+if _search_available():
+    WORKER_TOOLS.append("search")
+
+
 def register(http: httpx.Client) -> None:
+    body = {
+        "worker_id": WORKER_ID,
+        # Advertise the tool set so the coordinator's _ensure_live_worker
+        # check counts this worker against the right requested-tool 503
+        # check, and so /jobs/next routes search jobs here when running
+        # in the dockerized dev/test setup.
+        "capabilities": {"tools": WORKER_TOOLS},
+    }
     for attempt in range(20):
-        if post(http, "/register", {"worker_id": WORKER_ID}) is not None:
-            log.info("registered", extra={"event": "registered"})
+        if post(http, "/register", body) is not None:
+            log.info(
+                "registered tools=%s", WORKER_TOOLS,
+                extra={"event": "registered"},
+            )
             return
         time.sleep(2)
     log.error("failed to register; continuing")
@@ -231,6 +261,143 @@ def run_inference(
     }
 
 
+# ---------- search inference ----------
+SEARCH_RESULT_COUNT = 5
+SEARCH_PAGE_CHAR_CAP = 2500
+SEARCH_FETCH_TIMEOUT = 6.0
+
+
+def _ddg_search(query: str, max_results: int = SEARCH_RESULT_COUNT) -> list[dict]:
+    from ddgs import DDGS
+    with DDGS() as ddg:
+        return ddg.text(query, max_results=max_results) or []
+
+
+def _fetch_and_extract(url: str, http: httpx.Client) -> str:
+    try:
+        import trafilatura
+    except ImportError:
+        return ""
+    try:
+        resp = http.get(
+            url,
+            timeout=SEARCH_FETCH_TIMEOUT,
+            follow_redirects=True,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (X11; Linux x86_64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0 Safari/537.36"
+                ),
+            },
+        )
+        resp.raise_for_status()
+    except Exception:
+        return ""
+    try:
+        return (trafilatura.extract(resp.text) or "").strip()
+    except Exception:
+        return ""
+
+
+def _build_search_system(query: str, results: list[dict], mode: str) -> str:
+    lines = [
+        "You are a search assistant. The user has asked a question and the",
+        "system has retrieved fresh web results below. Use them — and only",
+        "them — to answer concisely and accurately.",
+        "",
+        "Rules:",
+        "- Cite sources inline as [1], [2], etc., matching the numbers below.",
+        "- If the results don't contain enough information, say so plainly.",
+        "- Prefer the most specific source for a given claim.",
+        "- Do not invent URLs or facts that aren't in the results.",
+        "",
+        f"User query: {query}",
+        "",
+        "Search results:",
+    ]
+    for i, r in enumerate(results, start=1):
+        title = (r.get("title") or "").strip()
+        url = (r.get("href") or r.get("url") or "").strip()
+        snippet = (r.get("body") or "").strip()
+        lines.append(f"[{i}] {title}")
+        lines.append(f"    URL: {url}")
+        if snippet:
+            lines.append(f"    Snippet: {snippet}")
+        body = (r.get("_extracted") or "").strip() if mode == "comprehensive" else ""
+        if body:
+            lines.append(f"    Body: {body[:SEARCH_PAGE_CHAR_CAP]}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _domain_of(url: str) -> str:
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(url).hostname or url
+        return host[4:] if host.startswith("www.") else host
+    except Exception:
+        return url
+
+
+def run_search_inference(
+    prompt: str,
+    job: dict,
+    http: httpx.Client,
+    on_partial=None,
+) -> dict:
+    """Search + summarize for the dockerized worker. Mirrors the
+    windows-agent path so dev-mode and prod-mode behave identically:
+    DDG → optional fetch+extract → Ollama summary with citation
+    instructions. Raises on failure so the coordinator records error
+    rather than fabricating an answer with no grounding."""
+    mode = ((job.get("search") or {}).get("mode") or "fast").lower()
+    if mode not in ("fast", "comprehensive"):
+        mode = "fast"
+    try:
+        results = _ddg_search(prompt, max_results=SEARCH_RESULT_COUNT)
+    except Exception as e:
+        raise RuntimeError(f"web search failed: {e}") from e
+    if not results:
+        raise RuntimeError(
+            "no search results — try a different query or uncheck search"
+        )
+    if mode == "comprehensive":
+        for r in results:
+            url = r.get("href") or r.get("url") or ""
+            if url:
+                r["_extracted"] = _fetch_and_extract(url, http)
+    system_text = _build_search_system(prompt, results, mode)
+    base = list(job.get("messages") or [])
+    if not base:
+        base = [{"role": "user", "content": prompt}]
+    chat_messages = [{"role": "system", "content": system_text}] + base
+    summary = run_inference(
+        prompt,
+        job.get("model"),
+        http,
+        on_partial=on_partial,
+        messages=chat_messages,
+    )
+    sources = [
+        {
+            "n": i,
+            "title": (r.get("title") or "").strip()
+                     or _domain_of(r.get("href") or ""),
+            "url": (r.get("href") or r.get("url") or "").strip(),
+            "domain": _domain_of(r.get("href") or r.get("url") or ""),
+        }
+        for i, r in enumerate(results, start=1)
+    ]
+    return {
+        "text": summary["text"],
+        "prompt_tokens": summary["prompt_tokens"],
+        "completion_tokens": summary["completion_tokens"],
+        "model": summary["model"],
+        "sources": sources,
+    }
+
+
 # ---------- gamer-machine realism ----------
 def simulate_network_delay() -> None:
     delay = random.uniform(NETWORK_DELAY_MIN, NETWORK_DELAY_MAX)
@@ -275,13 +442,19 @@ def process_job(r: redis.Redis, http: httpx.Client, job: dict, last_job_finished
     try:
         maybe_simulate_cold_start(last_job_finished)
         simulate_network_delay()
-        result = run_inference(
-            job["prompt"],
-            job.get("model"),
-            http,
-            on_partial=push_partial,
-            messages=job.get("messages"),
-        )
+        tool = (job.get("tool") or "chat").lower()
+        if tool == "search":
+            result = run_search_inference(
+                job["prompt"], job, http, on_partial=push_partial,
+            )
+        else:
+            result = run_inference(
+                job["prompt"],
+                job.get("model"),
+                http,
+                on_partial=push_partial,
+                messages=job.get("messages"),
+            )
         duration = round(time.time() - started, 3)
         complete_body = {
             "worker_id": WORKER_ID,
@@ -293,6 +466,8 @@ def process_job(r: redis.Redis, http: httpx.Client, job: dict, last_job_finished
             "duration_seconds": duration,
             "status": "complete",
         }
+        if result.get("sources"):
+            complete_body["sources"] = result["sources"]
         if claim_token is not None:
             complete_body["claim_token"] = claim_token
         post(http, "/jobs/complete", complete_body, timeout=30)
@@ -349,7 +524,11 @@ def main() -> None:
             heartbeat(http, "idle")
             last_heartbeat = now
 
-        item = r.blpop(JOB_QUEUE, timeout=int(POLL_INTERVAL))
+        # BLPOP across every queue we advertise so a search job
+        # doesn't sit on job_queue:search waiting for a poll cycle
+        # while this worker is idle.
+        blpop_queues = [job_queue_for(t) for t in WORKER_TOOLS]
+        item = r.blpop(blpop_queues, timeout=int(POLL_INTERVAL))
         if not item:
             continue
 
