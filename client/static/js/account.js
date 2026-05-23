@@ -36,3 +36,32 @@ if (pw && confirmPw) {
   pw.addEventListener('input', check);
   confirmPw.addEventListener('input', check);
 }
+
+// Invite-form "% of your daily allowance" tip. The form's data-* attrs
+// carry the inviter's tier name and per-axis allowance (or are absent
+// on unlimited tiers). As the host types a cap, the span right of the
+// input shows "≈ NN% of cap" — pure local arithmetic, no round-trip.
+(function inviteAllowanceTip() {
+  const form = document.querySelector('form[action="/account/invites"]');
+  if (!form) return;
+  function wire(inputId, tipId, allowanceAttr) {
+    const input = document.getElementById(inputId);
+    const tip = document.getElementById(tipId);
+    if (!input || !tip) return;
+    const allowance = parseInt(form.dataset[allowanceAttr] || '', 10);
+    if (!Number.isFinite(allowance) || allowance <= 0) return;
+    function render() {
+      const raw = parseInt(input.value, 10);
+      if (!Number.isFinite(raw) || raw <= 0) {
+        tip.textContent = '';
+        return;
+      }
+      const pct = Math.round((raw / allowance) * 100);
+      tip.textContent = `≈ ${pct}% of cap`;
+    }
+    input.addEventListener('input', render);
+    render();
+  }
+  wire('daily_quota_tokens', 'daily_quota_tokens_tip', 'tierTokens');
+  wire('daily_quota_images', 'daily_quota_images_tip', 'tierImages');
+})();

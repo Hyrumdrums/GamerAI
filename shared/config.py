@@ -69,6 +69,16 @@ AVAILABILITY_WINDOW = os.getenv("AVAILABILITY_WINDOW", "always")  # "always" | "
 RATE_PER_TOKEN = _float("RATE_PER_TOKEN", 0.000005)
 WORKER_SHARE = _float("WORKER_SHARE", 0.7)
 
+# --- image accounting ---
+# Cost of one "standard" image generation in image-unit terms. The
+# coordinator credits this against the submitter's member_usage on every
+# successful image job. A REAL column (member_usage.image_units) holds
+# the running total so future config options (higher resolution, more
+# steps, larger batches) can pre-multiply this base before crediting
+# without a schema change. The per-member daily image quota is enforced
+# in units, not raw image count, so a 4× cost image consumes 4 quota.
+IMAGE_UNIT_COST_BASE = _float("IMAGE_UNIT_COST_BASE", 1.0)
+
 # --- abuse / retry safety (all opt-in; 0 / unset disables) ---
 IDEMPOTENCY_TTL_SECONDS = _int("IDEMPOTENCY_TTL_SECONDS", 86400)  # 24h
 RATE_LIMIT_PER_MIN = _int("RATE_LIMIT_PER_MIN", 0)

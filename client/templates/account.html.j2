@@ -34,10 +34,18 @@
       <div class="v">{{ me.role }}</div>
       <div class="k">Tier</div>
       <div class="v">{{ me.tier }}</div>
-      <div class="k">Daily cap</div>
+      <div class="k">Daily cap (chat)</div>
       <div class="v">
         {% if me.daily_quota_tokens is not none %}
-          {{ me.daily_quota_tokens }} tokens/day
+          {{ "{:,}".format(me.daily_quota_tokens) }} tokens/day
+        {% else %}
+          unlimited
+        {% endif %}
+      </div>
+      <div class="k">Daily cap (images)</div>
+      <div class="v">
+        {% if me.daily_quota_images is not none %}
+          {{ me.daily_quota_images }} images/day
         {% else %}
           unlimited
         {% endif %}
@@ -68,6 +76,46 @@
     </form>
   </section>
 
+  <section class="card">
+    <h2>Your activity</h2>
+    <p class="muted">
+      One member, two ledgers. <strong>Used today</strong> is what you
+      consumed; <strong>earned</strong> is what your paired machines
+      contributed. They're independent — running an agent doesn't
+      offset your own usage, it earns you the tier that sets the cap.
+    </p>
+    <div class="kv">
+      <div class="k">Used today (chat)</div>
+      <div class="v">
+        {{ "{:,}".format(usage_today.get('tokens_out', 0)) }} tokens
+        {% if me.daily_quota_tokens %}
+          / {{ "{:,}".format(me.daily_quota_tokens) }}
+        {% endif %}
+      </div>
+      <div class="k">Used today (images)</div>
+      <div class="v">
+        {{ "%g"|format(usage_today.get('image_units', 0)) }} images
+        {% if me.daily_quota_images %}
+          / {{ me.daily_quota_images }}
+        {% endif %}
+      </div>
+      <div class="k">Earned (lifetime)</div>
+      <div class="v">
+        ${{ "%.4f"|format(earnings.get('total_usd', 0)) }}
+        across {{ earnings.get('machine_count', 0) }} machine{% if earnings.get('machine_count', 0) != 1 %}s{% endif %}
+        ({{ earnings.get('total_jobs', 0) }} jobs)
+      </div>
+    </div>
+    {% if partial_contributor_count and partial_contributor_count > 0 %}
+    <p class="muted partial-warn">
+      <strong>{{ partial_contributor_count }} of your machine{% if partial_contributor_count != 1 %}s are{% else %} is{% endif %} chat-only.</strong>
+      Image generation is unavailable on {% if partial_contributor_count != 1 %}them{% else %}it{% endif %}, so
+      {% if partial_contributor_count != 1 %}they{% else %}it{% endif %} count{% if partial_contributor_count == 1 %}s{% endif %} as a partial
+      contributor. Reinstall the agent with the image model to upgrade.
+    </p>
+    {% endif %}
+  </section>
+
   {% if me.host %}
   <section class="card">
     <h2>Your host</h2>
@@ -95,12 +143,44 @@
       share with someone over your preferred channel — we don't send
       emails yet.</p>
 
-    <form method="POST" action="/account/invites" class="inline-form">
+    <form method="POST" action="/account/invites" class="inline-form"
+          data-tier="{{ me.tier }}"
+          {% if tier_quota_tokens is not none %}
+          data-tier-tokens="{{ tier_quota_tokens }}"
+          {% endif %}
+          {% if tier_quota_images is not none %}
+          data-tier-images="{{ tier_quota_images }}"
+          {% endif %}>
       <label class="label" for="invitee_email">Friend's email</label>
       <input id="invitee_email" name="invitee_email" type="email"
              placeholder="friend@example.com" required>
-      <label class="label" for="daily_quota_tokens">Daily cap (tokens; blank = unlimited)</label>
-      <input id="daily_quota_tokens" name="daily_quota_tokens" type="number" min="0">
+
+      <label class="label" for="daily_quota_tokens">
+        Daily cap (tokens; blank = unlimited)
+        {% if tier_quota_tokens is not none %}
+        <span class="muted">— your {{ me.tier }} allowance is
+          {{ "{:,}".format(tier_quota_tokens) }}/day</span>
+        {% endif %}
+      </label>
+      <div class="input-with-tip">
+        <input id="daily_quota_tokens" name="daily_quota_tokens"
+               type="number" min="0">
+        <span class="invite-tip" id="daily_quota_tokens_tip"></span>
+      </div>
+
+      <label class="label" for="daily_quota_images">
+        Daily cap (images; blank = unlimited)
+        {% if tier_quota_images is not none %}
+        <span class="muted">— your {{ me.tier }} allowance is
+          {{ tier_quota_images }}/day</span>
+        {% endif %}
+      </label>
+      <div class="input-with-tip">
+        <input id="daily_quota_images" name="daily_quota_images"
+               type="number" min="0">
+        <span class="invite-tip" id="daily_quota_images_tip"></span>
+      </div>
+
       <label class="label" for="expires_hours">Expires in (hours; blank = never)</label>
       <input id="expires_hours" name="expires_hours" type="number" min="0" step="0.5">
       <button type="submit">Create invite</button>
@@ -110,13 +190,14 @@
     <h3>Open invites</h3>
     <table class="friends-table">
       <thead>
-        <tr><th>For</th><th>Cap</th><th>State</th><th>Link</th><th></th></tr>
+        <tr><th>For</th><th>Chat cap</th><th>Image cap</th><th>State</th><th>Link</th><th></th></tr>
       </thead>
       <tbody>
         {% for inv in friends.open_invites %}
         <tr>
           <td>{{ inv.invitee_email or '—' }}</td>
-          <td>{% if inv.daily_quota_tokens is not none %}{{ inv.daily_quota_tokens }}{% else %}∞{% endif %}</td>
+          <td>{% if inv.daily_quota_tokens is not none %}{{ "{:,}".format(inv.daily_quota_tokens) }}{% else %}∞{% endif %}</td>
+          <td>{% if inv.daily_quota_images is not none %}{{ inv.daily_quota_images }}{% else %}∞{% endif %}</td>
           <td>{{ inv.state }}</td>
           <td>
             <button class="copy-link" type="button"
@@ -137,18 +218,79 @@
 
     {% if friends.accepted %}
     <h3>Accepted invitees</h3>
-    <table class="friends-table">
+    <p class="muted">Edit each friend's caps inline, or revoke if they
+      signed up for a higher tier than their machine is delivering.
+      "Last seen" shows when they last touched the API.</p>
+    <table class="friends-table friends-editable">
       <thead>
-        <tr><th>Username</th><th>Email</th><th>Cap</th><th>Tier</th><th>State</th></tr>
+        <tr>
+          <th>Username</th>
+          <th>Chat cap</th>
+          <th>Image cap</th>
+          <th>Tier</th>
+          <th>Last seen</th>
+          <th>State</th>
+          <th></th>
+        </tr>
       </thead>
       <tbody>
         {% for f in friends.accepted %}
         <tr>
-          <td>{{ f.username or '(no username)' }}</td>
-          <td>{{ f.email or '—' }}</td>
-          <td>{% if f.daily_quota_tokens is not none %}{{ f.daily_quota_tokens }}{% else %}∞{% endif %}</td>
+          <td>
+            {{ f.username or '(no username)' }}
+            <div class="muted small">{{ f.email or '—' }}</div>
+          </td>
+          {% if f.revoked_at %}
+          <td>{% if f.daily_quota_tokens is not none %}{{ "{:,}".format(f.daily_quota_tokens) }}{% else %}∞{% endif %}</td>
+          <td>{% if f.daily_quota_images is not none %}{{ f.daily_quota_images }}{% else %}∞{% endif %}</td>
+          {% else %}
+          <td colspan="2">
+            <form method="POST"
+                  action="/account/friends/{{ f.member_id }}/quota"
+                  class="inline friend-quota-form">
+              <input type="number" min="0" step="1"
+                     name="daily_quota_tokens"
+                     placeholder="∞"
+                     value="{% if f.daily_quota_tokens is not none %}{{ f.daily_quota_tokens }}{% endif %}"
+                     aria-label="daily token cap" title="daily tokens">
+              <span class="qsep">tok ·</span>
+              <input type="number" min="0" step="1"
+                     name="daily_quota_images"
+                     placeholder="∞"
+                     value="{% if f.daily_quota_images is not none %}{{ f.daily_quota_images }}{% endif %}"
+                     aria-label="daily image cap" title="daily images">
+              <span class="qsep">img</span>
+              <button type="submit">save</button>
+            </form>
+          </td>
+          {% endif %}
           <td>{{ f.tier }}</td>
-          <td>{% if f.revoked_at %}revoked{% else %}active{% endif %}</td>
+          <td>
+            {% if f.last_active_at %}
+            <span title="{{ f.last_active_at }}">
+              {{ ((f.last_active_at | int) | string)[:10] }}
+            </span>
+            {% else %}
+            <span class="muted">never</span>
+            {% endif %}
+          </td>
+          <td>
+            {% if f.revoked_at %}
+            <span class="badge badge-revoked">revoked</span>
+            {% else %}
+            <span>active</span>
+            {% endif %}
+          </td>
+          <td>
+            {% if not f.revoked_at %}
+            <form method="POST"
+                  action="/account/friends/{{ f.member_id }}/revoke"
+                  class="inline"
+                  onsubmit="return confirm('Revoke {{ f.username or f.email or 'this friend' }}? Their token stops working immediately.');">
+              <button type="submit" class="danger">revoke</button>
+            </form>
+            {% endif %}
+          </td>
         </tr>
         {% endfor %}
       </tbody>
@@ -204,6 +346,34 @@
         {% endfor %}
       </tbody>
     </table>
+    {% if owned_workers %}
+    <h3>Registered workers</h3>
+    <p class="muted">What your machines advertise to the network.
+      Chat-only workers count as <strong>partial contributors</strong> —
+      install the image model to upgrade.</p>
+    <table class="friends-table">
+      <thead>
+        <tr><th>Worker</th><th>Status</th><th>Tools</th></tr>
+      </thead>
+      <tbody>
+        {% for w in owned_workers %}
+        <tr>
+          <td>{{ w.worker_id }}</td>
+          <td>{{ w.status }}</td>
+          <td>
+            {% if w.is_partial %}
+            <span class="badge badge-partial" title="image generation unavailable">
+              partial — no image
+            </span>
+            {% else %}
+            {{ w.tools | join(', ') }}
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
     {% else %}
     <p class="muted">
       No paired PCs yet.

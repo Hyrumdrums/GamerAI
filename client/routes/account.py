@@ -51,10 +51,24 @@ async def account_page(request: Request, flash: Optional[str] = None):
         friends = {"open_invites": [], "accepted": []}
     machines_status, machines_body = await _coord_get(bearer, "/me/machines")
     machines = machines_body.get("machines", []) if machines_status == 200 else []
+    owned_workers = (
+        machines_body.get("owned_workers", []) if machines_status == 200 else []
+    )
+    partial_count = (
+        machines_body.get("partial_contributor_count", 0)
+        if machines_status == 200 else 0
+    )
 
     # Friends section is admin-only in v1 (see docs/auth-design.md —
     # tier-gated per-contributor invites come with the 3b.i engine).
     can_invite = me.get("role") == "admin"
+
+    # Tier-based display allowance for the invite-form "% of your daily
+    # allowance" tip. /me returns this already shaped; we just unpack
+    # the two axes for the template so the JS data-attributes stay
+    # primitive. None on either axis = unlimited (admin / PLATINUM),
+    # which the JS treats as "no percentage tip".
+    tier_quota = me.get("tier_quota") or {}
 
     return templates.TemplateResponse(
         request,
@@ -63,6 +77,12 @@ async def account_page(request: Request, flash: Optional[str] = None):
             "me": me,
             "friends": friends,
             "machines": machines,
+            "owned_workers": owned_workers,
+            "partial_contributor_count": partial_count,
+            "tier_quota_tokens": tier_quota.get("tokens"),
+            "tier_quota_images": tier_quota.get("images"),
+            "earnings": me.get("earnings") or {},
+            "usage_today": me.get("usage_today") or {},
             "can_invite": can_invite,
             "flash": flash,
         },
@@ -138,6 +158,7 @@ async def account_password(
 async def account_create_invite(
     request: Request,
     daily_quota_tokens: str = Form(""),
+    daily_quota_images: str = Form(""),
     invitee_email: str = Form(""),
     expires_hours: str = Form(""),
 ):
@@ -162,6 +183,14 @@ async def account_create_invite(
         except ValueError:
             return RedirectResponse(
                 "/account?flash=Daily quota must be a number.",
+                status_code=303,
+            )
+    if daily_quota_images.strip():
+        try:
+            body["daily_quota_images"] = int(daily_quota_images)
+        except ValueError:
+            return RedirectResponse(
+                "/account?flash=Daily image cap must be a number.",
                 status_code=303,
             )
     if expires_hours.strip():
@@ -200,6 +229,93 @@ async def account_revoke_invite(code: str, request: Request):
     return RedirectResponse(
         "/account?flash=Invite revoked.", status_code=303,
     )
+
+
+@router.post("/account/friends/{friend_member_id}/quota")
+async def account_update_friend_quota(
+    friend_member_id: str,
+    request: Request,
+    daily_quota_tokens: str = Form(""),
+    daily_quota_images: str = Form(""),
+):
+    """Host updates an accepted invitee's two-dimensional cap from the
+    accepted-invitees row. Empty input = unlimited for that axis;
+    the form always submits both so the coordinator sees the new
+    full-state pair."""
+    bearer = session_bearer(request)
+    me = await identify(bearer) if bearer else None
+    if me is None:
+        return login_redirect("/account")
+
+    def parse_optional_int(raw: str, label: str):
+        if not raw.strip():
+            return None, None
+        try:
+            return int(raw), None
+        except ValueError:
+            return None, f"{label} must be a number."
+
+    tokens_val, err = parse_optional_int(daily_quota_tokens, "Daily token cap")
+    if err:
+        return RedirectResponse(f"/account?flash={err}", status_code=303)
+    images_val, err = parse_optional_int(daily_quota_images, "Daily image cap")
+    if err:
+        return RedirectResponse(f"/account?flash={err}", status_code=303)
+
+    async with coordinator_client._client(bearer=bearer) as c:
+        r = await c.post(
+            f"/me/friends/{friend_member_id}/quota",
+            json={
+                "daily_quota_tokens": tokens_val,
+                "daily_quota_images": images_val,
+            },
+            timeout=5,
+        )
+    if r.status_code == 200:
+        return RedirectResponse(
+            "/account?flash=Friend cap updated.", status_code=303,
+        )
+    detail = "Couldn't update friend cap."
+    try:
+        detail = r.json().get("detail", detail)
+    except ValueError:
+        pass
+    return RedirectResponse(f"/account?flash={detail}", status_code=303)
+
+
+@router.post("/account/friends/{friend_member_id}/revoke")
+async def account_revoke_friend(friend_member_id: str, request: Request):
+    """Host revokes an accepted invitee's access. Single-button POST —
+    the row in the accepted-invitees table renders a 'revoke' button
+    that hits this route."""
+    bearer = session_bearer(request)
+    me = await identify(bearer) if bearer else None
+    if me is None:
+        return login_redirect("/account")
+    async with coordinator_client._client(bearer=bearer) as c:
+        r = await c.post(
+            f"/me/friends/{friend_member_id}/revoke", timeout=5,
+        )
+    if r.status_code == 200:
+        body = {}
+        try:
+            body = r.json()
+        except ValueError:
+            pass
+        if body.get("was_already_revoked"):
+            return RedirectResponse(
+                "/account?flash=Friend was already revoked.",
+                status_code=303,
+            )
+        return RedirectResponse(
+            "/account?flash=Friend revoked.", status_code=303,
+        )
+    detail = "Couldn't revoke friend."
+    try:
+        detail = r.json().get("detail", detail)
+    except ValueError:
+        pass
+    return RedirectResponse(f"/account?flash={detail}", status_code=303)
 
 
 @router.get("/contribute", response_class=HTMLResponse)

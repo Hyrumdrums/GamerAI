@@ -145,6 +145,7 @@ class Member:
     parent_member_id: Optional[str]
     tier: str
     daily_quota_tokens: Optional[int]
+    daily_quota_images: Optional[int]
     revoked_at: Optional[float]
     created_at: float
     tos_accepted_at: Optional[float] = None
@@ -163,6 +164,9 @@ def _row_to_member(row) -> Member:
     password_set_at = (
         row["password_set_at"] if "password_set_at" in keys else None
     )
+    daily_image_cap_raw = (
+        row["daily_quota_images"] if "daily_quota_images" in keys else None
+    )
     return Member(
         member_id=row["member_id"],
         email=row["email"],
@@ -173,6 +177,9 @@ def _row_to_member(row) -> Member:
             int(row["daily_quota_tokens"])
             if row["daily_quota_tokens"] is not None
             else None
+        ),
+        daily_quota_images=(
+            int(daily_image_cap_raw) if daily_image_cap_raw is not None else None
         ),
         revoked_at=float(row["revoked_at"]) if row["revoked_at"] is not None else None,
         created_at=float(row["created_at"]),

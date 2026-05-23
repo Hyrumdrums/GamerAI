@@ -4513,8 +4513,43 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     # Image-tool bootstrap (best-effort; never blocks chat). When it
     # succeeds the worker advertises tools=["chat","image"] and pulls
-    # from the per-tool image queue; on failure we stay chat-only.
+    # from the per-tool image queue; on failure we stay chat-only and
+    # the coordinator flags this worker as a partial contributor.
     image_ready = bootstrap_image_inference(cfg, log)
+    if not image_ready:
+        # Loud warning block — partial contributors are a documented
+        # second-class state and the user should see it on first run
+        # rather than discover it later via the account page badge.
+        # Print to both the console (for foreground / first-run flows)
+        # and the rotating log file (for tray-mode operators who never
+        # see stdout). The console block is no-op when output is
+        # redirected.
+        msg_lines = [
+            "",
+            "================================================================",
+            "  WARNING: image generation is NOT available on this machine.",
+            "",
+            "  Your agent will still serve chat jobs, but the coordinator",
+            "  will register this worker as a PARTIAL CONTRIBUTOR — image",
+            "  jobs won't be routed here, and future tier promotions may",
+            "  weight your contribution accordingly.",
+            "",
+            "  To fix: ensure the image model (.gguf) is present and the",
+            "  sd.cpp sidecar reachable, then restart the agent. See the",
+            "  install guide / contribute page for details.",
+            "================================================================",
+            "",
+        ]
+        try:
+            for line in msg_lines:
+                sys.stdout.write(line + "\n")
+            sys.stdout.flush()
+        except Exception:
+            pass
+        log.warning(
+            "image bootstrap failed — running as partial contributor "
+            "(chat only)"
+        )
 
     coord = Coordinator(cfg.coordinator_url, worker_id, log, cfg.api_token)
     # Advertise the model and tools we can actually serve. The chat

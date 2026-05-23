@@ -29,6 +29,7 @@ from shared.config import (
     CANARY_INTERVAL_SECONDS,
     CANARY_PENDING,
     IMAGE_REWRITE_PENDING,
+    IMAGE_UNIT_COST_BASE,
     SEARCH_REWRITE_PENDING,
     SEARCH_AUTO_DISABLED,
     CANARY_SCORE_WINDOW,
@@ -51,9 +52,11 @@ from shared.config import (
     WORKER_TIMEOUT_SECONDS,
     job_queue_for,
 )
+from coordinator.tiers import quota_for as _tier_quota_for
 from shared.models import (
     AgentPairPollRequest,
     ConversationCreateRequest,
+    FriendQuotaUpdateRequest,
     GenerateRequest,
     GenerateResponse,
     HeartbeatRequest,
@@ -1558,24 +1561,39 @@ def generate(req: GenerateRequest, request: Request):
     member = getattr(request.state, "member", None)
     submitted_by = member.member_id if member is not None else None
 
-    # Daily-quota enforcement (slice 2). NULL quota = unlimited (admin,
-    # tier-unlimited contributor). The check runs against today's
-    # usage at submission time; a single prompt can overshoot the cap
-    # by its completion size, which we don't predict here.
-    if (
-        member is not None
-        and member.daily_quota_tokens is not None
-        and member.daily_quota_tokens > 0
-    ):
-        used = db.member_usage_today(member.member_id)["tokens_out"]
-        if used >= member.daily_quota_tokens:
-            raise HTTPException(
-                status_code=429,
-                detail=(
-                    f"daily quota exceeded: {used} / "
-                    f"{member.daily_quota_tokens} output tokens used today"
-                ),
-            )
+    # Two-dimensional daily-quota enforcement (slice 2 + image-limits
+    # slice). NULL on either column = unlimited for that dimension
+    # (admin, tier-unlimited contributor). The check runs against
+    # today's usage at submission time; a single prompt can overshoot
+    # the chat cap by its completion size, which we don't predict here.
+    # Image jobs gate on the image_units column instead — token output
+    # for image jobs is unrelated to image-cost weighting.
+    if member is not None:
+        usage_today = db.member_usage_today(member.member_id)
+        if tool == "image":
+            cap = member.daily_quota_images
+            if cap is not None and cap > 0:
+                used_units = usage_today["image_units"]
+                if used_units >= cap:
+                    raise HTTPException(
+                        status_code=429,
+                        detail=(
+                            f"daily image quota exceeded: "
+                            f"{used_units:g} / {cap} image-units used today"
+                        ),
+                    )
+        else:
+            cap = member.daily_quota_tokens
+            if cap is not None and cap > 0:
+                used = usage_today["tokens_out"]
+                if used >= cap:
+                    raise HTTPException(
+                        status_code=429,
+                        detail=(
+                            f"daily quota exceeded: {used} / "
+                            f"{cap} output tokens used today"
+                        ),
+                    )
 
     # Conversation context: if the caller passed conversation_id, load
     # the prior turns and build a chat messages[] array for the worker
@@ -2070,6 +2088,14 @@ def register(req: WorkerIdent, request: Request):
             WORKER_CAPABILITIES,
             req.worker_id,
             req.capabilities.model_dump_json(),
+        )
+        # Mirror the advertised tools list to SQLite so the account
+        # page can flag partial contributors (image bootstrap failed
+        # ⇒ tools=["chat"] only) without a Redis round-trip — and so
+        # the badge stays visible after the worker goes offline.
+        db.set_worker_tools(
+            req.worker_id,
+            json.dumps(list(req.capabilities.tools or [])),
         )
     log.info(
         "worker registered",
@@ -2649,33 +2675,59 @@ def complete(req: JobCompleteRequest, request: Request):
                 )
         db.touch_conversation(conv_id, now)
 
-    # Credit on completion. Chat jobs credit by completion_tokens; image
-    # jobs use the flat earnings computed above with a synthesized
-    # token count so the per-member-usage rollup still moves (the
-    # member's daily token quota is what gates additional jobs; not
-    # crediting image work would make image generation effectively
-    # free against the cap).
-    creditable_tokens = tokens
-    if (
+    # Credit on completion.
+    #
+    # Chat jobs credit by completion_tokens against both the worker
+    # earnings ledger (for payout) and the member usage ledger (for
+    # quota). Image jobs are independent: they credit IMAGE_UNIT_COST_BASE
+    # to a dedicated image_units column on member_usage (gated by
+    # daily_quota_images) and credit a small token-equivalent to the
+    # earnings ledger only — the per-image USD amount comes from
+    # ``earnings`` computed upstream. Pre-image-limits behavior was to
+    # fake a 200-token credit on the chat ledger; that conflated two
+    # resources and broke the token ledger as a chat-throughput
+    # signal. See business.md → "Dual-role accounting" for the model.
+    is_image_complete = (
         pre_complete_tool == "image"
         and req.status == "complete"
         and image_save_error is None
-    ):
-        creditable_tokens = 200
-    if req.status == "complete" and creditable_tokens > 0 and image_save_error is None:
-        db.add_earnings(req.worker_id, creditable_tokens, earnings)
-        submitter = (
-            job_row["submitted_by_member_id"]
-            if job_row is not None and "submitted_by_member_id" in job_row.keys()
-            else None
-        )
+    )
+    is_chat_complete = (
+        req.status == "complete"
+        and not is_image_complete
+        and tokens > 0
+        and image_save_error is None
+    )
+    submitter = (
+        job_row["submitted_by_member_id"]
+        if job_row is not None and "submitted_by_member_id" in job_row.keys()
+        else None
+    )
+    earnings_token_credit = 0
+    if is_chat_complete:
+        db.add_earnings(req.worker_id, tokens, earnings)
+        earnings_token_credit = tokens
         if submitter:
             db.add_member_usage(
                 submitter,
                 now,
                 tokens_in=int(req.prompt_tokens or 0),
-                tokens_out=creditable_tokens,
+                tokens_out=tokens,
             )
+    elif is_image_complete:
+        # Earnings still posts USD for the image; the synthesized 200
+        # is preserved here ONLY as a tokens-equivalent so the
+        # earnings ledger's tokens column stays additive across both
+        # tools. The member-side quota uses image_units, not tokens.
+        earnings_token_credit = 200
+        db.add_earnings(req.worker_id, earnings_token_credit, earnings)
+        if submitter:
+            db.add_member_image_usage(
+                submitter,
+                now,
+                units=IMAGE_UNIT_COST_BASE,
+            )
+    if is_chat_complete or is_image_complete:
         # mirror to redis hash for backwards compat
         existing = r.hget(WORKER_EARNINGS, req.worker_id)
         if existing:
@@ -2687,7 +2739,7 @@ def complete(req: JobCompleteRequest, request: Request):
             cur = {"earnings": 0.0, "jobs": 0, "tokens": 0}
         cur["earnings"] = round(float(cur.get("earnings", 0)) + earnings, 10)
         cur["jobs"] = int(cur.get("jobs", 0)) + 1
-        cur["tokens"] = int(cur.get("tokens", 0)) + creditable_tokens
+        cur["tokens"] = int(cur.get("tokens", 0)) + earnings_token_credit
         cur["worker_id"] = req.worker_id
         r.hset(WORKER_EARNINGS, req.worker_id, json.dumps(cur))
 
@@ -2855,6 +2907,24 @@ def me(request: Request):
         raise HTTPException(status_code=401, detail="unauthorized")
     usage = db.member_usage_today(member.member_id)
     paired_count = len(db.list_member_tokens(member.member_id))
+    # Earnings aggregated across every worker this member owns. The
+    # bridge join lives in db.member_earnings; admin members and
+    # never-contributed members both get zeros, which the account page
+    # renders as a "contribute to start earning" empty state. See
+    # business.md → "Dual-role accounting" for why the two ledgers
+    # stay independent and just meet at display time here.
+    earnings = db.member_earnings(member.member_id)
+    # tier_quota is the *display* allowance for this tier (see
+    # coordinator/tiers.py). It's not the enforcer — the per-member
+    # daily_quota_* columns still gate /generate — but the account page
+    # uses it as the denominator for the "% of your daily allowance"
+    # tip on the invite form. Admin members are unlimited regardless
+    # of tier; null out both axes so the UI shows "unlimited" instead
+    # of an arbitrary BRONZE-ish percentage.
+    if member.role == "admin":
+        tier_quota = {"tokens": None, "images": None}
+    else:
+        tier_quota = dict(_tier_quota_for(member.tier))
     return {
         "member_id": member.member_id,
         "email": member.email,
@@ -2862,7 +2932,9 @@ def me(request: Request):
         "parent_member_id": member.parent_member_id,
         "host": _host_summary(member.parent_member_id),
         "tier": member.tier,
+        "tier_quota": tier_quota,
         "daily_quota_tokens": member.daily_quota_tokens,
+        "daily_quota_images": member.daily_quota_images,
         "username": member.username,
         "has_password": member.has_password,
         "password_set_at": member.password_set_at,
@@ -2871,6 +2943,7 @@ def me(request: Request):
         # web UI shows the contribute pitch in the topbar.
         "paired_machines_count": paired_count,
         "usage_today": usage,
+        "earnings": earnings,
         "tos": {
             "accepted_at": member.tos_accepted_at,
             "version": member.tos_version,
@@ -2887,26 +2960,54 @@ def my_machines(request: Request):
     the per-machine unpair button. Never reveals the raw bearer (we
     don't have it — we only stored the hash) or even the full hash;
     the prefix is enough to disambiguate rows in the UI and is what
-    the unpair POST takes as a slug."""
+    the unpair POST takes as a slug.
+
+    Also includes an ``owned_workers`` list — workers the member's
+    machines have actually registered. Used by the UI to badge
+    "partial contributor" on chat-only workers (image bootstrap
+    failed). A pairing token without a matching worker just means the
+    agent paired but hasn't called /register yet; it's surfaced as a
+    pending machine via the ``machines`` list."""
     member = getattr(request.state, "member", None)
     if member is None:
         if not AUTH_ENABLED:
-            return {"machines": []}
+            return {"machines": [], "owned_workers": []}
         raise HTTPException(status_code=401, detail="unauthorized")
     rows = db.list_member_tokens(member.member_id)
     machines = []
-    for r in rows:
-        full_hash = r["token_hash"]
+    for row in rows:
+        full_hash = row["token_hash"]
         machines.append({
             # 12-char prefix is enough to disambiguate even tens of
             # thousands of rows; the full hash isn't a credential
             # but there's no reason to surface it.
             "id": full_hash[:12],
-            "label": r["label"] or "agent",
-            "created_at": r["created_at"],
-            "last_used_at": r["last_used_at"],
+            "label": row["label"] or "agent",
+            "created_at": row["created_at"],
+            "last_used_at": row["last_used_at"],
         })
-    return {"machines": machines}
+    worker_rows = db.list_workers_for_member(member.member_id)
+    now = time.time()
+    owned_workers = []
+    partial_count = 0
+    for w in worker_rows:
+        wid = w["worker_id"]
+        tools = db.worker_tools(wid) or ["chat"]
+        is_partial = "image" not in tools
+        if is_partial:
+            partial_count += 1
+        owned_workers.append({
+            "worker_id": wid,
+            "status": _worker_status(wid, now),
+            "last_seen": float(w["last_seen"] or 0),
+            "tools": tools,
+            "is_partial": is_partial,
+        })
+    return {
+        "machines": machines,
+        "owned_workers": owned_workers,
+        "partial_contributor_count": partial_count,
+    }
 
 
 @app.post("/me/machines/{prefix}/unpair")
@@ -2953,17 +3054,23 @@ def my_friends(request: Request):
     now = time.time()
     invites = db.list_invites_by_contributor(member.member_id)
     open_invites = []
-    for r in invites:
-        state = _invite_state(r, now)
+    for inv_row in invites:
+        state = _invite_state(inv_row, now)
         if state in ("accepted",):
             continue
+        keys = inv_row.keys()
         open_invites.append({
-            "code": r["code"],
+            "code": inv_row["code"],
             "state": state,
-            "daily_quota_tokens": r["daily_quota_tokens"],
-            "invitee_email": r["invitee_email"],
-            "expires_at": r["expires_at"],
-            "created_at": r["created_at"],
+            "daily_quota_tokens": inv_row["daily_quota_tokens"],
+            "daily_quota_images": (
+                inv_row["daily_quota_images"]
+                if "daily_quota_images" in keys
+                else None
+            ),
+            "invitee_email": inv_row["invitee_email"],
+            "expires_at": inv_row["expires_at"],
+            "created_at": inv_row["created_at"],
         })
 
     accepted = []
@@ -2976,6 +3083,11 @@ def my_friends(request: Request):
             "username": row["username"] if "username" in keys else None,
             "email": row["email"],
             "daily_quota_tokens": row["daily_quota_tokens"],
+            "daily_quota_images": (
+                row["daily_quota_images"]
+                if "daily_quota_images" in keys
+                else None
+            ),
             "tier": row["tier"],
             "revoked_at": row["revoked_at"],
             "created_at": row["created_at"],
@@ -2983,6 +3095,93 @@ def my_friends(request: Request):
         })
 
     return {"open_invites": open_invites, "accepted": accepted}
+
+
+def _friend_or_403(caller, friend_member_id: str):
+    """Resolve an accepted invitee for a friend-management mutation.
+
+    Caller must be either the friend's host (parent_member_id match)
+    or an admin. Returns the friend's member row on success; raises
+    HTTPException otherwise. 404 (not 403) on a mismatch so the
+    endpoint doesn't leak whether the member exists under a different
+    host."""
+    if caller is None:
+        if AUTH_ENABLED:
+            raise HTTPException(status_code=401, detail="unauthorized")
+        # Auth-off dev mode: no host concept; refuse the mutation
+        # because there's no "caller" to authorize.
+        raise HTTPException(
+            status_code=400,
+            detail="friend management requires auth",
+        )
+    row = db.get_member(friend_member_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="friend not found")
+    is_owner = row["parent_member_id"] == caller.member_id
+    is_admin = caller.role == "admin"
+    if not (is_owner or is_admin):
+        raise HTTPException(status_code=404, detail="friend not found")
+    return row
+
+
+@app.post("/me/friends/{friend_member_id}/quota")
+def update_friend_quota(
+    friend_member_id: str,
+    req: FriendQuotaUpdateRequest,
+    request: Request,
+):
+    """Host edits an accepted invitee's daily caps. Both axes are
+    rewritten on every call — the host form always sends the
+    new-full-state pair. ``null`` on an axis means unlimited.
+
+    Scoped to the friend's host (or admin); a stranger gets 404 so
+    the endpoint doesn't reveal whose tree the member belongs to."""
+    caller = getattr(request.state, "member", None)
+    _friend_or_403(caller, friend_member_id)
+    updated = db.update_member_quotas(
+        friend_member_id,
+        daily_quota_tokens=req.daily_quota_tokens,
+        daily_quota_images=req.daily_quota_images,
+    )
+    if not updated:
+        # Row vanished between the auth check and the update — race
+        # with a revoke from another tab. Surface a 404 so the UI
+        # re-renders against fresh state.
+        raise HTTPException(status_code=404, detail="friend not found")
+    log.info(
+        "friend quota updated",
+        extra={
+            "event": "friend_quota_updated",
+            "friend_member_id": friend_member_id,
+        },
+    )
+    return {
+        "ok": True,
+        "daily_quota_tokens": req.daily_quota_tokens,
+        "daily_quota_images": req.daily_quota_images,
+    }
+
+
+@app.post("/me/friends/{friend_member_id}/revoke")
+def revoke_friend(friend_member_id: str, request: Request):
+    """Host revokes an accepted invitee's access. Sets
+    ``members.revoked_at`` so all auth lookups for that member
+    immediately fail. Idempotent: revoking an already-revoked friend
+    returns ``ok: true, was_already_revoked: true`` rather than 404
+    so the UI can render a friendly state without distinguishing
+    races from genuine retries."""
+    caller = getattr(request.state, "member", None)
+    _friend_or_403(caller, friend_member_id)
+    now = time.time()
+    revoked = db.revoke_member_by_id(friend_member_id, now)
+    log.info(
+        "friend revoked" if revoked else "friend already revoked",
+        extra={
+            "event": "friend_revoked",
+            "friend_member_id": friend_member_id,
+        },
+    )
+    return {"ok": True, "was_already_revoked": not revoked}
 
 
 @app.post("/login")
@@ -3377,11 +3576,20 @@ def delete_conversation(conversation_id: str, request: Request):
 def _invite_summary(row, *, with_contributor_email: bool = False) -> dict:
     """Shared shape for invite responses. ``with_contributor_email`` is
     on for the public redemption endpoint (so Bob sees who invited him);
-    off for admin/contributor listings (which already know)."""
+    off for admin/contributor listings (which already know).
+
+    ``daily_quota_images`` is read defensively — legacy invite rows
+    created before the image-limits slice won't have the column."""
+    keys = row.keys()
     out = {
         "code": row["code"],
         "invitee_email": row["invitee_email"],
         "daily_quota_tokens": row["daily_quota_tokens"],
+        "daily_quota_images": (
+            row["daily_quota_images"]
+            if "daily_quota_images" in keys
+            else None
+        ),
         "expires_at": row["expires_at"],
         "accepted_at": row["accepted_at"],
         "accepted_by_member_id": row["accepted_by_member_id"],
@@ -3444,6 +3652,7 @@ def create_invite(req: InviteCreateRequest, request: Request):
         code=code,
         contributor_member_id=member.member_id,
         daily_quota_tokens=req.daily_quota_tokens,
+        daily_quota_images=req.daily_quota_images,
         invitee_email=invitee_email,
         expires_at=expires_at,
         notes=req.notes,
@@ -3457,6 +3666,7 @@ def create_invite(req: InviteCreateRequest, request: Request):
         "invite_id": invite_id,
         "code": code,
         "daily_quota_tokens": req.daily_quota_tokens,
+        "daily_quota_images": req.daily_quota_images,
         "expires_at": expires_at,
     }
 

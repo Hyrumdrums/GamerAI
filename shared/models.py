@@ -179,11 +179,15 @@ class InviteCreateRequest(BaseModel):
     host identify which open invite is which and gives us a fallback
     address if the redemption flow somehow ships without one.
 
-    ``daily_quota_tokens`` defaults to NULL = unlimited;
+    ``daily_quota_tokens`` and ``daily_quota_images`` are two-dimensional
+    quotas; either can be NULL = unlimited. The pair is inherited onto
+    the new member row at redemption and enforced independently in
+    /generate's quota gate.
     ``expires_hours`` defaults to no expiry.
     """
     invitee_email: str
     daily_quota_tokens: Optional[int] = None
+    daily_quota_images: Optional[int] = None
     expires_hours: Optional[float] = None
     notes: Optional[str] = None
 
@@ -216,6 +220,16 @@ class InviteAcceptRequest(BaseModel):
     password: str
     invitee_email: str
     tos_accepted: bool = False
+
+
+class FriendQuotaUpdateRequest(BaseModel):
+    """Host edits an accepted invitee's two-dimensional daily cap.
+    Both fields are sent on every update — the form always carries
+    the new full state. ``None`` on either axis means "unlimited";
+    a numeric value pins that dimension. There's no partial-update
+    semantic to keep the wire contract obvious."""
+    daily_quota_tokens: Optional[int] = None
+    daily_quota_images: Optional[int] = None
 
 
 class LoginRequest(BaseModel):

@@ -35,6 +35,24 @@ def _format_expiry(expires_at) -> str:
     )
 
 
+def _format_caps(tokens, images) -> str:
+    """Compact one-liner for both caps. ``unlimited`` on either side is
+    expressed inline so the redeemer doesn't see a confusing
+    "0 / unlimited" pair. The order matches the form on the host side
+    (tokens first, then images) so a host comparing the two pages
+    isn't surprised."""
+    parts = []
+    if tokens:
+        parts.append(f"{tokens:,} tokens")
+    else:
+        parts.append("unlimited tokens")
+    if images:
+        parts.append(f"{images} images")
+    else:
+        parts.append("unlimited images")
+    return " · ".join(parts)
+
+
 def _render_form(
     request: Request,
     *,
@@ -83,8 +101,10 @@ async def invite_landing(code: str, request: Request):
         or details.get("contributor_member_id")
         or "a GamerAI contributor"
     )
-    cap = details.get("daily_quota_tokens")
-    cap_text = f"{cap} tokens/day" if cap else "unlimited"
+    cap_text = _format_caps(
+        details.get("daily_quota_tokens"),
+        details.get("daily_quota_images"),
+    )
     return _render_form(
         request,
         contributor=str(contributor),
@@ -105,21 +125,23 @@ async def _fetch_invite_form_context(code: str) -> dict:
             r = await c.get(f"/invites/{code}", timeout=5)
         if r.status_code == 200:
             d = r.json()
-            cap = d.get("daily_quota_tokens")
             return {
                 "contributor": str(
                     d.get("contributor_email")
                     or d.get("contributor_member_id")
                     or "a GamerAI contributor"
                 ),
-                "cap_text": f"{cap} tokens/day" if cap else "unlimited",
+                "cap_text": _format_caps(
+                    d.get("daily_quota_tokens"),
+                    d.get("daily_quota_images"),
+                ),
                 "expires_at_text": _format_expiry(d.get("expires_at")),
             }
     except Exception:
         pass
     return {
         "contributor": "a GamerAI contributor",
-        "cap_text": "unlimited",
+        "cap_text": _format_caps(None, None),
         "expires_at_text": "",
     }
 

@@ -155,7 +155,11 @@ class WebUISmokeTests(unittest.TestCase):
         self.assertIn("You've been invited", body)
         self.assertIn("alice", body)
         self.assertIn("@example.com", body)
-        self.assertIn("200 tokens/day", body)
+        # Combined-cap one-liner — image-limits slice changed the
+        # rendering from "200 tokens/day" to "200 tokens · unlimited
+        # images" so the redeemer sees both axes upfront.
+        self.assertIn("200 tokens", body)
+        self.assertIn("unlimited images", body)
         # The form posts back to the same URL.
         self.assertIn(f'<form method="POST"', body)
 

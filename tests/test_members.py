@@ -175,5 +175,134 @@ class MemberUsageTests(unittest.TestCase):
         )
 
 
+class ImageUsageAndEarningsTests(unittest.TestCase):
+    """image-limits slice — image_units crediting stays independent from
+    the token ledger, and member_earnings bridges the worker→member gap."""
+
+    def setUp(self):
+        self.db = _fresh_db()
+        self.member_id = "mem_image_test"
+        self.db.create_member(
+            member_id=self.member_id,
+            email=None,
+            role="invitee",
+            parent_member_id=None,
+            token_hash=member_auth.hash_token(member_auth.generate_token()),
+        )
+
+    def test_image_usage_independent_of_tokens(self):
+        """Crediting an image-unit must not move tokens_out; that
+        column tracks real chat throughput only."""
+        now = time.time()
+        self.db.add_member_image_usage(self.member_id, now, units=1.0)
+        today = self.db.member_usage_today(self.member_id, now=now)
+        self.assertEqual(today["tokens_out"], 0)
+        self.assertEqual(today["tokens_in"], 0)
+        self.assertEqual(today["image_units"], 1.0)
+        self.assertEqual(today["jobs"], 1)
+
+    def test_image_usage_accumulates_within_day(self):
+        now = time.time()
+        self.db.add_member_image_usage(self.member_id, now, units=1.0)
+        self.db.add_member_image_usage(self.member_id, now, units=2.5)
+        today = self.db.member_usage_today(self.member_id, now=now)
+        self.assertAlmostEqual(today["image_units"], 3.5)
+        self.assertEqual(today["jobs"], 2)
+
+    def test_mixed_chat_and_image_share_one_row(self):
+        """The PRIMARY KEY (member_id, day) means chat + image on the
+        same day must coexist on a single row — both ledgers move
+        without clobbering each other."""
+        now = time.time()
+        self.db.add_member_usage(
+            self.member_id, now, tokens_in=10, tokens_out=20,
+        )
+        self.db.add_member_image_usage(self.member_id, now, units=1.0)
+        today = self.db.member_usage_today(self.member_id, now=now)
+        self.assertEqual(today["tokens_out"], 20)
+        self.assertEqual(today["image_units"], 1.0)
+        self.assertEqual(today["jobs"], 2)
+
+    def test_member_earnings_aggregates_across_owned_workers(self):
+        """The bridge: earnings keyed by worker_id, joined via
+        workers.owner_member_id, summed for display on /me."""
+        # Two workers owned by our member, plus one owned by someone
+        # else as a negative control.
+        now = time.time()
+        ok1, _ = self.db.claim_worker_ownership(
+            "w_owned_a", self.member_id, "idle", now,
+        )
+        ok2, _ = self.db.claim_worker_ownership(
+            "w_owned_b", self.member_id, "idle", now,
+        )
+        ok3, _ = self.db.claim_worker_ownership(
+            "w_stranger", "mem_stranger", "idle", now,
+        )
+        self.assertTrue(ok1 and ok2 and ok3)
+
+        self.db.add_earnings("w_owned_a", tokens=100, usd=0.0005)
+        self.db.add_earnings("w_owned_a", tokens=50, usd=0.00025)
+        self.db.add_earnings("w_owned_b", tokens=200, usd=0.001)
+        # Stranger's earnings must NOT show up in our member's totals.
+        self.db.add_earnings("w_stranger", tokens=9999, usd=99.0)
+
+        agg = self.db.member_earnings(self.member_id)
+        self.assertEqual(agg["total_tokens"], 350)
+        self.assertEqual(agg["total_jobs"], 3)
+        self.assertAlmostEqual(agg["total_usd"], 0.00175, places=6)
+        self.assertEqual(agg["machine_count"], 2)
+
+    def test_member_earnings_zero_when_no_workers(self):
+        agg = self.db.member_earnings(self.member_id)
+        self.assertEqual(agg["total_tokens"], 0)
+        self.assertEqual(agg["total_jobs"], 0)
+        self.assertEqual(agg["total_usd"], 0.0)
+        self.assertEqual(agg["machine_count"], 0)
+
+
+class WorkerToolsTests(unittest.TestCase):
+    """Persisted tools_json on workers — used by /me/machines to flag
+    partial contributors after image bootstrap fails."""
+
+    def setUp(self):
+        self.db = _fresh_db()
+        now = time.time()
+        self.db.claim_worker_ownership(
+            "w_chat_only", "mem_owner", "idle", now,
+        )
+        self.db.claim_worker_ownership(
+            "w_full", "mem_owner", "idle", now,
+        )
+
+    def test_set_and_read_tools(self):
+        import json
+        self.db.set_worker_tools("w_chat_only", json.dumps(["chat"]))
+        self.db.set_worker_tools(
+            "w_full", json.dumps(["chat", "image"]),
+        )
+        self.assertEqual(self.db.worker_tools("w_chat_only"), ["chat"])
+        self.assertEqual(
+            self.db.worker_tools("w_full"), ["chat", "image"],
+        )
+
+    def test_tools_none_for_unset_worker(self):
+        """A worker that registered before persistence shipped (or via
+        a pre-image agent) has NULL tools_json — callers treat None as
+        equivalent to ['chat'] but the row itself stays untouched."""
+        self.assertIsNone(self.db.worker_tools("w_chat_only"))
+
+    def test_tools_none_for_unknown_worker(self):
+        self.assertIsNone(self.db.worker_tools("w_doesnotexist"))
+
+    def test_list_workers_for_member_filters_by_owner(self):
+        other_now = time.time()
+        self.db.claim_worker_ownership(
+            "w_stranger", "mem_other", "idle", other_now,
+        )
+        rows = self.db.list_workers_for_member("mem_owner")
+        ids = sorted(r["worker_id"] for r in rows)
+        self.assertEqual(ids, ["w_chat_only", "w_full"])
+
+
 if __name__ == "__main__":
     unittest.main()

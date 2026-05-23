@@ -258,6 +258,45 @@ space's host. We can.
 - Privacy tiers, especially client-side embedding for sensitive prompts
   and enterprise customers
 
+## Dual-role accounting (contributor + consumer)
+
+A single member is, by default, both a contributor and a consumer:
+they run an agent on a PC and they chat / generate in the browser.
+The accounting model keeps these two flows on **two independent
+ledgers** that meet only at display time:
+
+- **Consumption ledger** — `member_usage`, keyed by `member_id`. Per
+  day, per dimension: `tokens_out` (chat) and `image_units` (image).
+  Every chat or image job the member submits decrements the matching
+  per-member daily quota, regardless of which worker served it.
+- **Contribution ledger** — `earnings`, keyed by `worker_id`, joined
+  to the member via `workers.owner_member_id`. Each completed job
+  credits the serving worker's owner with tokens, jobs, and USD —
+  independent of *who* submitted the job.
+
+**Membership is the right to consume.** Contributing earns you a
+tier; the tier sets your daily quota. Contributing does not credit
+your consumption ledger and does not refund usage already spent.
+When Alice's machine serves Alice's own prompt, both ledgers move —
+no double-count, no offset, no special case. Quota is enforced
+against consumption the same as anyone else.
+
+Implementation:
+
+- `db.member_earnings(member_id)` aggregates `SUM(earnings.*)` across
+  every owned worker.
+- `/me` returns both `earnings` and `usage_today` so the account
+  page can render the two sides side-by-side.
+- The membership rule (one ledger up, one ledger down, each
+  enforced independently) is what makes the contributor → consumer
+  bridge predictable; without it we'd be writing offset logic to
+  reconcile the two and inviting accounting bugs.
+
+The (future) tier-promotion engine reads the contribution ledger
+and writes `members.tier` + the matching `daily_quota_*` columns
+from `coordinator/tiers.py:TIER_QUOTAS`. Until that ships, tier is
+admin-set and the bridge above is the only cross-link in code.
+
 ## Risks (and why we still win)
 - **Latency** → Target async + batch workloads first
 - **Reliability** → Redundant job routing

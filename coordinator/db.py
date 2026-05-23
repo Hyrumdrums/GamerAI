@@ -34,11 +34,19 @@ CREATE INDEX IF NOT EXISTS idx_jobs_worker ON jobs(worker_id);
 -- submitted_by_member_id column is added, so legacy DBs that pre-date
 -- that column don't fail to start.
 
+-- tools_json is the JSON-encoded WorkerCapabilities.tools list a worker
+-- last advertised on /register (e.g. '["chat","image"]'). Persisted so
+-- account-page lookups don't need a Redis round-trip and so a worker
+-- still tagged as "partial" (image bootstrap failed) is visible even
+-- if it's currently offline. NULL on legacy rows pre-dating the
+-- 2026-05-23 image-capability slice — treated as "chat only" at read
+-- time.
 CREATE TABLE IF NOT EXISTS workers (
     worker_id TEXT PRIMARY KEY,
     status TEXT,
     last_seen REAL,
-    registered_at REAL
+    registered_at REAL,
+    tools_json TEXT
 );
 
 CREATE TABLE IF NOT EXISTS earnings (
@@ -52,6 +60,12 @@ CREATE TABLE IF NOT EXISTS earnings (
 -- Per-member identity. token_hash is sha256(raw_token); raw token is
 -- never stored. Admin members are seeded from the API_TOKEN env var
 -- on coordinator startup (see coordinator/main.py:ensure_admin_seed).
+--
+-- daily_quota_images is a parallel cap to daily_quota_tokens, in units
+-- (see shared/config.IMAGE_UNIT_COST_BASE). Two-dimensional quota
+-- prevents an invitee from emptying their token budget on chat AND
+-- their image budget on generation; each tool gates against its own
+-- column. NULL on either column = unlimited for that dimension.
 CREATE TABLE IF NOT EXISTS members (
     member_id TEXT PRIMARY KEY,
     email TEXT,
@@ -60,6 +74,7 @@ CREATE TABLE IF NOT EXISTS members (
     token_hash TEXT NOT NULL UNIQUE,
     tier TEXT NOT NULL DEFAULT 'BRONZE',
     daily_quota_tokens INTEGER,
+    daily_quota_images INTEGER,
     revoked_at REAL,
     created_at REAL NOT NULL,
     last_active_at REAL
@@ -70,11 +85,18 @@ CREATE INDEX IF NOT EXISTS idx_members_parent ON members(parent_member_id);
 
 -- Per-day consumption rollup, updated on /jobs/complete by submitter.
 -- Used for invitee quota enforcement (see /generate in main.py).
+--
+-- image_units is REAL (not INTEGER) so future per-image cost
+-- multipliers (higher resolution, more steps, larger batch sizes) can
+-- credit a fractional or >1 cost without a schema change. The /generate
+-- image-tool quota gate compares this column against
+-- members.daily_quota_images.
 CREATE TABLE IF NOT EXISTS member_usage (
     member_id TEXT NOT NULL,
     day TEXT NOT NULL,
     tokens_in INTEGER NOT NULL DEFAULT 0,
     tokens_out INTEGER NOT NULL DEFAULT 0,
+    image_units REAL NOT NULL DEFAULT 0,
     jobs INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (member_id, day)
 );
@@ -82,13 +104,15 @@ CREATE TABLE IF NOT EXISTS member_usage (
 -- One row per outstanding or historical invite. The ``code`` is the
 -- redemption secret (carried in the invite URL). ``accepted_at`` and
 -- ``accepted_by_member_id`` are set atomically with the member-row
--- insert when the invite is redeemed.
+-- insert when the invite is redeemed. Both daily caps are inherited
+-- onto the new member's row on redemption.
 CREATE TABLE IF NOT EXISTS invites (
     invite_id TEXT PRIMARY KEY,
     code TEXT NOT NULL UNIQUE,
     contributor_member_id TEXT NOT NULL,
     invitee_email TEXT,
     daily_quota_tokens INTEGER,
+    daily_quota_images INTEGER,
     expires_at REAL,
     accepted_at REAL,
     accepted_by_member_id TEXT,
@@ -313,6 +337,23 @@ class DB:
                 self._conn.execute(ddl)
             except sqlite3.OperationalError:
                 pass
+        # Two-dimensional quota + image accounting — added with the
+        # image-limits slice. members.daily_quota_images is the parallel
+        # cap to daily_quota_tokens (NULL = unlimited). member_usage
+        # gains image_units REAL so partial-cost weighting works without
+        # a future ALTER. invites.daily_quota_images is inherited onto
+        # the new member row on redemption.
+        for ddl in (
+            "ALTER TABLE members ADD COLUMN daily_quota_images INTEGER",
+            "ALTER TABLE invites ADD COLUMN daily_quota_images INTEGER",
+            "ALTER TABLE member_usage ADD COLUMN image_units REAL "
+            "NOT NULL DEFAULT 0",
+            "ALTER TABLE workers ADD COLUMN tools_json TEXT",
+        ):
+            try:
+                self._conn.execute(ddl)
+            except sqlite3.OperationalError:
+                pass
         # Per-member additional bearer tokens — added with the agent-
         # pairing slice. ``members.token_hash`` stays as the (single)
         # web-session credential rotated by /login. ``member_tokens``
@@ -513,6 +554,19 @@ class DB:
             cur = self._conn.execute("SELECT * FROM workers ORDER BY worker_id")
             return cur.fetchall()
 
+    def list_workers_for_member(self, member_id: str) -> list[sqlite3.Row]:
+        """Workers whose ``owner_member_id`` is ``member_id``. Used by
+        the account page to surface a "partial contributor — install
+        image gen" badge on chat-only workers without needing a Redis
+        round-trip. Filters out legacy unowned rows."""
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM workers WHERE owner_member_id=? "
+                "ORDER BY registered_at ASC",
+                (member_id,),
+            )
+            return cur.fetchall()
+
     # ---------- earnings ----------
     def add_earnings(self, worker_id: str, tokens: int, usd: float) -> None:
         now = time.time()
@@ -548,6 +602,7 @@ class DB:
         token_hash: str,
         tier: str = "BRONZE",
         daily_quota_tokens: Optional[int] = None,
+        daily_quota_images: Optional[int] = None,
         created_at: Optional[float] = None,
         tos_accepted_at: Optional[float] = None,
         tos_version: Optional[str] = None,
@@ -556,9 +611,9 @@ class DB:
         with self._lock:
             self._conn.execute(
                 "INSERT INTO members (member_id, email, role, parent_member_id, "
-                "token_hash, tier, daily_quota_tokens, created_at, "
-                "tos_accepted_at, tos_version) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "token_hash, tier, daily_quota_tokens, daily_quota_images, "
+                "created_at, tos_accepted_at, tos_version) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     member_id,
                     email,
@@ -567,6 +622,7 @@ class DB:
                     token_hash,
                     tier,
                     daily_quota_tokens,
+                    daily_quota_images,
                     now,
                     tos_accepted_at,
                     tos_version,
@@ -780,6 +836,39 @@ class DB:
             )
             return cur.rowcount > 0
 
+    def revoke_member_by_id(self, member_id: str, revoked_at: float) -> bool:
+        """Mark a member revoked by id. Used by the host-managed
+        friends UI — the host clicking "revoke" on an accepted invitee
+        gets the same effect as the legacy token-hash path. Idempotent:
+        revoking an already-revoked row returns False without raising."""
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE members SET revoked_at=? "
+                "WHERE member_id=? AND revoked_at IS NULL",
+                (revoked_at, member_id),
+            )
+            return cur.rowcount > 0
+
+    def update_member_quotas(
+        self,
+        member_id: str,
+        daily_quota_tokens: Optional[int],
+        daily_quota_images: Optional[int],
+    ) -> bool:
+        """Replace both daily caps on a member row. Passing None for
+        either dimension means "unlimited"; passing the same value back
+        is a harmless no-op. Returns False if the member doesn't
+        exist. Revoked members are still mutable so a host can adjust
+        their cap before re-activating (re-activation is a separate
+        flow not yet implemented)."""
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE members SET daily_quota_tokens=?, daily_quota_images=? "
+                "WHERE member_id=?",
+                (daily_quota_tokens, daily_quota_images, member_id),
+            )
+            return cur.rowcount > 0
+
     def touch_member(self, member_id: str, when: float) -> None:
         with self._lock:
             self._conn.execute(
@@ -807,24 +896,138 @@ class DB:
                 (member_id, day, tokens_in, tokens_out),
             )
 
+    def add_member_image_usage(
+        self,
+        member_id: str,
+        when: float,
+        units: float,
+    ) -> None:
+        """Credit ``units`` to the submitter's image-units rollup. Called
+        from /jobs/complete on successful image jobs in place of the
+        old synthetic 200-token credit, so the token ledger only tracks
+        real chat tokens and the image quota is enforced against its
+        own column. Always increments ``jobs`` by 1 — the rollup counts
+        every credited job regardless of tool, mirroring the chat
+        path."""
+        day = _utc_day(when)
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO member_usage "
+                "(member_id, day, tokens_in, tokens_out, image_units, jobs) "
+                "VALUES (?, ?, 0, 0, ?, 1) "
+                "ON CONFLICT(member_id, day) DO UPDATE SET "
+                "image_units = image_units + excluded.image_units, "
+                "jobs        = jobs        + 1",
+                (member_id, day, units),
+            )
+
     def member_usage_today(self, member_id: str, now: Optional[float] = None) -> dict:
         when = now if now is not None else time.time()
         day = _utc_day(when)
         with self._lock:
             cur = self._conn.execute(
-                "SELECT tokens_in, tokens_out, jobs FROM member_usage "
-                "WHERE member_id=? AND day=?",
+                "SELECT tokens_in, tokens_out, image_units, jobs "
+                "FROM member_usage WHERE member_id=? AND day=?",
                 (member_id, day),
             )
             row = cur.fetchone()
         if row is None:
-            return {"day": day, "tokens_in": 0, "tokens_out": 0, "jobs": 0}
+            return {
+                "day": day,
+                "tokens_in": 0,
+                "tokens_out": 0,
+                "image_units": 0.0,
+                "jobs": 0,
+            }
+        # image_units may be missing on a row predating the migration —
+        # SELECT against a freshly migrated DB always returns the column,
+        # but a row keys() check is cheaper than a try/except.
+        keys = row.keys()
         return {
             "day": day,
             "tokens_in": int(row["tokens_in"]),
             "tokens_out": int(row["tokens_out"]),
+            "image_units": (
+                float(row["image_units"]) if "image_units" in keys else 0.0
+            ),
             "jobs": int(row["jobs"]),
         }
+
+    def member_earnings(self, member_id: str) -> dict:
+        """Aggregate earnings across every worker owned by this member.
+        Returns ``{total_tokens, total_jobs, total_usd, machine_count}``.
+
+        Bridges the structurally split ledgers: ``earnings`` is keyed
+        on ``worker_id``, ``workers.owner_member_id`` ties each machine
+        back to its owner. Aggregated at read time so a member adding
+        or unpairing a machine is reflected immediately without any
+        backfill pass. ``machine_count`` is the count of distinct owned
+        workers that have any earnings rows (zero on the common
+        "paired-but-never-earned" path)."""
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT "
+                "COALESCE(SUM(e.total_tokens), 0) AS total_tokens, "
+                "COALESCE(SUM(e.total_jobs),   0) AS total_jobs, "
+                "COALESCE(SUM(e.total_usd),    0) AS total_usd, "
+                "COUNT(*)                       AS machine_count "
+                "FROM earnings e "
+                "JOIN workers w ON w.worker_id = e.worker_id "
+                "WHERE w.owner_member_id = ?",
+                (member_id,),
+            )
+            row = cur.fetchone()
+        if row is None:
+            return {
+                "total_tokens": 0,
+                "total_jobs": 0,
+                "total_usd": 0.0,
+                "machine_count": 0,
+            }
+        return {
+            "total_tokens": int(row["total_tokens"]),
+            "total_jobs": int(row["total_jobs"]),
+            "total_usd": round(float(row["total_usd"]), 8),
+            "machine_count": int(row["machine_count"]),
+        }
+
+    def set_worker_tools(self, worker_id: str, tools_json: str) -> None:
+        """Persist the JSON-encoded tools list a worker last advertised
+        on /register. Idempotent UPDATE — the row must already exist
+        (claim_worker_ownership runs first in the /register handler).
+        Stored alongside status/last_seen so the account page can
+        compute is_partial without a Redis round-trip."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE workers SET tools_json=? WHERE worker_id=?",
+                (tools_json, worker_id),
+            )
+
+    def worker_tools(self, worker_id: str) -> Optional[list[str]]:
+        """Return the persisted tools list for ``worker_id``, or None
+        if the worker has never advertised one (legacy or
+        chat-only-with-no-explicit-list). Callers treat None as
+        equivalent to ``["chat"]`` so an unupdated agent is still a
+        valid chat-only contributor."""
+        import json as _json
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT tools_json FROM workers WHERE worker_id=?",
+                (worker_id,),
+            )
+            row = cur.fetchone()
+        if row is None:
+            return None
+        raw = row["tools_json"] if "tools_json" in row.keys() else None
+        if not raw:
+            return None
+        try:
+            parsed = _json.loads(raw)
+            if isinstance(parsed, list):
+                return [str(t) for t in parsed]
+        except (ValueError, TypeError):
+            return None
+        return None
 
     # ---------- invites ----------
     def create_invite(
@@ -833,6 +1036,7 @@ class DB:
         code: str,
         contributor_member_id: str,
         daily_quota_tokens: Optional[int],
+        daily_quota_images: Optional[int] = None,
         invitee_email: Optional[str] = None,
         expires_at: Optional[float] = None,
         notes: Optional[str] = None,
@@ -842,14 +1046,16 @@ class DB:
         with self._lock:
             self._conn.execute(
                 "INSERT INTO invites (invite_id, code, contributor_member_id, "
-                "invitee_email, daily_quota_tokens, expires_at, notes, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "invitee_email, daily_quota_tokens, daily_quota_images, "
+                "expires_at, notes, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     invite_id,
                     code,
                     contributor_member_id,
                     invitee_email,
                     daily_quota_tokens,
+                    daily_quota_images,
                     expires_at,
                     notes,
                     now,
@@ -960,18 +1166,28 @@ class DB:
                         self._conn.execute("ROLLBACK")
                         return None, "email_taken"
 
+                # daily_quota_images is read defensively — a row stored
+                # before the migration won't have the column at all
+                # under SQLite's permissive schema, but row.keys()
+                # reflects the live schema so the lookup is safe.
+                invite_image_cap = (
+                    row["daily_quota_images"]
+                    if "daily_quota_images" in row.keys()
+                    else None
+                )
                 self._conn.execute(
                     "INSERT INTO members (member_id, email, role, parent_member_id, "
-                    "token_hash, tier, daily_quota_tokens, created_at, "
-                    "tos_accepted_at, tos_version, username, password_hash, "
-                    "password_set_at) "
-                    "VALUES (?, ?, 'invitee', ?, ?, 'BRONZE', ?, ?, ?, ?, ?, ?, ?)",
+                    "token_hash, tier, daily_quota_tokens, daily_quota_images, "
+                    "created_at, tos_accepted_at, tos_version, username, "
+                    "password_hash, password_set_at) "
+                    "VALUES (?, ?, 'invitee', ?, ?, 'BRONZE', ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         new_member_id,
                         invitee_email,
                         row["contributor_member_id"],
                         new_token_hash,
                         row["daily_quota_tokens"],
+                        invite_image_cap,
                         accepted_at,
                         accepted_at,  # tos_accepted_at — checkbox was required at submit
                         tos_version,

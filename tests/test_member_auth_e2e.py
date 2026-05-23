@@ -592,6 +592,264 @@ class MemberAuthE2ETests(unittest.TestCase):
             )
             self.assertEqual(resp.status_code, 200)
 
+    # ------------------------------------------------------------------
+    # image-limits slice — two-dimensional quota gate
+    # ------------------------------------------------------------------
+    def test_image_over_quota_returns_429_and_chat_untouched(self):
+        """The image gate must fire on image_units, not tokens_out —
+        a member at their image cap can still submit chat (and vice
+        versa)."""
+        _, contributor_token = self._make_contributor()
+        code = self._create_invite(
+            contributor_token,
+            daily_quota_tokens=100_000,  # plenty of chat
+            daily_quota_images=1,
+        )
+        accept = self.client.post(
+            f"/invites/{code}/accept", json=self._accept_payload()
+        ).json()
+        invitee_token = accept["token"]
+        invitee_member = member_auth.lookup_member_by_token(
+            self.db, invitee_token
+        )
+        # Burn through the image cap directly.
+        self.db.add_member_image_usage(
+            invitee_member.member_id, time.time(), units=1.0,
+        )
+        # Image submit is rejected.
+        img_resp = self.client.post(
+            "/generate",
+            json={"prompt": "draw a cat", "tool": "image"},
+            headers={"Authorization": f"Bearer {invitee_token}"},
+        )
+        self.assertEqual(img_resp.status_code, 429)
+        self.assertIn("image", img_resp.json()["detail"])
+        # Chat is still fine — separate ledger.
+        chat_resp = self.client.post(
+            "/generate",
+            json={"prompt": "hello"},
+            headers={"Authorization": f"Bearer {invitee_token}"},
+        )
+        self.assertEqual(chat_resp.status_code, 200)
+
+    def test_token_over_quota_does_not_block_images(self):
+        """The chat gate fires on tokens_out only — a member exhausted
+        on tokens can still submit images while under their image
+        cap."""
+        _, contributor_token = self._make_contributor()
+        code = self._create_invite(
+            contributor_token,
+            daily_quota_tokens=5,
+            daily_quota_images=10,
+        )
+        accept = self.client.post(
+            f"/invites/{code}/accept", json=self._accept_payload()
+        ).json()
+        invitee_token = accept["token"]
+        invitee_member = member_auth.lookup_member_by_token(
+            self.db, invitee_token
+        )
+        self.db.add_member_usage(
+            invitee_member.member_id, time.time(), tokens_in=0, tokens_out=10,
+        )
+        # Chat 429.
+        chat_resp = self.client.post(
+            "/generate",
+            json={"prompt": "hi"},
+            headers={"Authorization": f"Bearer {invitee_token}"},
+        )
+        self.assertEqual(chat_resp.status_code, 429)
+        # Image still accepted.
+        img_resp = self.client.post(
+            "/generate",
+            json={"prompt": "draw something", "tool": "image"},
+            headers={"Authorization": f"Bearer {invitee_token}"},
+        )
+        self.assertEqual(img_resp.status_code, 200)
+
+    def test_me_returns_tier_quota_and_earnings_envelope(self):
+        """/me grows three new fields: tier_quota, daily_quota_images,
+        earnings — the account-page activity card depends on all
+        three being present, even when zero."""
+        resp = self.client.get("/me", headers=self._admin_headers())
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertIn("tier_quota", body)
+        self.assertIn("daily_quota_images", body)
+        self.assertIn("earnings", body)
+        self.assertEqual(
+            set(body["earnings"].keys()),
+            {"total_tokens", "total_jobs", "total_usd", "machine_count"},
+        )
+        # Admin → tier_quota nullified to "unlimited" regardless of tier.
+        self.assertIsNone(body["tier_quota"]["tokens"])
+        self.assertIsNone(body["tier_quota"]["images"])
+        # usage_today now includes image_units.
+        self.assertIn("image_units", body["usage_today"])
+
+    def test_me_bronze_member_gets_concrete_tier_quota(self):
+        """A non-admin member gets the BRONZE allowance baked into
+        coordinator/tiers.py reflected back through /me."""
+        _, contributor_token = self._make_contributor()
+        resp = self.client.get(
+            "/me",
+            headers={"Authorization": f"Bearer {contributor_token}"},
+        )
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["tier"], "BRONZE")
+        # Numbers come from TIER_QUOTAS; assert they're non-null
+        # rather than pinning the magic constants here (so a tuning
+        # change to the table doesn't break this test).
+        self.assertIsNotNone(body["tier_quota"]["tokens"])
+        self.assertIsNotNone(body["tier_quota"]["images"])
+
+    # ------------------------------------------------------------------
+    # friend management — host edits / revokes accepted invitees
+    # ------------------------------------------------------------------
+    def _accept_invite_under(self, contributor_token: str) -> tuple[str, str]:
+        """Create + redeem an invite under ``contributor_token`` and
+        return ``(invitee_member_id, invitee_token)``. Shorthand used
+        by the friend-management tests so each can build its own
+        host→invitee pair without rewriting the dance."""
+        code = self._create_invite(
+            contributor_token,
+            daily_quota_tokens=100,
+            daily_quota_images=5,
+        )
+        accept = self.client.post(
+            f"/invites/{code}/accept", json=self._accept_payload()
+        ).json()
+        invitee_token = accept["token"]
+        invitee = member_auth.lookup_member_by_token(self.db, invitee_token)
+        return invitee.member_id, invitee_token
+
+    def test_host_can_edit_friend_quota(self):
+        _, contributor_token = self._make_contributor()
+        invitee_id, invitee_token = self._accept_invite_under(contributor_token)
+        resp = self.client.post(
+            f"/me/friends/{invitee_id}/quota",
+            json={"daily_quota_tokens": 250, "daily_quota_images": 12},
+            headers={"Authorization": f"Bearer {contributor_token}"},
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        # /me from the invitee's side reflects the new caps.
+        me = self.client.get(
+            "/me",
+            headers={"Authorization": f"Bearer {invitee_token}"},
+        ).json()
+        self.assertEqual(me["daily_quota_tokens"], 250)
+        self.assertEqual(me["daily_quota_images"], 12)
+
+    def test_quota_update_to_null_means_unlimited(self):
+        _, contributor_token = self._make_contributor()
+        invitee_id, invitee_token = self._accept_invite_under(contributor_token)
+        resp = self.client.post(
+            f"/me/friends/{invitee_id}/quota",
+            json={"daily_quota_tokens": None, "daily_quota_images": None},
+            headers={"Authorization": f"Bearer {contributor_token}"},
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        me = self.client.get(
+            "/me",
+            headers={"Authorization": f"Bearer {invitee_token}"},
+        ).json()
+        self.assertIsNone(me["daily_quota_tokens"])
+        self.assertIsNone(me["daily_quota_images"])
+
+    def test_stranger_cannot_edit_other_hosts_friend(self):
+        """A different contributor must not be able to mutate someone
+        else's invitee's quota. 404 (not 403) so the endpoint doesn't
+        reveal whose tree the member belongs to."""
+        _, host_token = self._make_contributor()
+        invitee_id, _ = self._accept_invite_under(host_token)
+        _, stranger_token = self._make_contributor()
+        resp = self.client.post(
+            f"/me/friends/{invitee_id}/quota",
+            json={"daily_quota_tokens": 999_999, "daily_quota_images": 999},
+            headers={"Authorization": f"Bearer {stranger_token}"},
+        )
+        self.assertEqual(resp.status_code, 404)
+
+    def test_admin_can_edit_any_friend(self):
+        _, host_token = self._make_contributor()
+        invitee_id, _ = self._accept_invite_under(host_token)
+        resp = self.client.post(
+            f"/me/friends/{invitee_id}/quota",
+            json={"daily_quota_tokens": 42, "daily_quota_images": 3},
+            headers=self._admin_headers(),
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+
+    def test_host_can_revoke_friend(self):
+        _, contributor_token = self._make_contributor()
+        invitee_id, invitee_token = self._accept_invite_under(contributor_token)
+        resp = self.client.post(
+            f"/me/friends/{invitee_id}/revoke",
+            headers={"Authorization": f"Bearer {contributor_token}"},
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertFalse(resp.json()["was_already_revoked"])
+        # Invitee's bearer no longer authenticates.
+        unauth = self.client.get(
+            "/me",
+            headers={"Authorization": f"Bearer {invitee_token}"},
+        )
+        self.assertEqual(unauth.status_code, 401)
+
+    def test_revoke_is_idempotent(self):
+        _, contributor_token = self._make_contributor()
+        invitee_id, _ = self._accept_invite_under(contributor_token)
+        first = self.client.post(
+            f"/me/friends/{invitee_id}/revoke",
+            headers={"Authorization": f"Bearer {contributor_token}"},
+        ).json()
+        second = self.client.post(
+            f"/me/friends/{invitee_id}/revoke",
+            headers={"Authorization": f"Bearer {contributor_token}"},
+        ).json()
+        self.assertFalse(first["was_already_revoked"])
+        self.assertTrue(second["was_already_revoked"])
+
+    def test_stranger_cannot_revoke_other_hosts_friend(self):
+        _, host_token = self._make_contributor()
+        invitee_id, invitee_token = self._accept_invite_under(host_token)
+        _, stranger_token = self._make_contributor()
+        resp = self.client.post(
+            f"/me/friends/{invitee_id}/revoke",
+            headers={"Authorization": f"Bearer {stranger_token}"},
+        )
+        self.assertEqual(resp.status_code, 404)
+        # Invitee is still active.
+        ok = self.client.get(
+            "/me",
+            headers={"Authorization": f"Bearer {invitee_token}"},
+        )
+        self.assertEqual(ok.status_code, 200)
+
+    def test_invite_accepts_and_inherits_image_cap(self):
+        """daily_quota_images must round-trip through /invites POST →
+        redeem → the new invitee member's row."""
+        _, contributor_token = self._make_contributor()
+        code = self._create_invite(
+            contributor_token,
+            daily_quota_tokens=50_000,
+            daily_quota_images=7,
+        )
+        # Public details endpoint surfaces both caps.
+        details = self.client.get(f"/invites/{code}").json()
+        self.assertEqual(details["daily_quota_images"], 7)
+        # Redeem.
+        accept = self.client.post(
+            f"/invites/{code}/accept", json=self._accept_payload()
+        ).json()
+        invitee_token = accept["token"]
+        invitee_member = member_auth.lookup_member_by_token(
+            self.db, invitee_token,
+        )
+        self.assertEqual(invitee_member.daily_quota_images, 7)
+        self.assertEqual(invitee_member.daily_quota_tokens, 50_000)
+
 
 if __name__ == "__main__":
     unittest.main()
