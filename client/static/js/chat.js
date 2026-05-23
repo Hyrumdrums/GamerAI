@@ -50,11 +50,56 @@ async function refreshSidebar() {
     // title from the empty-state DOM still renders as a single ellipsised
     // line instead of leaking blank space into the layout.
     const raw = c.title || '(untitled)';
-    div.textContent = raw.replace(/\s+/g, ' ').trim() || '(untitled)';
+    const titleSpan = document.createElement('span');
+    titleSpan.className = 'conv-title';
+    titleSpan.textContent = raw.replace(/\s+/g, ' ').trim() || '(untitled)';
     div.title = raw;
+    div.appendChild(titleSpan);
+    // Delete button — hidden by default, visible on hover (and
+    // always visible on the active row). Click is a hard delete;
+    // confirm() first because the action wipes images + history.
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'conv-del';
+    del.setAttribute('aria-label', 'Delete chat');
+    del.title = 'Delete chat';
+    del.textContent = '×';
+    del.onclick = (e) => {
+      e.stopPropagation();  // don't also fire the row's openConversation
+      deleteConversation(c.conversation_id, raw);
+    };
+    div.appendChild(del);
     div.onclick = () => openConversation(c.conversation_id);
     list.appendChild(div);
   }
+}
+
+// Hard-delete a conversation: confirms first because the server wipes
+// messages + all attached images from disk + Redis. On success, drops
+// the row from the cache and rerenders; if the deleted chat is the
+// one currently on screen, also blanks the pane back to the empty
+// state so the user isn't staring at a phantom conversation.
+async function deleteConversation(id, label) {
+  const display = (label || '').replace(/\s+/g, ' ').trim() || '(untitled)';
+  if (!window.confirm(
+    `Delete "${display}"?\n\nThis permanently removes the chat history ` +
+    `and any generated images. This can't be undone.`,
+  )) return;
+  const r = await fetch('/api/conversations/' + encodeURIComponent(id), {
+    method: 'DELETE',
+  });
+  if (!r.ok) {
+    alert(`Couldn't delete: ${r.status} ${r.statusText}`);
+    return;
+  }
+  msgCache.delete(id);
+  if (currentId === id) {
+    currentId = null;
+    document.getElementById('chat-pane').innerHTML =
+      '<div class="empty"><h2>What\'s on your mind?</h2>' +
+      '<div>Start a new conversation by typing below.</div></div>';
+  }
+  await refreshSidebar();
 }
 
 document.getElementById('new-chat').onclick = () => {

@@ -2093,15 +2093,78 @@ def retry_message(message_id: str, request: Request):
 
 @app.delete("/conversations/{conversation_id}")
 def delete_conversation(conversation_id: str, request: Request):
-    """Soft delete (sets archived_at). The conversation and its
-    messages stay in the DB so an admin can audit, but they no longer
-    appear in the caller's default list."""
+    """Hard-delete the conversation and everything attached:
+
+    - all message rows
+    - all job rows linked via ``messages.job_id`` or ``jobs.conversation_id``
+    - every generated PNG referenced by those messages (off disk)
+    - residual Redis state for those jobs (JOB_RESULTS / JOB_PROCESSING / JOB_PARTIALS)
+    - the conversation row itself
+
+    A request to delete an unknown conversation returns 404; the
+    member must own the conversation (admin can override) or they
+    get the same 404 (we don't distinguish "yours doesn't exist" from
+    "someone else's exists", per _require_conversation_owner).
+
+    This used to be a soft archive (sets ``archived_at``). The
+    contract changed in v1.1.26 once the UI grew a real delete button
+    — users expect "delete" to mean "the bytes are gone," not "hidden
+    from my sidebar." There is no current consumer of the archive
+    semantics; if one shows up later, the path forward is a separate
+    /conversations/{id}/archive endpoint rather than reviving this
+    one."""
     row = db.get_conversation(conversation_id)
     if row is None:
         raise HTTPException(status_code=404, detail="conversation not found")
     _require_conversation_owner(request, row)
-    db.archive_conversation(conversation_id, time.time())
-    return {"ok": True}
+    image_basenames, job_ids = db.purge_conversation(conversation_id)
+    # Filesystem cleanup — best-effort per file; one missing or
+    # locked file shouldn't block the deletion of the others.
+    for name in image_basenames:
+        # Defense in depth: the basename came from our own DB write
+        # (a uuid + ".png"), but path-traversal validation here costs
+        # nothing and protects against a future code path that stores
+        # an attacker-controlled string in image_path.
+        if not re.fullmatch(r"[A-Za-z0-9_-]+\.png", name or ""):
+            continue
+        path = IMAGE_DIR / name
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            log.warning(
+                "image file unlink failed",
+                extra={
+                    "event": "image_unlink_failed",
+                    "conversation_id": conversation_id,
+                    "image_path": name,
+                    "error": str(exc),
+                },
+            )
+    # Redis cleanup. Late /jobs/complete from a worker after deletion
+    # will already 410 via the claim-token gate (the JOB_PROCESSING
+    # entry is gone), so this is just sweeping up the result + partial
+    # text that would otherwise linger until natural eviction.
+    for jid in job_ids:
+        r.hdel(JOB_RESULTS, jid)
+        r.hdel(JOB_PROCESSING, jid)
+        r.hdel(JOB_PARTIALS, jid)
+    log.info(
+        "conversation deleted",
+        extra={
+            "event": "conversation_deleted",
+            "conversation_id": conversation_id,
+            "images_removed": len(image_basenames),
+            "jobs_removed": len(job_ids),
+        },
+    )
+    return {
+        "ok": True,
+        "deleted": True,
+        "images_removed": len(image_basenames),
+        "jobs_removed": len(job_ids),
+    }
 
 
 # ---------- invites ----------

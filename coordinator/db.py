@@ -780,6 +780,61 @@ class DB:
             )
             return cur.rowcount > 0
 
+    def purge_conversation(
+        self, conversation_id: str,
+    ) -> tuple[list[str], list[str]]:
+        """Hard-delete a conversation and everything anchored to it.
+        Returns ``(image_basenames, job_ids)`` so the caller can clean
+        up the matching filesystem (IMAGE_DIR PNG files) and Redis
+        entries (JOB_RESULTS / JOB_PROCESSING / JOB_PARTIALS) — those
+        live outside the DB and the DB can't reach them directly.
+
+        Idempotent: a missing conversation_id just returns empty
+        lists. SQL deletions happen in one transaction so a partial
+        failure can't leave a half-purged row set behind."""
+        with self._lock:
+            image_rows = self._conn.execute(
+                "SELECT image_path FROM messages "
+                "WHERE conversation_id=? AND image_path IS NOT NULL",
+                (conversation_id,),
+            ).fetchall()
+            image_basenames = [r["image_path"] for r in image_rows if r["image_path"]]
+            # Both jobs reachable via messages.job_id AND jobs.conversation_id —
+            # the latter catches pending jobs not yet wired to a message
+            # row (the brief window between /generate enqueue and the
+            # message-insert).
+            job_rows = self._conn.execute(
+                "SELECT job_id FROM messages "
+                "WHERE conversation_id=? AND job_id IS NOT NULL",
+                (conversation_id,),
+            ).fetchall()
+            job_ids = {r["job_id"] for r in job_rows if r["job_id"]}
+            extra_rows = self._conn.execute(
+                "SELECT job_id FROM jobs WHERE conversation_id=?",
+                (conversation_id,),
+            ).fetchall()
+            job_ids.update(r["job_id"] for r in extra_rows if r["job_id"])
+
+            try:
+                self._conn.execute("BEGIN")
+                self._conn.execute(
+                    "DELETE FROM messages WHERE conversation_id=?",
+                    (conversation_id,),
+                )
+                self._conn.execute(
+                    "DELETE FROM jobs WHERE conversation_id=?",
+                    (conversation_id,),
+                )
+                self._conn.execute(
+                    "DELETE FROM conversations WHERE conversation_id=?",
+                    (conversation_id,),
+                )
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+            return image_basenames, sorted(job_ids)
+
     def touch_conversation(self, conversation_id: str, when: float) -> None:
         with self._lock:
             self._conn.execute(

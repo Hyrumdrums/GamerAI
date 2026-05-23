@@ -176,30 +176,140 @@ class ConversationCrudTests(_BaseE2E):
         )
         self.assertEqual(resp.status_code, 200)
 
-    def test_delete_archives(self):
+    def test_delete_hard_deletes_empty_conversation(self):
+        # v1.1.26: DELETE is no longer a soft archive — the row goes
+        # away. Even include_archived=true cannot bring it back.
         _, t = self._make_member(email="d@x.com")
         conv = self.client.post(
             "/conversations", json={"title": "todelete"},
             headers={"Authorization": f"Bearer {t}"},
         ).json()
         cid = conv["conversation_id"]
-        # Default list excludes archived.
         d = self.client.delete(
             f"/conversations/{cid}", headers={"Authorization": f"Bearer {t}"}
         )
-        self.assertEqual(d.status_code, 200)
+        self.assertEqual(d.status_code, 200, d.text)
+        self.assertTrue(d.json().get("deleted"))
+        # Gone from the default list.
         listed = self.client.get(
             "/conversations", headers={"Authorization": f"Bearer {t}"}
         ).json()["conversations"]
-        ids = [c["conversation_id"] for c in listed]
-        self.assertNotIn(cid, ids)
-        # include_archived=true brings it back.
+        self.assertNotIn(cid, [c["conversation_id"] for c in listed])
+        # Gone from the with-archived list too — it's not archived, it's
+        # actually deleted.
         listed_all = self.client.get(
             "/conversations?include_archived=true",
             headers={"Authorization": f"Bearer {t}"},
         ).json()["conversations"]
-        ids_all = [c["conversation_id"] for c in listed_all]
-        self.assertIn(cid, ids_all)
+        self.assertNotIn(cid, [c["conversation_id"] for c in listed_all])
+        # DB row truly gone.
+        self.assertIsNone(self.db.get_conversation(cid))
+
+    def test_delete_cleans_up_messages_jobs_images_and_redis(self):
+        # End-to-end purge: a conversation with one chat turn + one
+        # image turn must leave NOTHING behind after DELETE — no
+        # messages, no jobs, no PNG, no Redis residue. The "obese cow"
+        # incident is the motivating scenario.
+        import os
+        from coordinator.main import IMAGE_DIR
+        _, t = self._make_member(email="purge@x.com")
+        conv = self.client.post(
+            "/conversations", json={}, headers={"Authorization": f"Bearer {t}"},
+        ).json()
+        cid = conv["conversation_id"]
+
+        # --- chat turn ---
+        chat_gen = self.client.post(
+            "/generate", json={"prompt": "hi", "conversation_id": cid},
+            headers={"Authorization": f"Bearer {t}"},
+        ).json()
+        chat_jid = chat_gen["job_id"]
+        chat_claim = self.client.post(
+            "/jobs/claim",
+            json={"worker_id": "wpurge", "job_id": chat_jid},
+            headers=self._admin_headers(),
+        ).json()
+        self.client.post(
+            "/jobs/complete",
+            json={
+                "worker_id": "wpurge", "job_id": chat_jid, "text": "hello",
+                "model": "m", "prompt_tokens": 1, "completion_tokens": 1,
+                "duration_seconds": 0.1, "status": "complete",
+                "claim_token": chat_claim["claim_token"],
+            },
+            headers=self._admin_headers(),
+        )
+
+        # --- image turn ---
+        img_gen = self.client.post(
+            "/generate",
+            json={"prompt": "a dog", "tool": "image", "conversation_id": cid},
+            headers={"Authorization": f"Bearer {t}"},
+        ).json()
+        img_jid = img_gen["job_id"]
+        img_claim = self.client.post(
+            "/jobs/claim",
+            json={"worker_id": "wpurge-img", "job_id": img_jid},
+            headers=self._admin_headers(),
+        ).json()
+        # 1x1 transparent PNG — same fixture the image suite uses.
+        png_b64 = (
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+            "+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        )
+        self.client.post(
+            "/jobs/complete",
+            json={
+                "worker_id": "wpurge-img", "job_id": img_jid, "text": "",
+                "model": "dreamshaper8", "prompt_tokens": 0,
+                "completion_tokens": 0, "duration_seconds": 1.0,
+                "status": "complete", "image_b64": png_b64,
+                "claim_token": img_claim["claim_token"],
+            },
+            headers=self._admin_headers(),
+        )
+        image_path = IMAGE_DIR / f"{img_jid}.png"
+        self.assertTrue(image_path.exists(), "image should have been written")
+
+        # --- DELETE ---
+        d = self.client.delete(
+            f"/conversations/{cid}", headers={"Authorization": f"Bearer {t}"},
+        )
+        self.assertEqual(d.status_code, 200, d.text)
+        body = d.json()
+        self.assertEqual(body.get("images_removed"), 1)
+        self.assertGreaterEqual(body.get("jobs_removed"), 2)
+
+        # Conversation gone.
+        self.assertIsNone(self.db.get_conversation(cid))
+        # Messages gone.
+        self.assertEqual(self.db.list_messages(cid), [])
+        # Jobs gone.
+        self.assertIsNone(self.db.get_job(chat_jid))
+        self.assertIsNone(self.db.get_job(img_jid))
+        # Image file off disk.
+        self.assertFalse(image_path.exists(), "image file should have been unlinked")
+        # Redis residue gone — nothing left under any of the per-job keys.
+        self.assertIsNone(self.r.hget("job_results", chat_jid))
+        self.assertIsNone(self.r.hget("job_results", img_jid))
+        self.assertIsNone(self.r.hget("job_processing", chat_jid))
+        self.assertIsNone(self.r.hget("job_processing", img_jid))
+
+    def test_delete_rejects_non_owner(self):
+        _, owner = self._make_member(email="powner@x.com")
+        _, intruder = self._make_member(email="pintruder@x.com")
+        conv = self.client.post(
+            "/conversations", json={}, headers={"Authorization": f"Bearer {owner}"},
+        ).json()
+        cid = conv["conversation_id"]
+        # Intruder gets 404 (we don't leak "exists but not yours").
+        resp = self.client.delete(
+            f"/conversations/{cid}",
+            headers={"Authorization": f"Bearer {intruder}"},
+        )
+        self.assertEqual(resp.status_code, 404)
+        # Conversation still exists for the rightful owner.
+        self.assertIsNotNone(self.db.get_conversation(cid))
 
 
 class GenerateConversationContextTests(_BaseE2E):

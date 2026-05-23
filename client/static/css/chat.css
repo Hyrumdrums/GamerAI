@@ -24,12 +24,33 @@ body { display: flex; flex-direction: column; }
 .conv-item {
   padding: .65rem .9rem; cursor: pointer; font-size: .92rem;
   color: #333; border-left: 3px solid transparent;
+  display: flex; align-items: center; gap: .4rem;
+}
+.conv-item .conv-title {
+  flex: 1; min-width: 0;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .conv-item:hover { background: #f5f5f5; }
 .conv-item.active {
   background: #eef3fb; color: var(--text); font-weight: 500;
   border-left-color: var(--brand);
+}
+/* × button — hidden by default, visible on row hover OR on the
+ * currently-open chat so the user always has an obvious way to nuke
+ * the conversation they're looking at. Touchscreen "hover" is
+ * unreliable, hence the always-on for .active. */
+.conv-item .conv-del {
+  flex: 0 0 auto; width: 1.5rem; height: 1.5rem; padding: 0;
+  background: transparent; border: 0; cursor: pointer;
+  color: #999; font-size: 1.2rem; line-height: 1;
+  border-radius: 4px;
+  opacity: 0; transition: opacity .12s, background .12s, color .12s;
+}
+.conv-item:hover .conv-del,
+.conv-item.active .conv-del,
+.conv-item .conv-del:focus { opacity: 1; }
+.conv-item .conv-del:hover {
+  background: #fdecec; color: #b53232;
 }
 .hamburger {
   background: transparent; color: var(--text); border: 0;
