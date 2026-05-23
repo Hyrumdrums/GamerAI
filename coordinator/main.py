@@ -29,6 +29,7 @@ from shared.config import (
     CANARY_INTERVAL_SECONDS,
     CANARY_PENDING,
     IMAGE_REWRITE_PENDING,
+    SEARCH_REWRITE_PENDING,
     CANARY_SCORE_WINDOW,
     IDEMPOTENCY_TTL_SECONDS,
     JOB_PARTIALS,
@@ -440,6 +441,183 @@ def _dispatch_image_after_rewrite(
         )
     finally:
         r.hdel(IMAGE_REWRITE_PENDING, rewrite_job_id)
+
+
+def _build_search_query_meta_prompt(history: str, user_prompt: str) -> str:
+    """Meta-prompt: small chat model reads recent conversation + the
+    new user message and emits a focused DDG search query. Same intent-
+    reading shape as the image rewriter (`_build_rewrite_meta_prompt`)
+    so a 1-3B model can handle it, but tuned for SEARCH-engine queries
+    instead of image descriptions.
+
+    The user's transcript that motivated this:
+      User: "news"            (DDG returned the Wikipedia "News" page)
+      User: "try again"       (DDG returned Aaliyah song lyrics)
+    Both are unrecoverable as literal queries; only "try again given
+    the prior topic was news" produces a usable query."""
+    return (
+        "You craft web search queries from conversational context.\n\n"
+        "RECENT CONVERSATION:\n"
+        f"{history}\n\n"
+        f"NEW USER MESSAGE: {user_prompt}\n\n"
+        "Decide what the user actually wants to search for, then "
+        "write a single concise search query a web search engine "
+        "(like Google or DuckDuckGo) will handle well. Follow these "
+        "intent-reading rules:\n\n"
+        "1. If the new message is a fragment that only makes sense "
+        "with prior context (e.g. \"try again\", \"more like that\", "
+        "\"any specific examples?\", \"what about Europe?\"): use the "
+        "prior topic to fill in the missing subject. \"try again\" "
+        "after a news search becomes a query for a different recent "
+        "news event; \"what about Europe?\" after banking becomes "
+        "\"recent banking news Europe\".\n"
+        "2. If the new message is a clear standalone question or "
+        "topic (e.g. \"SVB collapse 2023\", \"latest iPhone reviews\"): "
+        "tighten it into search-engine keywords. Drop conversational "
+        "filler like \"can you tell me\" or \"I'm curious about\".\n"
+        "3. If the user is asking for the latest / newest of "
+        "something, add a recency keyword (\"today\", \"latest\", or "
+        "the current year). Don't invent a specific date.\n"
+        "4. Keep the query SHORT (typically 3-8 words). Search "
+        "engines work better with keywords than full sentences.\n\n"
+        "Output requirements:\n"
+        "- One line. No quotes around the query. No labels like "
+        "\"Query:\" or \"Search:\". Just the query itself.\n"
+        "- Do not refuse or add commentary about the user's intent.\n\n"
+        "QUERY:"
+    )
+
+
+def _enqueue_chat_rewrite_for_search(
+    search_job_id: str,
+    search_envelope: dict,
+    original_prompt: str,
+    history: str,
+    submitted_by: Optional[str],
+    submitted_at: float,
+) -> str:
+    """Same plumbing as `_enqueue_chat_rewrite_for_image` but linkage
+    lives in SEARCH_REWRITE_PENDING and the eventual dispatch lands
+    on `job_queue:search` instead of `job_queue:image`. The two
+    rewrite types are stored under separate hashes so /jobs/complete
+    knows which dispatcher to call without inspecting the original
+    job's tool field."""
+    rewrite_job_id = str(uuid.uuid4())
+    meta_prompt = _build_search_query_meta_prompt(history, original_prompt)
+    rewrite_envelope = {
+        "job_id": rewrite_job_id,
+        "prompt": meta_prompt,
+        "submitted_at": submitted_at,
+        "tool": "chat",
+    }
+    db.insert_job(
+        rewrite_job_id,
+        meta_prompt,
+        None,
+        submitted_at,
+        submitted_by,
+        conversation_id=None,
+        tool="chat",
+    )
+    r.hset(
+        SEARCH_REWRITE_PENDING,
+        rewrite_job_id,
+        json.dumps({
+            "search_job_id": search_job_id,
+            "search_envelope": search_envelope,
+            "original_prompt": original_prompt,
+        }),
+    )
+    r.rpush(job_queue_for("chat"), json.dumps(rewrite_envelope))
+    log.info(
+        "search query rewrite enqueued",
+        extra={
+            "event": "search_rewrite_enqueued",
+            "rewrite_job_id": rewrite_job_id,
+            "search_job_id": search_job_id,
+        },
+    )
+    return rewrite_job_id
+
+
+def _clean_rewritten_search_query(raw: Optional[str], fallback: str) -> str:
+    """Same defensive cleanup as `_clean_rewritten_prompt` but with a
+    tighter length budget (search queries should be SHORT — anything
+    over 200 chars is the model rambling) and an additional pass that
+    flattens multi-line output to a single line. DDG accepts long
+    queries but treats every extra word as a hard requirement, which
+    is the opposite of what we want for a paraphrased follow-up."""
+    if not raw:
+        return fallback
+    s = raw.strip()
+    for _ in range(3):
+        stripped = False
+        for header in (
+            "QUERY:", "Query:", "Search query:", "Search:",
+            "FINAL QUERY:", "Rewritten query:", "Output:",
+        ):
+            if s.lower().startswith(header.lower()):
+                s = s[len(header):].strip()
+                stripped = True
+                break
+        if not stripped:
+            break
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ('"', "'"):
+        s = s[1:-1].strip()
+    # First line only — a multi-line query is the model writing prose,
+    # which DDG won't handle. The first line is almost always the
+    # actual query.
+    s = s.split("\n", 1)[0].strip()
+    if not s or len(s) > 200:
+        return fallback
+    return s
+
+
+def _dispatch_search_after_rewrite(
+    rewrite_job_id: str,
+    link: dict,
+    rewritten_text: Optional[str],
+) -> None:
+    """Called from /jobs/complete when a search-rewrite chat job
+    finishes. Same shape as `_dispatch_image_after_rewrite` — plug
+    the cleaned rewritten text into the stored search envelope, flip
+    the search job out of `awaiting_rewrite`, RPUSH onto the search
+    queue. Skips the dispatch (still cleans the link) if the search
+    job is no longer awaiting_rewrite — the cancel-while-rewriting
+    and conversation-purged races."""
+    search_job_id = link["search_job_id"]
+    search_envelope = link["search_envelope"]
+    original = link["original_prompt"]
+    try:
+        search_row = db.get_job(search_job_id)
+        if search_row is None or search_row["status"] != "awaiting_rewrite":
+            r.hdel(SEARCH_REWRITE_PENDING, rewrite_job_id)
+            log.info(
+                "search rewrite finished but search job no longer awaiting "
+                "rewrite — skipping dispatch",
+                extra={
+                    "event": "search_rewrite_dispatch_skipped",
+                    "rewrite_job_id": rewrite_job_id,
+                    "search_job_id": search_job_id,
+                    "search_status": search_row["status"] if search_row else "missing",
+                },
+            )
+            return
+        final_query = _clean_rewritten_search_query(rewritten_text, original)
+        search_envelope["prompt"] = final_query
+        db.set_job_pending_with_prompt(search_job_id, final_query)
+        r.rpush(job_queue_for("search"), json.dumps(search_envelope))
+        log.info(
+            "search dispatched after rewrite",
+            extra={
+                "event": "search_rewrite_dispatched",
+                "rewrite_job_id": rewrite_job_id,
+                "search_job_id": search_job_id,
+                "rewrite_was_used": final_query != original,
+            },
+        )
+    finally:
+        r.hdel(SEARCH_REWRITE_PENDING, rewrite_job_id)
 
 
 def _combine_negative_prompt(user_negative: Optional[str]) -> str:
@@ -1218,15 +1396,21 @@ def generate(req: GenerateRequest, request: Request):
         # search_mode is validated above; carry it through so the agent
         # can branch fast (snippets) vs comprehensive (fetch + extract).
         job["search"] = {"mode": search_mode or "fast"}
-    # Decide whether this image job should go through the context-
-    # aware rewrite pipeline. Skipped when:
-    # - it's not an image job (chat jobs never rewrite)
-    # - no conversation_id (no history to draw on)
-    # - conversation is empty (first turn — nothing to refine against)
-    # - no chat worker online to do the rewrite (avoid stranding the
-    #   image behind a rewrite job that no one will pick up)
+    # Decide whether this job should go through the context-aware
+    # rewrite pipeline. Two flavors share the same skip-paths:
+    # - tool=image: rewrite the visual prompt using prior turns (see
+    #   _enqueue_chat_rewrite_for_image)
+    # - tool=search: rewrite the DDG query using prior turns (see
+    #   _enqueue_chat_rewrite_for_search) — "try again" → "different
+    #   recent news topic"
+    #
+    # Skipped when: chat tool (no rewrite needed), no conversation_id,
+    # empty conversation (first turn — nothing to refine against), no
+    # chat worker online (avoid stranding the job behind a rewrite
+    # nobody can pick up).
+    rewriteable = tool in ("image", "search")
     needs_rewrite = (
-        tool == "image"
+        rewriteable
         and conversation_id is not None
         and prior
         and _conversation_has_prior_context(prior)
@@ -1284,17 +1468,28 @@ def generate(req: GenerateRequest, request: Request):
         # though the message is now persisted earlier than before.
         db.set_conversation_title(conversation_id, req.prompt[:80].strip())
     if needs_rewrite:
-        # Hand the image envelope to the rewrite pipeline. It enqueues
-        # a hidden chat job; the image goes on the real queue later,
-        # in /jobs/complete's rewrite-dispatch handler.
-        _enqueue_chat_rewrite_for_image(
-            image_job_id=job_id,
-            image_envelope=job,
-            original_prompt=req.prompt,
-            history=_format_rewrite_history(prior),
-            submitted_by=submitted_by,
-            submitted_at=submitted_at,
-        )
+        # Hand the envelope to the matching rewrite pipeline (image or
+        # search). The pipeline enqueues a hidden chat job; the real
+        # job goes on its target queue later, in /jobs/complete's
+        # rewrite-dispatch handler.
+        if tool == "image":
+            _enqueue_chat_rewrite_for_image(
+                image_job_id=job_id,
+                image_envelope=job,
+                original_prompt=req.prompt,
+                history=_format_rewrite_history(prior),
+                submitted_by=submitted_by,
+                submitted_at=submitted_at,
+            )
+        else:  # tool == "search"
+            _enqueue_chat_rewrite_for_search(
+                search_job_id=job_id,
+                search_envelope=job,
+                original_prompt=req.prompt,
+                history=_format_rewrite_history(prior),
+                submitted_by=submitted_by,
+                submitted_at=submitted_at,
+            )
     else:
         r.rpush(job_queue_for(tool), json.dumps(job))
     idem.remember(idem_key, job_id)
@@ -1959,6 +2154,45 @@ def complete(req: JobCompleteRequest, request: Request):
                 except Exception:
                     pass
                 r.hdel(IMAGE_REWRITE_PENDING, req.job_id)
+
+    # Same pattern as the image-rewrite handler above but for the
+    # search-query rewrite pipeline. Linkage lives in a separate hash
+    # so we don't have to inspect the original job's tool field to
+    # pick the right dispatcher.
+    search_rewrite_link_raw = r.hget(SEARCH_REWRITE_PENDING, req.job_id)
+    if search_rewrite_link_raw:
+        try:
+            srlink = json.loads(search_rewrite_link_raw)
+        except json.JSONDecodeError:
+            srlink = None
+        if srlink:
+            rewritten = req.text if req.status == "complete" else None
+            try:
+                _dispatch_search_after_rewrite(req.job_id, srlink, rewritten)
+            except Exception as exc:
+                log.warning(
+                    "search-rewrite dispatch failed; falling back to raw query",
+                    extra={
+                        "event": "search_rewrite_dispatch_failed",
+                        "rewrite_job_id": req.job_id,
+                        "error": str(exc),
+                    },
+                )
+                # Best-effort recovery: push the search envelope with
+                # the original query so the user still gets SOMETHING
+                # rather than a stuck pending bubble.
+                try:
+                    fallback_env = srlink.get("search_envelope") or {}
+                    fallback_env["prompt"] = srlink.get("original_prompt", "")
+                    search_job_id = srlink.get("search_job_id")
+                    if search_job_id:
+                        db.set_job_pending_with_prompt(
+                            search_job_id, fallback_env["prompt"],
+                        )
+                    r.rpush(job_queue_for("search"), json.dumps(fallback_env))
+                except Exception:
+                    pass
+                r.hdel(SEARCH_REWRITE_PENDING, req.job_id)
 
     # Look up the original job row so we can branch image vs. chat
     # before touching earnings + storage.

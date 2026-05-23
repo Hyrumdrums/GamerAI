@@ -15,6 +15,15 @@ let currentId = null;     // active conversation_id, or null = brand-new
 // new message.
 const msgCache = new Map();
 
+// Per-conversation search-mode state. Search is sticky within a
+// conversation (unlike image, which is one-shot per turn) — once you
+// check it for the first follow-up, the natural flow is to keep
+// drilling in with more search-grounded questions. Auto-unchecking
+// every turn was forcing the user to re-check and they kept
+// forgetting. Keyed by conversation_id; the "brand new chat" state
+// (currentId === null) gets its own slot via the null key.
+const searchModeByConv = new Map();
+
 // ---- bootstrap --------------------------------------------------------
 async function init() {
   try {
@@ -103,6 +112,12 @@ async function deleteConversation(id, label) {
 
 document.getElementById('new-chat').onclick = () => {
   currentId = null;
+  // Brand-new chat defaults to plain chat mode — don't inherit the
+  // last conversation's search-on state. restoreModeFor is defined
+  // below; function declarations are hoisted, so calling it from this
+  // click handler is fine even before the file finishes parsing.
+  searchModeByConv.delete(null);
+  restoreModeFor(null);
   document.getElementById('chat-pane').innerHTML =
     '<div class="empty"><h2>What\'s on your mind?</h2><div>Start a new conversation by typing below.</div></div>';
   document.querySelectorAll('.conv-item').forEach(el => el.classList.remove('active'));
@@ -119,6 +134,11 @@ document.getElementById('hamburger').onclick = () => {
 // ---- conversation rendering ------------------------------------------
 async function openConversation(id) {
   currentId = id;
+  // Restore the per-conversation search-mode state. If the user had
+  // search on the last time they were in this conversation, the
+  // checkbox flips back on so a follow-up automatically searches —
+  // no need to remember to re-check it.
+  restoreModeFor(id);
   // Cancel any in-flight stream for the conversation we're leaving;
   // renderMessages may start a new one if the conversation we're
   // opening has a pending turn of its own.
@@ -609,13 +629,24 @@ async function streamIntoBubble(jobId, wrap, statusEl, startMs, messageId) {
   }
 }
 
-// ---- image / search toggles (one-shot checkboxes) --------------------
-// Image and Search are mutually exclusive per-turn opt-ins. Both
-// auto-clear after submit so an accidental sticky-mode can't burn a
-// queue of contributor jobs (image) or web-search inferences (search)
-// in a row. Whichever box gets checked HIDES the other so the row
-// reads cleanly — there's no use case for "image of search results"
-// and showing both invites the user to ask for it.
+// ---- image / search toggles ------------------------------------------
+// Two checkboxes, mutually exclusive (checking one hides the other —
+// there's no use case for "image of search results"). Different
+// stickiness contracts:
+//
+// - Image: one-shot per turn. Auto-clears after submit so an
+//   accidental left-on can't burn 5 contributor GPU jobs in a row.
+// - Search: STICKY per conversation. Once you've checked it for a
+//   topic, the natural drill-in flow ("what about Europe?" → "any
+//   specific examples?") wants search on every follow-up. Auto-
+//   unchecking forced re-checks every turn and the user kept
+//   forgetting. Now the checkbox stays in whatever state the user
+//   last set it for the current conversation, persisted in
+//   searchModeByConv; switching to a different conversation restores
+//   that conv's state; "+ New chat" resets to off.
+//
+// Search misfires are cheap (one DDG call + a normal chat turn), so
+// the worst case of leaving it on is much milder than the image case.
 const imageCheckbox = document.getElementById('tool-image-cb');
 const searchCheckbox = document.getElementById('tool-search-cb');
 const imageWrap = document.getElementById('image-toggle-wrap');
@@ -639,13 +670,34 @@ function refreshComposerUI() {
   }
 }
 
+// Persist the current search-checkbox state under the current
+// conversation key. Null key is the "brand new chat" slot — most
+// users start a search and immediately submit, so capturing this
+// means the conv created on submit inherits the right mode.
+function persistSearchMode() {
+  searchModeByConv.set(currentId, searchCheckbox.checked);
+}
+
+// Restore the search checkbox for the conversation we're switching
+// to. Image is always restored to off (one-shot, never sticky).
+// Called from openConversation / new-chat / right after a brand-new
+// conversation is created on submit.
+function restoreModeFor(convId) {
+  const want = !!searchModeByConv.get(convId);
+  searchCheckbox.checked = want;
+  imageCheckbox.checked = false;
+  refreshComposerUI();
+}
+
 imageCheckbox.addEventListener('change', () => {
   // Mutually exclusive — checking image clears search and vice versa.
   if (imageCheckbox.checked) searchCheckbox.checked = false;
+  persistSearchMode();
   refreshComposerUI();
 });
 searchCheckbox.addEventListener('change', () => {
   if (searchCheckbox.checked) imageCheckbox.checked = false;
+  persistSearchMode();
   refreshComposerUI();
 });
 refreshComposerUI();
@@ -724,6 +776,11 @@ document.getElementById('composer').onsubmit = async (e) => {
   textarea.disabled = true;
 
   // If this is a brand-new chat (no currentId), create one first.
+  // Hold the pre-create checkbox state so we can copy it onto the
+  // freshly-minted conversation id below — without this, a "+ New
+  // chat → check search → submit" flow would lose the sticky bit.
+  const wasNewChat = !currentId;
+  const newChatSearchState = wasNewChat ? searchCheckbox.checked : null;
   if (!currentId) {
     const cr = await fetch('/api/conversations', {
       method: 'POST',
@@ -736,20 +793,26 @@ document.getElementById('composer').onsubmit = async (e) => {
       return;
     }
     currentId = (await cr.json()).conversation_id;
+    if (newChatSearchState !== null) {
+      searchModeByConv.set(currentId, newChatSearchState);
+    }
   }
 
   // Snapshot the checkbox state at submit time. Mid-stream toggling
-  // shouldn't change what this turn is. Then immediately auto-clear
-  // the checkboxes so the NEXT submit defaults back to chat — image
-  // and search are intentionally opt-in per-turn to avoid stale
-  // sticky modes (a left-on search box would burn DDG hits + an LLM
-  // round-trip on every casual message).
+  // shouldn't change what this turn is.
+  //
+  // Image is one-shot — auto-clear after submit so an accidental
+  // left-on can't burn 5 contributor GPU jobs in a row. Search
+  // is STICKY per-conversation (see the comment on searchModeByConv
+  // above); the checkbox state is preserved across submits and only
+  // resets when the user manually unchecks, opens a different
+  // conversation, or starts a new chat.
   let submitTool = 'chat';
   if (imageCheckbox.checked) submitTool = 'image';
   else if (searchCheckbox.checked) submitTool = 'search';
   const submitSearchMode = submitTool === 'search' ? selectedSearchMode() : null;
   imageCheckbox.checked = false;
-  searchCheckbox.checked = false;
+  // searchCheckbox stays — sticky.
   refreshComposerUI();
 
   // Append the user message optimistically so it shows up right away.

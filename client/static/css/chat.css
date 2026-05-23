@@ -112,6 +112,16 @@ body { display: flex; flex-direction: column; }
 }
 .image-toggle:hover { color: var(--text); }
 
+/* The browser's UA stylesheet has [hidden] { display: none } but at
+ * specificity 0,1,0 — anything matching .image-toggle or .search-mode
+ * (display: inline-flex below) outranks it on equal specificity by
+ * source order. Without these explicit rules, JS toggling
+ * `wrap.hidden = true` would set the attribute but the element would
+ * stay visible. Same fix needed for both toggles + the search-mode
+ * sub-row. */
+.image-toggle[hidden],
+.search-mode[hidden] { display: none; }
+
 /* Fast/comprehensive sub-toggle for search. Only shown when the
  * Search checkbox is on; defaults to Fast. Inline radio pair matches
  * the look of the parent checkbox row. */

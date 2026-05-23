@@ -1283,10 +1283,13 @@ class SearchToolTests(_BaseE2E):
         # untouched (no orphan job).
         self.assertEqual(self.r.llen("job_queue:search"), 0)
 
-    def test_search_with_conversation_carries_messages(self):
-        # Search inside a conversation gets the prior turns as
-        # messages[] so a follow-up like "what about Europe?" has
-        # context to disambiguate the query.
+    def test_search_with_conversation_goes_through_rewrite(self):
+        # Search inside a conversation with prior context AND a chat
+        # worker online → hidden chat rewrite job lands on the chat
+        # queue, search job is held in 'awaiting_rewrite' status. The
+        # search envelope stashed in SEARCH_REWRITE_PENDING still
+        # carries the conversation history so the worker has context
+        # for the LLM summary once it actually runs.
         _, t = self._make_member(email="srch4@x.com")
         self._make_search_worker(t)
         conv = self.client.post(
@@ -1313,14 +1316,37 @@ class SearchToolTests(_BaseE2E):
             headers={"Authorization": f"Bearer {t}"},
         )
         self.assertEqual(gr.status_code, 200, gr.text)
-        env = json.loads(self.r.lindex("job_queue:search", 0))
+        # The search envelope is NOT on the search queue yet — it's
+        # held pending until the rewrite chat job completes.
+        self.assertEqual(self.r.llen("job_queue:search"), 0)
+        # A rewrite chat job IS on the chat queue.
+        self.assertEqual(self.r.llen("job_queue"), 1)
+        rewrite_env = json.loads(self.r.lindex("job_queue", 0))
+        self.assertEqual(rewrite_env["tool"], "chat")
+        # The rewrite meta-prompt threads the history + new message
+        # so the rewriter can read intent ("what about in Europe?"
+        # referencing the prior banking context).
+        self.assertIn("banking", rewrite_env["prompt"])
+        self.assertIn("what about in Europe?", rewrite_env["prompt"])
+        # Search job row is in the holding state.
+        self.assertEqual(
+            self.db.get_job(gr.json()["job_id"])["status"], "awaiting_rewrite",
+        )
+        # Linkage hash is populated; the stashed envelope retains
+        # the conversation messages[] so when the rewrite returns
+        # and the search envelope gets pushed to job_queue:search,
+        # the worker still has context for the LLM summary.
+        self.assertEqual(self.r.hlen("search_rewrite_pending"), 1)
+        link_raw = list(self.r.hgetall("search_rewrite_pending").values())[0]
+        link = json.loads(link_raw)
+        env = link["search_envelope"]
         self.assertIn("messages", env)
-        # Last entry should be the new prompt, prior entries should
-        # carry the seeded history.
-        self.assertEqual(env["messages"][-1]["content"], "what about in Europe?")
+        self.assertEqual(
+            env["messages"][-1]["content"], "what about in Europe?",
+        )
         self.assertTrue(
             any("banking" in m.get("content", "") for m in env["messages"]),
-            f"prior history not threaded into envelope: {env['messages']!r}",
+            f"prior history not threaded into stashed envelope: {env['messages']!r}",
         )
 
     def test_complete_with_sources_surfaces_on_result(self):
@@ -1370,6 +1396,358 @@ class SearchToolTests(_BaseE2E):
         ).json()
         self.assertEqual(res["status"], "complete")
         self.assertEqual(res["sources"], sources_payload)
+
+
+class SearchQueryRewriteTests(_BaseE2E):
+    """v1.1.28: when a search submission lives inside a conversation
+    that already has prior turns, /generate enqueues a hidden chat
+    job that rewrites the literal DDG query using context, then
+    dispatches the search job with the rewritten query.
+
+    Same skip-paths as the image rewrite. The motivating user
+    transcript was 'news' → Wikipedia hit, then 'try again' → Aaliyah
+    song lyrics — both unrecoverable as literal queries; the rewrite
+    re-frames 'try again' as 'different recent news event' using the
+    conversation history."""
+
+    def _make_search_capable_worker(self, token: str) -> str:
+        # Worker advertises both chat (to serve the rewrite job) and
+        # search (to satisfy the live-worker gate for /generate). The
+        # rewrite + dispatch flow needs both online; without the chat
+        # capability, /generate's `_chat_worker_available_for_rewrite`
+        # would skip the rewrite and push the literal query straight
+        # to the search queue.
+        worker_id = f"wkr-sr-{uuid.uuid4().hex[:6]}"
+        self.client.post(
+            "/register",
+            json={
+                "worker_id": worker_id,
+                "capabilities": {"tools": ["chat", "search"]},
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.client.post(
+            "/heartbeat", json={"worker_id": worker_id, "status": "idle"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        return worker_id
+
+    def setUp(self):
+        # Each test in this class clears just the queues + linkage
+        # hash it asserts on. Mirror of ImagePromptRewriteTests.setUp.
+        self.r.delete("job_queue", "job_queue:search", "search_rewrite_pending")
+
+    def _seed_conversation_with_one_turn(self, t: str) -> str:
+        # Build a conversation that has at least one completed turn,
+        # so the "first message in this conv" skip doesn't apply.
+        # message_ids are randomized per call so multiple tests in
+        # this class don't trip the messages.message_id UNIQUE
+        # constraint sharing the same _BaseE2E DB.
+        conv = self.client.post(
+            "/conversations", json={},
+            headers={"Authorization": f"Bearer {t}"},
+        ).json()
+        cid = conv["conversation_id"]
+        suffix = uuid.uuid4().hex[:8]
+        self.db.append_message(
+            message_id=f"msg_sseed_{suffix}_u", conversation_id=cid, seq=0,
+            role="user", text="tell me the latest news",
+        )
+        self.db.append_message(
+            message_id=f"msg_sseed_{suffix}_a", conversation_id=cid, seq=1,
+            role="assistant", text="News A, News B, News C.",
+            status="complete",
+        )
+        return cid
+
+    def test_search_first_message_skips_rewrite(self):
+        # First message in a brand-new conversation IS a search → no
+        # prior context to disambiguate against → push the literal
+        # query straight to the search queue. Same skip-path as the
+        # image rewrite's first-message case.
+        _, t = self._make_member(email="srrw1@x.com")
+        self._make_search_capable_worker(t)
+        conv = self.client.post(
+            "/conversations", json={},
+            headers={"Authorization": f"Bearer {t}"},
+        ).json()
+        cid = conv["conversation_id"]
+        gr = self.client.post(
+            "/generate",
+            json={
+                "prompt": "news", "tool": "search",
+                "conversation_id": cid,
+            },
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        self.assertEqual(gr.status_code, 200, gr.text)
+        # Search landed on the search queue with the raw prompt.
+        self.assertEqual(self.r.llen("job_queue:search"), 1)
+        self.assertEqual(self.r.hlen("search_rewrite_pending"), 0)
+        env = json.loads(self.r.lindex("job_queue:search", 0))
+        self.assertEqual(env["prompt"], "news")
+        # Job row is normal 'pending', not 'awaiting_rewrite'.
+        self.assertEqual(self.db.get_job(gr.json()["job_id"])["status"], "pending")
+
+    def test_search_without_conversation_id_skips_rewrite(self):
+        # No conversation_id → no history → no rewrite. Same skip-path
+        # as image rewrite's "no conversation_id" branch.
+        _, t = self._make_member(email="srrw2@x.com")
+        self._make_search_capable_worker(t)
+        gr = self.client.post(
+            "/generate",
+            json={"prompt": "news", "tool": "search"},
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        self.assertEqual(gr.status_code, 200, gr.text)
+        self.assertEqual(self.r.llen("job_queue:search"), 1)
+        self.assertEqual(self.r.hlen("search_rewrite_pending"), 0)
+
+    def test_search_with_no_chat_worker_online_skips_rewrite(self):
+        # Conversation has prior context but NO chat-capable worker is
+        # heartbeating — fall back to the raw query rather than
+        # stranding the search behind a rewrite no one can complete.
+        # Mirror of the image-rewrite skip-path for this case: register
+        # a worker (so /generate has *something* in the registry), then
+        # blow away the heartbeats hash so
+        # _chat_worker_available_for_rewrite() sees nothing.
+        _, t = self._make_member(email="srrw3@x.com")
+        self._make_search_capable_worker(t)
+        cid = self._seed_conversation_with_one_turn(t)
+        # Same trick as ImagePromptRewriteTests uses: drop heartbeats
+        # so the rewrite-availability check (which DOES inspect
+        # heartbeats directly, regardless of REQUIRE_LIVE_WORKER) sees
+        # no recent chat worker. Other tests in this class set up their
+        # own heartbeats fresh; this isolates the skip-path.
+        self.r.delete("worker_heartbeats")
+        gr = self.client.post(
+            "/generate",
+            json={
+                "prompt": "try again", "tool": "search",
+                "conversation_id": cid,
+            },
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        self.assertEqual(gr.status_code, 200, gr.text)
+        # Skipped rewrite → raw query straight to the search queue.
+        self.assertEqual(self.r.llen("job_queue:search"), 1)
+        self.assertEqual(self.r.hlen("search_rewrite_pending"), 0)
+        env = json.loads(self.r.lindex("job_queue:search", 0))
+        self.assertEqual(env["prompt"], "try again")
+
+    def test_search_with_context_enqueues_rewrite(self):
+        # Happy path: conversation has prior context AND a chat-
+        # capable worker is online → rewrite chat job is enqueued
+        # on the CHAT queue, search job is held in 'awaiting_rewrite'
+        # until the rewrite returns.
+        _, t = self._make_member(email="srrw4@x.com")
+        self._make_search_capable_worker(t)
+        cid = self._seed_conversation_with_one_turn(t)
+        gr = self.client.post(
+            "/generate",
+            json={
+                "prompt": "try again", "tool": "search",
+                "conversation_id": cid,
+            },
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        self.assertEqual(gr.status_code, 200, gr.text)
+        # Search queue empty (held back for the rewrite).
+        self.assertEqual(self.r.llen("job_queue:search"), 0)
+        # Rewrite chat job on the chat queue.
+        self.assertEqual(self.r.llen("job_queue"), 1)
+        rewrite_env = json.loads(self.r.lindex("job_queue", 0))
+        self.assertEqual(rewrite_env["tool"], "chat")
+        # The meta-prompt embeds the user's literal "try again" plus
+        # the prior assistant message so the rewriter can disambiguate.
+        self.assertIn("try again", rewrite_env["prompt"])
+        self.assertIn("News A", rewrite_env["prompt"])
+        # Search job row is held.
+        self.assertEqual(
+            self.db.get_job(gr.json()["job_id"])["status"], "awaiting_rewrite",
+        )
+        # Linkage hash populated.
+        self.assertEqual(self.r.hlen("search_rewrite_pending"), 1)
+
+    def test_rewrite_complete_dispatches_search_with_new_query(self):
+        # End-to-end: rewrite returns a cleaner query, the dispatcher
+        # plugs it into the held search envelope, pushes onto the
+        # search queue, and the search job row flips from
+        # awaiting_rewrite → pending so the worker picks it up.
+        _, t = self._make_member(email="srrw5@x.com")
+        wid = self._make_search_capable_worker(t)
+        cid = self._seed_conversation_with_one_turn(t)
+        gr = self.client.post(
+            "/generate",
+            json={
+                "prompt": "try again", "tool": "search",
+                "conversation_id": cid,
+            },
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        search_job_id = gr.json()["job_id"]
+        # Pop the rewrite chat job off (mimic worker BLPOP), claim,
+        # complete with the "rewritten" query.
+        self.r.lpop("job_queue")
+        rewrite_links = self.r.hgetall("search_rewrite_pending")
+        rewrite_job_id = list(rewrite_links.keys())[0]
+        claim = self.client.post(
+            "/jobs/claim",
+            json={"worker_id": wid, "job_id": rewrite_job_id},
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        self.client.post(
+            "/jobs/complete",
+            json={
+                "worker_id": wid, "job_id": rewrite_job_id,
+                "text": "different recent news event",
+                "model": "llama3.2:1b",
+                "prompt_tokens": 50, "completion_tokens": 5,
+                "duration_seconds": 1.0, "status": "complete",
+                "claim_token": claim.json()["claim_token"],
+            },
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        # Search envelope now on the search queue with the rewritten
+        # query as its prompt.
+        self.assertEqual(self.r.llen("job_queue:search"), 1)
+        search_env = json.loads(self.r.lindex("job_queue:search", 0))
+        self.assertEqual(search_env["prompt"], "different recent news event")
+        # Conversation history is still present in the dispatched
+        # envelope so the LLM summary step has context.
+        self.assertIn("messages", search_env)
+        # Search job row flipped out of awaiting_rewrite.
+        self.assertEqual(
+            self.db.get_job(search_job_id)["status"], "pending",
+        )
+        # Linkage cleaned up.
+        self.assertEqual(self.r.hlen("search_rewrite_pending"), 0)
+
+    def test_rewrite_error_falls_back_to_raw_query(self):
+        # If the rewrite chat job errors out, the dispatcher's
+        # _clean_rewritten_search_query falls back to the original
+        # prompt — better to ship a literal DDG query than no query
+        # at all.
+        _, t = self._make_member(email="srrw6@x.com")
+        wid = self._make_search_capable_worker(t)
+        cid = self._seed_conversation_with_one_turn(t)
+        gr = self.client.post(
+            "/generate",
+            json={
+                "prompt": "try again", "tool": "search",
+                "conversation_id": cid,
+            },
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        search_job_id = gr.json()["job_id"]
+        self.r.lpop("job_queue")
+        rewrite_job_id = list(self.r.hgetall("search_rewrite_pending").keys())[0]
+        claim = self.client.post(
+            "/jobs/claim",
+            json={"worker_id": wid, "job_id": rewrite_job_id},
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        self.client.post(
+            "/jobs/complete",
+            json={
+                "worker_id": wid, "job_id": rewrite_job_id,
+                "text": "",
+                "model": "llama3.2:1b",
+                "prompt_tokens": 50, "completion_tokens": 0,
+                "duration_seconds": 0.5, "status": "error",
+                "error": "model died",
+                "claim_token": claim.json()["claim_token"],
+            },
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        # Search dispatched with the ORIGINAL query.
+        self.assertEqual(self.r.llen("job_queue:search"), 1)
+        env = json.loads(self.r.lindex("job_queue:search", 0))
+        self.assertEqual(env["prompt"], "try again")
+        self.assertEqual(self.db.get_job(search_job_id)["status"], "pending")
+        self.assertEqual(self.r.hlen("search_rewrite_pending"), 0)
+
+    def test_cancel_search_during_rewrite_skips_dispatch(self):
+        # User cancels the search after the rewrite job is in flight
+        # but before it returns. When the rewrite eventually finishes,
+        # the dispatcher notices the search row is no longer in
+        # awaiting_rewrite and bails — no orphan search lands on the
+        # queue.
+        _, t = self._make_member(email="srrw7@x.com")
+        wid = self._make_search_capable_worker(t)
+        cid = self._seed_conversation_with_one_turn(t)
+        gr = self.client.post(
+            "/generate",
+            json={
+                "prompt": "try again", "tool": "search",
+                "conversation_id": cid,
+            },
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        search_job_id = gr.json()["job_id"]
+        # Get the rewrite envelope (it's still on the chat queue).
+        self.r.lpop("job_queue")
+        rewrite_job_id = list(self.r.hgetall("search_rewrite_pending").keys())[0]
+        # User cancels the search.
+        cancel = self.client.post(
+            "/jobs/cancel", json={"job_id": search_job_id},
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        self.assertEqual(cancel.status_code, 200, cancel.text)
+        # Rewrite chat job returns.
+        claim = self.client.post(
+            "/jobs/claim",
+            json={"worker_id": wid, "job_id": rewrite_job_id},
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        self.client.post(
+            "/jobs/complete",
+            json={
+                "worker_id": wid, "job_id": rewrite_job_id,
+                "text": "different recent news event",
+                "model": "llama3.2:1b",
+                "prompt_tokens": 50, "completion_tokens": 5,
+                "duration_seconds": 1.0, "status": "complete",
+                "claim_token": claim.json()["claim_token"],
+            },
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        # No search on the queue (dispatcher saw cancelled status, bailed).
+        self.assertEqual(self.r.llen("job_queue:search"), 0)
+        self.assertEqual(self.r.hlen("search_rewrite_pending"), 0)
+        self.assertEqual(self.db.get_job(search_job_id)["status"], "cancelled")
+
+
+class SearchQueryCleanerUnitTests(_BaseE2E):
+    """Unit-level coverage for _clean_rewritten_search_query in
+    isolation. The cleaner is stricter than the image-prompt cleaner
+    (search queries are short by nature; multi-line is wrong)."""
+
+    def test_strips_quotes_and_headers(self):
+        clean = self.coord_main._clean_rewritten_search_query
+        self.assertEqual(clean('"recent news today"', "orig"), "recent news today")
+        self.assertEqual(clean("QUERY: SVB collapse 2023", "orig"), "SVB collapse 2023")
+        self.assertEqual(clean("Search: latest iPhone", "orig"), "latest iPhone")
+
+    def test_takes_first_line_only(self):
+        # The image cleaner preserves multi-line because sd.cpp likes
+        # rich prompts; DDG does NOT — extra words are hard
+        # requirements. Multi-line model output is the rewriter
+        # rambling; take the first line and drop the rest.
+        clean = self.coord_main._clean_rewritten_search_query
+        raw = (
+            "recent news today\n"
+            "Also you might want to search for...\n"
+            "Or another option is..."
+        )
+        self.assertEqual(clean(raw, "orig"), "recent news today")
+
+    def test_falls_back_on_empty_or_oversized(self):
+        clean = self.coord_main._clean_rewritten_search_query
+        self.assertEqual(clean("", "orig"), "orig")
+        self.assertEqual(clean(None, "orig"), "orig")
+        # 200-char cap — anything longer is the model writing prose.
+        self.assertEqual(clean("x" * 250, "orig"), "orig")
 
 
 if __name__ == "__main__":

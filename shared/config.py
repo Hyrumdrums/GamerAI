@@ -132,3 +132,10 @@ CANARY_PENDING = "canary_pending"
 # after dispatch (or after a fallback-to-raw error path) so a stale
 # rewrite_chat_job_id never leaks into the next request.
 IMAGE_REWRITE_PENDING = "image_rewrite_pending"
+# Same pattern as IMAGE_REWRITE_PENDING but for search jobs. The
+# rewrite turns "try again" (a literal query that produces Aaliyah
+# song results) into a context-aware query like "different recent
+# news event" using the conversation history. Fires on follow-ups
+# only (no rewrite on first-turn searches — same skip-paths as
+# image rewrite). Consumed by /jobs/complete; deleted after dispatch.
+SEARCH_REWRITE_PENDING = "search_rewrite_pending"
