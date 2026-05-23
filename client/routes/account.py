@@ -174,6 +174,23 @@ async def account_revoke_invite(code: str, request: Request):
     )
 
 
+@router.get("/contribute", response_class=HTMLResponse)
+async def contribute_page(request: Request):
+    """Onboarding pitch for non-contributors: how the network works,
+    how contributing earns access for you and your invitees, and the
+    Windows-only TL;DR for actually installing the agent. Reachable
+    while signed in (topbar CTA) and anonymously (so a curious
+    visitor following a link from somewhere can read it without an
+    account)."""
+    bearer = session_bearer(request)
+    me = await identify(bearer) if bearer else None
+    return templates.TemplateResponse(
+        request,
+        "contribute.html.j2",
+        {"me": me},
+    )
+
+
 @router.get("/agent/pair", response_class=HTMLResponse)
 async def agent_pair_landing(request: Request, code: str = ""):
     """Browser-side of the agent-pairing handoff. The Windows agent

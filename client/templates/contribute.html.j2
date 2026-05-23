@@ -1,0 +1,177 @@
+{% extends "base.html.j2" %}
+{% block title %}Contribute & invite friends — GamerAI{% endblock %}
+{% block extra_css %}
+<link rel="stylesheet" href="/static/css/contribute.css">
+{% endblock %}
+
+{% block topbar %}
+<div class="topbar">
+  <div class="brand">GamerAI</div>
+  <div class="topbar-actions">
+    {% if me %}
+    <a href="/" class="hide-mobile">← chat</a>
+    <a href="/account">{{ me.username or me.email or 'account' }}</a>
+    <a href="/logout">sign out</a>
+    {% else %}
+    <a href="/login">sign in</a>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}
+
+{% block content %}
+<div class="page">
+
+  <section class="hero">
+    <h1>An AI suite powered by your friends and neighbors</h1>
+    <p class="lede">
+      GamerAI runs on contributors' gaming PCs. You run a small agent
+      when your machine is idle; in return, you and the people you
+      invite get free access to the whole toolbox — chat, image
+      generation, and more — without a subscription and without
+      anyone harvesting your prompts to train their model.
+    </p>
+  </section>
+
+  <section class="card">
+    <h2>How it works, honestly</h2>
+    <ol class="how">
+      <li>
+        <strong>You run the agent on your gaming PC.</strong> It picks
+        up jobs from the shared queue only when the machine is idle
+        — gaming or working takes priority. Power scales with demand,
+        not uptime: ~0 W when nothing's running, ~30 W during the
+        keep-alive window after a job, full GPU draw only during
+        active inference.
+      </li>
+      <li>
+        <strong>You earn tier-based access</strong> (BRONZE → SILVER
+        → GOLD → PLATINUM) based on uptime, capability, and how many
+        jobs you actually serve. Each tier raises the daily quota
+        for you and the friends you invite. No subscription, no
+        billing — your contribution <em>is</em> the membership.
+      </li>
+      <li>
+        <strong>You invite the people you want on the network.</strong>
+        Each invite is a link you share over your own channel (text,
+        Slack, however) — we don't run an email service. Your
+        invitees use the suite under your tier's quota; you can
+        adjust their daily cap or revoke their access from your
+        Account page anytime.
+      </li>
+    </ol>
+  </section>
+
+  <section class="card">
+    <h2>How the coordinator stays online</h2>
+    <p>
+      When the contributor pool has spare capacity, we make it
+      available to outside customers — small startups, developers
+      building on the API, batch workloads — at a price between
+      Anthropic Haiku and pure self-hosting. <strong>80% of that
+      revenue flows back to the contributors who actually served
+      those paying jobs</strong> (opt-in, gated on a week of stable
+      uptime). The other 20% pays the coordinator's bill —
+      ~$50/month at our current size, which means about two paying
+      developer customers and one PLATINUM contributor in the paid
+      pool cover the whole infrastructure indefinitely.
+    </p>
+    <p>
+      That's the deal: paid customers fund the plumbing so
+      contributors and their invitees never have to. The platform
+      never charges you, never sells your prompts, never wedges a
+      paywall between you and the friends you brought onto the
+      network.
+    </p>
+  </section>
+
+  <section class="card">
+    <h2>Set up on Windows in five minutes</h2>
+    <p class="muted">
+      Windows-only for now — the Mac/Linux agent isn't packaged yet.
+      If you're on those platforms and comfortable with Python, the
+      agent runs from source at
+      <a href="https://github.com/Hyrumdrums/GamerAI/tree/main/windows-agent" target="_blank">github.com/Hyrumdrums/GamerAI</a>.
+    </p>
+
+    <h3>What you need</h3>
+    <ul class="reqs">
+      <li><strong>Windows 10 or 11</strong> on a desktop or laptop
+        with a discrete GPU.</li>
+      <li><strong>NVIDIA GPU with ≥6 GB VRAM</strong> to serve chat
+        jobs (~7B model class). 8+ GB unlocks the image-generation
+        tool (SDXL-class). AMD GPUs work via ROCm but aren't
+        installer-blessed yet.</li>
+      <li><strong>Recent driver</strong> (Studio or Game Ready, either
+        is fine).</li>
+      <li><strong>A GamerAI account</strong> — accept an invite from
+        someone already on the network, or
+        <a href="/login">sign in</a> if you already have one.</li>
+    </ul>
+
+    <h3>Install</h3>
+    <ol class="steps">
+      <li>
+        Download the installer:
+        <a class="btn" href="/download/GamerAI-Agent-Setup.exe">
+          GamerAI-Agent-Setup.exe
+        </a>
+      </li>
+      <li>
+        Run it. <strong>Windows SmartScreen</strong> will pop a
+        "Windows protected your PC" warning the first time — the
+        binary isn't code-signed yet. Click <em>More info</em> →
+        <em>Run anyway</em>. (The source is open at
+        <a href="https://github.com/Hyrumdrums/GamerAI" target="_blank">github.com/Hyrumdrums/GamerAI</a>;
+        the binary is built by GitHub Actions on every push.)
+      </li>
+      <li>
+        Open the agent from the Start menu. The first run will print
+        a pairing URL and open your default browser to it.
+      </li>
+      <li>
+        On the browser page, click <em>Pair this PC</em>. You'll need
+        to be signed in — if you're not, sign in first and the page
+        will bounce back. The agent picks up its credentials
+        automatically.
+      </li>
+      <li>
+        Leave the agent running. It autostarts at login and only
+        serves jobs while your machine is idle.
+      </li>
+    </ol>
+
+    <p class="hint">
+      Already paired? Open your <a href="/account">Account page</a>
+      to see the machine, your tier, and the friends you've invited.
+    </p>
+  </section>
+
+  <section class="card">
+    <h2>Realistic earnings (paid pool, opt-in)</h2>
+    <p>
+      Bonus payouts only apply when you opt your machine into serving
+      paying customers — and only once you've held GOLD tier for a
+      week (reliability proof). Honest numbers at US-median
+      electricity:
+    </p>
+    <table class="earnings">
+      <thead>
+        <tr><th>GPU</th><th>1 hr/day active</th><th>3 hr/day</th><th>8 hr/day saturated</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>RTX 3060 (~170 W, 30 tok/s)</td><td>$3/mo</td><td>$9/mo</td><td>$24/mo</td></tr>
+        <tr><td>RTX 4070 (~200 W, 70 tok/s)</td><td>$8/mo</td><td>$22/mo</td><td>$58/mo</td></tr>
+        <tr><td>RTX 4090 (~450 W, 100 tok/s)</td><td>$11/mo</td><td>$32/mo</td><td>$87/mo</td></tr>
+      </tbody>
+    </table>
+    <p class="muted">
+      "Netflix-sub money" on basic gear; meaningful secondary income
+      on a 4090 at saturation. The pitch isn't the money — it's
+      hosting AI for the people you actually want on the network,
+      with the paid layer covering coordinator costs as a side effect.
+    </p>
+  </section>
+
+</div>
+{% endblock %}

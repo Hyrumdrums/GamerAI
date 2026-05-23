@@ -61,6 +61,9 @@
     # no /account or /agent/pair routes).
     @web_ui_account path /account /account/*
     @web_ui_agent_pair path /agent/pair /agent/pair/*
+    # Public onboarding pitch + Windows install TL;DR. Reachable
+    # while signed in (topbar CTA) and anonymously.
+    @web_ui_contribute path /contribute
     # Vendored JS (marked + DOMPurify) — referenced by both the chat
     # UI (client:8080) and the ToS page (served by coordinator:8000,
     # which has its own copy). We route to the client since both
@@ -91,6 +94,9 @@
         reverse_proxy client:8080
     }
     handle @web_ui_agent_pair {
+        reverse_proxy client:8080
+    }
+    handle @web_ui_contribute {
         reverse_proxy client:8080
     }
     handle @web_ui_static {

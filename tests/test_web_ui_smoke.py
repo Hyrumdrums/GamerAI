@@ -392,6 +392,36 @@ class WebUISmokeTests(unittest.TestCase):
         # At least one open invite is now in the table.
         self.assertIn("Open invites", page.text)
 
+    # ------------------------------------------------------------------
+    # /contribute onboarding page
+    # ------------------------------------------------------------------
+    def test_contribute_page_renders_for_anonymous(self):
+        anon = TestClient(client_web.app, follow_redirects=False)
+        resp = anon.get("/contribute")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("powered by your friends", resp.text)
+        self.assertIn("GamerAI-Agent-Setup.exe", resp.text)
+        # Signed-out users see a sign-in link, not the account link.
+        self.assertIn('href="/login"', resp.text)
+
+    def test_contribute_page_renders_for_signed_in_user(self):
+        resp = self.web.get("/contribute")
+        self.assertEqual(resp.status_code, 200)
+        # Signed-in users see their account link in the topbar.
+        self.assertIn('href="/account"', resp.text)
+
+    def test_me_endpoint_includes_paired_machines_count(self):
+        """JS uses this to decide whether to show the topbar
+        Contribute CTA — zero paired machines means "not yet a
+        contributor"."""
+        r = self.coord.get(
+            "/me", headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+        )
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertIn("paired_machines_count", body)
+        self.assertIsInstance(body["paired_machines_count"], int)
+
     def test_account_create_invite_rejects_missing_email(self):
         resp = self.web.post(
             "/account/invites",

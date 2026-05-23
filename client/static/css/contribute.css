@@ -1,0 +1,31 @@
+.page { max-width: 720px; }
+.hero h1 { font-size: 1.75rem; margin: 0 0 .5rem; }
+.hero .lede {
+  font-size: 1.05rem; line-height: 1.5; color: var(--muted, #555);
+  margin: 0 0 1.5rem;
+}
+.card {
+  background: var(--card-bg, #fff);
+  border: 1px solid var(--border, #e0e0e0);
+  border-radius: var(--radius, 8px);
+  padding: 1.1rem 1.25rem;
+  margin-bottom: 1.25rem;
+}
+.card h2 { margin-top: 0; }
+.card h3 { font-size: 1rem; color: var(--muted, #666); margin-top: 1rem; }
+ol.how,
+ol.steps { padding-left: 1.25rem; }
+ol.how li,
+ol.steps li { margin-bottom: .75rem; line-height: 1.5; }
+ul.reqs { padding-left: 1.25rem; }
+ul.reqs li { margin-bottom: .35rem; line-height: 1.45; }
+.steps .btn { display: inline-block; margin-top: .25rem; }
+.hint { color: var(--muted, #666); font-size: .9rem; }
+table.earnings { width: 100%; border-collapse: collapse; margin: .5rem 0 1rem; }
+table.earnings th,
+table.earnings td {
+  text-align: left; padding: .4rem .5rem;
+  border-bottom: 1px solid var(--border, #e0e0e0);
+  font-size: .92rem;
+}
+table.earnings th { color: var(--muted, #666); font-weight: 600; }

@@ -34,8 +34,13 @@ button.danger {
   border: 1px solid #e9a4a4;
 }
 button.copy-link {
-  background: transparent; border: 1px solid var(--border, #ccc);
+  background: transparent;
+  color: var(--brand);
+  border: 1px solid var(--border, #ccc);
   padding: .2rem .5rem; font-size: .85rem; cursor: pointer;
+}
+button.copy-link:hover {
+  background: var(--surface, #f3f3f3);
 }
 .flash {
   background: #e8f4ff; border: 1px solid #a7c8ec; color: #1c4a78;

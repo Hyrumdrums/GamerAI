@@ -2854,6 +2854,7 @@ def me(request: Request):
             return {"auth_disabled": True}
         raise HTTPException(status_code=401, detail="unauthorized")
     usage = db.member_usage_today(member.member_id)
+    paired_count = len(db.list_member_tokens(member.member_id))
     return {
         "member_id": member.member_id,
         "email": member.email,
@@ -2865,6 +2866,10 @@ def me(request: Request):
         "username": member.username,
         "has_password": member.has_password,
         "password_set_at": member.password_set_at,
+        # Count of additional bearers in member_tokens — i.e. paired
+        # agents. Zero means "no contributing machine yet" and the
+        # web UI shows the contribute pitch in the topbar.
+        "paired_machines_count": paired_count,
         "usage_today": usage,
         "tos": {
             "accepted_at": member.tos_accepted_at,

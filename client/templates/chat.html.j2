@@ -6,9 +6,13 @@
 
 {% block topbar %}
 <div class="topbar">
-  <div style="display:flex;align-items:center;gap:.4rem">
+  <div style="display:flex;align-items:center;gap:.6rem">
     <button class="hamburger" id="hamburger" type="button" aria-label="Toggle conversations">☰</button>
     <div class="brand">GamerAI</div>
+    <a id="contributelink" href="/contribute" class="contribute-cta" hidden>
+      <span class="hide-mobile">Contribute and invite friends</span>
+      <span class="hide-desktop">Invite friends</span>
+    </a>
   </div>
   <div class="topbar-actions">
     <a id="who" href="/account">signing in…</a>

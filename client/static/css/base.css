@@ -98,6 +98,21 @@ input:focus, textarea:focus { outline: 0; border-color: var(--brand); }
 /* On phones, hide non-essential topbar items; admin/terms/logout still
    reachable from the dashboard. Override per page if needed. */
 .topbar .hide-mobile { display: none; }
+.topbar .hide-desktop { display: inline; }
+
+/* Topbar "Contribute and invite friends" CTA — chip-style so it
+   reads as a call-to-action rather than another nav link. Sits next
+   to the brand on the left edge. */
+.topbar .contribute-cta {
+  background: var(--brand);
+  color: #fff;
+  padding: .2rem .6rem;
+  border-radius: 999px;
+  font-size: .8rem;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.topbar .contribute-cta:hover { background: var(--brand-hover); }
 
 @media (min-width: 640px) {
   .page { max-width: 760px; margin: 2.5rem auto; padding: 0 1.5rem; }
@@ -106,6 +121,7 @@ input:focus, textarea:focus { outline: 0; border-color: var(--brand); }
   table { display: table; overflow: visible; }
   .topbar { padding: .55rem 1.25rem; }
   .topbar .hide-mobile { display: inline; }
+  .topbar .hide-desktop { display: none; }
   /* Buttons inside .topbar / forms stop trying to be full-width once
      we have horizontal room. */
   button.full, .btn.full { width: auto; }

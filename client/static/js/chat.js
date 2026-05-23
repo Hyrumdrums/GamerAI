@@ -36,6 +36,12 @@ async function init() {
     if (me.role === 'admin') {
       document.getElementById('adminlink').hidden = false;
     }
+    // Show the "Contribute and invite friends" CTA only when the
+    // member has no paired agent yet. Once they pair a machine, they
+    // *are* a contributor — the link becomes redundant.
+    if (!me.paired_machines_count) {
+      document.getElementById('contributelink').hidden = false;
+    }
   } catch { location.href = '/login'; return; }
   await refreshSidebar();
   if (conversations.length > 0) {
