@@ -376,6 +376,56 @@ Resolved. `.github/workflows/ci.yml` runs the unittest suite,
 validates that `docker-compose.yml` and the prod overlay merge
 cleanly, and syntax-checks the bash scripts on every push and PR.
 
+### 🟡 Windows agent: stowaway-instance failure mode
+
+Discovered during the 2026-05-22 v1.1.21 → v1.1.22 rollout: a
+contributor's box ended up running **two** fully-initialized agent
+processes simultaneously, with one (Instance A, tray-mode, hidden
+console) bound to the IPC port and the other (Instance B, foreground,
+visible console) operating as an unenforced duplicate. The duplicate
+then propagated its no-tray state forward into the next auto-update
+cycle, leaving v1.1.22 running in foreground mode with no tray icon
+and no single-instance protection.
+
+Three interacting causes — all in `windows-agent/agent.py`:
+
+1. **TOCTOU race in `_claim_single_instance` (lines 278–320).** The
+   `sock.bind()` + `sock.listen(4)` succeeds before the IPC accept loop
+   gets wired up later in `main()`. A second process's `bind()` fails
+   correctly, but its handshake probe hits a listening-but-not-accepting
+   socket and times out, triggering the "surrender enforcement" branch
+   at line 316. Both processes proceed as "first instance."
+
+2. **Single-instance check only runs in tray mode** (gated on
+   `tray_active` at line 3415). A foreground/args-less launch
+   doesn't even try to bind, so it coexists silently with the tray
+   instance. Should run unconditionally on Windows, with an explicit
+   `--dev-multi` (or similar) opt-out for devs.
+
+3. **No-tray inheritance through `update.bat`.** `relaunch_args =
+   ["--tray"] if args.tray else []` at line 3694 means a foreground
+   Instance B that processes the user's `update` command will
+   relaunch the next version in foreground too, perpetuating the
+   stowaway across updates.
+
+And the deterministic trigger:
+
+4. **`installer.iss` Start Menu shortcut has empty arguments.**
+   Clicking "GamerAI Agent" from the Start Menu while the autostart
+   instance is running spawns a fresh foreground Instance B every
+   time. Should pass `--background` (or `--tray`) like the autostart
+   shortcut does.
+
+**Fix when this surfaces again:** Wire #4 first (one-line installer
+change — fixes the visible footgun). Then #1 (move accept-loop into
+`_claim_single_instance` before it returns, closing the handshake
+window). Then #2 (run single-instance unconditionally on Windows).
+#3 might just go away once #1 + #2 + #4 hold; if not, add an
+install-path heuristic so update.bat reasserts `--tray` when the exe
+lives under `%LOCALAPPDATA%\Programs\GamerAI Agent\`. Each piece is
+small; the trick is shipping them in an order that doesn't leave a
+worse intermediate state.
+
 ---
 
 ## 3. Product completeness
