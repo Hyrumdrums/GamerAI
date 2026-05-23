@@ -233,6 +233,30 @@ installer) follow the same SFTP-chroot path that agent.exe uses today.
 End state: VPS has no outbound credentials to any source-of-truth
 system. Discussed 2026-05-22 during the DreamShaper mirror rollout.
 
+### 🟡 No push-to-deploy for the coordinator — manual SSH step
+
+Today the windows-agent half of a release auto-ships (CI builds the
+exe + SFTPs it to the VPS download chroot), but the coordinator / UI
+half doesn't. After pushing main, *someone* still has to SSH in and
+run `sudo /opt/gamerai/infra/deploy.sh`. The current workflow has
+Claude do the SSH step from the user's workstation — quick, dirty,
+works — but the *control plane* for that deploy lives on a workstation
+SSH key (`id_ed25519_gamerai`), which means there's no audit trail in
+GitHub for "what code is currently running in prod" and a stale
+workstation key would silently keep working.
+
+**Fix when we wire it up:** A GitHub Action on push-to-main that
+either (a) `docker compose pull`s from GHCR (paired with the GHCR
+migration in the gap above), or (b) SFTPs a tarball of the build into
+the same chrooted upload path agent.exe uses, then triggers a small
+`pull-and-restart` script that's already on disk. Either way: prod
+holds **zero** outbound credentials to GitHub. GH Actions is the only
+thing that touches the VPS; the deploy key on `/root/.ssh/` goes
+away; deploy attempts show up in the Actions log instead of bash
+history on whichever workstation typed the command. Pairs naturally
+with the GHCR migration above — same direction, just covers the
+*invocation* side as well as the *source* side.
+
 ### 🟢 No persistent client-side cache (offline / reload-resilience)
 
 The chat UI keeps an in-memory `Map` of loaded conversation messages
