@@ -409,6 +409,14 @@
         {% endfor %}
       </tbody>
     </table>
+    {% elif not owned_workers %}
+    <p class="muted">
+      No paired PCs yet.
+      <a href="/contribute">Run an agent on a Windows PC</a> to
+      contribute to the network and lift your tier.
+    </p>
+    {% endif %}
+
     {% if owned_workers %}
     <h3>Registered workers</h3>
     <p class="muted">What your machines advertise to the network.
@@ -457,13 +465,6 @@
       hidden. Earnings history is preserved.
     </p>
     {% endif %}
-    {% endif %}
-    {% else %}
-    <p class="muted">
-      No paired PCs yet.
-      <a href="/contribute">Run an agent on a Windows PC</a> to
-      contribute to the network and lift your tier.
-    </p>
     {% endif %}
   </section>
 

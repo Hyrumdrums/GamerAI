@@ -783,6 +783,212 @@ class WebUISmokeTests(unittest.TestCase):
         self.assertIn("total_jobs", body)
         self.assertIn("queue_depth", body)
 
+    # ------------------------------------------------------------------
+    # tier UX — the Contribution status card + the invite form's
+    # tier-allowance hint + forget-worker round-trip.
+    # ------------------------------------------------------------------
+    def _signed_in_member(self, username: str = "alicebrowse") -> tuple[TestClient, str]:
+        """Bootstrap a contributor + accept their own invite (since
+        v1 admins are the only ones who can create invites) so we end
+        up with a member-cookie'd TestClient. Returns ``(client,
+        member_id)``. Useful for any test that needs to render the
+        account page as a non-admin."""
+        _, code = self._make_contributor_and_invite()
+        accept = self.web.post(
+            f"/invite/{code}",
+            data=self._accept_form(
+                username=username,
+                password="correct-horse-battery",
+                password_confirm="correct-horse-battery",
+            ),
+            follow_redirects=False,
+        )
+        invitee_cookie = accept.cookies[client_web.SESSION_COOKIE]
+        member = self.db.get_member_by_username(username)
+        self.assertIsNotNone(member)
+        c = TestClient(client_web.app, follow_redirects=False)
+        c.cookies.set(client_web.SESSION_COOKIE, invitee_cookie)
+        return c, member["member_id"]
+
+    def test_account_page_renders_contribution_status_for_member(self):
+        """Non-admin members see the Contribution status card with
+        7-day uptime numbers and the current-tier requirements. The
+        card is the visible surface of the tier engine — if it stops
+        rendering, the host loses sight of why they're at whatever
+        tier they're at."""
+        bob, _ = self._signed_in_member("bobtier")
+        resp = bob.get("/account")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.text
+        self.assertIn("Contribution status", body)
+        # 7-day uptime block.
+        self.assertIn("7-day uptime", body)
+        self.assertIn("of 7 days online", body)
+        # Current-tier requirements line ("≥ N hr/day · ≥ M days/week").
+        self.assertIn("Current tier needs", body)
+        self.assertIn("hr/day", body)
+        self.assertIn("days/week", body)
+
+    def test_account_page_omits_contribution_status_for_admin(self):
+        """Admins are off the tier ladder by design. The card must
+        not render for them — the template gate is
+        ``contrib_status.engine_applies``."""
+        resp = self.web.get("/account")
+        self.assertEqual(resp.status_code, 200)
+        self.assertNotIn("Contribution status", resp.text)
+
+    def test_account_page_shows_below_bar_badge_for_new_member(self):
+        """A freshly minted member has zero credited uptime → below
+        BRONZE's 2hr × 4d bar → the 'below bar' badge fires. The
+        demotion-countdown warning paragraph is intentionally
+        suppressed for BRONZE (it's the floor; there's no tier to
+        demote to). This guards the visible 'something's wrong'
+        signal, which is the most likely thing to silently regress
+        when the template gets re-shuffled."""
+        bob, _ = self._signed_in_member("bobnew")
+        resp = bob.get("/account")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.text
+        self.assertIn("below bar", body)
+        # Badge class is the actual CSS hook the UI styles against.
+        self.assertIn("badge-warn", body)
+
+    def test_account_page_shows_demotion_warning_for_above_bronze(self):
+        """For a SILVER+ member below their bar, the warning paragraph
+        names the demotion target so the host knows what they're at
+        risk of dropping to. Promote the test member to SILVER via
+        direct DB write to short-circuit the engine's daily cadence."""
+        bob, member_id = self._signed_in_member("bobwarn")
+        # Hand-set tier to SILVER. (The engine would do this after
+        # observing a week of meeting the SILVER bar, but we don't
+        # want to spin up the engine here.)
+        import time as _time
+        self.db.set_member_tier(
+            member_id, "SILVER", _time.time(),
+            new_daily_quota_tokens=500_000,
+            new_daily_quota_images=100,
+        )
+        resp = bob.get("/account")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.text
+        self.assertIn("below bar", body)
+        self.assertIn("You're below the", body)
+        self.assertIn("BRONZE", body)  # the demotion target is named
+
+    def test_account_page_shows_meeting_bar_when_uptime_sufficient(self):
+        """Seed enough worker_uptime for BRONZE (2hr × 4d) across an
+        owned worker; the badge must flip to 'meeting bar' and the
+        warning must disappear. Exercises the engine's read path
+        end-to-end through the template."""
+        bob, member_id = self._signed_in_member("bobmeet")
+        # Plant an owned worker + 4 distinct UTC days, 3 hours each.
+        import time as _time
+        now = _time.time()
+        self.db.claim_worker_ownership(
+            "w_meeting", member_id, "idle", now,
+        )
+        for d in range(4):
+            self.db.add_worker_uptime_minutes(
+                "w_meeting", now - d * 86400.0, 180,  # 3hr
+            )
+        resp = bob.get("/account")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.text
+        self.assertIn("meeting bar", body)
+        self.assertNotIn("below bar", body)
+        # Next-tier line is rendered (SILVER); won't be eligible yet
+        # because 3hr/day is below SILVER's 6hr bar.
+        self.assertIn("Next tier (SILVER)", body)
+        self.assertNotIn("eligible — promoting", body)
+
+    def test_account_page_shows_eligible_for_promotion_when_next_tier_met(self):
+        """When the member also meets the *next* tier's bar, the UI
+        shows the 'eligible — promoting on next nightly run' badge so
+        the host knows the engine will move them soon."""
+        bob, member_id = self._signed_in_member("bobpromo")
+        import time as _time
+        now = _time.time()
+        self.db.claim_worker_ownership(
+            "w_promo", member_id, "idle", now,
+        )
+        # SILVER bar = 6hr × 5d. Give 6hr × 6d (over both axes).
+        for d in range(6):
+            self.db.add_worker_uptime_minutes(
+                "w_promo", now - d * 86400.0, 360,  # 6hr
+            )
+        resp = bob.get("/account")
+        body = resp.text
+        self.assertIn("eligible — promoting on next nightly run", body)
+
+    def test_account_invite_form_carries_tier_allowance_data_attrs(self):
+        """The form's data-tier-tokens / data-tier-images attrs are
+        what the inline JS reads to compute '≈ N% of cap' as the host
+        types. Without them the tip silently disappears. Admin is on
+        an unlimited tier so the attrs may be absent — admin's
+        tier_quota is null'd in /me; this test only checks the form
+        EXISTS and carries data-tier."""
+        resp = self.web.get("/account")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.text
+        # Form scaffold present.
+        self.assertIn('action="/account/invites"', body)
+        # data-tier attr is always rendered (carries the tier name).
+        self.assertIn('data-tier="', body)
+        # Both image-cap input AND its placeholder tip span exist.
+        self.assertIn('name="daily_quota_images"', body)
+        self.assertIn('id="daily_quota_images_tip"', body)
+
+    def test_forget_worker_round_trips(self):
+        """The stale-worker fix: a host clicking "forget" on a
+        registered worker row sends POST /account/workers/{id}/forget,
+        which proxies to the coordinator and removes the row. Mirrors
+        the unpair pattern."""
+        bob, member_id = self._signed_in_member("bobforget")
+        import time as _time
+        self.db.claim_worker_ownership(
+            "w_stale", member_id, "idle", _time.time(),
+        )
+        # Page renders with the worker present.
+        before = bob.get("/account").text
+        self.assertIn("w_stale", before)
+        # POST forget.
+        resp = bob.post(
+            "/account/workers/w_stale/forget", follow_redirects=False,
+        )
+        self.assertEqual(resp.status_code, 303)
+        # Flash is URL-encoded into the Location header.
+        self.assertIn("Worker", resp.headers["location"])
+        self.assertIn("forgotten", resp.headers["location"])
+        # Row is gone from the DB and the next page render.
+        self.assertIsNone(self.db.worker_owner("w_stale"))
+        after = bob.get("/account").text
+        self.assertNotIn("w_stale", after)
+
+    def test_forget_worker_owned_by_someone_else_flashes_error(self):
+        """Trying to forget a worker you don't own surfaces the
+        coordinator's 404 as a flash message rather than 500ing or
+        deleting the wrong row."""
+        bob, _ = self._signed_in_member("bobthief")
+        # Plant a worker under someone else.
+        import time as _time
+        other_id = "mem_other_owner"
+        self.db.create_member(
+            member_id=other_id, email=None, role="contributor",
+            parent_member_id=None,
+            token_hash=member_auth.hash_token(member_auth.generate_token()),
+        )
+        self.db.claim_worker_ownership(
+            "w_other", other_id, "idle", _time.time(),
+        )
+        resp = bob.post(
+            "/account/workers/w_other/forget", follow_redirects=False,
+        )
+        self.assertEqual(resp.status_code, 303)
+        # The flash carries the coordinator's "worker not found" detail.
+        self.assertIn("worker", resp.headers["location"].lower())
+        # And the row survives.
+        self.assertEqual(self.db.worker_owner("w_other"), other_id)
+
 
 if __name__ == "__main__":
     unittest.main()
