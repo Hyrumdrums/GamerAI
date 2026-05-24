@@ -29,9 +29,10 @@ class Model:
     min_vram_gb: float    # rough minimum VRAM at INT4 quantization
     license: str
     notes: str = ""
-    # "chat" (LLM) or "image" (diffusion). Most callers don't care, but
-    # routing + tool-aware validation does — an image model on a /generate
-    # call with tool="chat" should be rejected by STRICT_MODELS=true.
+    # "chat" (LLM), "image" (diffusion), or "tts" (CPU speech synth).
+    # Most callers don't care, but routing + tool-aware validation
+    # does — an image model on a /generate call with tool="chat"
+    # should be rejected by STRICT_MODELS=true.
     kind: str = "chat"
 
     @property
@@ -89,6 +90,16 @@ _CATALOG: dict[str, Model] = {
               "CreativeML Open RAIL++-M",
               "1024x1024 base; high-end contributors only; not yet on the mirror",
               kind="image"),
+        # Text-to-speech. Piper is the Phase 1 v1 choice — CPU-only,
+        # ~50 MB ONNX per voice, ~150ms first audio on a modern desktop
+        # CPU. min_vram_gb is 0 because TTS runs on the worker's CPU
+        # loop, not the GPU; params_b is the underlying VITS-style
+        # network size for the en_US-libritts-high voice. See
+        # voice-phase1 memory for why Piper over Kokoro for v1.
+        Model("piper:en_us-libritts-high", "piper", 0.025, 0.025, 0.0,
+              "MIT",
+              "CPU TTS; ~22 kHz mono PCM out, 50 MB ONNX, ~150ms first audio",
+              kind="tts"),
     )
 }
 
@@ -118,6 +129,12 @@ def list_all() -> list[Model]:
 # bootstrap and the coordinator stay in sync.
 DEFAULT_IMAGE_MODEL = "dreamshaperXL-lightning"
 
+# Default TTS voice — what /generate falls back to when tool="tts"
+# arrives with no `model` field. Same single-source-of-truth contract
+# as DEFAULT_IMAGE_MODEL: the agent's Piper bootstrap pulls this voice
+# and the coordinator's STRICT_MODELS gate accepts it.
+DEFAULT_TTS_MODEL = "piper:en_us-libritts-high"
+
 
 def is_image_model(name: str | None) -> bool:
     """True if *name* is registered as an image model. Unknown names
@@ -127,6 +144,16 @@ def is_image_model(name: str | None) -> bool:
         return False
     m = _CATALOG.get(name)
     return m is not None and m.kind == "image"
+
+
+def is_tts_model(name: str | None) -> bool:
+    """True if *name* is registered as a TTS voice. Used to gate
+    tool="tts" requests in /generate the same way is_image_model
+    gates tool="image"."""
+    if not name:
+        return False
+    m = _CATALOG.get(name)
+    return m is not None and m.kind == "tts"
 
 
 def validate_or_raise(name: str | None, *, strict: bool | None = None) -> None:

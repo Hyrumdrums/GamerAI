@@ -368,6 +368,24 @@ class DB:
                 self._conn.execute(ddl)
             except sqlite3.OperationalError:
                 pass
+        # Voice (TTS + future STT) accounting — added with the
+        # voice-phase1 slice. Same shape as image: a daily-min cap on
+        # members/invites (NULL = fall through to the tier default cap
+        # at gate time — see /generate for the precedence), and a
+        # voice_seconds REAL rollup on member_usage. Seconds rather than
+        # minutes so sub-second sentences from client-side segmentation
+        # don't round to zero; the /generate gate converts to minutes
+        # to compare against the cap.
+        for ddl in (
+            "ALTER TABLE members ADD COLUMN daily_quota_voice_minutes INTEGER",
+            "ALTER TABLE invites ADD COLUMN daily_quota_voice_minutes INTEGER",
+            "ALTER TABLE member_usage ADD COLUMN voice_seconds REAL "
+            "NOT NULL DEFAULT 0",
+        ):
+            try:
+                self._conn.execute(ddl)
+            except sqlite3.OperationalError:
+                pass
         # Tier-engine state. tier_last_changed_at gates the
         # 1-move-per-day rule (engine refuses to act on a member moved
         # within the last 24h). tier_below_threshold_since is set when
@@ -646,6 +664,7 @@ class DB:
         tier: str = "BRONZE",
         daily_quota_tokens: Optional[int] = None,
         daily_quota_images: Optional[int] = None,
+        daily_quota_voice_minutes: Optional[int] = None,
         created_at: Optional[float] = None,
         tos_accepted_at: Optional[float] = None,
         tos_version: Optional[str] = None,
@@ -655,8 +674,9 @@ class DB:
             self._conn.execute(
                 "INSERT INTO members (member_id, email, role, parent_member_id, "
                 "token_hash, tier, daily_quota_tokens, daily_quota_images, "
+                "daily_quota_voice_minutes, "
                 "created_at, tos_accepted_at, tos_version) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     member_id,
                     email,
@@ -666,6 +686,7 @@ class DB:
                     tier,
                     daily_quota_tokens,
                     daily_quota_images,
+                    daily_quota_voice_minutes,
                     now,
                     tos_accepted_at,
                     tos_version,
@@ -897,18 +918,30 @@ class DB:
         member_id: str,
         daily_quota_tokens: Optional[int],
         daily_quota_images: Optional[int],
+        daily_quota_voice_minutes: Optional[int] = None,
     ) -> bool:
-        """Replace both daily caps on a member row. Passing None for
-        either dimension means "unlimited"; passing the same value back
-        is a harmless no-op. Returns False if the member doesn't
-        exist. Revoked members are still mutable so a host can adjust
-        their cap before re-activating (re-activation is a separate
-        flow not yet implemented)."""
+        """Replace all daily caps on a member row. Passing None for
+        any dimension means "unlimited" for tokens/images, or "fall
+        through to tier default" for voice (see /generate). Passing
+        the same value back is a harmless no-op. Returns False if the
+        member doesn't exist. Revoked members are still mutable so a
+        host can adjust their cap before re-activating (re-activation
+        is a separate flow not yet implemented). The voice column is
+        kw-only with a None default so legacy callers updating only
+        tokens+images don't have to be patched all at once."""
         with self._lock:
             cur = self._conn.execute(
-                "UPDATE members SET daily_quota_tokens=?, daily_quota_images=? "
+                "UPDATE members SET "
+                "daily_quota_tokens=?, "
+                "daily_quota_images=?, "
+                "daily_quota_voice_minutes=? "
                 "WHERE member_id=?",
-                (daily_quota_tokens, daily_quota_images, member_id),
+                (
+                    daily_quota_tokens,
+                    daily_quota_images,
+                    daily_quota_voice_minutes,
+                    member_id,
+                ),
             )
             return cur.rowcount > 0
 
@@ -964,12 +997,38 @@ class DB:
                 (member_id, day, units),
             )
 
+    def add_member_voice_usage(
+        self,
+        member_id: str,
+        when: float,
+        seconds: float,
+    ) -> None:
+        """Credit ``seconds`` of synthesised (or future: transcribed)
+        audio to the submitter's voice rollup. Same shape as
+        add_member_image_usage: own column on member_usage, jobs+1 per
+        call. Stored as seconds (REAL) — the /generate gate divides by
+        60 to compare against the daily-minute cap. Sub-second
+        sentences from client-side segmentation must accumulate
+        accurately, so int-minutes would round away most of a chatty
+        conversation's usage."""
+        day = _utc_day(when)
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO member_usage "
+                "(member_id, day, tokens_in, tokens_out, voice_seconds, jobs) "
+                "VALUES (?, ?, 0, 0, ?, 1) "
+                "ON CONFLICT(member_id, day) DO UPDATE SET "
+                "voice_seconds = voice_seconds + excluded.voice_seconds, "
+                "jobs          = jobs          + 1",
+                (member_id, day, seconds),
+            )
+
     def member_usage_today(self, member_id: str, now: Optional[float] = None) -> dict:
         when = now if now is not None else time.time()
         day = _utc_day(when)
         with self._lock:
             cur = self._conn.execute(
-                "SELECT tokens_in, tokens_out, image_units, jobs "
+                "SELECT tokens_in, tokens_out, image_units, voice_seconds, jobs "
                 "FROM member_usage WHERE member_id=? AND day=?",
                 (member_id, day),
             )
@@ -980,11 +1039,13 @@ class DB:
                 "tokens_in": 0,
                 "tokens_out": 0,
                 "image_units": 0.0,
+                "voice_seconds": 0.0,
                 "jobs": 0,
             }
-        # image_units may be missing on a row predating the migration —
-        # SELECT against a freshly migrated DB always returns the column,
-        # but a row keys() check is cheaper than a try/except.
+        # image_units / voice_seconds may be missing on a row predating
+        # their respective migrations — SELECT against a freshly migrated
+        # DB always returns the columns, but the row keys() check is
+        # cheaper than a try/except and keeps test fixtures happy.
         keys = row.keys()
         return {
             "day": day,
@@ -992,6 +1053,9 @@ class DB:
             "tokens_out": int(row["tokens_out"]),
             "image_units": (
                 float(row["image_units"]) if "image_units" in keys else 0.0
+            ),
+            "voice_seconds": (
+                float(row["voice_seconds"]) if "voice_seconds" in keys else 0.0
             ),
             "jobs": int(row["jobs"]),
         }
@@ -1147,6 +1211,7 @@ class DB:
         when: float,
         new_daily_quota_tokens: Optional[int] = None,
         new_daily_quota_images: Optional[int] = None,
+        new_daily_quota_voice_minutes: Optional[int] = None,
     ) -> None:
         """Set a member's tier and stamp ``tier_last_changed_at`` so the
         next engine pass enforces the 1-move-per-day cap. The caller
@@ -1162,6 +1227,7 @@ class DB:
                 "tier=?, "
                 "daily_quota_tokens=?, "
                 "daily_quota_images=?, "
+                "daily_quota_voice_minutes=?, "
                 "tier_last_changed_at=?, "
                 "tier_below_threshold_since=NULL "
                 "WHERE member_id=?",
@@ -1169,6 +1235,7 @@ class DB:
                     new_tier,
                     new_daily_quota_tokens,
                     new_daily_quota_images,
+                    new_daily_quota_voice_minutes,
                     when,
                     member_id,
                 ),

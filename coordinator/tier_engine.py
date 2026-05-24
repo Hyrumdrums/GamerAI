@@ -284,6 +284,7 @@ class TierEngine(threading.Thread):
                 now,
                 new_daily_quota_tokens=q["tokens"],
                 new_daily_quota_images=q["images"],
+                new_daily_quota_voice_minutes=q["voice_minutes"],
             )
             log.info(json.dumps({
                 "event": "member_promoted",
@@ -330,6 +331,7 @@ class TierEngine(threading.Thread):
             now,
             new_daily_quota_tokens=q["tokens"],
             new_daily_quota_images=q["images"],
+            new_daily_quota_voice_minutes=q["voice_minutes"],
         )
         log.info(json.dumps({
             "event": "member_demoted",

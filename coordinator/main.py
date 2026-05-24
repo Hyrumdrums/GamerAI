@@ -1410,6 +1410,10 @@ _NO_SEARCH_WORKERS_MESSAGE = (
     "No search-capable community members are online right now. "
     "Please try again in a few minutes, or uncheck search."
 )
+_NO_TTS_WORKERS_MESSAGE = (
+    "No voice-capable community members are online right now. "
+    "Please try again in a few minutes, or turn off voice mode."
+)
 
 
 def _worker_advertises_tool(worker_id: str, tool: str) -> bool:
@@ -1452,6 +1456,8 @@ def _ensure_live_worker_or_503(tool: str = "chat") -> None:
         detail = _NO_IMAGE_WORKERS_MESSAGE
     elif tool == "search":
         detail = _NO_SEARCH_WORKERS_MESSAGE
+    elif tool == "tts":
+        detail = _NO_TTS_WORKERS_MESSAGE
     else:
         detail = _NO_WORKERS_MESSAGE
     raise HTTPException(status_code=503, detail=detail)
@@ -1538,7 +1544,7 @@ def generate(req: GenerateRequest, request: Request):
     if not req.prompt or not req.prompt.strip():
         raise HTTPException(status_code=400, detail="prompt required")
     tool = (req.tool or "chat").lower()
-    if tool not in ("chat", "image", "search"):
+    if tool not in ("chat", "image", "search", "tts"):
         raise HTTPException(
             status_code=400, detail=f"unknown tool: {tool!r}",
         )
@@ -1560,6 +1566,12 @@ def generate(req: GenerateRequest, request: Request):
     # concrete name. Single source of truth: model_registry.DEFAULT_IMAGE_MODEL.
     if tool == "image" and not req.model:
         req.model = model_registry.DEFAULT_IMAGE_MODEL
+    # Same shape for TTS — the v1 Piper voice is the default the
+    # agent's bootstrap pulls, so naming it here keeps coordinator and
+    # agent in sync. Voice mode on the client never picks a model
+    # explicitly today.
+    if tool == "tts" and not req.model:
+        req.model = model_registry.DEFAULT_TTS_MODEL
 
     # optional model-registry validation (off unless STRICT_MODELS=true)
     try:
@@ -1650,6 +1662,27 @@ def generate(req: GenerateRequest, request: Request):
                             f"{used_units:g} / {cap} image-units used today"
                         ),
                     )
+        elif tool == "tts":
+            # Voice cap precedence: explicit per-member override wins;
+            # otherwise the tier's default voice_minutes from
+            # tiers.TIER_QUOTAS. Different from tokens/images (where
+            # NULL = unlimited) because voice ships with tier-driven
+            # defaults — see voice-phase1 design memory. Admin is
+            # always unlimited regardless of column value.
+            if member.role != "admin":
+                cap = member.daily_quota_voice_minutes
+                if cap is None:
+                    cap = _tier_quota_for(member.tier).get("voice_minutes")
+                if cap is not None and cap > 0:
+                    used_min = usage_today["voice_seconds"] / 60.0
+                    if used_min >= cap:
+                        raise HTTPException(
+                            status_code=429,
+                            detail=(
+                                f"daily voice quota exceeded: "
+                                f"{used_min:.1f} / {cap} voice-minutes used today"
+                            ),
+                        )
         else:
             cap = member.daily_quota_tokens
             if cap is not None and cap > 0:
@@ -2649,6 +2682,20 @@ def complete(req: JobCompleteRequest, request: Request):
         # equivalent of a 200-token chat completion. Replaced by per-
         # image pricing in Phase 3b.ii.
         earnings = round(200 * RATE_PER_TOKEN * WORKER_SHARE, 10)
+    if pre_complete_tool == "tts" and req.status == "complete":
+        # TTS earnings model: pay per-second of audio produced rather
+        # than per-token, since the unit of work the contributor is
+        # selling is "audio you can listen to" not "tokens you can
+        # read." 50 token-equivalents per audio-second lands a 5-second
+        # sentence at the same payout as a 250-token chat completion,
+        # which roughly matches the GPU-vs-CPU work delta (Piper is
+        # cheap, so under-priced vs chat is correct). Tuned in
+        # Phase 2 once per-second TTS demand data exists; tracked in
+        # project_open_strategy_questions § 6.
+        audio_secs = float(req.audio_seconds or 0.0)
+        earnings = round(
+            audio_secs * 50.0 * RATE_PER_TOKEN * WORKER_SHARE, 10,
+        )
 
     payload = {
         "job_id": req.job_id,
@@ -2664,6 +2711,12 @@ def complete(req: JobCompleteRequest, request: Request):
     }
     if image_path:
         payload["image_path"] = image_path
+    if pre_complete_tool == "tts" and req.audio_b64:
+        # Ephemeral — never written to disk. Client reads it off
+        # /result/{job_id}, plays it, drops it. Saves a /audio/<name>
+        # round-trip per sentence, which matters for voice-mode latency.
+        payload["audio_b64"] = req.audio_b64
+        payload["audio_seconds"] = float(req.audio_seconds or 0.0)
     if req.sources:
         # Render-only data: the polling client reads it from
         # /result/{job_id} and shows it under the bubble. We don't
@@ -2764,9 +2817,14 @@ def complete(req: JobCompleteRequest, request: Request):
         and req.status == "complete"
         and image_save_error is None
     )
+    is_tts_complete = (
+        pre_complete_tool == "tts"
+        and req.status == "complete"
+    )
     is_chat_complete = (
         req.status == "complete"
         and not is_image_complete
+        and not is_tts_complete
         and tokens > 0
         and image_save_error is None
     )
@@ -2808,7 +2866,26 @@ def complete(req: JobCompleteRequest, request: Request):
                 now,
                 units=units,
             )
-    if is_chat_complete or is_image_complete:
+    elif is_tts_complete:
+        # Voice charges by the audio's playback duration, not by the
+        # worker's wall-clock synthesis time — the user thinks in
+        # "minutes of voice consumed," not "compute spent." The audio
+        # length comes from the worker's audio_seconds (Piper reports
+        # frame count / sample rate), which the agent cannot inflate
+        # without producing a longer file: the audio_b64 we just stored
+        # is the ground-truth artifact a future audit could re-measure.
+        # The tokens-equivalent for the earnings ledger mirrors the
+        # earnings rate used above (50 token-equivalents / audio-second).
+        audio_secs = float(req.audio_seconds or 0.0)
+        earnings_token_credit = int(round(audio_secs * 50.0))
+        db.add_earnings(req.worker_id, earnings_token_credit, earnings)
+        if submitter:
+            db.add_member_voice_usage(
+                submitter,
+                now,
+                seconds=audio_secs,
+            )
+    if is_chat_complete or is_image_complete or is_tts_complete:
         # mirror to redis hash for backwards compat
         existing = r.hget(WORKER_EARNINGS, req.worker_id)
         if existing:
@@ -3003,9 +3080,13 @@ def me(request: Request):
     # of tier; null out both axes so the UI shows "unlimited" instead
     # of an arbitrary BRONZE-ish percentage.
     if member.role == "admin":
-        tier_quota = {"tokens": None, "images": None}
+        tier_quota = {"tokens": None, "images": None, "voice_minutes": None}
     else:
         tier_quota = dict(_tier_quota_for(member.tier))
+    # voice_seconds → voice_minutes for display. We store seconds in
+    # member_usage so sub-second segments accumulate without rounding,
+    # but the user-facing meter is minutes — see voice-phase1 design.
+    voice_minutes_used = round(usage.get("voice_seconds", 0.0) / 60.0, 2)
     return {
         "member_id": member.member_id,
         "email": member.email,
@@ -3016,6 +3097,8 @@ def me(request: Request):
         "tier_quota": tier_quota,
         "daily_quota_tokens": member.daily_quota_tokens,
         "daily_quota_images": member.daily_quota_images,
+        "daily_quota_voice_minutes": member.daily_quota_voice_minutes,
+        "voice_minutes_today": voice_minutes_used,
         "username": member.username,
         "has_password": member.has_password,
         "password_set_at": member.password_set_at,

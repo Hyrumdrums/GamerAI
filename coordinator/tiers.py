@@ -27,6 +27,7 @@ from typing import Optional, TypedDict
 class TierQuota(TypedDict):
     tokens: Optional[int]
     images: Optional[int]
+    voice_minutes: Optional[int]
 
 
 class TierRequirement(TypedDict):
@@ -35,11 +36,16 @@ class TierRequirement(TypedDict):
 
 
 TIER_QUOTAS: dict[str, TierQuota] = {
-    "BRONZE":   {"tokens":    100_000, "images":   20},
-    "SILVER":   {"tokens":    500_000, "images":  100},
-    "GOLD":     {"tokens":  2_000_000, "images":  500},
-    "PLATINUM": {"tokens": 10_000_000, "images": 2500},
+    "BRONZE":   {"tokens":    100_000, "images":   20, "voice_minutes":  30},
+    "SILVER":   {"tokens":    500_000, "images":  100, "voice_minutes": 120},
+    "GOLD":     {"tokens":  2_000_000, "images":  500, "voice_minutes": 360},
+    "PLATINUM": {"tokens": 10_000_000, "images": 2500, "voice_minutes": 720},
 }
+# voice_minutes is a *lump* daily cap covering TTS output + future
+# server-side STT input — see voice-phase1 design memory for why one
+# bucket spans both directions. Ratios tighten at the top (3-4× per
+# step vs 5× for tokens/images) because 1440 min/day caps the space:
+# PLATINUM 720 is already half a contributor's waking life.
 
 # What each tier asks of its contributors. Numbers picked for an
 # uptime-first promotion ladder:

@@ -109,11 +109,18 @@ def job_queue_for(tool: str) -> str:
     Image jobs go to a dedicated queue so chat-only workers (the
     majority of the network) never pick one up and fail. Search jobs
     likewise get their own queue — a chat-only agent without the ddgs
-    dependency installed would error out on tool=search."""
+    dependency installed would error out on tool=search. TTS jobs
+    ride their own queue because (a) the agent's CPU TTS loop polls
+    only this key, decoupled from the GPU chat/image loop so the two
+    can run concurrently on the same worker (see voice-phase1 design),
+    and (b) workers that haven't bootstrapped Piper must not accidentally
+    BLPOP an audio job they can't fulfil."""
     if tool == "image":
         return "job_queue:image"
     if tool == "search":
         return "job_queue:search"
+    if tool == "tts":
+        return "job_queue:tts"
     return JOB_QUEUE
 JOB_RESULTS = "job_results"
 JOB_PROCESSING = "job_processing"

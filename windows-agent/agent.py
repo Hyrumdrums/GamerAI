@@ -1363,6 +1363,15 @@ DEFAULTS = {
         # populated by infra/setup-image-mirror.sh.
         "image_enabled": True,
         "image_model": "dreamshaperXL-lightning",
+        # TTS bootstrap (Phase 1 voice feature). Best-effort: failure
+        # leaves the agent serving chat/image only. Downloads the
+        # piper runtime zip + the default voice .onnx/.onnx.json from
+        # the mirror (setup-tts-mirror.sh). CPU-only — does not
+        # contend with the GPU loop, so a worker can serve TTS while
+        # mid-chat (see voice-phase1 design memory for the dual-loop
+        # rationale).
+        "tts_enabled": True,
+        "tts_model": "piper:en_us-libritts-high",
     },
     "model": None,
     "worker_id": None,
@@ -1388,6 +1397,8 @@ class Config:
     bootstrap_mirror_base_url: Optional[str]
     bootstrap_image_enabled: bool
     bootstrap_image_model: str
+    bootstrap_tts_enabled: bool
+    bootstrap_tts_model: str
     model: Optional[str]
     worker_id: Optional[str]
     api_token: Optional[str]
@@ -1462,6 +1473,10 @@ class Config:
             ),
             bootstrap_image_enabled=bool(bootstrap.get("image_enabled", False)),
             bootstrap_image_model=str(bootstrap.get("image_model", "dreamshaperXL-lightning")),
+            bootstrap_tts_enabled=bool(bootstrap.get("tts_enabled", False)),
+            bootstrap_tts_model=str(
+                bootstrap.get("tts_model", "piper:en_us-libritts-high")
+            ),
             model=data.get("model"),
             worker_id=data.get("worker_id"),
             api_token=token or None,
@@ -2674,6 +2689,232 @@ def _sweep_stale_image_models(active_slug: str, log: logging.Logger) -> None:
             log.warning("image bootstrap: could not remove %s (%s)", entry.name, exc)
 
 
+# ---------------------------------------------------------------------------
+# TTS bootstrap (Phase 1 voice feature, see voice-phase1 design memory)
+#
+# Same shape as the image bootstrap: pulls a runtime + a voice model
+# from the coordinator's mirror, persists under state_dir()/tts so a
+# user cleaning up has one folder to remove. Differences from image:
+#   1. Runtime arrives as a zip (piper.exe + onnxruntime.dll +
+#      espeak-ng-data/) — too many small files in espeak-ng-data to
+#      flat-serve. We unzip once on first run.
+#   2. Voice slugs use "piper:en_us-libritts-high" in the registry —
+#      the colon is invalid on NTFS, so we substitute "__" when
+#      mapping slug → filesystem path. The slug stays canonical in
+#      the registry, capability list, and stdin commands.
+#   3. CPU-only — does not contend with the image GPU loop.
+# ---------------------------------------------------------------------------
+
+def tts_install_dir() -> Path:
+    d = state_dir() / "tts"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def tts_voices_dir() -> Path:
+    d = tts_install_dir() / "voices"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def tts_binary_path() -> Path:
+    return tts_install_dir() / "piper.exe"
+
+
+def _tts_slug_to_fs(slug: str) -> str:
+    """Map a registry slug ("piper:en_us-libritts-high") to a
+    filesystem-safe name ("piper__en_us-libritts-high"). Colon is
+    legal on Linux but is the NTFS alt-stream separator on Windows,
+    so the canonical slug round-trips through this on every filesystem
+    touch. Mirrors the substitution in setup-tts-mirror.sh."""
+    return slug.replace(":", "__")
+
+
+def tts_voice_path(slug: str) -> Path:
+    return tts_voices_dir() / f"{_tts_slug_to_fs(slug)}.onnx"
+
+
+def tts_voice_config_path(slug: str) -> Path:
+    """Upstream piper config — sample_rate, espeak voice, phoneme map.
+    Required (not best-effort): the piper binary refuses to load a
+    voice without its sibling .onnx.json."""
+    return tts_voices_dir() / f"{_tts_slug_to_fs(slug)}.onnx.json"
+
+
+def tts_sidecar_path(slug: str) -> Path:
+    """GamerAI-owned per-voice defaults (length_scale, noise_scale)
+    that are *separate* from the upstream config so we can tune pacing
+    without mutating Piper's distributed file. Mirrors the image
+    sidecar shape."""
+    return tts_voices_dir() / f"{_tts_slug_to_fs(slug)}.json"
+
+
+# Piper invocation defaults. length_scale=1.0 is natural pace;
+# noise_scale + noise_w control phoneme variation (higher = more
+# expressive but less predictable). Falls back to these when the
+# sidecar JSON is missing or malformed.
+_TTS_DEFAULTS_FALLBACK = {
+    "sample_rate": 22050,
+    "default_length_scale": 1.0,
+    "default_noise_scale": 0.667,
+    "default_noise_w": 0.8,
+}
+
+
+def load_tts_voice_defaults(slug: str, log: logging.Logger) -> dict:
+    """Read tts-voices/<slug>.json (our sidecar) and return the
+    length/noise/sample-rate defaults to feed Piper. Tolerates missing
+    or malformed files — falls back to the Piper-recommended values so
+    inference still runs."""
+    path = tts_sidecar_path(slug)
+    if not path.exists():
+        return dict(_TTS_DEFAULTS_FALLBACK)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        log.warning("tts: sidecar %s unreadable (%s) — using fallback", path, exc)
+        return dict(_TTS_DEFAULTS_FALLBACK)
+    merged = dict(_TTS_DEFAULTS_FALLBACK)
+    for k in _TTS_DEFAULTS_FALLBACK:
+        if k in data:
+            merged[k] = data[k]
+    return merged
+
+
+# Marker file dropped after a successful unzip so subsequent runs can
+# skip the (idempotent but slow) extract step. Touched with the URL
+# the zip came from so a mirror_base_url change invalidates the cache.
+_TTS_RUNTIME_MARKER = "piper-runtime.installed"
+
+
+def bootstrap_tts_inference(cfg: "Config", log: logging.Logger) -> bool:
+    """Make sure piper.exe + espeak-ng-data + the default voice ONNX
+    are ready. Returns True on success, False (best-effort) on failure
+    — caller drops "tts" from advertised capabilities and the agent
+    keeps serving chat/image.
+
+    Three phases:
+      1. Download piper-runtime.zip (~30 MB) and unzip if marker is
+         missing or stale.
+      2. Download <voice>.onnx + <voice>.onnx.json (~75 MB combined
+         for libritts-high).
+      3. Download our sidecar JSON (best-effort; fallback defaults
+         kick in if absent).
+    """
+    if not cfg.bootstrap_tts_enabled:
+        log.info("tts bootstrap: disabled in config — skipping")
+        return False
+    if not IS_WINDOWS:
+        log.info("tts bootstrap: not on Windows — skipping (dev mode)")
+        return False
+    mirror_base = (cfg.bootstrap_mirror_base_url or cfg.coordinator_url).rstrip("/")
+    install_dir = tts_install_dir()
+    marker = install_dir / _TTS_RUNTIME_MARKER
+    runtime_url = f"{mirror_base}/download/piper-runtime.zip"
+    marker_payload = runtime_url + "\n"
+    needs_runtime = (
+        not tts_binary_path().exists()
+        or not marker.exists()
+        or marker.read_text(encoding="utf-8", errors="replace") != marker_payload
+    )
+    if needs_runtime:
+        zip_path = install_dir / "piper-runtime.zip"
+        log.info(
+            "tts bootstrap: pulling runtime from %s (~30 MB; first-run "
+            "extract includes espeak-ng phoneme data)",
+            runtime_url,
+        )
+        if not _download_to(runtime_url, zip_path, log, "piper-runtime.zip"):
+            return False
+        try:
+            import zipfile
+            with zipfile.ZipFile(zip_path) as zf:
+                # Upstream layout is "piper/piper.exe" + siblings. We
+                # flatten so piper.exe lands directly in install_dir
+                # alongside espeak-ng-data/ — matches sd.exe shape and
+                # keeps the binary callable by tts_binary_path().
+                for member in zf.namelist():
+                    # zipfile names use forward slashes regardless of
+                    # platform; strip a leading "piper/" prefix.
+                    rel = member.split("/", 1)[1] if "/" in member else member
+                    if not rel:
+                        continue  # the directory entry itself
+                    dest = install_dir / rel
+                    if member.endswith("/"):
+                        dest.mkdir(parents=True, exist_ok=True)
+                        continue
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    with zf.open(member) as src, open(dest, "wb") as out:
+                        out.write(src.read())
+            marker.write_text(marker_payload, encoding="utf-8")
+        except (OSError, zipfile.BadZipFile) as exc:
+            log.warning("tts bootstrap: extract failed (%s)", exc)
+            return False
+        finally:
+            try:
+                zip_path.unlink()
+            except OSError:
+                pass
+    voice_path = tts_voice_path(cfg.bootstrap_tts_model)
+    voice_config_path = tts_voice_config_path(cfg.bootstrap_tts_model)
+    fs_slug = _tts_slug_to_fs(cfg.bootstrap_tts_model)
+    if not voice_path.exists():
+        url = f"{mirror_base}/download/tts-voices/{fs_slug}.onnx"
+        log.info(
+            "tts bootstrap: voice %s not found; downloading from %s",
+            cfg.bootstrap_tts_model, url,
+        )
+        if not _download_to(url, voice_path, log, f"{fs_slug}.onnx"):
+            return False
+    if not voice_config_path.exists():
+        url = f"{mirror_base}/download/tts-voices/{fs_slug}.onnx.json"
+        if not _download_to(url, voice_config_path, log, f"{fs_slug}.onnx.json"):
+            # Without the config Piper refuses to load — fail bootstrap
+            # cleanly so the agent advertises chat only.
+            return False
+    sidecar_path = tts_sidecar_path(cfg.bootstrap_tts_model)
+    if not sidecar_path.exists():
+        url = f"{mirror_base}/download/tts-voices/{fs_slug}.json"
+        # Best-effort — load_tts_voice_defaults falls back if absent.
+        _download_to(url, sidecar_path, log, f"{fs_slug}.json")
+    _sweep_stale_tts_voices(cfg.bootstrap_tts_model, log)
+    log.info(
+        "tts bootstrap: ready (install_dir=%s, voice=%s)",
+        install_dir, voice_path,
+    )
+    return True
+
+
+def _sweep_stale_tts_voices(active_slug: str, log: logging.Logger) -> None:
+    """Delete voice ONNX / JSON files in tts_voices_dir() that don't
+    match the active slug. Same rationale as
+    _sweep_stale_image_models: contributor disks shouldn't accumulate
+    a 75 MB voice per swap."""
+    voices_dir = tts_voices_dir()
+    if not voices_dir.exists():
+        return
+    fs_slug = _tts_slug_to_fs(active_slug)
+    keep = {
+        f"{fs_slug}.onnx",
+        f"{fs_slug}.onnx.json",
+        f"{fs_slug}.json",
+    }
+    for entry in voices_dir.iterdir():
+        if entry.name in keep:
+            continue
+        if entry.suffix not in (".onnx", ".json"):
+            continue
+        try:
+            size_mb = entry.stat().st_size / (1024 * 1024)
+            entry.unlink()
+            log.info(
+                "tts bootstrap: removed stale %s (%.1f MB)",
+                entry.name, size_mb,
+            )
+        except OSError as exc:
+            log.warning("tts bootstrap: could not remove %s (%s)", entry.name, exc)
+
+
 def bootstrap_inference(cfg: "Config", log: logging.Logger) -> Optional[str]:
     """Make sure Ollama + the default model are ready. Returns the
     working Ollama URL on success, or None on any failure (caller
@@ -3266,6 +3507,155 @@ def _mock_image_b64() -> str:
 
 
 # ---------------------------------------------------------------------------
+# TTS inference (Piper, CPU-only)
+# ---------------------------------------------------------------------------
+
+# Piper has a few-second startup hit per invocation (ONNX session
+# warmup). For Phase 1 we eat it; Phase 2 will keep a long-lived piper
+# subprocess and pipe text into it on demand to drop first-audio
+# latency further.
+TTS_TIMEOUT_SECONDS = 60
+
+
+def run_tts_inference(
+    prompt: str,
+    job: dict,
+    cfg: "Config",
+    log: logging.Logger,
+) -> tuple[str, float, str]:
+    """Synthesize ``prompt`` to WAV audio with piper.exe and return
+    ``(base64_wav, audio_seconds, model_used)``. audio_seconds is the
+    *playback* duration (what bills against the submitter's
+    voice_minutes daily cap), measured from the WAV's data-chunk size
+    and the voice's sample rate — never from wall-clock synthesis
+    time, which would let a slow worker over-charge the user.
+
+    Mock branch (non-Windows or piper.exe missing) returns a 1-second
+    silent WAV so dev/test on Linux can still exercise the end-to-end
+    coordinator → /result flow."""
+    if not IS_WINDOWS or not tts_binary_path().exists():
+        log.info("tts: piper.exe not available — returning mock silent WAV")
+        return _mock_audio_b64(), 1.0, "mock-tts"
+    voice_slug = cfg.bootstrap_tts_model
+    defaults = load_tts_voice_defaults(voice_slug, log)
+    sample_rate = int(defaults["sample_rate"])
+    length_scale = float(defaults["default_length_scale"])
+    noise_scale = float(defaults["default_noise_scale"])
+    noise_w = float(defaults["default_noise_w"])
+    voice_path = tts_voice_path(voice_slug)
+    if not voice_path.exists():
+        raise RuntimeError(
+            f"tts voice {voice_slug}.onnx missing at {voice_path}"
+        )
+    out_path = (
+        tts_install_dir() / f"out-{os.getpid()}-{int(time.time()*1000)}.wav"
+    )
+    # Piper CLI:
+    #   piper --model voice.onnx --output_file out.wav \
+    #         --length_scale L --noise_scale N --noise_w W
+    # Reads text from stdin (one line = one utterance for our use).
+    # See https://github.com/rhasspy/piper for the full flag set.
+    argv = [
+        str(tts_binary_path()),
+        "--model", str(voice_path),
+        "--output_file", str(out_path),
+        "--length_scale", f"{length_scale:.3f}",
+        "--noise_scale", f"{noise_scale:.3f}",
+        "--noise_w", f"{noise_w:.3f}",
+    ]
+    log.info(
+        "tts: running piper.exe (voice=%s len=%.2f noise=%.2f)",
+        voice_slug, length_scale, noise_scale,
+    )
+    try:
+        result = subprocess.run(
+            argv,
+            input=prompt,
+            timeout=TTS_TIMEOUT_SECONDS,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        try:
+            out_path.unlink()
+        except OSError:
+            pass
+        raise RuntimeError(
+            f"piper.exe timed out after {TTS_TIMEOUT_SECONDS}s"
+        )
+    if result.returncode != 0:
+        snippet = (result.stderr or result.stdout or "").strip()[:500]
+        raise RuntimeError(
+            f"piper.exe failed (rc={result.returncode}): {snippet}"
+        )
+    if not out_path.exists():
+        raise RuntimeError("piper.exe completed but produced no WAV output")
+    try:
+        data = out_path.read_bytes()
+    finally:
+        try:
+            out_path.unlink()
+        except OSError:
+            pass
+    if not data:
+        raise RuntimeError("piper.exe wrote an empty WAV")
+    audio_seconds = _wav_duration_seconds(data, sample_rate)
+    import base64 as _b64
+    return _b64.b64encode(data).decode("ascii"), audio_seconds, voice_slug
+
+
+def _wav_duration_seconds(wav_bytes: bytes, fallback_sample_rate: int) -> float:
+    """Compute WAV playback duration from the file's data-chunk size
+    and bytes-per-frame, using the stdlib wave module. Falls back to
+    a sample-rate-only estimate if the header is malformed, since a
+    bogus duration is better than crashing the job. The voice cap
+    enforcement reads this number, so accuracy matters for billing —
+    a worker that wrote a 5-second clip can't claim 50 seconds."""
+    try:
+        import io
+        import wave
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+            frames = wf.getnframes()
+            rate = wf.getframerate() or fallback_sample_rate
+            if rate <= 0:
+                return 0.0
+            return frames / float(rate)
+    except (wave.Error, EOFError, OSError):
+        # Rough fallback: assume 16-bit mono at fallback rate. Off by
+        # a constant factor if the voice is actually stereo or
+        # different bit depth, but never wildly wrong.
+        if fallback_sample_rate <= 0:
+            return 0.0
+        body_bytes = max(len(wav_bytes) - 44, 0)  # 44 = standard WAV header
+        return body_bytes / float(fallback_sample_rate * 2)
+
+
+# Minimal valid WAV: 44-byte header + 1s of silence at 22050 Hz mono
+# 16-bit. Computed once at module load so the mock path doesn't
+# rebuild it on every job. Used to keep the end-to-end /result flow
+# testable on Linux dev boxes where piper.exe isn't present.
+def _build_mock_wav() -> bytes:
+    import io
+    import wave
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(22050)
+        wf.writeframes(b"\x00\x00" * 22050)
+    return buf.getvalue()
+
+
+_MOCK_WAV_BYTES = _build_mock_wav()
+_MOCK_WAV_B64 = __import__("base64").b64encode(_MOCK_WAV_BYTES).decode("ascii")
+
+
+def _mock_audio_b64() -> str:
+    return _MOCK_WAV_B64
+
+
+# ---------------------------------------------------------------------------
 # Idle gate
 # ---------------------------------------------------------------------------
 def is_system_idle(cfg: Config) -> tuple[bool, str]:
@@ -3529,20 +3919,29 @@ def _ordered_queues(
 ) -> list[str]:
     """Per-tool poll order for one main-loop tick.
 
-    Defaults to ["chat"]; appends "image" / "search" when the agent
-    advertises them. Promotes the agent's *last-served* tool to the
-    front so back-to-back jobs of the same kind keep the model warm
-    in VRAM — a chat streak keeps Ollama hot; an image streak keeps
-    sd.cpp's weights loaded; a search streak skips the cold-cache hit
-    on trafilatura's lazy imports. The flip only happens when the
-    preferred queue is empty AND another queue has work, so demand-
-    shaped routing still falls out naturally without any coordinator-
-    side state."""
+    Defaults to ["chat"]; appends "image" / "search" / "tts" when the
+    agent advertises them. Promotes the agent's *last-served* tool to
+    the front so back-to-back jobs of the same kind keep the model
+    warm in VRAM — a chat streak keeps Ollama hot; an image streak
+    keeps sd.cpp's weights loaded; a search streak skips the cold-
+    cache hit on trafilatura's lazy imports. The flip only happens
+    when the preferred queue is empty AND another queue has work, so
+    demand-shaped routing still falls out naturally without any
+    coordinator-side state.
+
+    TTS is here for the *single-loop* path. The dual-loop architecture
+    (voice-phase1) ultimately wants TTS on its own dedicated CPU loop
+    so it doesn't queue behind chat — that's tracked separately. For
+    now, advertising tts here means the same main loop will pick up
+    TTS jobs when the GPU loop is idle, which is correct for a
+    1-worker / 1-user testbed."""
     available = ["chat"]
     if tools and "image" in tools:
         available.append("image")
     if tools and "search" in tools:
         available.append("search")
+    if tools and "tts" in tools:
+        available.append("tts")
     if last_tool in available and last_tool != available[0]:
         return [last_tool] + [t for t in available if t != last_tool]
     return available
@@ -3628,6 +4027,48 @@ def process_one(
             else:
                 log.info(
                     "job %s (image): %.2fs of work discarded — "
+                    "claim was superseded or cancelled",
+                    job_id, duration,
+                )
+        elif tool == "tts":
+            audio_b64, audio_seconds, model_used = run_tts_inference(
+                prompt, job, cfg, log,
+            )
+            duration = round(time.time() - started, 3)
+            accepted, out = coord.complete(
+                {
+                    "worker_id": coord.worker_id,
+                    "job_id": job_id,
+                    # The prompt is what the user asked us to read
+                    # aloud; echo a snippet back so the result row
+                    # has a human-readable handle in the admin UI.
+                    "text": prompt[:200],
+                    "model": model_used,
+                    "prompt_tokens": estimate_tokens(prompt),
+                    "completion_tokens": 0,
+                    "duration_seconds": duration,
+                    "status": "complete",
+                    "audio_b64": audio_b64,
+                    "audio_seconds": audio_seconds,
+                },
+                claim_token=claim_token,
+            )
+            if accepted:
+                earnings = float((out or {}).get("earnings", 0.0))
+                state["jobs"] = int(state.get("jobs", 0)) + 1
+                state["earnings_usd"] = round(
+                    float(state.get("earnings_usd", 0.0)) + earnings, 10,
+                )
+                state["last_tool"] = "tts"
+                save_state(state)
+                log.info(
+                    "job %s finished (tts): %.2fs audio, $%.8f, "
+                    "%.2fs synth",
+                    job_id, audio_seconds, earnings, duration,
+                )
+            else:
+                log.info(
+                    "job %s (tts): %.2fs of work discarded — "
                     "claim was superseded or cancelled",
                     job_id, duration,
                 )
@@ -4698,6 +5139,18 @@ def main(argv: Optional[list[str]] = None) -> int:
             "(chat only)"
         )
 
+    # TTS bootstrap (Phase 1 voice feature; see voice-phase1 design).
+    # Best-effort like image: failure drops "tts" from advertised
+    # capabilities, agent keeps serving chat/image. Quiet failure —
+    # voice is additive, so it doesn't warrant the loud partial-
+    # contributor banner above.
+    tts_ready = bootstrap_tts_inference(cfg, log)
+    if not tts_ready and cfg.bootstrap_tts_enabled:
+        log.warning(
+            "tts bootstrap failed — voice jobs will not route to "
+            "this worker (chat / image still served)"
+        )
+
     coord = Coordinator(cfg.coordinator_url, worker_id, log, cfg.api_token)
     # Advertise the model and tools we can actually serve. The chat
     # bootstrap above either confirmed the model is loaded into Ollama
@@ -4711,11 +5164,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     # at startup so an agent built without those wheels (e.g. a
     # custom pyinstaller spec that excluded them) advertises chat
     # without search and the coordinator never hands it a search job.
+    # TTS is its own capability (CPU-only Piper) — see voice-phase1.
     tools = ["chat"]
     if image_ready:
         tools.append("image")
     if _search_deps_available(log):
         tools.append("search")
+    if tts_ready:
+        tools.append("tts")
     capabilities: Optional[dict] = None
     if cfg.bootstrap_enabled and os.getenv("OLLAMA_URL"):
         capabilities = {"models": [cfg.bootstrap_model], "tools": tools}

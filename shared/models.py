@@ -24,10 +24,12 @@ class ImageParams(BaseModel):
 class GenerateRequest(BaseModel):
     prompt: str
     model: Optional[str] = None
-    # "chat" (default, legacy), "image", or "search". Each tool routes
-    # to its own Redis queue and is only picked up by workers that
-    # advertise the matching capability — chat-only agents never get
-    # handed an image or search job.
+    # "chat" (default, legacy), "image", "search", or "tts". Each tool
+    # routes to its own Redis queue and is only picked up by workers
+    # that advertise the matching capability — chat-only agents never
+    # get handed an image / search / tts job. TTS rides on the
+    # contributor's CPU loop (Piper, see voice-phase1), so a worker
+    # mid-chat can serve TTS concurrently from its idle CPU.
     tool: str = "chat"
     # Image-only knobs. Ignored for tool="chat" / "search". When
     # tool="image" and omitted, the model's defaults are used.
@@ -155,6 +157,19 @@ class JobCompleteRequest(BaseModel):
     # validates the PNG header, writes to /data/images/<job_id>.png,
     # and stamps the message's image_path. Empty/absent on chat jobs.
     image_b64: Optional[str] = None
+    # For tts jobs: the synthesized audio (Opus/ogg) as base64. Unlike
+    # images, TTS audio is ephemeral — the coordinator stuffs it into
+    # JOB_RESULTS for the client to play and never persists to disk.
+    # Empty/absent on chat / image / search jobs.
+    audio_b64: Optional[str] = None
+    # For tts jobs: the playback duration of the synthesized audio,
+    # measured by the worker. This is what bills against the user's
+    # voice_minutes daily cap (NOT duration_seconds, which is wall-
+    # clock synthesis time and unrelated to perceived "minutes of
+    # voice consumed"). Float so sub-second sentences carry their
+    # real cost — client-side segmentation produces a lot of short
+    # clauses that would round to zero in integer minutes.
+    audio_seconds: Optional[float] = None
     # For search jobs: ordered list of citations matching the [1][2]
     # references in ``text``. Each entry is {"n": int, "title": str,
     # "url": str, "domain": str}. Coordinator stores these on

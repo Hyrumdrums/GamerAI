@@ -146,6 +146,11 @@ class Member:
     tier: str
     daily_quota_tokens: Optional[int]
     daily_quota_images: Optional[int]
+    # NULL on this column means "fall through to the tier default cap"
+    # at /generate gate time — different precedence from tokens/images
+    # where NULL = unlimited. See voice-phase1 design memory for why
+    # voice quotas are tier-driven rather than invite-customised.
+    daily_quota_voice_minutes: Optional[int]
     revoked_at: Optional[float]
     created_at: float
     tos_accepted_at: Optional[float] = None
@@ -167,6 +172,10 @@ def _row_to_member(row) -> Member:
     daily_image_cap_raw = (
         row["daily_quota_images"] if "daily_quota_images" in keys else None
     )
+    daily_voice_cap_raw = (
+        row["daily_quota_voice_minutes"]
+        if "daily_quota_voice_minutes" in keys else None
+    )
     return Member(
         member_id=row["member_id"],
         email=row["email"],
@@ -180,6 +189,9 @@ def _row_to_member(row) -> Member:
         ),
         daily_quota_images=(
             int(daily_image_cap_raw) if daily_image_cap_raw is not None else None
+        ),
+        daily_quota_voice_minutes=(
+            int(daily_voice_cap_raw) if daily_voice_cap_raw is not None else None
         ),
         revoked_at=float(row["revoked_at"]) if row["revoked_at"] is not None else None,
         created_at=float(row["created_at"]),

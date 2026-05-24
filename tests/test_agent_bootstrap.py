@@ -146,6 +146,8 @@ class BootstrapInferenceShortCircuitTests(unittest.TestCase):
             bootstrap_mirror_base_url=None,
             bootstrap_image_enabled=True,
             bootstrap_image_model="sd1.5",
+            bootstrap_tts_enabled=False,
+            bootstrap_tts_model="piper:en_us-libritts-high",
             model=None,
             worker_id=None,
             api_token=None,
