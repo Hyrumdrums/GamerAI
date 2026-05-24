@@ -1303,7 +1303,7 @@ DEFAULTS = {
         # {mirror_base}/download/sd-models/<slug>.gguf. The mirror is
         # populated by infra/setup-image-mirror.sh.
         "image_enabled": True,
-        "image_model": "dreamshaper8",
+        "image_model": "dreamshaperXL-lightning",
     },
     "model": None,
     "worker_id": None,
@@ -1402,7 +1402,7 @@ class Config:
                 else None
             ),
             bootstrap_image_enabled=bool(bootstrap.get("image_enabled", False)),
-            bootstrap_image_model=str(bootstrap.get("image_model", "dreamshaper8")),
+            bootstrap_image_model=str(bootstrap.get("image_model", "dreamshaperXL-lightning")),
             model=data.get("model"),
             worker_id=data.get("worker_id"),
             api_token=token or None,
@@ -3061,6 +3061,14 @@ def run_image_inference(
         "--steps", str(steps),
         "--cfg-scale", str(cfg_scale),
         "--sampling-method", sampler,
+        # Tiled VAE decode. SDXL-class models at 1024² peak ~5.5–6 GB
+        # of VRAM through the VAE step; without tiling, 6 GB cards
+        # (1660 Ti / 3060 6 GB / 4050) OOM at decode time on an
+        # otherwise-fine generation. Tiling lowers the peak by ~1 GB
+        # at a small (~5 %) speed cost, which is the right trade for
+        # the floor of our advertised contributor tier. Harmless on
+        # SD 1.5 / dreamshaper8 (VAE fits well below the threshold).
+        "--vae-tiling",
         "-o", str(out_path),
     ]
     if seed is not None:

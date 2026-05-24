@@ -248,12 +248,14 @@ and its own failure modes worth knowing.
 | Artifact | Path | Owner | When it changes |
 |---|---|---|---|
 | `sd.exe` + `stable-diffusion.dll` | `/var/www/downloads-chroot/uploads/{sd.exe,stable-diffusion.dll}` | `infra/setup-image-mirror.sh` | Only when bumping the pinned sd.cpp version |
-| `sd-models/sd1.5.gguf` (~1.5 GB) | `/var/www/downloads-chroot/uploads/sd-models/sd1.5.gguf` | `infra/setup-image-mirror.sh` | Only when swapping the default image model |
+| `sd-models/dreamshaperXL-lightning.gguf` (~5 GB) | `/var/www/downloads-chroot/uploads/sd-models/dreamshaperXL-lightning.gguf` | `infra/setup-image-mirror.sh` | Current default; ship a new GGUF here to swap |
+| `sd-models/dreamshaper8.gguf` (~0.9 GB) | `/var/www/downloads-chroot/uploads/sd-models/dreamshaper8.gguf` | `infra/setup-image-mirror.sh` | Kept as a legacy 4 GB-tier fallback; do not delete |
+| `sd-models/sd1.5.gguf` (~1.5 GB) | `/var/www/downloads-chroot/uploads/sd-models/sd1.5.gguf` | `infra/setup-image-mirror.sh` | Vanilla baseline kept for debugging |
 | Generated PNGs | `/opt/gamerai/data/images/<job_id>.png` on the VPS | Coordinator, on `/jobs/complete` | One per image job; never rotated yet |
 
 The mirror script runs as a one-shot on the VPS — it's not part of
 the docker compose deploy. Re-run it whenever you bump the pinned
-sd.cpp release or rotate the model file.
+sd.cpp release or add/rotate a model file.
 
 ### Bootstrap or refresh the mirror
 
@@ -263,10 +265,59 @@ sudo /opt/gamerai/infra/setup-image-mirror.sh
 ```
 
 Idempotent — re-running skips downloads when files are non-empty.
-Set `FORCE=1` to redownload. Defaults source the SD 1.5 GGUF from
-a local file path (`/home/beargroup/ai/models/sd/...`); override
-`DEFAULT_MODEL_SRC=<vps-path>` or `DEFAULT_MODEL_URL=<https://...>`
-to source elsewhere if you don't already have the file on the box.
+Set `FORCE=1` to redownload. Per-model source files live under
+`/home/beargroup/ai/models/sd/` on the VPS; the script copies them
+into the mirror and writes a sidecar JSON (`<slug>.json`) carrying
+the per-model defaults (steps, cfg scale, sampler, native resolution).
+If a model's source file is missing, the script warns and skips that
+entry — safe to commit a catalog row before staging the file.
+
+### Rolling out the SDXL Lightning default
+
+Default since v1.1.27. `coordinator/model_registry.DEFAULT_IMAGE_MODEL`
+points at `dreamshaperXL-lightning`, and the agent's `DEFAULTS` dict
+in `windows-agent/agent.py` ships the same slug. Existing
+contributors auto-migrate on their next agent restart: the bootstrap
+notices `<slug>.gguf` is missing, downloads it, and
+`_sweep_stale_image_models` deletes the previous model GGUF/sidecar
+from disk so each agent only carries one model at a time. The VPS
+mirror keeps every entry — `dreamshaper8` stays online as a fallback
+GGUF a contributor can pin via `bootstrap.image_model` in their
+local `config.json` if their card is below the 6 GB tier.
+
+Deploying a new GGUF on the VPS:
+
+```bash
+# 1. Stage the GGUF on the box (the catalog row's <local-src>
+#    column tells you where it expects to find each one):
+scp dreamshaperXL_lightning-Q4_K_M.gguf \
+    root@ai.dallinlayton.com:/home/beargroup/ai/models/sd/
+
+# 2. Pull the matching coordinator code so the agent default,
+#    registry, and seeder all reference the same slug:
+ssh root@ai.dallinlayton.com 'cd /opt/gamerai && git pull && \
+  docker compose up -d --build coordinator'
+
+# 3. Re-run the mirror seeder. It copies the new GGUF in,
+#    writes the sidecar JSON (steps=6, cfg=1.5, sampler=euler,
+#    1024×1024), and leaves the prior models in place:
+ssh root@ai.dallinlayton.com 'sudo /opt/gamerai/infra/setup-image-mirror.sh'
+
+# 4. Verify from a client:
+curl -I https://ai.dallinlayton.com/download/sd-models/dreamshaperXL-lightning.gguf
+curl -I https://ai.dallinlayton.com/download/sd-models/dreamshaperXL-lightning.json
+```
+
+Sourcing the GGUF: SDXL Lightning is widely converted to GGUF on
+Hugging Face (e.g. `city96/DreamShaper-XL-Lightning-GGUF` or any
+equivalent Q4_K_M Lightning fine-tune). Confirm the magic bytes
+read `GGUF`; the seeder rejects mis-typed files automatically.
+
+Rollback: bump `DEFAULT_IMAGE_MODEL` back to `dreamshaper8` in
+`coordinator/model_registry.py` and the matching `DEFAULTS` slug in
+`windows-agent/agent.py`, redeploy. Contributors' next agent restart
+re-downloads the old GGUF from the mirror — no manual cleanup
+needed.
 
 ### Diagnosing an image job that errors
 
@@ -286,8 +337,9 @@ to source elsewhere if you don't already have the file on the box.
 
 ### `/data/images` rotation
 
-There is none yet. PNGs accumulate forever, ~1.5 MB each at the
-default 512×512. At 100 images/day that's ~50 GB/year. Worth
+There is none yet. PNGs accumulate forever; the SDXL Lightning
+default emits ~2.5–3 MB PNGs at 1024×1024 (vs ~1.5 MB at the legacy
+512×512). At 100 images/day that's ~100 GB/year. Worth
 adding a nightly job to drop images older than 90 days (or
 archive to S3) once the network has enough volume to feel it.
 Until then: `du -sh /opt/gamerai/data/images/` is the canary.

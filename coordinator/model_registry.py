@@ -61,15 +61,25 @@ _CATALOG: dict[str, Model] = {
         Model("phi3:14b",     "phi",      14.0,  14.0,  10.0, "MIT"),
         # Image-generation models. params_b is the unet+text-encoder
         # parameter count (estimate); min_vram_gb is the rough Q4 GGUF
-        # requirement for 512×512 generation. DreamShaper 8 LCM is the
-        # mirror default — versatile community fine-tune, runs in 8
-        # steps thanks to LCM distillation (~8s on a 1660 Ti vs ~20s
-        # for vanilla SD1.5 at 20 steps). Vanilla sd1.5 stays around as
-        # a debugging fallback. SDXL is registered but the mirror only
-        # serves it once we promote it (see infra/setup-image-mirror.sh).
+        # requirement at the model's native resolution. DreamShaper XL
+        # Lightning is the current mirror default — SDXL-derived,
+        # Lightning-distilled (4–8 steps at cfg≈1.5), native 1024×1024,
+        # comfortably the best SFW-leaning result we can run on the
+        # 6 GB contributor tier. The smaller SD1.5 entries stay
+        # registered so older catalog references and the mirror's
+        # fallback GGUF keep working — they're not removed from the
+        # VPS, just demoted. SDXL base remains a stub for future
+        # high-VRAM tier work.
+        Model("dreamshaperXL-lightning", "dreamshaper-xl-lightning",
+              3.5, 3.5, 6.0,
+              "CreativeML Open RAIL++-M",
+              "Q4_K_M GGUF; SDXL Lightning fine-tune (6 steps, cfg≈1.5); "
+              "mirror default; native 1024×1024; ~12–20s/image on a 1660 Ti",
+              kind="image"),
         Model("dreamshaper8", "dreamshaper-8-lcm", 0.86, 0.86, 4.0,
               "CreativeML Open RAIL-M",
-              "iq4_nl GGUF; LCM-distilled (8 steps); mirror default; ~8s/image on a 1660 Ti",
+              "iq4_nl GGUF; LCM-distilled (8 steps); legacy 6 GB-tier "
+              "fallback; ~8s/image on a 1660 Ti",
               kind="image"),
         Model("sd1.5",  "stable-diffusion-1.5", 0.86, 0.86, 4.0,
               "CreativeML Open RAIL-M",
@@ -77,7 +87,7 @@ _CATALOG: dict[str, Model] = {
               kind="image"),
         Model("sdxl",   "stable-diffusion-xl",  3.5,  3.5,  8.0,
               "CreativeML Open RAIL++-M",
-              "1024x1024; high-end contributors only; not yet on the mirror",
+              "1024x1024 base; high-end contributors only; not yet on the mirror",
               kind="image"),
     )
 }
@@ -106,7 +116,7 @@ def list_all() -> list[Model]:
 # Default image model — what /generate falls back to when tool="image"
 # arrives with no `model` field. Single source of truth so the agent
 # bootstrap and the coordinator stay in sync.
-DEFAULT_IMAGE_MODEL = "dreamshaper8"
+DEFAULT_IMAGE_MODEL = "dreamshaperXL-lightning"
 
 
 def is_image_model(name: str | None) -> bool:

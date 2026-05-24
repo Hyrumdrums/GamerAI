@@ -51,6 +51,7 @@ coordinator.redis_client.get_client = lambda: _FAKE  # type: ignore[assignment]
 from fastapi.testclient import TestClient  # noqa: E402
 
 from coordinator import main as coordinator_main  # noqa: E402
+from coordinator import model_registry  # noqa: E402
 from coordinator.scheduler import Reaper  # noqa: E402
 
 
@@ -373,14 +374,15 @@ class ImageGenerationTests(unittest.TestCase):
         self.assertEqual(envelope["tool"], "image")
         # When the UI doesn't pin per-job knobs, the coordinator no
         # longer bakes hard defaults into the envelope — the worker
-        # falls through to the model's sidecar (LCM-tuned for
-        # dreamshaper8 at steps=8). steps/width/height should NOT be
-        # in the envelope at all.
+        # falls through to the model's sidecar (Lightning-tuned for
+        # the current default at steps≈6). steps/width/height should
+        # NOT be in the envelope at all.
         self.assertNotIn("width", envelope["image"])
         self.assertNotIn("height", envelope["image"])
         self.assertNotIn("steps", envelope["image"])
-        # Default image model auto-selected (model_registry.DEFAULT_IMAGE_MODEL).
-        self.assertEqual(envelope["model"], "dreamshaper8")
+        # Default image model auto-selected. Read it from the registry
+        # so this test survives a default swap without churn.
+        self.assertEqual(envelope["model"], model_registry.DEFAULT_IMAGE_MODEL)
 
     def test_image_generate_passes_through_explicit_overrides(self):
         # When the UI pins values, the coordinator DOES emit them so

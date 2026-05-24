@@ -28,18 +28,23 @@ SD_BINARY="${MIRROR_ROOT}/sd.exe"
 # win-cu12-x64.zip too).
 SD_BINARY_URL="${SD_BINARY_URL:-https://github.com/leejet/stable-diffusion.cpp/releases/download/master-637-ef92a00/sd-master-ef92a00-bin-win-vulkan-x64.zip}"
 
-# Image model catalog. Each entry is "<slug>|<local-src>|<family>|<steps>|<cfg>|<sampler>".
+# Image model catalog. Each entry is
+#   "<slug>|<local-src>|<family>|<steps>|<cfg>|<sampler>|<width>|<height>".
 # The agent's image bootstrap downloads `<slug>.gguf` + `<slug>.json`;
-# `<slug>.json` carries the per-model defaults (steps, cfg scale, sampler)
-# the agent feeds to sd.exe. LCM-distilled models need step≈8 / cfg≈1.5 /
-# sampler=lcm; vanilla SD1.5 wants step≈20 / cfg≈7 / sampler=euler_a.
+# `<slug>.json` carries the per-model defaults (steps, cfg scale, sampler,
+# resolution) the agent feeds to sd.exe. LCM-distilled models need
+# step≈8 / cfg≈1.5 / sampler=lcm at 512²; SDXL Lightning wants
+# step≈6 / cfg≈1.5 / sampler=euler at 1024²; vanilla SD1.5 wants
+# step≈20 / cfg≈7 / sampler=euler_a at 512².
 #
 # Local-src files are copied (not re-downloaded from HF) since the
-# upstream repos are sometimes auth-gated. The script bails per-entry
-# if a source file is missing — easier to add models incrementally.
+# upstream repos are sometimes auth-gated. The script warns and skips
+# per-entry if a source file is missing — easier to add models
+# incrementally. See docs/OPERATOR.md for where to obtain each GGUF.
 MODEL_CATALOG=(
-  "dreamshaper8|/home/beargroup/ai/models/sd/dreamshaper_8LCM-iq4_nl-imv2.gguf|dreamshaper-8-lcm|8|1.5|lcm"
-  "sd1.5|/home/beargroup/ai/models/sd/stable-diffusion-v1-5-pruned-emaonly-Q4_0.gguf|stable-diffusion-1.5|20|7.0|euler_a"
+  "dreamshaperXL-lightning|/home/beargroup/ai/models/sd/dreamshaperXL_lightning-Q4_K_M.gguf|dreamshaper-xl-lightning|6|1.5|euler|1024|1024"
+  "dreamshaper8|/home/beargroup/ai/models/sd/dreamshaper_8LCM-iq4_nl-imv2.gguf|dreamshaper-8-lcm|8|1.5|lcm|512|512"
+  "sd1.5|/home/beargroup/ai/models/sd/stable-diffusion-v1-5-pruned-emaonly-Q4_0.gguf|stable-diffusion-1.5|20|7.0|euler_a|512|512"
 )
 
 mkdir -p "${SD_MODELS_DIR}"
@@ -109,7 +114,12 @@ fi
 # of a 1.5 GB blob we already have) and writes a sidecar JSON the agent
 # reads for per-model defaults (steps / cfg / sampler).
 for entry in "${MODEL_CATALOG[@]}"; do
-  IFS='|' read -r slug src family steps cfg sampler <<<"${entry}"
+  IFS='|' read -r slug src family steps cfg sampler width height <<<"${entry}"
+  # Backward-compatible default for legacy catalog rows that predate
+  # the explicit width/height columns — keeps the sidecar valid even
+  # if someone forgets to fill them in.
+  width="${width:-512}"
+  height="${height:-512}"
   dest="${SD_MODELS_DIR}/${slug}.gguf"
   sidecar="${SD_MODELS_DIR}/${slug}.json"
 
@@ -138,8 +148,8 @@ for entry in "${MODEL_CATALOG[@]}"; do
   "name": "${slug}",
   "family": "${family}",
   "kind": "image",
-  "default_width": 512,
-  "default_height": 512,
+  "default_width": ${width},
+  "default_height": ${height},
   "default_steps": ${steps},
   "default_cfg_scale": ${cfg},
   "default_sampler": "${sampler}",
@@ -161,5 +171,6 @@ for entry in "${MODEL_CATALOG[@]}"; do
   echo "  curl -I https://ai.dallinlayton.com/download/sd-models/${slug}.gguf"
 done
 echo
-echo "TODO: SDXL ships once a high-VRAM contributor tier exists."
+echo "TODO: SDXL base (non-Lightning) ships once a high-VRAM tier exists."
 echo "      Source: /home/beargroup/ai/image-generation/models/checkpoints/sd_xl_base_1.0.safetensors"
+echo "      The current default (dreamshaperXL-lightning) covers the 6 GB tier."
