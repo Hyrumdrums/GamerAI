@@ -333,6 +333,134 @@ class SearchInferenceTests(unittest.TestCase):
         order = agent._ordered_queues(["chat", "search"], last_tool="search")
         self.assertEqual(order[0], "search")
 
+    def test_ordered_queues_excludes_tts(self):
+        # voice-phase1 invariant: the GPU loop must NOT poll
+        # job_queue:tts even when the agent advertises tts. The CPU
+        # tts_loop is the sole consumer; double-polling would let one
+        # loop steal jobs the other should be processing.
+        order = agent._ordered_queues(
+            ["chat", "image", "search", "tts"], last_tool=None,
+        )
+        self.assertNotIn("tts", order)
+        self.assertEqual(order, ["chat", "image", "search"])
+        # Even when tts was the last-served tool (not expected, since
+        # the CPU loop sets last_tool=None — but defensive), it must
+        # not promote tts into the GPU loop's queue order.
+        order = agent._ordered_queues(["chat", "tts"], last_tool="tts")
+        self.assertNotIn("tts", order)
+
+
+class CreditCompletedJobTests(unittest.TestCase):
+    """The dual-loop architecture (voice-phase1) has the GPU and CPU
+    loops racing on state.json counters. credit_completed_job wraps
+    the read-modify-write under _STATE_LOCK so concurrent increments
+    don't lose updates."""
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        # Point STATE_PATH at a temp file so the test doesn't write
+        # to the user's real state. _save_state_locked uses an atomic
+        # rename so the temp file gets replaced on each call.
+        self._tmp = Path(tempfile.mkstemp(suffix=".json")[1])
+        self._orig_state_path = agent.STATE_PATH
+        agent.STATE_PATH = self._tmp
+
+    def tearDown(self):
+        agent.STATE_PATH = self._orig_state_path
+        try:
+            self._tmp.unlink()
+        except OSError:
+            pass
+
+    def test_single_credit_increments_all_counters(self):
+        state = {"jobs": 5, "tokens": 100, "earnings_usd": 0.05}
+        agent.credit_completed_job(
+            state, last_tool="chat", earnings=0.0012, tokens=42,
+        )
+        self.assertEqual(state["jobs"], 6)
+        self.assertEqual(state["tokens"], 142)
+        self.assertAlmostEqual(state["earnings_usd"], 0.0512)
+        self.assertEqual(state["last_tool"], "chat")
+
+    def test_last_tool_none_preserves_previous(self):
+        # The CPU tts loop calls with last_tool=None so the GPU loop's
+        # warm-queue preference (chat/image/search) isn't disturbed.
+        state = {"jobs": 0, "tokens": 0, "earnings_usd": 0.0,
+                 "last_tool": "image"}
+        agent.credit_completed_job(state, last_tool=None, earnings=0.001)
+        self.assertEqual(state["last_tool"], "image")
+
+    def test_concurrent_increments_dont_lose(self):
+        # Spawn 50 threads each crediting one job; final jobs counter
+        # must be exactly 50. Without _STATE_LOCK this races and lands
+        # somewhere < 50.
+        import threading
+        state = {"jobs": 0, "tokens": 0, "earnings_usd": 0.0}
+        barrier = threading.Barrier(50)
+
+        def worker():
+            barrier.wait()
+            agent.credit_completed_job(
+                state, last_tool="chat", earnings=0.001, tokens=1,
+            )
+
+        threads = [threading.Thread(target=worker) for _ in range(50)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(state["jobs"], 50)
+        self.assertEqual(state["tokens"], 50)
+        self.assertAlmostEqual(state["earnings_usd"], 0.05, places=6)
+
+
+class TTSInferenceMockTests(unittest.TestCase):
+    """Linux dev-box path: piper.exe is unavailable so run_tts_inference
+    returns the mock silent WAV. This pins the contract so the
+    coordinator's /jobs/complete + /result + voice_seconds crediting
+    can be exercised end-to-end on CI without a Windows runner."""
+
+    def test_mock_branch_returns_one_second_wav(self):
+        import logging
+
+        class FakeCfg:
+            bootstrap_tts_model = "piper:en_us-libritts-high"
+
+        audio_b64, audio_seconds, model_used = agent.run_tts_inference(
+            "hello", {}, FakeCfg(), logging.getLogger("test-tts"),
+        )
+        self.assertEqual(model_used, "mock-tts")
+        # Mock WAV is 1 second of silence at 22050 Hz.
+        self.assertAlmostEqual(audio_seconds, 1.0, places=2)
+        # b64-encoded WAV starts with the RIFF header.
+        self.assertTrue(audio_b64.startswith("UklGR"))
+
+    def test_wav_duration_from_header(self):
+        # The duration the worker reports bills against the user's
+        # voice_minutes cap — measuring from the WAV header (not
+        # wall-clock synthesis time) is what prevents a slow worker
+        # from over-billing. Pinning this so a refactor can't
+        # accidentally swap to len(bytes)/bitrate or similar.
+        wav = agent._MOCK_WAV_BYTES
+        self.assertAlmostEqual(
+            agent._wav_duration_seconds(wav, 22050), 1.0, places=2,
+        )
+
+    def test_tts_slug_filesystem_mapping(self):
+        # Registry slug "piper:en_us-libritts-high" → fs-safe form
+        # "piper__en_us-libritts-high". Required because NTFS treats
+        # colon as a stream identifier; the substitution must match
+        # what setup-tts-mirror.sh writes to disk.
+        self.assertEqual(
+            agent._tts_slug_to_fs("piper:en_us-libritts-high"),
+            "piper__en_us-libritts-high",
+        )
+        # Already-safe slugs round-trip unchanged.
+        self.assertEqual(
+            agent._tts_slug_to_fs("plain-name"), "plain-name",
+        )
+
 
 class SearchBackendRotationTests(unittest.TestCase):
     """Cover the multi-backend fallback in _ddg_search. The rotation

@@ -912,6 +912,227 @@ class MemberAuthE2ETests(unittest.TestCase):
         self.assertEqual(invitee_member.daily_quota_images, 7)
         self.assertEqual(invitee_member.daily_quota_tokens, 50_000)
 
+    # ------------------------------------------------------------------
+    # voice-phase1 slice — tts quota gate + audio crediting
+    # ------------------------------------------------------------------
+    def test_tts_gate_falls_back_to_tier_default_when_column_null(self):
+        """An invitee whose daily_quota_voice_minutes is NULL must still
+        be capped at their tier's voice_minutes from TIER_QUOTAS.
+        Different precedence from tokens/images (NULL=unlimited) —
+        voice is tier-driven by design (see voice-phase1)."""
+        from coordinator.tiers import TIER_QUOTAS
+        _, contributor_token = self._make_contributor()
+        # Invite without setting voice cap → column stays NULL.
+        code = self._create_invite(contributor_token)
+        accept = self.client.post(
+            f"/invites/{code}/accept", json=self._accept_payload()
+        ).json()
+        invitee_token = accept["token"]
+        invitee_member = member_auth.lookup_member_by_token(
+            self.db, invitee_token,
+        )
+        self.assertIsNone(invitee_member.daily_quota_voice_minutes)
+        # Burn through the BRONZE tier default cap by writing
+        # voice_seconds directly to the rollup.
+        bronze_cap = TIER_QUOTAS["BRONZE"]["voice_minutes"]
+        self.db.add_member_voice_usage(
+            invitee_member.member_id, time.time(),
+            seconds=bronze_cap * 60,
+        )
+        tts_resp = self.client.post(
+            "/generate",
+            json={"prompt": "speak", "tool": "tts"},
+            headers={"Authorization": f"Bearer {invitee_token}"},
+        )
+        self.assertEqual(tts_resp.status_code, 429)
+        self.assertIn("voice", tts_resp.json()["detail"])
+        # Chat still works — separate ledger.
+        chat_resp = self.client.post(
+            "/generate",
+            json={"prompt": "hi"},
+            headers={"Authorization": f"Bearer {invitee_token}"},
+        )
+        self.assertEqual(chat_resp.status_code, 200)
+
+    def test_tts_gate_respects_per_member_override(self):
+        """An explicit per-member voice cap overrides the tier default.
+        Setting it to 1 minute means we're rejected after 60 seconds of
+        usage regardless of the tier's larger allowance."""
+        _, contributor_token = self._make_contributor()
+        code = self._create_invite(contributor_token)
+        accept = self.client.post(
+            f"/invites/{code}/accept", json=self._accept_payload()
+        ).json()
+        invitee_token = accept["token"]
+        invitee_member = member_auth.lookup_member_by_token(
+            self.db, invitee_token,
+        )
+        self.db.update_member_quotas(
+            invitee_member.member_id,
+            daily_quota_tokens=invitee_member.daily_quota_tokens,
+            daily_quota_images=invitee_member.daily_quota_images,
+            daily_quota_voice_minutes=1,
+        )
+        self.db.add_member_voice_usage(
+            invitee_member.member_id, time.time(), seconds=61.0,
+        )
+        resp = self.client.post(
+            "/generate",
+            json={"prompt": "speak", "tool": "tts"},
+            headers={"Authorization": f"Bearer {invitee_token}"},
+        )
+        self.assertEqual(resp.status_code, 429)
+
+    def test_admin_unlimited_voice(self):
+        """Admin role bypasses the voice cap entirely, matching the
+        existing tokens/images precedent."""
+        admin_member = member_auth.lookup_member_by_token(
+            self.db, ADMIN_TOKEN,
+        )
+        self.db.add_member_voice_usage(
+            admin_member.member_id, time.time(), seconds=99_999.0,
+        )
+        resp = self.client.post(
+            "/generate",
+            json={"prompt": "speak", "tool": "tts"},
+            headers=self._admin_headers(),
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+
+    def test_me_returns_voice_envelope(self):
+        """/me grows voice_minutes_today + daily_quota_voice_minutes —
+        the account-page voice meter depends on both being present."""
+        resp = self.client.get("/me", headers=self._admin_headers()).json()
+        self.assertIn("voice_minutes_today", resp)
+        self.assertIn("daily_quota_voice_minutes", resp)
+        self.assertIn("voice_minutes", resp["tier_quota"])
+        # Admin → tier_quota all-None including voice.
+        self.assertIsNone(resp["tier_quota"]["voice_minutes"])
+
+    def test_me_bronze_member_gets_voice_tier_quota(self):
+        """Non-admin members see the TIER_QUOTAS voice_minutes value
+        in /me.tier_quota — the UI's voice cap denominator."""
+        from coordinator.tiers import TIER_QUOTAS
+        _, contributor_token = self._make_contributor()
+        resp = self.client.get(
+            "/me", headers={"Authorization": f"Bearer {contributor_token}"},
+        ).json()
+        self.assertEqual(
+            resp["tier_quota"]["voice_minutes"],
+            TIER_QUOTAS["BRONZE"]["voice_minutes"],
+        )
+
+    def _claim_and_complete_tts(
+        self,
+        invitee_token: str,
+        prompt: str,
+        *,
+        audio_seconds: float,
+        duration_seconds: float = 0.5,
+        audio_b64: str = "AAAA",
+    ) -> str:
+        """End-to-end submit + worker-claim + complete for a tts job.
+        Mirrors the existing chat-completion test's claim flow:
+        /generate enqueues → LPOP simulates the worker's BLPOP →
+        /jobs/claim mints a claim_token → /jobs/complete posts the
+        audio bill. Returns the job_id so the caller can poll
+        /result."""
+        submit = self.client.post(
+            "/generate",
+            json={"prompt": prompt, "tool": "tts"},
+            headers={"Authorization": f"Bearer {invitee_token}"},
+        )
+        self.assertEqual(submit.status_code, 200, submit.text)
+        job_id = submit.json()["job_id"]
+        # Drain the per-tool queue (LPOP on job_queue:tts) — the
+        # voice-phase1 routing change put tts on its own Redis list.
+        self.assertIsNotNone(self.r.lpop("job_queue:tts"))
+        worker_id = "wkr-" + uuid.uuid4().hex[:6]
+        self.client.post(
+            "/register",
+            json={"worker_id": worker_id},
+            headers=self._admin_headers(),
+        )
+        claim = self.client.post(
+            "/jobs/claim",
+            json={"worker_id": worker_id, "job_id": job_id},
+            headers=self._admin_headers(),
+        )
+        self.assertEqual(claim.status_code, 200, claim.text)
+        claim_token = claim.json()["claim_token"]
+        complete = self.client.post(
+            "/jobs/complete",
+            json={
+                "worker_id": worker_id,
+                "job_id": job_id,
+                "text": prompt[:200],
+                "model": "piper:en_us-libritts-high",
+                "prompt_tokens": 2,
+                "completion_tokens": 0,
+                "duration_seconds": duration_seconds,
+                "status": "complete",
+                "audio_b64": audio_b64,
+                "audio_seconds": audio_seconds,
+                "claim_token": claim_token,
+            },
+            headers=self._admin_headers(),
+        )
+        self.assertEqual(complete.status_code, 200, complete.text)
+        return job_id
+
+    def test_tts_completion_credits_voice_seconds(self):
+        """A successful tts /jobs/complete bumps the submitter's
+        voice_seconds rollup AND stashes audio_b64 on /result so the
+        polling client can play it."""
+        _, contributor_token = self._make_contributor()
+        code = self._create_invite(contributor_token)
+        accept = self.client.post(
+            f"/invites/{code}/accept", json=self._accept_payload()
+        ).json()
+        invitee_token = accept["token"]
+        invitee_member = member_auth.lookup_member_by_token(
+            self.db, invitee_token,
+        )
+        import base64 as _b64
+        fake_audio = _b64.b64encode(b"RIFF1234WAVEdata...").decode("ascii")
+        job_id = self._claim_and_complete_tts(
+            invitee_token, "hello world",
+            audio_seconds=7.5, duration_seconds=0.8, audio_b64=fake_audio,
+        )
+        usage = self.db.member_usage_today(invitee_member.member_id)
+        self.assertAlmostEqual(usage["voice_seconds"], 7.5, places=2)
+        # /result/{job_id} surfaces the audio for the polling client.
+        result = self.client.get(
+            f"/result/{job_id}",
+            headers={"Authorization": f"Bearer {invitee_token}"},
+        ).json()
+        self.assertEqual(result["audio_b64"], fake_audio)
+        self.assertAlmostEqual(result["audio_seconds"], 7.5, places=2)
+
+    def test_tts_worker_cannot_overbill_via_audio_seconds(self):
+        """The audio_seconds the worker reports IS what bills against
+        the user — by design (see voice-phase1). This test pins the
+        contract so a future refactor doesn't accidentally start
+        crediting duration_seconds (synthesis wall-clock) instead,
+        which would let a slow worker over-bill the submitter."""
+        _, contributor_token = self._make_contributor()
+        code = self._create_invite(contributor_token)
+        accept = self.client.post(
+            f"/invites/{code}/accept", json=self._accept_payload()
+        ).json()
+        invitee_token = accept["token"]
+        invitee_member = member_auth.lookup_member_by_token(
+            self.db, invitee_token,
+        )
+        # Pathologically slow synth (30s of compute), tiny clip (2s of
+        # audio). Bill is 2s, not 30s.
+        self._claim_and_complete_tts(
+            invitee_token, "hi",
+            audio_seconds=2.0, duration_seconds=30.0,
+        )
+        usage = self.db.member_usage_today(invitee_member.member_id)
+        self.assertAlmostEqual(usage["voice_seconds"], 2.0, places=2)
+
 
 if __name__ == "__main__":
     unittest.main()
