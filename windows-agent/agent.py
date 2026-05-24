@@ -23,6 +23,7 @@ import logging
 import logging.handlers
 import os
 import platform
+import queue
 import socket
 import subprocess
 import sys
@@ -1609,13 +1610,54 @@ def resolve_worker_id(cfg_worker_id: Optional[str], state: dict) -> str:
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
+# Async-logging plumbing. The agent logger emits LogRecords onto a
+# bounded in-memory queue (non-blocking), and a single background
+# thread drains the queue and runs the real handlers (file + stdout).
+# This decouples the main job loop from anything that could ever block
+# on a log write:
+#   - Windows conhost pausing the stdout pipe (QuickEdit select mode,
+#     Ctrl+S/XOFF flow control, Pause/Break, scrollbar drag, resize).
+#     _disable_console_quickedit() removes the most common trigger
+#     (mouse click), but conhost has other pause modes we can't all
+#     disable individually — the queue makes the agent immune to
+#     every one of them by construction.
+#   - File handle rotation latency on a slow disk.
+#   - Any future custom handler (network log shipping, syslog, etc.)
+#     that turns out to have a slow path.
+# Bounded queue (DROP_ON_FULL) is the right policy here: better to
+# lose log lines during a long conhost pause than to silently freeze
+# the worker. Stdlib queue.Full raised in enqueue() is swallowed so
+# the failure doesn't bubble back into the main thread via
+# QueueHandler's default handleError -> sys.stderr write path (which
+# would itself block on the same paused pipe).
+_LOG_QUEUE_CAPACITY = 10_000
+_LOG_LISTENER: Optional["logging.handlers.QueueListener"] = None
+
+
+class _DropOnFullQueueHandler(logging.handlers.QueueHandler):
+    """QueueHandler that drops records when the queue is full instead
+    of propagating queue.Full back through handleError. handleError's
+    default writes to sys.stderr, which on Windows shares the same
+    paused conhost pipe — re-introducing the very block we're trying
+    to escape. Silent drop is the only safe behavior here."""
+
+    def enqueue(self, record: logging.LogRecord) -> None:
+        try:
+            self.queue.put_nowait(record)
+        except queue.Full:
+            pass
+
+
 def setup_logging(headless: bool = False) -> logging.Logger:
-    """Install the file + (optionally) stdout log handlers.
+    """Install the file + (optionally) stdout log handlers behind a
+    queue, so the main thread never blocks on a slow or paused sink.
 
     ``headless=True`` skips the StreamHandler entirely — meant for any
     future truly-console-less mode. Tray mode passes ``headless=False``
     because the hidden console buffers stdout into its scrollback, which
     is exactly what the user sees when they click "Show console".
+
+    Idempotent: calling twice tears down the prior listener cleanly.
     """
     log = logging.getLogger("gamerai.agent")
     log.setLevel(logging.INFO)
@@ -1626,6 +1668,10 @@ def setup_logging(headless: bool = False) -> logging.Logger:
         "%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S"
     )
 
+    # Real handlers — these are what actually do the WriteFile / write()
+    # calls that can block. The listener thread owns them.
+    real_handlers: list[logging.Handler] = []
+
     file_handler = logging.handlers.RotatingFileHandler(
         logs_dir() / "agent.log",
         maxBytes=1_000_000,
@@ -1633,17 +1679,52 @@ def setup_logging(headless: bool = False) -> logging.Logger:
         encoding="utf-8",
     )
     file_handler.setFormatter(fmt)
-    log.addHandler(file_handler)
+    real_handlers.append(file_handler)
 
     if not headless:
         try:
             stream = logging.StreamHandler(sys.stdout)
             stream.setFormatter(fmt)
-            log.addHandler(stream)
+            real_handlers.append(stream)
         except Exception:
             pass
 
+    # Stop any prior listener (defensive — setup_logging is called once
+    # in practice, but a re-invocation would otherwise leak a thread).
+    global _LOG_LISTENER
+    if _LOG_LISTENER is not None:
+        try:
+            _LOG_LISTENER.stop()
+        except Exception:
+            pass
+        _LOG_LISTENER = None
+
+    log_q: "queue.Queue[Optional[logging.LogRecord]]" = queue.Queue(
+        maxsize=_LOG_QUEUE_CAPACITY,
+    )
+    log.addHandler(_DropOnFullQueueHandler(log_q))
+
+    _LOG_LISTENER = logging.handlers.QueueListener(
+        log_q, *real_handlers, respect_handler_level=False,
+    )
+    _LOG_LISTENER.start()
+
     return log
+
+
+def stop_log_listener() -> None:
+    """Flush and stop the background log thread. Idempotent. Called
+    from the shutdown path so any records still in the queue land in
+    the file before the process exits."""
+    global _LOG_LISTENER
+    listener = _LOG_LISTENER
+    if listener is None:
+        return
+    _LOG_LISTENER = None
+    try:
+        listener.stop()
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -4759,6 +4840,14 @@ def main(argv: Optional[list[str]] = None) -> int:
                 pass
         try:
             print_earnings(state, log)
+        except Exception:
+            pass
+        # Drain any log records still in the queue + stop the listener
+        # thread cleanly. Runs last so all of the messages above (the
+        # graceful-shutdown line, final earnings) actually make it to
+        # the file before the process exits.
+        try:
+            stop_log_listener()
         except Exception:
             pass
 
