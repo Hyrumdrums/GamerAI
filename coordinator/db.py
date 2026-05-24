@@ -198,6 +198,20 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, seq);
+
+-- Per-worker per-day uptime rollup, written by the UptimeSampler every
+-- 5 minutes (one row gains 5 minutes for each worker that heartbeated
+-- within the sample window). Day is UTC YYYY-MM-DD so a member in
+-- Pacific time and one in Sydney share the same day boundary. The
+-- tier engine reads the last 7 days to decide promote/demote/grace.
+CREATE TABLE IF NOT EXISTS worker_uptime (
+    worker_id TEXT NOT NULL,
+    day TEXT NOT NULL,
+    minutes_online INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (worker_id, day)
+);
+
+CREATE INDEX IF NOT EXISTS idx_worker_uptime_day ON worker_uptime(day);
 """
 
 
@@ -349,6 +363,20 @@ class DB:
             "ALTER TABLE member_usage ADD COLUMN image_units REAL "
             "NOT NULL DEFAULT 0",
             "ALTER TABLE workers ADD COLUMN tools_json TEXT",
+        ):
+            try:
+                self._conn.execute(ddl)
+            except sqlite3.OperationalError:
+                pass
+        # Tier-engine state. tier_last_changed_at gates the
+        # 1-move-per-day rule (engine refuses to act on a member moved
+        # within the last 24h). tier_below_threshold_since is set when
+        # the engine first observes a member failing their current
+        # tier's bar; demotion only fires after 14 days of continuous
+        # failure, and a single passing day clears it.
+        for ddl in (
+            "ALTER TABLE members ADD COLUMN tier_last_changed_at REAL",
+            "ALTER TABLE members ADD COLUMN tier_below_threshold_since REAL",
         ):
             try:
                 self._conn.execute(ddl)
@@ -566,6 +594,21 @@ class DB:
                 (member_id,),
             )
             return cur.fetchall()
+
+    def delete_worker(self, worker_id: str) -> bool:
+        """Hard-delete a worker row. Used by the account-page "forget"
+        button to clear out a stale registration (the previous install,
+        a decommissioned PC, etc.). Earnings rows are left alone —
+        they keyed on worker_id and form an immutable lifetime
+        ledger, so deleting the worker row breaks the bridge for that
+        machine only. The owner's lifetime earnings stay visible via
+        any remaining owned workers; we accept the bridge gap on a
+        forgotten worker rather than orphan-deleting earnings."""
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM workers WHERE worker_id=?", (worker_id,),
+            )
+            return cur.rowcount > 0
 
     # ---------- earnings ----------
     def add_earnings(self, worker_id: str, tokens: int, usd: float) -> None:
@@ -990,6 +1033,183 @@ class DB:
             "total_usd": round(float(row["total_usd"]), 8),
             "machine_count": int(row["machine_count"]),
         }
+
+    # ---------- worker uptime ----------
+    def add_worker_uptime_minutes(
+        self,
+        worker_id: str,
+        when: float,
+        minutes: int,
+    ) -> None:
+        """Credit ``minutes`` of online time to ``worker_id`` for the
+        UTC day containing ``when``. Called by the UptimeSampler every
+        N minutes for each worker that heartbeated within the window.
+        Idempotent INSERT-OR-UPDATE so a sampler restart can't double-
+        count or skip — the worst case is a sample missed during the
+        downtime window, which is acceptable for tier-promotion
+        granularity."""
+        day = _utc_day(when)
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO worker_uptime (worker_id, day, minutes_online) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT(worker_id, day) DO UPDATE SET "
+                "minutes_online = minutes_online + excluded.minutes_online",
+                (worker_id, day, int(minutes)),
+            )
+
+    def member_uptime_summary(
+        self,
+        member_id: str,
+        window_days: int = 7,
+        now: Optional[float] = None,
+    ) -> dict:
+        """Aggregate the last ``window_days`` of uptime across every
+        worker the member owns. Returns:
+
+        - ``days_online``: number of distinct UTC days in the window
+          where at least one owned worker logged ≥60 minutes (1 hour).
+          The hour threshold filters out flaky 15-min bursts that
+          shouldn't count as "online for the day."
+        - ``avg_hours_per_active_day``: average hours of total owned-
+          worker uptime on the days that counted as online. A member
+          with two PCs each online 4 hours scores 8 hours that day —
+          the network sees them as 8 worker-hours of capacity.
+        - ``total_minutes``: raw sum across the window (for display).
+
+        Returns zeroes for a member with no owned workers — the engine
+        treats them as "not meeting any tier" and keeps them at
+        BRONZE without demotion (BRONZE is the floor; can't go
+        lower)."""
+        when = now if now is not None else time.time()
+        # Build the inclusive list of UTC days in the window.
+        days = []
+        for i in range(window_days):
+            ts = when - i * 86400.0
+            days.append(_utc_day(ts))
+        placeholders = ",".join(["?"] * len(days))
+        with self._lock:
+            cur = self._conn.execute(
+                f"SELECT u.day AS day, SUM(u.minutes_online) AS total_min "
+                f"FROM worker_uptime u "
+                f"JOIN workers w ON w.worker_id = u.worker_id "
+                f"WHERE w.owner_member_id = ? AND u.day IN ({placeholders}) "
+                f"GROUP BY u.day",
+                (member_id, *days),
+            )
+            rows = cur.fetchall()
+        if not rows:
+            return {
+                "window_days": window_days,
+                "days_online": 0,
+                "avg_hours_per_active_day": 0.0,
+                "total_minutes": 0,
+            }
+        # An "online day" is any day where the member's combined
+        # owned-worker uptime is ≥ 60 minutes. Below that we treat
+        # the day as a fluke and don't credit it.
+        ONLINE_DAY_THRESHOLD_MIN = 60
+        active_days = [r for r in rows if int(r["total_min"] or 0) >= ONLINE_DAY_THRESHOLD_MIN]
+        total_minutes = sum(int(r["total_min"] or 0) for r in rows)
+        if not active_days:
+            return {
+                "window_days": window_days,
+                "days_online": 0,
+                "avg_hours_per_active_day": 0.0,
+                "total_minutes": total_minutes,
+            }
+        avg_min = sum(int(r["total_min"] or 0) for r in active_days) / len(active_days)
+        return {
+            "window_days": window_days,
+            "days_online": len(active_days),
+            "avg_hours_per_active_day": round(avg_min / 60.0, 2),
+            "total_minutes": total_minutes,
+        }
+
+    def prune_worker_uptime(self, older_than_days: int = 60) -> int:
+        """Drop uptime rows older than ``older_than_days``. Called by
+        the daily engine to keep the table bounded — we only ever
+        look back 7 days, so 60-day retention gives plenty of
+        headroom for debugging. Returns the row count deleted."""
+        cutoff_ts = time.time() - older_than_days * 86400.0
+        cutoff_day = _utc_day(cutoff_ts)
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM worker_uptime WHERE day < ?", (cutoff_day,),
+            )
+            return cur.rowcount
+
+    # ---------- tier engine state ----------
+    def set_member_tier(
+        self,
+        member_id: str,
+        new_tier: str,
+        when: float,
+        new_daily_quota_tokens: Optional[int] = None,
+        new_daily_quota_images: Optional[int] = None,
+    ) -> None:
+        """Set a member's tier and stamp ``tier_last_changed_at`` so the
+        next engine pass enforces the 1-move-per-day cap. The caller
+        passes the new tier's quota defaults so the quotas track the
+        tier change atomically — no risk of a half-moved member with
+        a new tier but stale quotas. Clears
+        ``tier_below_threshold_since`` because the situation changed
+        (either promoted out of below-threshold, or demoted into a
+        looser bar)."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE members SET "
+                "tier=?, "
+                "daily_quota_tokens=?, "
+                "daily_quota_images=?, "
+                "tier_last_changed_at=?, "
+                "tier_below_threshold_since=NULL "
+                "WHERE member_id=?",
+                (
+                    new_tier,
+                    new_daily_quota_tokens,
+                    new_daily_quota_images,
+                    when,
+                    member_id,
+                ),
+            )
+
+    def mark_member_below_threshold(self, member_id: str, when: float) -> None:
+        """Start the demotion countdown for ``member_id``. Only writes
+        if ``tier_below_threshold_since`` is currently NULL — the
+        countdown is a single sustained streak, not a rolling clock,
+        so repeated calls during the grace window don't restart it."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE members SET tier_below_threshold_since=? "
+                "WHERE member_id=? AND tier_below_threshold_since IS NULL",
+                (when, member_id),
+            )
+
+    def clear_member_below_threshold(self, member_id: str) -> None:
+        """Cancel an in-progress demotion countdown. Called by the
+        engine when a previously below-threshold member is observed
+        meeting their tier's bar again — a single passing day forgives
+        the streak."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE members SET tier_below_threshold_since=NULL "
+                "WHERE member_id=?",
+                (member_id,),
+            )
+
+    def list_members_for_tier_engine(self) -> list[sqlite3.Row]:
+        """Members the tier engine should evaluate: non-admin, not
+        revoked. Admins are unbounded by design and shouldn't be
+        re-tiered. Revoked members are already barred from consuming;
+        no need to spend cycles on them."""
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM members "
+                "WHERE role <> 'admin' AND revoked_at IS NULL "
+                "ORDER BY member_id"
+            )
+            return cur.fetchall()
 
     def set_worker_tools(self, worker_id: str, tools_json: str) -> None:
         """Persist the JSON-encoded tools list a worker last advertised

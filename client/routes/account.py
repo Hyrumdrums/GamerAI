@@ -58,6 +58,19 @@ async def account_page(request: Request, flash: Optional[str] = None):
         machines_body.get("partial_contributor_count", 0)
         if machines_status == 200 else 0
     )
+    hidden_stale_count = (
+        machines_body.get("hidden_stale_count", 0)
+        if machines_status == 200 else 0
+    )
+    # Tier-engine status: 7d uptime, current/next-tier requirements,
+    # below-threshold grace timer. The account page renders a
+    # "Contribution status" card from this. Admins get a synthetic
+    # response that the template treats as "engine does not apply".
+    contrib_status_code, contrib_status = await _coord_get(
+        bearer, "/me/contributor-status",
+    )
+    if contrib_status_code != 200:
+        contrib_status = {}
 
     # Friends section is admin-only in v1 (see docs/auth-design.md —
     # tier-gated per-contributor invites come with the 3b.i engine).
@@ -79,6 +92,8 @@ async def account_page(request: Request, flash: Optional[str] = None):
             "machines": machines,
             "owned_workers": owned_workers,
             "partial_contributor_count": partial_count,
+            "hidden_stale_count": hidden_stale_count,
+            "contrib_status": contrib_status,
             "tier_quota_tokens": tier_quota.get("tokens"),
             "tier_quota_images": tier_quota.get("images"),
             "earnings": me.get("earnings") or {},
@@ -87,6 +102,32 @@ async def account_page(request: Request, flash: Optional[str] = None):
             "flash": flash,
         },
     )
+
+
+@router.post("/account/workers/{worker_id}/forget")
+async def account_forget_worker(worker_id: str, request: Request):
+    """Delete a stale worker registration from the account page.
+    Common case: the host rebuilt their PC, generating a new
+    worker_id; the old one sits as an offline 'partial contributor'
+    polluting the page. This wipes the row."""
+    bearer = session_bearer(request)
+    me = await identify(bearer) if bearer else None
+    if me is None:
+        return login_redirect("/account")
+    async with coordinator_client._client(bearer=bearer) as c:
+        r = await c.post(
+            f"/me/workers/{worker_id}/forget", timeout=5,
+        )
+    if r.status_code == 200:
+        return RedirectResponse(
+            "/account?flash=Worker forgotten.", status_code=303,
+        )
+    detail = "Couldn't forget worker."
+    try:
+        detail = r.json().get("detail", detail)
+    except ValueError:
+        pass
+    return RedirectResponse(f"/account?flash={detail}", status_code=303)
 
 
 @router.post("/account/machines/{prefix}/unpair")

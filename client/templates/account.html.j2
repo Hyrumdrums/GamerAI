@@ -76,6 +76,69 @@
     </form>
   </section>
 
+  {% if contrib_status and contrib_status.get('engine_applies') %}
+  <section class="card">
+    <h2>Contribution status</h2>
+    {% set req = contrib_status.current_tier_requirements %}
+    {% set up = contrib_status.uptime_7d %}
+    <p class="muted">
+      Your tier is set by a daily promote/demote engine. It looks at
+      the last 7 days of uptime across your registered workers.
+      Promotions are immediate when you meet the next tier's bar;
+      demotions wait 14 days of continuous underperformance so a
+      single vacation week won't drop you.
+    </p>
+    <div class="kv">
+      <div class="k">Current tier</div>
+      <div class="v">
+        {{ contrib_status.tier }}
+        {% if contrib_status.meets_current %}
+        <span class="badge badge-ok">meeting bar</span>
+        {% else %}
+        <span class="badge badge-warn">below bar</span>
+        {% endif %}
+      </div>
+      <div class="k">7-day uptime</div>
+      <div class="v">
+        {{ up.days_online }} of 7 days online ·
+        avg {{ up.avg_hours_per_active_day }} hr/active day
+      </div>
+      <div class="k">Current tier needs</div>
+      <div class="v">
+        ≥ {{ req.min_hours_per_day }} hr/day · ≥
+        {{ req.min_days_per_week }} days/week
+      </div>
+      {% if contrib_status.next_tier %}
+      {% set nreq = contrib_status.next_tier_requirements %}
+      <div class="k">Next tier ({{ contrib_status.next_tier }})</div>
+      <div class="v">
+        ≥ {{ nreq.min_hours_per_day }} hr/day · ≥
+        {{ nreq.min_days_per_week }} days/week
+        {% if contrib_status.meets_next %}
+        <span class="badge badge-ok">eligible — promoting on next nightly run</span>
+        {% endif %}
+      </div>
+      {% else %}
+      <div class="k">Next tier</div>
+      <div class="v">You're at the top of the ladder.</div>
+      {% endif %}
+    </div>
+    {% if not contrib_status.meets_current and contrib_status.previous_tier %}
+    <p class="muted partial-warn">
+      <strong>You're below the {{ contrib_status.tier }} bar.</strong>
+      {% if contrib_status.tier_below_threshold_since %}
+      If this continues for 14 days you'll drop to
+      {{ contrib_status.previous_tier }}. Get back above the bar to
+      reset the countdown.
+      {% else %}
+      The countdown starts tomorrow — get back above the bar today
+      to avoid it.
+      {% endif %}
+    </p>
+    {% endif %}
+  </section>
+  {% endif %}
+
   <section class="card">
     <h2>Your activity</h2>
     <p class="muted">
@@ -350,10 +413,16 @@
     <h3>Registered workers</h3>
     <p class="muted">What your machines advertise to the network.
       Chat-only workers count as <strong>partial contributors</strong> —
-      install the image model to upgrade.</p>
+      install the image model to upgrade. Use <em>forget</em> to clear
+      a stale registration after a PC rebuild.</p>
     <table class="friends-table">
       <thead>
-        <tr><th>Worker</th><th>Status</th><th>Tools</th></tr>
+        <tr>
+          <th>Worker</th>
+          <th>Status</th>
+          <th>Tools</th>
+          <th></th>
+        </tr>
       </thead>
       <tbody>
         {% for w in owned_workers %}
@@ -369,10 +438,25 @@
             {{ w.tools | join(', ') }}
             {% endif %}
           </td>
+          <td>
+            <form method="POST"
+                  action="/account/workers/{{ w.worker_id }}/forget"
+                  class="inline"
+                  onsubmit="return confirm('Forget {{ w.worker_id }}? Lifetime earnings stay, but the row disappears from this page.');">
+              <button type="submit" class="danger">forget</button>
+            </form>
+          </td>
         </tr>
         {% endfor %}
       </tbody>
     </table>
+    {% if hidden_stale_count and hidden_stale_count > 0 %}
+    <p class="muted small">
+      {{ hidden_stale_count }} more worker{% if hidden_stale_count != 1 %}s{% endif %}
+      offline for 30+ days {% if hidden_stale_count != 1 %}are{% else %}is{% endif %}
+      hidden. Earnings history is preserved.
+    </p>
+    {% endif %}
     {% endif %}
     {% else %}
     <p class="muted">

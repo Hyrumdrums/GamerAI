@@ -24,6 +24,11 @@ from coordinator.idempotency import IdempotencyStore
 from coordinator.rate_limit import RateLimiter
 from coordinator.redis_client import get_client
 from coordinator.scheduler import Reaper
+from coordinator.tier_engine import (
+    STALE_WORKER_HIDE_DAYS,
+    TierEngine,
+    UptimeSampler,
+)
 from shared.auth import API_TOKEN, AUTH_ENABLED, is_public_path
 from shared.config import (
     CANARY_INTERVAL_SECONDS,
@@ -52,7 +57,13 @@ from shared.config import (
     WORKER_TIMEOUT_SECONDS,
     job_queue_for,
 )
-from coordinator.tiers import quota_for as _tier_quota_for
+from coordinator.tiers import (
+    quota_for as _tier_quota_for,
+    requirements_for as _tier_requirements_for,
+    tier_above as _tier_above,
+    tier_below as _tier_below,
+    meets_requirements as _tier_meets,
+)
 from shared.models import (
     AgentPairPollRequest,
     ConversationCreateRequest,
@@ -130,6 +141,8 @@ idem = IdempotencyStore(r, IDEMPOTENCY_TTL_SECONDS)
 rate_limiter = RateLimiter(r, RATE_LIMIT_PER_MIN)
 _reaper: Reaper | None = None
 _canary_injector: CanaryInjector | None = None
+_uptime_sampler: UptimeSampler | None = None
+_tier_engine: TierEngine | None = None
 
 
 # Where generated images are written. Lives next to the SQLite DB so
@@ -1146,13 +1159,22 @@ def ensure_admin_seed() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _reaper, _canary_injector
+    global _reaper, _canary_injector, _uptime_sampler, _tier_engine
     ensure_admin_seed()
     _reaper = Reaper(r, db)
     _reaper.start()
     if CANARY_INTERVAL_SECONDS > 0:
         _canary_injector = CanaryInjector(r, db, interval=CANARY_INTERVAL_SECONDS)
         _canary_injector.start()
+    # Uptime sampler + tier engine — separate threads so a slow tier
+    # evaluation can't starve the sampler (which feeds the very data
+    # the engine reads). Sampler runs every 5 min; engine runs once
+    # daily a few minutes after UTC midnight (see tier_engine
+    # constructor for offset logic).
+    _uptime_sampler = UptimeSampler(r, db)
+    _uptime_sampler.start()
+    _tier_engine = TierEngine(db)
+    _tier_engine.start()
     log.info("coordinator ready", extra={"event": "startup"})
     try:
         yield
@@ -1161,6 +1183,10 @@ async def lifespan(app: FastAPI):
             _reaper.stop()
         if _canary_injector:
             _canary_injector.stop()
+        if _uptime_sampler:
+            _uptime_sampler.stop()
+        if _tier_engine:
+            _tier_engine.stop()
 
 
 app = FastAPI(title="GamerAI Coordinator", version="0.3.0", lifespan=lifespan)
@@ -2988,10 +3014,21 @@ def my_machines(request: Request):
         })
     worker_rows = db.list_workers_for_member(member.member_id)
     now = time.time()
+    stale_cutoff = now - STALE_WORKER_HIDE_DAYS * 86400.0
     owned_workers = []
+    hidden_stale_count = 0
     partial_count = 0
     for w in worker_rows:
         wid = w["worker_id"]
+        last_seen = float(w["last_seen"] or 0)
+        # Hide workers we haven't heard from in 30+ days — they're
+        # almost always an old install lingering after the user
+        # rebuilt the machine. The row stays in the DB so the
+        # "forget" button can still target it via /me/workers/all
+        # (future); the registered-workers UI just doesn't show them.
+        if last_seen and last_seen < stale_cutoff:
+            hidden_stale_count += 1
+            continue
         tools = db.worker_tools(wid) or ["chat"]
         is_partial = "image" not in tools
         if is_partial:
@@ -2999,14 +3036,107 @@ def my_machines(request: Request):
         owned_workers.append({
             "worker_id": wid,
             "status": _worker_status(wid, now),
-            "last_seen": float(w["last_seen"] or 0),
+            "last_seen": last_seen,
             "tools": tools,
             "is_partial": is_partial,
         })
     return {
         "machines": machines,
         "owned_workers": owned_workers,
+        "hidden_stale_count": hidden_stale_count,
         "partial_contributor_count": partial_count,
+    }
+
+
+@app.post("/me/workers/{worker_id}/forget")
+def forget_my_worker(worker_id: str, request: Request):
+    """Owner deletes a stale worker row from the account page.
+    Earnings rows survive (see db.delete_worker docstring); only the
+    workers row goes. Scoped to the caller's owned workers — a
+    stranger asking to forget someone else's worker gets 404."""
+    member = getattr(request.state, "member", None)
+    if member is None:
+        if not AUTH_ENABLED:
+            return {"deleted": False}
+        raise HTTPException(status_code=401, detail="unauthorized")
+    if db.worker_owner(worker_id) != member.member_id:
+        # 404 (not 403) — don't reveal whether someone else owns it.
+        raise HTTPException(status_code=404, detail="worker not found")
+    deleted = db.delete_worker(worker_id)
+    log.info(
+        "worker forgotten",
+        extra={
+            "event": "worker_forgotten",
+            "worker_id": worker_id,
+            "by_member_id": member.member_id,
+        },
+    )
+    return {"deleted": deleted}
+
+
+@app.get("/me/contributor-status")
+def my_contributor_status(request: Request):
+    """7-day uptime summary + tier-engine state for the caller.
+
+    Returns the data the account page needs to render "you're at
+    BRONZE, meeting X/Y requirements; SILVER needs Z" — so the host
+    can see exactly what's keeping them from the next tier without
+    reading the engine logs. Admin members get a synthetic
+    "admin"-shaped response that the UI treats as "unbounded — tier
+    engine does not apply."""
+    member = getattr(request.state, "member", None)
+    if member is None:
+        if not AUTH_ENABLED:
+            return {"auth_disabled": True}
+        raise HTTPException(status_code=401, detail="unauthorized")
+    if member.role == "admin":
+        return {
+            "tier": member.tier,
+            "is_admin": True,
+            "engine_applies": False,
+        }
+    summary = db.member_uptime_summary(member.member_id, window_days=7)
+    current = member.tier
+    cur_req = dict(_tier_requirements_for(current))
+    next_tier = _tier_above(current)
+    next_req = dict(_tier_requirements_for(next_tier)) if next_tier else None
+    prev_tier = _tier_below(current)
+    # tier_below_threshold_since / tier_last_changed_at live on the
+    # member row but aren't on the Member dataclass — read directly.
+    row = db.get_member(member.member_id)
+    keys = row.keys() if row is not None else []
+    below_since = (
+        float(row["tier_below_threshold_since"])
+        if row is not None
+        and "tier_below_threshold_since" in keys
+        and row["tier_below_threshold_since"] is not None
+        else None
+    )
+    last_changed = (
+        float(row["tier_last_changed_at"])
+        if row is not None
+        and "tier_last_changed_at" in keys
+        and row["tier_last_changed_at"] is not None
+        else None
+    )
+    days_online = summary["days_online"]
+    avg_hours = summary["avg_hours_per_active_day"]
+    return {
+        "tier": current,
+        "is_admin": False,
+        "engine_applies": True,
+        "uptime_7d": summary,
+        "current_tier_requirements": cur_req,
+        "meets_current": _tier_meets(current, days_online, avg_hours),
+        "next_tier": next_tier,
+        "next_tier_requirements": next_req,
+        "meets_next": (
+            next_tier is not None
+            and _tier_meets(next_tier, days_online, avg_hours)
+        ),
+        "previous_tier": prev_tier,
+        "tier_below_threshold_since": below_since,
+        "tier_last_changed_at": last_changed,
     }
 
 

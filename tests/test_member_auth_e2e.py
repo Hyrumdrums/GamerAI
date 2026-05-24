@@ -705,6 +705,68 @@ class MemberAuthE2ETests(unittest.TestCase):
         self.assertIsNotNone(body["tier_quota"]["images"])
 
     # ------------------------------------------------------------------
+    # worker forget endpoint + contributor-status
+    # ------------------------------------------------------------------
+    def test_forget_worker_deletes_owned_row(self):
+        _, contributor_token = self._make_contributor()
+        contributor = member_auth.lookup_member_by_token(
+            self.db, contributor_token,
+        )
+        # Plant a worker owned by this contributor.
+        self.db.claim_worker_ownership(
+            "w_to_forget", contributor.member_id, "idle", time.time(),
+        )
+        resp = self.client.post(
+            "/me/workers/w_to_forget/forget",
+            headers={"Authorization": f"Bearer {contributor_token}"},
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertTrue(resp.json()["deleted"])
+        # Worker row is gone.
+        self.assertIsNone(self.db.worker_owner("w_to_forget"))
+
+    def test_forget_worker_404_for_stranger(self):
+        """A different member can't forget someone else's worker."""
+        _, host_token = self._make_contributor()
+        host = member_auth.lookup_member_by_token(self.db, host_token)
+        self.db.claim_worker_ownership(
+            "w_protected", host.member_id, "idle", time.time(),
+        )
+        _, stranger_token = self._make_contributor()
+        resp = self.client.post(
+            "/me/workers/w_protected/forget",
+            headers={"Authorization": f"Bearer {stranger_token}"},
+        )
+        self.assertEqual(resp.status_code, 404)
+        # Worker survived.
+        self.assertEqual(self.db.worker_owner("w_protected"), host.member_id)
+
+    def test_contributor_status_envelope_for_admin(self):
+        resp = self.client.get(
+            "/me/contributor-status", headers=self._admin_headers(),
+        )
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertTrue(body["is_admin"])
+        self.assertFalse(body["engine_applies"])
+
+    def test_contributor_status_envelope_for_member(self):
+        _, contributor_token = self._make_contributor()
+        resp = self.client.get(
+            "/me/contributor-status",
+            headers={"Authorization": f"Bearer {contributor_token}"},
+        )
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertFalse(body["is_admin"])
+        self.assertTrue(body["engine_applies"])
+        self.assertIn("uptime_7d", body)
+        self.assertIn("current_tier_requirements", body)
+        self.assertEqual(body["tier"], "BRONZE")
+        # Brand-new member has zero uptime → does not meet BRONZE bar.
+        self.assertFalse(body["meets_current"])
+
+    # ------------------------------------------------------------------
     # friend management — host edits / revokes accepted invitees
     # ------------------------------------------------------------------
     def _accept_invite_under(self, contributor_token: str) -> tuple[str, str]:

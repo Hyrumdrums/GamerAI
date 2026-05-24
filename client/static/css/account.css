@@ -92,6 +92,15 @@ table.friends-table th { color: var(--muted, #666); font-weight: 600; }
 .badge-revoked {
   background: #fde7e7; color: #8a1f1f; border-color: #e9a4a4;
 }
+.badge-ok {
+  background: #e6f4ea; color: #1e6a37; border-color: #a9d9b9;
+}
+.badge-warn {
+  background: #fff7e6; color: #6e4f12; border-color: #f0d496;
+}
+.muted.small {
+  font-size: .8rem;
+}
 .friends-editable .friend-quota-form {
   display: inline-flex; align-items: center; gap: .25rem;
   flex-wrap: nowrap;
