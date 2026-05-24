@@ -706,13 +706,50 @@ const searchCheckbox = document.getElementById('tool-search-cb');
 const imageWrap = document.getElementById('image-toggle-wrap');
 const searchWrap = document.getElementById('search-toggle-wrap');
 const searchModeWrap = document.getElementById('search-mode-wrap');
+const imageSizeWrap = document.getElementById('image-size-wrap');
+
+// Image resolution buckets. The composer's three radios map to one of
+// these; the coordinator clamps and the worker renders at whatever
+// width/height we send. Cost in image-units (charged against the
+// daily image quota) scales with pixel area — see
+// coordinator.main.image_cost_multiplier. Small is the default
+// because it's ~4× faster than Large on the SDXL Lightning model
+// running on a 6 GB contributor GPU, and a one-shot left-on shouldn't
+// silently chew through a BRONZE user's whole day of credits.
+const IMAGE_SIZE_PRESETS = {
+  small:  {width:  512, height:  512},
+  medium: {width:  768, height:  768},
+  large:  {width: 1024, height: 1024},
+};
+// Sticky last choice across page loads. Validated against the preset
+// table on read so a stale/malformed localStorage value can't crash
+// the composer — it just falls through to the small default.
+const IMAGE_SIZE_STORAGE_KEY = 'gamerai.image_size';
+function loadImageSizePreference() {
+  try {
+    const v = localStorage.getItem(IMAGE_SIZE_STORAGE_KEY);
+    if (v && Object.prototype.hasOwnProperty.call(IMAGE_SIZE_PRESETS, v)) {
+      return v;
+    }
+  } catch (_) { /* private mode / disabled storage → just use default */ }
+  return 'small';
+}
+function saveImageSizePreference(v) {
+  try { localStorage.setItem(IMAGE_SIZE_STORAGE_KEY, v); }
+  catch (_) { /* ignore — preference becomes per-session only */ }
+}
+function selectedImageSize() {
+  const checked = document.querySelector('input[name="image-size"]:checked');
+  return (checked && checked.value) || 'small';
+}
 
 function refreshComposerUI() {
   // Visibility: whichever checkbox is checked claims the row alone.
   imageWrap.hidden = searchCheckbox.checked;
   searchWrap.hidden = imageCheckbox.checked;
-  // Sub-toggle (fast vs comprehensive) only relevant for search.
+  // Sub-toggles only show under their parent checkbox.
   searchModeWrap.hidden = !searchCheckbox.checked;
+  imageSizeWrap.hidden = !imageCheckbox.checked;
   // Placeholder cues the user about the active mode.
   const ta = document.getElementById('prompt');
   if (imageCheckbox.checked) {
@@ -723,6 +760,20 @@ function refreshComposerUI() {
     ta.placeholder = 'Message GamerAI...';
   }
 }
+
+// Restore the sticky resolution radio before the first refresh — the
+// HTML defaults to small=checked, but a returning user may have
+// picked medium/large last time and expects that to stick.
+(function applyStickyImageSize() {
+  const want = loadImageSizePreference();
+  const r = document.querySelector(`input[name="image-size"][value="${want}"]`);
+  if (r) r.checked = true;
+  // Persist any change immediately so a refresh mid-stream picks up
+  // the latest choice instead of the value at page load.
+  document.querySelectorAll('input[name="image-size"]').forEach((el) => {
+    el.addEventListener('change', () => saveImageSizePreference(el.value));
+  });
+})();
 
 // Persist the current search-checkbox state under the current
 // conversation key. Null key is the "brand new chat" slot — most
@@ -865,6 +916,9 @@ document.getElementById('composer').onsubmit = async (e) => {
   if (imageCheckbox.checked) submitTool = 'image';
   else if (searchCheckbox.checked) submitTool = 'search';
   const submitSearchMode = submitTool === 'search' ? selectedSearchMode() : null;
+  // Snapshot before auto-clearing the image checkbox so the resolution
+  // pick that the user saw on submit is what we actually send.
+  const submitImageSize = submitTool === 'image' ? selectedImageSize() : null;
   imageCheckbox.checked = false;
   // searchCheckbox stays — sticky.
   refreshComposerUI();
@@ -891,6 +945,12 @@ document.getElementById('composer').onsubmit = async (e) => {
   const body = {prompt, conversation_id: currentId};
   if (submitTool === 'image') {
     body.tool = 'image';
+    // Always pin width/height so the worker doesn't fall through to
+    // the model's native default (1024² on SDXL Lightning) — that
+    // would silently bill the user the 4× large rate when they meant
+    // to pick small.
+    const preset = IMAGE_SIZE_PRESETS[submitImageSize] || IMAGE_SIZE_PRESETS.small;
+    body.image = {width: preset.width, height: preset.height};
   } else if (submitTool === 'search') {
     body.tool = 'search';
     body.search_mode = submitSearchMode;

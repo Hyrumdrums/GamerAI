@@ -337,6 +337,49 @@ class CoordinatorE2ETests(unittest.TestCase):
         self.assertEqual(row["status"], "pending")
 
 
+class ImageCostMultiplierTests(unittest.TestCase):
+    """Pixel-area → quota-multiplier table. The composer's small /
+    medium / large radios map to 512² / 768² / 1024² and should bill
+    1× / 2× / 4× image-units against the daily image quota. Edge
+    cases worth pinning: zero/negative dims fall through to 1× (no
+    silent 4× surprise on a malformed worker output), and the
+    boundaries are inclusive of the named bucket (a 512² image costs
+    1×, a 513² image costs 2×)."""
+
+    def test_small_bucket_at_and_below_512_squared(self):
+        from coordinator.main import image_cost_multiplier
+        self.assertEqual(image_cost_multiplier(512, 512), 1.0)
+        self.assertEqual(image_cost_multiplier(256, 256), 1.0)
+        self.assertEqual(image_cost_multiplier(1, 1), 1.0)
+
+    def test_medium_bucket_between_513_and_768_squared(self):
+        from coordinator.main import image_cost_multiplier
+        # First step above the small boundary.
+        self.assertEqual(image_cost_multiplier(513, 513), 2.0)
+        self.assertEqual(image_cost_multiplier(768, 768), 2.0)
+
+    def test_large_bucket_above_768_squared(self):
+        from coordinator.main import image_cost_multiplier
+        self.assertEqual(image_cost_multiplier(769, 769), 4.0)
+        self.assertEqual(image_cost_multiplier(1024, 1024), 4.0)
+        self.assertEqual(image_cost_multiplier(1536, 1536), 4.0)
+
+    def test_unknown_dims_default_to_small(self):
+        # A worker output we couldn't parse (PNG too short, dims=0)
+        # should bill 1× rather than 4× — better to undercount the
+        # edge case than blindside a BRONZE user.
+        from coordinator.main import image_cost_multiplier
+        self.assertEqual(image_cost_multiplier(0, 0), 1.0)
+        self.assertEqual(image_cost_multiplier(-1, 1024), 1.0)
+
+    def test_asymmetric_dims_use_area_not_max_side(self):
+        # A 256x1024 image (262,144 px) is still small-bucket area
+        # even though its long side is large. Confirms we're billing
+        # by compute (area) and not by max-dim.
+        from coordinator.main import image_cost_multiplier
+        self.assertEqual(image_cost_multiplier(256, 1024), 1.0)
+
+
 class ImageGenerationTests(unittest.TestCase):
     """Smoke tests for the image-tool slice. KISS coverage: queue +
     routing + PNG-storage path. Heavier image fidelity (real sd.cpp,

@@ -113,14 +113,14 @@ body { display: flex; flex-direction: column; }
 .image-toggle:hover { color: var(--text); }
 
 /* The browser's UA stylesheet has [hidden] { display: none } but at
- * specificity 0,1,0 — anything matching .image-toggle or .search-mode
- * (display: inline-flex below) outranks it on equal specificity by
- * source order. Without these explicit rules, JS toggling
- * `wrap.hidden = true` would set the attribute but the element would
- * stay visible. Same fix needed for both toggles + the search-mode
- * sub-row. */
+ * specificity 0,1,0 — anything matching .image-toggle, .search-mode,
+ * or .image-size (display: inline-flex below) outranks it on equal
+ * specificity by source order. Without these explicit rules, JS
+ * toggling `wrap.hidden = true` would set the attribute but the
+ * element would stay visible. */
 .image-toggle[hidden],
-.search-mode[hidden] { display: none; }
+.search-mode[hidden],
+.image-size[hidden] { display: none; }
 
 /* Fast/comprehensive sub-toggle for search. Only shown when the
  * Search checkbox is on; defaults to Fast. Inline radio pair matches
@@ -133,6 +133,24 @@ body { display: flex; flex-direction: column; }
   display: inline-flex; align-items: center; gap: .25rem; cursor: pointer;
 }
 .search-mode input[type="radio"] { width: auto; margin: 0; cursor: pointer; }
+
+/* Small/medium/large resolution radios. Mirrors .search-mode visually
+ * (same inline radio strip) but lives next to the Image checkbox and
+ * only appears when that checkbox is on. The little <em> after each
+ * label shows the credit cost (1× / 2× / 4×) so the user can see why
+ * Large costs more before they pick it. */
+.image-size {
+  display: inline-flex; align-items: center; gap: .75rem;
+  font-size: .8rem; color: var(--muted);
+}
+.image-size label {
+  display: inline-flex; align-items: center; gap: .25rem; cursor: pointer;
+}
+.image-size input[type="radio"] { width: auto; margin: 0; cursor: pointer; }
+.image-size em {
+  font-style: normal; font-size: .7rem; color: var(--muted);
+  opacity: .75; margin-left: .15rem;
+}
 
 /* Sources strip rendered at the end of a search-answer bubble. Numbered
  * list of clickable domains so the user can verify citations the

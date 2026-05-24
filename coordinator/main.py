@@ -921,6 +921,42 @@ def _clamp_image_dim(value: int) -> int:
     return (v // 64) * 64 or _IMAGE_DIM_MIN
 
 
+def _png_dimensions(data: bytes) -> tuple[int, int]:
+    """Parse (width, height) from a PNG IHDR. Layout: 8-byte signature
+    + 4-byte chunk length + 4-byte 'IHDR' + 4-byte width BE + 4-byte
+    height BE. Returns (0, 0) on a buffer too short to hold the chunk
+    — callers treat that as 'unknown' and fall back to the smallest
+    cost bucket so an oddball worker output never auto-bills 4×."""
+    if len(data) < 24:
+        return (0, 0)
+    return (
+        int.from_bytes(data[16:20], "big"),
+        int.from_bytes(data[20:24], "big"),
+    )
+
+
+def image_cost_multiplier(width: int, height: int) -> float:
+    """Quota multiplier for an image of (*width*, *height*). Three
+    buckets aligned with the composer's small/medium/large radios:
+
+    - small  (≤ 512²)             → 1×
+    - medium (≤ 768²)             → 2×
+    - large  (anything bigger,
+      including SDXL-native 1024²) → 4×
+
+    Compute is roughly proportional to pixel area on diffusion models,
+    so the factors approximate GPU work while keeping the displayed
+    cost an integer the UI can render as 'costs N image-credits'.
+    Unknown / zero dims fall through to 1× — fair-by-default for
+    edge cases like a sub-256 canary."""
+    area = max(int(width), 0) * max(int(height), 0)
+    if area <= 0 or area <= 512 * 512:
+        return 1.0
+    if area <= 768 * 768:
+        return 2.0
+    return 4.0
+
+
 def _default_image_params():
     """Wraps ImageParams() so the import lives at the top of the file
     only — keeps the /generate body short."""
@@ -1057,11 +1093,16 @@ def _classify_image_or_raise(png_bytes: bytes, job_id: str) -> None:
         )
 
 
-def _save_image_or_raise(job_id: str, image_b64: Optional[str]) -> str:
+def _save_image_or_raise(
+    job_id: str, image_b64: Optional[str]
+) -> tuple[str, int, int]:
     """Decode the worker-supplied PNG and persist it under IMAGE_DIR.
-    Returns the basename (the messages.image_path the UI fetches from
-    /images/<basename>). Raises HTTPException on malformed payloads
-    so /jobs/complete responds 400 — the worker should not retry the
+    Returns ``(basename, width, height)`` — basename is the
+    messages.image_path the UI fetches from /images/<basename>;
+    width/height come from the PNG's IHDR and are used by
+    /jobs/complete to bill the right quota multiplier for the
+    rendered size. Raises HTTPException on malformed payloads so
+    /jobs/complete responds 400 — the worker should not retry the
     same broken bytes.
 
     Validates the PNG magic header so a worker can't sneak a JPEG (or
@@ -1109,7 +1150,8 @@ def _save_image_or_raise(job_id: str, image_b64: Optional[str]) -> str:
     tmp = dest.with_suffix(".png.tmp")
     tmp.write_bytes(data)
     tmp.replace(dest)
-    return fname
+    width, height = _png_dimensions(data)
+    return fname, width, height
 
 
 def ensure_admin_seed() -> None:
@@ -2576,9 +2618,13 @@ def complete(req: JobCompleteRequest, request: Request):
     # pricing table.
     image_path: Optional[str] = None
     image_save_error: Optional[str] = None
+    image_width: int = 0
+    image_height: int = 0
     if pre_complete_tool == "image" and req.status == "complete":
         try:
-            image_path = _save_image_or_raise(req.job_id, req.image_b64)
+            image_path, image_width, image_height = _save_image_or_raise(
+                req.job_id, req.image_b64,
+            )
         except HTTPException:
             # Re-raise — the worker sent malformed bytes; surface a 400.
             raise
@@ -2748,10 +2794,19 @@ def complete(req: JobCompleteRequest, request: Request):
         earnings_token_credit = 200
         db.add_earnings(req.worker_id, earnings_token_credit, earnings)
         if submitter:
+            # Charge by rendered resolution, not a flat per-image rate:
+            # a 1024² image is ~4× the GPU work of a 512², and the
+            # multiplier (see image_cost_multiplier) tracks pixel area
+            # so the daily image quota measures actual cost. PNG dims
+            # come from the saved file's IHDR — the worker can't bias
+            # the bill by lying about width/height in the envelope.
+            units = IMAGE_UNIT_COST_BASE * image_cost_multiplier(
+                image_width, image_height,
+            )
             db.add_member_image_usage(
                 submitter,
                 now,
-                units=IMAGE_UNIT_COST_BASE,
+                units=units,
             )
     if is_chat_complete or is_image_complete:
         # mirror to redis hash for backwards compat
