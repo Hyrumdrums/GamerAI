@@ -171,6 +171,7 @@ body { display: flex; flex-direction: column; }
 }
 .composer button { width: auto; }
 .status { color: var(--muted); font-size: .8rem; text-align: center; min-height: 1em; margin-top: .35rem; }
+.conv-tokens { color: var(--muted); font-size: .75rem; text-align: center; margin-top: .15rem; opacity: .8; }
 
 .retry-btn {
   margin-top: .5rem; padding: .35rem .7rem; font-size: .85rem;

@@ -24,6 +24,30 @@ const msgCache = new Map();
 // (currentId === null) gets its own slot via the null key.
 const searchModeByConv = new Map();
 
+// Running token total (prompt + completion) for the visible conversation.
+// Recomputed from messages on render; incremented per completed turn so
+// the bottom-of-chat counter stays live mid-session.
+let convTokens = 0;
+function setConvTokens(n) {
+  convTokens = Math.max(0, n | 0);
+  const el = document.getElementById('conv-tokens');
+  if (!el) return;
+  if (convTokens > 0) {
+    el.textContent = convTokens.toLocaleString() + ' tokens this chat';
+    el.hidden = false;
+  } else {
+    el.textContent = '';
+    el.hidden = true;
+  }
+}
+function sumMessageTokens(messages) {
+  let t = 0;
+  for (const m of messages || []) {
+    t += (m.prompt_tokens || 0) + (m.completion_tokens || 0);
+  }
+  return t;
+}
+
 // ---- bootstrap --------------------------------------------------------
 async function init() {
   try {
@@ -113,6 +137,7 @@ async function deleteConversation(id, label) {
     document.getElementById('chat-pane').innerHTML =
       '<div class="empty"><h2>What\'s on your mind?</h2>' +
       '<div>Start a new conversation by typing below.</div></div>';
+    setConvTokens(0);
   }
   await refreshSidebar();
 }
@@ -129,6 +154,7 @@ document.getElementById('new-chat').onclick = () => {
     '<div class="empty"><h2>What\'s on your mind?</h2><div>Start a new conversation by typing below.</div></div>';
   document.querySelectorAll('.conv-item').forEach(el => el.classList.remove('active'));
   document.getElementById('sidebar').classList.remove('open');
+  setConvTokens(0);
   document.getElementById('prompt').focus();
 };
 
@@ -187,6 +213,7 @@ let activeStream = null;
 function renderMessages(messages) {
   const pane = document.getElementById('chat-pane');
   pane.innerHTML = '';
+  setConvTokens(sumMessageTokens(messages));
   if (messages.length === 0) {
     pane.innerHTML = '<div class="empty"><h2>(empty)</h2></div>';
     return;
@@ -632,6 +659,15 @@ async function streamIntoBubble(jobId, wrap, statusEl, startMs, messageId) {
           else label = `done in ${dt}s · ${res.completion_tokens || 0} tokens · ${res.worker_id || 'unknown worker'}`;
           statusEl.textContent = label;
         }
+        // Roll this turn's tokens into the running chat total. Image jobs
+        // report 0/0, so they no-op. The cache invalidation on submit
+        // means the next conv-open recomputes from server-of-record, so
+        // a wrong delta here self-heals on the next navigation.
+        setConvTokens(
+          convTokens
+          + (res.prompt_tokens || 0)
+          + (res.completion_tokens || 0),
+        );
         return finalRes;
       }
     }
