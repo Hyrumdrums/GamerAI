@@ -516,6 +516,64 @@ def _install_console_close_handler(shutdown_now) -> None:
         pass
 
 
+def _disable_console_quickedit() -> None:
+    """Clear conhost's QuickEdit + Mouse Input flags so a contributor
+    accidentally clicking inside the agent's console window doesn't
+    park the entire process.
+
+    Windows' default cmd.exe / conhost.exe enables QuickEdit, which
+    means a single click anywhere in the buffer puts the console into
+    "select mode" and BLOCKS every stdout/stderr write the process
+    attempts until the user presses Enter or right-clicks. Our main
+    loop logs on every tick (status lines, job-claim, job-complete),
+    and Python's blocking stdout means the next log call freezes the
+    main thread mid-claim. Symptom from the field: agent appears
+    idle, /jobs/next stops, jobs sit on the queue. Pressing Enter in
+    the console "resumes" the agent because it deselects and drains
+    the buffered writes.
+
+    Surveyed alternatives before reaching for ctypes:
+      - pywin32 (win32console.SetConsoleMode) — works, but pulls in
+        ~10 MB of native modules for a single GetMode/SetMode pair.
+      - colorama — only touches output mode, not input mode flags.
+      - windows-curses — adds an ncurses runtime; overkill.
+      Pure ctypes is the established Win32 pattern in this file
+      (see _install_console_close_handler above) and adds zero deps.
+
+    Best-effort: no-op on non-Windows, when run headless without a
+    console attached (Windows Service), or on any ctypes failure.
+    The worst case is the original bug, not a regression.
+    """
+    if not IS_WINDOWS:
+        return
+    try:
+        from ctypes import wintypes
+        kernel32 = ctypes.windll.kernel32
+        STD_INPUT_HANDLE = -10
+        # SetConsoleMode flags. Clearing QuickEdit only takes effect
+        # when ENABLE_EXTENDED_FLAGS is also set — Microsoft's docs
+        # state this explicitly.
+        ENABLE_EXTENDED_FLAGS = 0x0080
+        ENABLE_QUICK_EDIT_MODE = 0x0040
+        ENABLE_MOUSE_INPUT = 0x0010
+        handle = kernel32.GetStdHandle(STD_INPUT_HANDLE)
+        # GetStdHandle returns INVALID_HANDLE_VALUE (-1) on no console.
+        if handle == 0 or handle == ctypes.c_void_p(-1).value:
+            return
+        mode = wintypes.DWORD()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return
+        new_mode = (
+            (mode.value & ~ENABLE_QUICK_EDIT_MODE & ~ENABLE_MOUSE_INPUT)
+            | ENABLE_EXTENDED_FLAGS
+        )
+        if new_mode == mode.value:
+            return
+        kernel32.SetConsoleMode(handle, new_mode)
+    except Exception:
+        pass
+
+
 def _start_tray(
     *,
     stop_event: "threading.Event",
@@ -4705,6 +4763,10 @@ def main(argv: Optional[list[str]] = None) -> int:
             pass
 
     _install_console_close_handler(_shutdown_now)
+    # Disable QuickEdit so a user click inside the console never parks
+    # the main loop by blocking stdout writes. See the function's
+    # docstring for the failure mode this prevents.
+    _disable_console_quickedit()
 
     try:
         main_loop(

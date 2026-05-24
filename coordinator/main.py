@@ -3584,6 +3584,26 @@ def retry_message(message_id: str, request: Request):
     # model → coordinator default at job-fetch time. Keeping the same
     # model on retry avoids a surprise model swap mid-conversation.
     use_model = conv_row["model"] or msg["model"]
+    # Carry the original job's tool forward so the retry lands on the
+    # matching per-tool queue. Today only chat reaches this endpoint
+    # (image/search messages don't surface retry buttons), but
+    # defaulting to "chat" with a DB-driven lookup means an image
+    # retry added later doesn't silently land on the chat queue.
+    orig_tool = "chat"
+    # sqlite3.Row exposes columns via __getitem__, not .get() — wrap
+    # the lookup in try/except so a row without a job_id (legacy
+    # message rows) falls through to the chat default cleanly.
+    try:
+        orig_job_id = msg["job_id"]
+    except (IndexError, KeyError):
+        orig_job_id = None
+    if orig_job_id:
+        orig_job = db.get_job(orig_job_id)
+        if orig_job is not None:
+            try:
+                orig_tool = (orig_job["tool"] or "chat").lower()
+            except (IndexError, KeyError):
+                pass
     new_job_id = str(uuid.uuid4())
     submitted_at = time.time()
     member = getattr(request.state, "member", None)
@@ -3608,8 +3628,9 @@ def retry_message(message_id: str, request: Request):
         "model": use_model,
         "submitted_at": submitted_at,
         "messages": worker_messages,
+        "tool": orig_tool,
     }
-    r.rpush(JOB_QUEUE, json.dumps(job))
+    r.rpush(job_queue_for(orig_tool), json.dumps(job))
     log.info(
         "retry queued",
         extra={

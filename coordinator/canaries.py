@@ -22,7 +22,7 @@ import uuid
 from shared.config import (
     CANARY_INTERVAL_SECONDS,
     CANARY_PENDING,
-    JOB_QUEUE,
+    job_queue_for,
 )
 
 log = logging.getLogger("coordinator.canaries")
@@ -132,7 +132,12 @@ class CanaryInjector(threading.Thread):
             submitted_at=now,
             submitted_by_member_id=None,
         )
-        self.r.rpush(JOB_QUEUE, json.dumps(envelope))
+        # Route through job_queue_for("chat") instead of the bare
+        # JOB_QUEUE constant. They resolve to the same Redis key today
+        # (JOB_QUEUE *is* the legacy chat alias), but going through the
+        # helper means a future rename of the alias won't silently
+        # strand canaries on an unconsumed queue.
+        self.r.rpush(job_queue_for("chat"), json.dumps(envelope))
         log.info(json.dumps({
             "event": "canary_injected",
             "job_id": job_id,
