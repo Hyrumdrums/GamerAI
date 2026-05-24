@@ -1606,9 +1606,45 @@ def save_state(state: dict) -> None:
     # RuntimeError: dictionary changed size during iteration. Lock keeps
     # the serialize+replace pair atomic across threads.
     with _STATE_LOCK:
-        tmp = STATE_PATH.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
-        tmp.replace(STATE_PATH)
+        _save_state_locked(state)
+
+
+def _save_state_locked(state: dict) -> None:
+    """Inner save — caller must already hold _STATE_LOCK. Used by
+    credit_completed_job so the increment + persist pair stays atomic
+    under the same lock acquisition."""
+    tmp = STATE_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    tmp.replace(STATE_PATH)
+
+
+def credit_completed_job(
+    state: dict,
+    *,
+    last_tool: Optional[str],
+    earnings: float,
+    tokens: int = 0,
+) -> None:
+    """Atomically credit a completed job to the shared state dict +
+    persist. Necessary because the dual-loop architecture (voice-phase1)
+    has the GPU and CPU loops racing on the same counters — without the
+    lock here, a concurrent jobs+=1 from each loop would lose one
+    increment.
+
+    ``last_tool`` is the warm-model preference used by _ordered_queues.
+    Pass None to leave the previous value (rare — the TTS path on the
+    CPU loop deliberately doesn't promote tts to the front of the
+    GPU loop's queue order)."""
+    with _STATE_LOCK:
+        state["jobs"] = int(state.get("jobs", 0)) + 1
+        state["earnings_usd"] = round(
+            float(state.get("earnings_usd", 0.0)) + earnings, 10,
+        )
+        if tokens:
+            state["tokens"] = int(state.get("tokens", 0)) + int(tokens)
+        if last_tool is not None:
+            state["last_tool"] = last_tool
+        _save_state_locked(state)
 
 
 def resolve_worker_id(cfg_worker_id: Optional[str], state: dict) -> str:
@@ -3919,29 +3955,27 @@ def _ordered_queues(
 ) -> list[str]:
     """Per-tool poll order for one main-loop tick.
 
-    Defaults to ["chat"]; appends "image" / "search" / "tts" when the
-    agent advertises them. Promotes the agent's *last-served* tool to
-    the front so back-to-back jobs of the same kind keep the model
-    warm in VRAM — a chat streak keeps Ollama hot; an image streak
-    keeps sd.cpp's weights loaded; a search streak skips the cold-
-    cache hit on trafilatura's lazy imports. The flip only happens
-    when the preferred queue is empty AND another queue has work, so
-    demand-shaped routing still falls out naturally without any
-    coordinator-side state.
+    Defaults to ["chat"]; appends "image" / "search" when the agent
+    advertises them. Promotes the agent's *last-served* tool to the
+    front so back-to-back jobs of the same kind keep the model warm
+    in VRAM — a chat streak keeps Ollama hot; an image streak keeps
+    sd.cpp's weights loaded; a search streak skips the cold-cache hit
+    on trafilatura's lazy imports. The flip only happens when the
+    preferred queue is empty AND another queue has work, so demand-
+    shaped routing still falls out naturally without any coordinator-
+    side state.
 
-    TTS is here for the *single-loop* path. The dual-loop architecture
-    (voice-phase1) ultimately wants TTS on its own dedicated CPU loop
-    so it doesn't queue behind chat — that's tracked separately. For
-    now, advertising tts here means the same main loop will pick up
-    TTS jobs when the GPU loop is idle, which is correct for a
-    1-worker / 1-user testbed."""
+    "tts" is intentionally NOT included here even when the agent
+    advertises it: the dedicated CPU loop (tts_loop) is the sole
+    consumer of job_queue:tts, so a worker mid-chat can serve TTS in
+    parallel on its idle CPU rather than queueing TTS behind a 10 s
+    chat. See voice-phase1 design memory for the latency walkthrough
+    that motivates the dual-loop architecture."""
     available = ["chat"]
     if tools and "image" in tools:
         available.append("image")
     if tools and "search" in tools:
         available.append("search")
-    if tools and "tts" in tools:
-        available.append("tts")
     if last_tool in available and last_tool != available[0]:
         return [last_tool] + [t for t in available if t != last_tool]
     return available
@@ -4014,12 +4048,9 @@ def process_one(
             )
             if accepted:
                 earnings = float((out or {}).get("earnings", 0.0))
-                state["jobs"] = int(state.get("jobs", 0)) + 1
-                state["earnings_usd"] = round(
-                    float(state.get("earnings_usd", 0.0)) + earnings, 10,
+                credit_completed_job(
+                    state, last_tool="image", earnings=earnings,
                 )
-                state["last_tool"] = "image"
-                save_state(state)
                 log.info(
                     "job %s finished (image): $%.8f, %.2fs",
                     job_id, earnings, duration,
@@ -4027,48 +4058,6 @@ def process_one(
             else:
                 log.info(
                     "job %s (image): %.2fs of work discarded — "
-                    "claim was superseded or cancelled",
-                    job_id, duration,
-                )
-        elif tool == "tts":
-            audio_b64, audio_seconds, model_used = run_tts_inference(
-                prompt, job, cfg, log,
-            )
-            duration = round(time.time() - started, 3)
-            accepted, out = coord.complete(
-                {
-                    "worker_id": coord.worker_id,
-                    "job_id": job_id,
-                    # The prompt is what the user asked us to read
-                    # aloud; echo a snippet back so the result row
-                    # has a human-readable handle in the admin UI.
-                    "text": prompt[:200],
-                    "model": model_used,
-                    "prompt_tokens": estimate_tokens(prompt),
-                    "completion_tokens": 0,
-                    "duration_seconds": duration,
-                    "status": "complete",
-                    "audio_b64": audio_b64,
-                    "audio_seconds": audio_seconds,
-                },
-                claim_token=claim_token,
-            )
-            if accepted:
-                earnings = float((out or {}).get("earnings", 0.0))
-                state["jobs"] = int(state.get("jobs", 0)) + 1
-                state["earnings_usd"] = round(
-                    float(state.get("earnings_usd", 0.0)) + earnings, 10,
-                )
-                state["last_tool"] = "tts"
-                save_state(state)
-                log.info(
-                    "job %s finished (tts): %.2fs audio, $%.8f, "
-                    "%.2fs synth",
-                    job_id, audio_seconds, earnings, duration,
-                )
-            else:
-                log.info(
-                    "job %s (tts): %.2fs of work discarded — "
                     "claim was superseded or cancelled",
                     job_id, duration,
                 )
@@ -4124,11 +4113,12 @@ def process_one(
             )
             if accepted:
                 earnings = float((out or {}).get("earnings", 0.0))
-                state["jobs"] = int(state.get("jobs", 0)) + 1
-                state["tokens"] = int(state.get("tokens", 0)) + int(result["completion_tokens"])
-                state["earnings_usd"] = round(float(state.get("earnings_usd", 0.0)) + earnings, 10)
-                state["last_tool"] = tool
-                save_state(state)
+                credit_completed_job(
+                    state,
+                    last_tool=tool,
+                    earnings=earnings,
+                    tokens=int(result["completion_tokens"]),
+                )
                 log.info(
                     "job %s finished (%s): %d tokens, $%.8f, %.2fs",
                     job_id, tool, result["completion_tokens"], earnings, duration,
@@ -4158,6 +4148,135 @@ def process_one(
     finally:
         coord.set_idle()
     return True, job_id
+
+
+# ---------------------------------------------------------------------------
+# CPU TTS loop (voice-phase1 dual-loop architecture)
+#
+# Runs concurrently with the GPU loop (main_loop above) so a worker
+# mid-chat can serve TTS jobs from its idle CPU instead of queueing
+# them behind the multi-second chat job. See voice-phase1 design
+# memory for the worked latency comparison that motivated this.
+#
+# This loop intentionally does NOT touch coord.set_busy / set_idle —
+# those reflect the GPU loop's state for the heartbeat-extension
+# protocol the reaper relies on for long chat/image jobs. TTS jobs
+# are short enough (~1-2 s of Piper synthesis) that JOB_TIMEOUT_SECONDS
+# (120s) is never even close, so they don't need reaper extension.
+# ---------------------------------------------------------------------------
+
+def tts_loop(
+    cfg: "Config",
+    coord: "Coordinator",
+    state: dict,
+    log: logging.Logger,
+    stop_event: threading.Event,
+) -> None:
+    """Drive the CPU TTS loop until stop_event is set. Same idle-gate
+    semantics as the GPU loop: when the user is active, defer
+    polling so the contributor's box isn't audibly cranking through
+    TTS jobs while they're trying to game."""
+    log.info("tts loop started (cpu-only, voice-phase1 dual-loop)")
+    while not stop_event.is_set():
+        idle, _reason = is_system_idle(cfg)
+        if not idle:
+            # GPU loop's main_loop handles the user-visible offline
+            # message + WORKER_STATUS update — we just back off here.
+            stop_event.wait(cfg.polling_interval)
+            continue
+        try:
+            process_tts_one(cfg, coord, state, log)
+        except Exception:
+            log.exception("tts loop tick failed")
+            stop_event.wait(cfg.polling_interval)
+    log.info("tts loop stopped")
+
+
+def process_tts_one(
+    cfg: "Config",
+    coord: "Coordinator",
+    state: dict,
+    log: logging.Logger,
+) -> None:
+    """One iteration of the CPU TTS loop. Long-polls only on
+    job_queue:tts (via tools=["tts"]) so it never claims a chat or
+    image job — those belong to the GPU loop."""
+    job = coord.next_job(tools=["tts"], wait=LONG_POLL_WAIT_SECONDS)
+    if not job:
+        return
+    job_id = job.get("job_id")
+    prompt = job.get("prompt", "")
+    claim_token = job.pop("_claim_token", None)
+    log.info("tts job %s started (cpu loop)", job_id)
+
+    if cfg.override_drain:
+        idle_now, reason = is_system_idle(cfg)
+        if not idle_now:
+            log.info(
+                "override-drain: %s — abandoning tts job %s "
+                "(earnings forfeited)",
+                reason, job_id,
+            )
+            coord.abandon(job_id, claim_token=claim_token)
+            return
+
+    started = time.time()
+    try:
+        audio_b64, audio_seconds, model_used = run_tts_inference(
+            prompt, job, cfg, log,
+        )
+        duration = round(time.time() - started, 3)
+        accepted, out = coord.complete(
+            {
+                "worker_id": coord.worker_id,
+                "job_id": job_id,
+                # Echo the spoken text back so the admin view has a
+                # human-readable handle. Bounded so a long-paragraph
+                # TTS job doesn't bloat the JOB_RESULTS payload.
+                "text": prompt[:200],
+                "model": model_used,
+                "prompt_tokens": estimate_tokens(prompt),
+                "completion_tokens": 0,
+                "duration_seconds": duration,
+                "status": "complete",
+                "audio_b64": audio_b64,
+                "audio_seconds": audio_seconds,
+            },
+            claim_token=claim_token,
+        )
+        if accepted:
+            earnings = float((out or {}).get("earnings", 0.0))
+            # last_tool=None: don't promote tts to the GPU loop's
+            # warm-queue front (that's the chat/image/search preference
+            # heuristic — tts has its own dedicated loop here).
+            credit_completed_job(
+                state, last_tool=None, earnings=earnings,
+            )
+            log.info(
+                "tts job %s finished: %.2fs audio, $%.8f, %.2fs synth",
+                job_id, audio_seconds, earnings, duration,
+            )
+        else:
+            log.info(
+                "tts job %s discarded — claim was superseded or cancelled",
+                job_id,
+            )
+    except Exception as e:
+        log.exception("tts job %s failed: %s", job_id, e)
+        coord.complete(
+            {
+                "worker_id": coord.worker_id,
+                "job_id": job_id,
+                "text": "",
+                "model": cfg.bootstrap_tts_model,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "duration_seconds": round(time.time() - started, 3),
+                "status": "error",
+                "error": str(e),
+            },
+            claim_token=claim_token,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -5243,6 +5362,23 @@ def main(argv: Optional[list[str]] = None) -> int:
         daemon=True,
     )
     stdin_thread.start()
+
+    # CPU TTS loop (voice-phase1 dual-loop). Only spawned when Piper
+    # bootstrap succeeded — without it, advertising "tts" capability
+    # would route audio jobs to a worker that can't fulfil them, so
+    # the capability advertisement above is also gated on tts_ready.
+    # daemon=True so a clean shutdown_done.set() lets us not bother
+    # joining; the loop's stop_event check exits within one
+    # LONG_POLL_WAIT_SECONDS BLPOP window.
+    tts_thread: Optional[threading.Thread] = None
+    if tts_ready:
+        tts_thread = threading.Thread(
+            target=tts_loop,
+            args=(cfg, coord, state, log, stop_event),
+            name="gamerai-tts",
+            daemon=True,
+        )
+        tts_thread.start()
 
     # Tray icon: spawn after stop_event exists so Exit can signal a
     # clean shutdown. Returns None if pystray/Pillow failed to import
