@@ -24,6 +24,134 @@ const msgCache = new Map();
 // (currentId === null) gets its own slot via the null key.
 const searchModeByConv = new Map();
 
+// ---- voice mode (voice-phase1) ----------------------------------------
+// Session-global toggle. When ON, the streaming loop in streamIntoBubble
+// segments the assistant response into sentences and fires a tool="tts"
+// /generate per sentence, then plays each returned audio_b64 in
+// submission order. Off by default; flipped via the mic button.
+//
+// Why session-global rather than per-conversation: voice mode is a UX
+// preference (do I want audio right now?), not a conversation property
+// the way search-mode is. Sticking it to a conversation would make a
+// returning user wonder why some threads spontaneously start talking.
+let voiceMode = false;
+
+// Sequential playback queue. Each in-flight TTS job claims a slot
+// (promise that resolves with {b64} or null on error). The playback
+// worker awaits each slot in order, so audio plays in the order
+// sentences were spoken even if a later sentence's TTS completes
+// first. Reset on voice-mode off and at the start of each new
+// streamIntoBubble session.
+const voiceQueue = {
+  slots: [],         // Promises in submission order
+  worker: null,      // The async playback loop, or null when idle
+  currentAudio: null,
+  sessionToken: 0,   // bumped each reset; in-flight jobs check it
+  reset() {
+    this.sessionToken += 1;
+    this.slots = [];
+    if (this.currentAudio) {
+      try { this.currentAudio.pause(); } catch (_e) {}
+      this.currentAudio = null;
+    }
+    this.worker = null;
+  },
+};
+
+// Matches the tail of a completed sentence — terminal punctuation
+// (with optional closing quotes/brackets) followed by whitespace, OR
+// a newline. Greedy enough that "...etc.) Then" splits after the
+// closing paren. Doesn't try to be clever about abbreviations or
+// decimals; Piper handles "3.14" or "Dr." just fine when they end up
+// inside a clause, and an occasional early break sounds like a brief
+// pause rather than a bug.
+const VOICE_SENTENCE_RE = /[.!?]+["')\]]*(?:\s+|$)|\n+/g;
+
+function extractCompletedSentences(text, fromIndex) {
+  const slice = text.slice(fromIndex);
+  const sentences = [];
+  let cursor = 0;
+  let m;
+  VOICE_SENTENCE_RE.lastIndex = 0;
+  while ((m = VOICE_SENTENCE_RE.exec(slice)) !== null) {
+    const end = m.index + m[0].length;
+    const s = slice.slice(cursor, end).trim();
+    if (s) sentences.push(s);
+    cursor = end;
+  }
+  return { sentences, newIndex: fromIndex + cursor };
+}
+
+async function speakSentence(text) {
+  const startToken = voiceQueue.sessionToken;
+  if (!voiceMode || !text.trim()) return;
+  // Reserve the playback slot now so order is preserved even if
+  // later sentences' /generate POSTs return first.
+  let resolveSlot;
+  const slotPromise = new Promise(r => { resolveSlot = r; });
+  voiceQueue.slots.push(slotPromise);
+  ensureVoicePlaybackWorker();
+  try {
+    const r = await fetch('/api/generate', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({prompt: text, tool: 'tts'}),
+    });
+    if (!r.ok || voiceQueue.sessionToken !== startToken) {
+      resolveSlot(null); return;
+    }
+    const {job_id} = await r.json();
+    // Poll for the audio. 250ms cadence — Piper finishes a typical
+    // sentence in ~0.5-1.5s so the first poll often already has it.
+    while (true) {
+      await new Promise(r => setTimeout(r, 250));
+      if (voiceQueue.sessionToken !== startToken) { resolveSlot(null); return; }
+      let res;
+      try {
+        res = await fetch('/api/result/' + job_id).then(r => r.json());
+      } catch (_e) { continue; }
+      if (res && res.audio_b64) { resolveSlot({b64: res.audio_b64}); return; }
+      if (res && (res.status === 'error' || res.status === 'cancelled')) {
+        resolveSlot(null); return;
+      }
+    }
+  } catch (_e) {
+    resolveSlot(null);
+  }
+}
+
+async function ensureVoicePlaybackWorker() {
+  if (voiceQueue.worker) return;
+  const startToken = voiceQueue.sessionToken;
+  voiceQueue.worker = (async () => {
+    while (voiceQueue.slots.length > 0) {
+      if (voiceQueue.sessionToken !== startToken) break;
+      const slot = voiceQueue.slots.shift();
+      const audio = await slot;
+      if (!audio || !voiceMode || voiceQueue.sessionToken !== startToken) continue;
+      await playAudioB64(audio.b64);
+    }
+    voiceQueue.worker = null;
+  })();
+}
+
+function playAudioB64(b64) {
+  return new Promise(resolve => {
+    // Piper writes WAV; the mock branch on Linux workers also writes
+    // WAV. data: URLs work for short clips like a single sentence
+    // without exhausting browser limits.
+    const a = new Audio('data:audio/wav;base64,' + b64);
+    voiceQueue.currentAudio = a;
+    const done = () => {
+      if (voiceQueue.currentAudio === a) voiceQueue.currentAudio = null;
+      resolve();
+    };
+    a.onended = done;
+    a.onerror = done;
+    a.play().catch(done);
+  });
+}
+
 // Running token total (prompt + completion) for the visible conversation.
 // Recomputed from messages on render; incremented per completed turn so
 // the bottom-of-chat counter stays live mid-session.
@@ -466,6 +594,15 @@ async function streamIntoBubble(jobId, wrap, statusEl, startMs, messageId) {
   let finalizeResolver = null;
   const finalizePromise = new Promise(r => { finalizeResolver = r; });
 
+  // Voice mode: index into ``target`` of the next character that has
+  // not yet been shipped to TTS. We dispatch one tool=tts job per
+  // completed sentence so audio starts playing while the chat is still
+  // streaming — the latency win argued for in voice-phase1. Reset the
+  // playback queue at the start of each session so a new submit
+  // doesn't talk over the tail of the previous response.
+  let ttsConsumedChars = 0;
+  if (voiceMode) voiceQueue.reset();
+
   function renderShown() {
     if (activeStream !== myToken) return;
     setBubbleContent(bubble, 'assistant', target.substring(0, shownChars));
@@ -590,6 +727,15 @@ async function streamIntoBubble(jobId, wrap, statusEl, startMs, messageId) {
         lastProgressMs = Date.now();
         clearStuckNotice();
         startTypewriter();
+        // Voice mode: ship every newly-completed sentence to TTS as
+        // it lands. Skips image/search bubbles — their "text" field
+        // is either a prompt echo or the search rewrite, neither of
+        // which is meant to be read aloud.
+        if (voiceMode && !isImage && !isSearch) {
+          const out = extractCompletedSentences(target, ttsConsumedChars);
+          ttsConsumedChars = out.newIndex;
+          for (const s of out.sentences) speakSentence(s);
+        }
       } else if (Date.now() - lastProgressMs > stuckThresholdMs) {
         showStuckNotice();
       }
@@ -607,6 +753,17 @@ async function streamIntoBubble(jobId, wrap, statusEl, startMs, messageId) {
         startTypewriter();
         if (rafId !== null) {
           await finalizePromise;
+        }
+        // Voice mode tail-flush. The sentence-boundary regex only
+        // matches *completed* sentences (terminal punct + whitespace
+        // OR newline), so a response that ends mid-clause leaves a
+        // tail unspoken. On terminal, ship whatever's left.
+        if (voiceMode && !isImage && !isSearch) {
+          const tail = target.slice(ttsConsumedChars).trim();
+          if (tail) {
+            ttsConsumedChars = target.length;
+            speakSentence(tail);
+          }
         }
         if (res.status === 'cancelled') {
           // The user cancelled (or someone with the same session
@@ -707,6 +864,19 @@ const imageWrap = document.getElementById('image-toggle-wrap');
 const searchWrap = document.getElementById('search-toggle-wrap');
 const searchModeWrap = document.getElementById('search-mode-wrap');
 const imageSizeWrap = document.getElementById('image-size-wrap');
+const voiceToggleBtn = document.getElementById('voice-toggle');
+
+// Voice mode toggle. The click is what unlocks the browser's audio
+// autoplay restriction for this session — once the user has gestured
+// to enable voice, subsequent audio.play() calls during streaming
+// work without further user interaction.
+if (voiceToggleBtn) {
+  voiceToggleBtn.addEventListener('click', () => {
+    voiceMode = !voiceMode;
+    voiceToggleBtn.setAttribute('aria-pressed', String(voiceMode));
+    if (!voiceMode) voiceQueue.reset();
+  });
+}
 
 // Image resolution buckets. The composer's three radios map to one of
 // these; the coordinator clamps and the worker renders at whatever

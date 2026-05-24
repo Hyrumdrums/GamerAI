@@ -189,6 +189,34 @@ body { display: flex; flex-direction: column; }
   flex: 1; min-height: 2.5rem; max-height: 10rem; resize: none;
 }
 .composer button { width: auto; }
+
+/* Voice mode toggle. Square icon-only button to the left of the
+ * textarea — when pressed (aria-pressed=true) it picks up the accent
+ * color so a glance at the composer tells the user whether the next
+ * response will be spoken. Sized to match the textarea's min-height
+ * so the row stays vertically aligned. */
+.voice-toggle {
+  flex: 0 0 auto;
+  width: 2.5rem; height: 2.5rem;
+  padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--surface);
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  cursor: pointer;
+  transition: color 120ms ease, background 120ms ease, border-color 120ms ease;
+}
+.voice-toggle:hover { color: var(--text); }
+.voice-toggle[aria-pressed="true"] {
+  background: var(--accent, #2d72d2);
+  color: #fff;
+  border-color: var(--accent, #2d72d2);
+}
+.voice-toggle:focus-visible {
+  outline: 2px solid var(--accent, #2d72d2);
+  outline-offset: 2px;
+}
 .status { color: var(--muted); font-size: .8rem; text-align: center; min-height: 1em; margin-top: .35rem; }
 .conv-tokens { color: var(--muted); font-size: .75rem; text-align: center; margin-top: .15rem; opacity: .8; }
 
