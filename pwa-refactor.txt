@@ -1,0 +1,433 @@
+PWA REFACTOR + ARCHITECTURE CLEANUP — CHECKLIST
+================================================
+
+Goal: turn the Flask web UI into an installable PWA with offline shell
+and (eventually) push notifications, without losing logic during the
+modularization work. PWA reference: PWA_REFERENCE.md (React/Vite stack —
+patterns transfer; we re-implement in Flask + vanilla ES modules +
+pywebpush instead of vite-plugin-pwa + web-push).
+
+Ground rule for every "move" task below: cut-and-paste the existing
+code verbatim. Only mechanical changes (import/export, qualify `me` as
+`state.me`, etc.) are allowed. No improvements, no renames, no
+"while we're here" tweaks. Behavior must be identical post-refactor.
+
+
+PHASE 0 — Decisions (one-time, recorded here so we can refer back)
+==================================================================
+
+  - Module system: ES modules (`<script type="module">`). Each split
+    file is `client/static/js/<name>.js`, uses `import { ... } from
+    './<other>.js'`. Reasons: explicit deps, strict mode default,
+    no global namespace pollution, modern-browser native.
+  - Shared mutable state: one `state.js` module exporting an object
+    (`export const state = {...}`). Other modules mutate via
+    `state.foo = bar`. This is the minimum syntactic change required
+    to share `let`-scoped variables across modules.
+  - SW strategy: hand-rolled `sw.js` (no Workbox/vite-plugin-pwa
+    dependency — we have no build step). One file, one install
+    handler, one fetch handler, one push handler.
+  - Push backend: pywebpush on the coordinator (it owns the DB and
+    member auth). Client/Flask just proxies subscribe/unsubscribe.
+  - Icon strategy: generate from a single source SVG/PNG at the sizes
+    required by manifest + apple-touch-icon. Placeholders OK initially
+    so we can finalize art later (PWA_REFERENCE.md §8 warns iOS caches
+    icons stickily — bump filenames when redesigning).
+
+
+PHASE 1 — Split chat.js into modules
+====================================
+Current: client/static/js/chat.js = 1437 LOC, mixes state, TTS,
+rendering, streaming, composer, image lightbox.
+
+Target file layout under client/static/js/:
+  state.js              ~80 LOC   shared mutable state object
+  readAloud.js          ~200 LOC  TTS dispatch, audio cache, playback
+  messageRenderer.js    ~150 LOC  DOM for message bubbles + sources
+  streamingEngine.js    ~350 LOC  polling, typewriter, stuck-UX, retry
+  composer.js           ~150 LOC  composer DOM refs, refreshComposerUI,
+                                  image size & search mode helpers
+  imageGallery.js       ~150 LOC  lightbox + swipe + click delegate
+  chat.js               ~350 LOC  orchestrator: init, sidebar, open,
+                                  delete, refresh, submit
+
+Dependency graph (→ = imports from):
+  chat.js → state, readAloud, messageRenderer, streamingEngine, composer, imageGallery
+  streamingEngine ↔ messageRenderer (circular: function-body refs only)
+  streamingEngine → state, readAloud, composer (for refreshComposerUI)
+  messageRenderer → readAloud, streamingEngine (for makeRetryButton)
+  composer → state, readAloud (for stopReadAloud on voice toggle)
+  readAloud → state
+  imageGallery → (none — self-contained)
+
+CHECKLIST
+---------
+
+[x] 1.1  Create state.js
+        Move from chat.js → state.js:
+          - line 16   const msgCache = new Map();
+          - line 25   const searchModeByConv = new Map();
+          - line 99   const readAloudCache = new Map();
+          - line 104  let readAloudPlaying = null;
+          - line 248  let convTokens = 0;
+          - line 436  let activeStream = null;
+          - implicit globals from init/sidebar/open: me, conversations, currentId
+          - line 37   let voiceMode = false;
+        Expose as:
+          export const state = {
+            me: null, conversations: [], currentId: null,
+            voiceMode: false, convTokens: 0,
+            activeStream: null, readAloudPlaying: null,
+          };
+          export const msgCache = new Map();
+          export const searchModeByConv = new Map();
+          export const readAloudCache = new Map();
+        Also export the two helpers that read/write convTokens because
+        they're called from both chat.js and streamingEngine.js:
+          export function setConvTokens(n)    (move from chat.js:249)
+          export function sumMessageTokens(m) (move from chat.js:261)
+        Keep the preamble comments above each variable verbatim.
+
+[x] 1.2  Create readAloud.js
+        Move from chat.js → readAloud.js (preserve comments verbatim):
+          - lines 27-37    voice mode comment block (but voiceMode itself moved to state.js)
+          - lines 39-79    normalizeForTTS
+          - lines 81-98    readAloudCache comment block (cache moved to state.js)
+          - lines 101-103  readAloudPlaying comment block (state moved to state.js)
+          - lines 106-112  stopReadAloud           → mutate state.readAloudPlaying
+          - lines 114-128  setReadAloudState
+          - lines 130-167  fetchReadAloudAudio
+          - lines 169-187  playReadAloudAudio      → mutate state.readAloudPlaying
+          - lines 189-216  onReadAloudClick        → reads state.readAloudPlaying, readAloudCache
+          - lines 218-230  makeReadAloudButton
+          - lines 232-243  isAssistantTextMessage
+        Imports: state, readAloudCache from './state.js'
+        Exports: normalizeForTTS, stopReadAloud, setReadAloudState,
+                 fetchReadAloudAudio, playReadAloudAudio, onReadAloudClick,
+                 makeReadAloudButton, isAssistantTextMessage
+
+[x] 1.3  Create messageRenderer.js
+        Move from chat.js → messageRenderer.js:
+          - lines 473-485  setBubbleContent
+          - lines 487-504  setImageBubble
+          - lines 506-556  messageEl    (creates retry button — uses makeRetryButton)
+          - lines 1093-1133 renderSources
+        Imports:
+          from './readAloud.js': makeReadAloudButton, isAssistantTextMessage
+          from './streamingEngine.js': makeRetryButton  (circular: OK, used only in function body)
+        Exports: setBubbleContent, setImageBubble, messageEl, renderSources
+
+[x] 1.4  Create streamingEngine.js
+        Move from chat.js → streamingEngine.js:
+          - lines 558-565  makeRetryButton  (calls retryMessage)
+          - lines 567-581  startCooldown
+          - lines 583-616  retryMessage     (uses msgCache, currentId; calls streamIntoBubble)
+          - lines 618-647  TYPEWRITER_* / STUCK_MS_* constants
+          - lines 649-943  streamIntoBubble
+        Imports:
+          from './state.js': state, msgCache, searchModeByConv, setConvTokens
+          from './readAloud.js': makeReadAloudButton, onReadAloudClick, stopReadAloud
+          from './messageRenderer.js': setBubbleContent, setImageBubble, renderSources
+                                       (circular: used only inside function bodies)
+        Exports: streamIntoBubble, makeRetryButton, retryMessage, startCooldown
+        Note: references to module-scope `voiceMode`, `searchCheckbox`,
+        `refreshComposerUI`, `currentId`, `convTokens`, `msgCache`,
+        `activeStream`, `setConvTokens` must be rewritten to use the
+        imported names (state.voiceMode, state.currentId, etc.).
+        `searchCheckbox` and `refreshComposerUI` live in chat.js — pass
+        them in via state, OR import lazily. Simplest: expose
+        `searchCheckbox` and `refreshComposerUI` from state.js? No —
+        state.js is data only. Better: import searchCheckbox lookup
+        from a tiny `composerRefs` getter that chat.js sets up. KISS
+        path: do `document.getElementById('tool-search-cb').checked = false`
+        inline at the one call site (chat.js:909-911 region). Decide
+        at refactor time, keep the change mechanical.
+
+[x] 1.5  Create imageGallery.js
+        Move from chat.js → imageGallery.js:
+          - lines 1285-1428 imageViewer IIFE
+          - lines 1430-1437 pane click delegate
+        No imports needed (self-contained).
+        Exports: initImageGallery()  — a wrapper around the IIFE that
+        binds the click delegate. chat.js calls it once at startup.
+
+[x] 1.6  Trim chat.js to orchestrator
+        Keep in chat.js:
+          - lines 245-267  convTokens helpers — actually moved to state.js (1.1)
+          - lines 269-293  init
+          - lines 295-332  refreshSidebar
+          - lines 334-362  deleteConversation
+          - lines 364-379  new-chat handler
+          - lines 381-385  hamburger handler
+          - lines 387-423  openConversation
+          - lines 425-432  refreshConversation
+          - lines 438-471  renderMessages
+          - lines 945-983  composer DOM refs + voice toggle binding
+          - lines 985-1018 image size logic
+          - lines 1020-1036 refreshComposerUI
+          - lines 1038-1050 sticky-image-size IIFE
+          - lines 1052-1069 persistSearchMode, restoreModeFor
+          - lines 1071-1082 checkbox event handlers + refreshComposerUI() call
+          - lines 1084-1091 selectedSearchMode
+          - lines 1135-1283 composer submit handler
+        Top of file:
+          import { state, msgCache, searchModeByConv, setConvTokens, sumMessageTokens } from './state.js';
+          import { stopReadAloud } from './readAloud.js';
+          import { messageEl } from './messageRenderer.js';
+          import { streamIntoBubble } from './streamingEngine.js';
+          import { initImageGallery } from './imageGallery.js';
+        Rewrite `me` → `state.me`, `currentId` → `state.currentId`,
+        `conversations` → `state.conversations`, `voiceMode` →
+        `state.voiceMode`, `activeStream` → `state.activeStream`,
+        `convTokens` → state.convTokens (read) / setConvTokens (write).
+        Call initImageGallery() at the end.
+
+[x] 1.7  Update chat.html.j2
+        Replace:
+          <script src="/static/js/chat.js"></script>
+        With:
+          <script type="module" src="/static/js/chat.js"></script>
+
+[x] 1.8  Manual smoke test of every code path:
+        [x] Page loads, sidebar populates
+        [x] Open existing conversation → renders messages
+        [x] Send chat message → streams in, typewriter works, token count updates
+        [x] Send image (small, medium, large) → renders in bubble + lightbox works
+        [x] Send search (fast, comprehensive) → sources render
+        [x] Read-aloud per-message → audio plays
+        [x] Voice mode → auto-fires on completion
+        [x] Retry on error bubble → re-streams
+        [x] Stuck-job notice appears after threshold + Cancel works
+        [x] New chat clears state
+        [x] Delete chat removes from sidebar + clears pane
+        [x] Mobile drawer (hamburger) opens/closes
+        [x] Image lightbox: swipe, keyboard, Save, close
+        [x] Page reload mid-stream → resumes polling
+
+[x] 1.9  Commit:
+        refactor(client): split chat.js into focused ES modules
+
+
+PHASE 2 — api_client facade (optional for shell, required for queued sends)
+===========================================================================
+[x] 2.1  Create client/services/api_client.py
+        Wrap the raw httpx access (currently inline in every route)
+        with named async methods. Move pure wiring only; no logic
+        changes.
+[x] 2.2  Refactor client/routes/api.py to use the facade
+[x] 2.3  Refactor client/routes/chat.py to use the facade
+[x] 2.4  Refactor client/routes/account.py to use the facade (just
+        the read paths used by GET /account — the POST handlers can
+        wait for Phase 6+)
+[x] 2.5  Smoke test: all proxied endpoints still respond
+[x] 2.6  Commit: refactor(client): api_client facade hides httpx from routes
+
+
+PHASE 3 — PWA install shell (no offline behavior yet)
+=====================================================
+[ ] 3.1  Generate app icons (placeholder OK for v1; final art later):
+        - client/static/icons/icon-192.png  (192x192, any purpose)
+        - client/static/icons/icon-512.png  (512x512, any purpose)
+        - client/static/icons/icon-512-maskable.png  (512x512, maskable)
+        - client/static/icons/apple-touch-icon.png  (180x180)
+        - client/static/icons/favicon.ico
+[ ] 3.2  Create client/static/manifest.webmanifest
+        - name "GamerAI", short_name "GamerAI"
+        - theme_color, background_color
+        - display "standalone"
+        - scope "/", start_url "/"
+        - icons array referencing the files in 3.1
+[ ] 3.3  Add to client/templates/base.html.j2 <head>:
+        - <link rel="manifest" href="/static/manifest.webmanifest">
+        - <link rel="icon" href="/static/icons/favicon.ico">
+        - <link rel="apple-touch-icon" href="/static/icons/apple-touch-icon.png">
+        - <meta name="theme-color" content="...">
+        - <meta name="apple-mobile-web-app-capable" content="yes">
+        - <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+        - <meta name="apple-mobile-web-app-title" content="GamerAI">
+        - <meta name="format-detection" content="telephone=no,email=no">
+[ ] 3.4  Add Flask route to serve the manifest with correct MIME type
+        (application/manifest+json). Just need to confirm static-file
+        handler does it; if not, add explicit /static/manifest.webmanifest
+        handler.
+[ ] 3.5  Lighthouse PWA audit — confirm installable on Chrome desktop
+[ ] 3.6  Test "Add to Home Screen" on Android Chrome (auto prompt should fire)
+[ ] 3.7  Test "Add to Home Screen" on real iOS Safari 16.4+ (manual via Share menu)
+[ ] 3.8  Commit: feat(client): installable PWA — manifest + icons + meta tags
+
+
+PHASE 4 — Service worker + offline shell
+========================================
+[ ] 4.1  Create client/static/sw.js
+        Handlers needed:
+          - install: precache app-shell (manifest, base.css, chat.css,
+            marked.min.js, purify.min.js, the 6 ES modules from Phase 1,
+            icons)
+          - activate: cleanup old caches
+          - fetch:
+              navigate requests → network-first, /offline fallback
+              static (CSS/JS/icons) → cache-first
+              API (/api/*) → network-only (queued sends come in Phase 5)
+        Cache versioning: const CACHE_VERSION = 'v1';  (bump on each release)
+[ ] 4.2  Create client/templates/offline.html.j2 — minimal "you're
+        offline, retry when connected" page
+[ ] 4.3  Add /offline route to serve offline.html.j2
+[ ] 4.4  Register SW from base.html.j2 (only over HTTPS or localhost):
+          if ('serviceWorker' in navigator) {
+            window.addEventListener('load', () => {
+              navigator.serviceWorker.register('/sw.js');
+            });
+          }
+[ ] 4.5  Test: open page, go offline, reload → shell loads from cache;
+        navigate to a path → offline.html shown.
+[ ] 4.6  Test: SW update flow (bump CACHE_VERSION, deploy, ensure
+        clients pick up the new shell after one reload cycle).
+[ ] 4.7  Commit: feat(client): offline shell via service worker
+
+
+PHASE 5 — Background sync: queued message sends
+================================================
+Depends on: Phase 2 (api_client facade simplifies the rewrite)
+
+[ ] 5.1  Create client/static/js/offlineQueue.js
+        - IndexedDB wrapper for storing pending sends
+          {id, conversation_id, prompt, tool, ...}
+        - drain() — iterate queue, POST to /api/generate, remove on success
+[ ] 5.2  Update streamingEngine.js / chat.js submit handler:
+        - On fetch fail (offline) → enqueue + register 'send-message' sync
+        - On reconnect → drain queue, dispatch results into bubbles
+[ ] 5.3  Update sw.js: sync handler for tag 'send-message' → call drain
+[ ] 5.4  Update messageRenderer.js: pending bubble shows "queued — will
+        send when online" if message is queued, swaps to "thinking…"
+        on dispatch
+[ ] 5.5  Test: airplane mode → submit → message shows "queued"; back
+        online → dispatches and streams normally
+[ ] 5.6  Commit: feat(client): queued sends via background sync
+
+
+PHASE 6 — Push notifications (adapted from PWA_REFERENCE.md)
+=============================================================
+Mapping from PWA_REFERENCE (React/Express/Postgres) → our stack
+(vanilla JS/Flask+FastAPI/SQLite):
+
+  vite-plugin-pwa     →  hand-rolled sw.js (already exists from Phase 4)
+  web-push (npm)      →  pywebpush (Python)
+  Postgres            →  SQLite (already)
+  Express endpoints   →  FastAPI on coordinator
+  usePushNotifications.js (React hook)  →  notifications.js (vanilla module)
+  PushNotificationBanner.jsx            →  banner DOM + handler in chat.js
+  InstallPrompt.jsx                     →  installPrompt.js (iOS/Android UI)
+
+[ ] 6.1  Generate VAPID keys:
+          python -c "from pywebpush import generate_vapid_private_key; ..."
+        Store in coordinator env (docker-compose.yml):
+          VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY, VAPID_SUBJECT
+[ ] 6.2  Add pywebpush to requirements (coordinator)
+[ ] 6.3  Schema additions in coordinator/db.py (translate
+        PWA_REFERENCE §6 to SQLite):
+          - push_subscriptions (member_id, endpoint, p256dh, auth, ua, created_at)
+            UNIQUE(member_id, endpoint)
+          - notifications (member_id, type, title, body, data JSON,
+            read, pushed, created_at)
+            INDEX (member_id, read), INDEX (created_at DESC)
+          - notification_preferences (member_id, category, enabled)
+            UNIQUE(member_id, category)
+[ ] 6.4  Create coordinator/notifications.py
+        - subscribe_member(member_id, sub_dict, ua)
+        - unsubscribe_member(member_id, endpoint)
+        - list_for_member(member_id, limit, offset)
+        - unread_count(member_id)
+        - mark_read(member_id, notification_id)
+        - mark_all_read(member_id)
+        - get_preferences(member_id) / update_preferences(...)
+        - send(member_id, type, title, body, data)
+            → check prefs (skip if opted out)
+            → INSERT into notifications
+            → for each subscription: pywebpush.webpush(...)
+              on WebPushException with 404/410 → delete subscription
+[ ] 6.5  Add 8 endpoints to coordinator/main.py (per PWA_REFERENCE §7):
+          GET   /notifications/vapid-key       (public)
+          POST  /notifications/subscribe       (member auth)
+          DELETE /notifications/subscribe      (member auth)
+          GET   /notifications                  (paginated)
+          GET   /notifications/unread-count
+          PUT   /notifications/{id}/read
+          PUT   /notifications/read-all
+          GET   /notifications/preferences
+          PUT   /notifications/preferences
+[ ] 6.6  Add Flask proxy routes in client/routes/api.py for the same paths
+[ ] 6.7  Add push + notificationclick handlers to sw.js
+        - Validate notification.data.url starts with '/' (open-redirect
+          guard per PWA_REFERENCE §3 / §14)
+        - userVisibleOnly: true is implicit in subscribe; just make
+          sure we always call showNotification on push
+        - vibrate [200, 100, 200] (iOS ignores, fine)
+[ ] 6.8  Create client/static/js/notifications.js (vanilla port of
+        usePushNotifications.js):
+          - subscribe(): permission → vapid-key → subscribe → POST
+          - unsubscribe()
+          - urlBase64ToUint8Array helper (verbatim from PWA_REFERENCE §4)
+          - Support detection: 'serviceWorker' in navigator && 'PushManager' in window
+[ ] 6.9  Create client/static/js/installPrompt.js:
+          - isPWA detection (matchMedia + iOS navigator.standalone — both!)
+          - beforeinstallprompt capture (Android)
+          - iOS manual instructions UI ("Share → Add to Home Screen")
+          - Stash dismissal in localStorage['push-prompted']
+[ ] 6.10 Add opt-in banner to chat.html.j2 (hidden by default; shown
+        only when isPWA && Notification.permission === 'default' &&
+        !localStorage['push-prompted'])
+[ ] 6.11 Generate use-cases for what we actually push:
+        - Voice/image quota refilled at midnight (probably noisy — opt-out
+          by default)
+        - Worker came online (relevant only if user is the contributor)
+        - Long-running image job finished (most likely target)
+        - Cross-device: same convo updated elsewhere
+        Decide before wiring; users hate spam.
+[ ] 6.12 Test on real iPhone (PWA_REFERENCE §14: "the simulator lies")
+        - Add to Home Screen first (iOS only delivers push to installed PWAs)
+        - Permission prompt → enable → trigger event → notification shows
+[ ] 6.13 Test on Android Chrome (works in-browser + installed)
+[ ] 6.14 Commit (multiple): feat(coordinator): push subscriptions schema
+        + endpoints; feat(client): push opt-in banner + service worker
+        push handler
+
+
+PHASE 7 — Post-PWA cleanup (defer until PWA ships)
+==================================================
+From the architecture review (May 25 2026):
+
+[ ] 7.1  Extract coordinator/billing.py (quota gates + earnings credit
+        from main.py:~1644-1697 + ~2803-2887)
+[ ] 7.2  Extract coordinator/rewrites.py (image + search rewrite
+        dispatch from main.py:~230-900 + dispatch handlers)
+[ ] 7.3  Split coordinator/db.py: migrations vs runtime CRUD
+[ ] 7.4  Extract windows-agent/coordinator.py (HTTP client + claim
+        token protocol) from agent.py
+[ ] 7.5  Fix asymmetric idempotency on /jobs/complete
+[ ] 7.6  Add prompt length cap + regex DoS guard on image denylist
+[ ] 7.7  Atomic conversation deletion transaction in db.py
+[ ] 7.8  CSRF tokens on POST forms
+[ ] 7.9  Add worker.py unit tests
+[ ] 7.10 Add voice quota isolation tests
+[ ] 7.11 Add agent dual-loop / pause-resume tests
+
+
+NOTES
+=====
+- Every Phase 1 file move must preserve every comment verbatim. The
+  comments encode design decisions and incident history; losing them
+  is a regression.
+- For circular imports between streamingEngine ↔ messageRenderer:
+  ES module live bindings handle this fine because the cross-module
+  function references are used only inside function bodies (not at
+  module-evaluation time). If we hit a real cycle issue, the escape
+  hatch is to move makeRetryButton's caller (messageEl) to call
+  retry via a late-bound reference set up in chat.js init.
+- Keep the existing static-file paths (/static/js/...) — the SW
+  precache list in Phase 4 will need to list them explicitly.
+- We may need to add a Flask handler to serve sw.js with the right
+  Content-Type and Service-Worker-Allowed scope; Flask's default
+  static handler should work but worth checking in Phase 4.
+- DO NOT touch coordinator, worker, or agent code during Phases 1-5.
+  Push notifications (Phase 6) is the first time the backend is
+  modified for this initiative.

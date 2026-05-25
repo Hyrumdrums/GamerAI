@@ -1,293 +1,47 @@
-// ---- state ------------------------------------------------------------
-let me = null;
-let conversations = [];   // [{conversation_id, title, updated_at, ...}]
-let currentId = null;     // active conversation_id, or null = brand-new
-// 'chat' or 'image' — picked via the tool toggle. Defaults to chat so
-// every existing user lands on the prior UX unless they explicitly
-// switch. Persists in-memory only; we don't put it on the conversation
-// because users want to flip mid-thread (write a paragraph then ask
-// for an illustration).
-// In-memory message cache so switching between already-opened
-// conversations is instant. Keyed by conversation_id; value is the
-// full messages[] array. Cleared on page refresh — not a substitute
-// for offline persistence (see project-gaps.md). Each completed
-// turn appends to the cache directly so we don't refetch on every
-// new message.
-const msgCache = new Map();
+// ---- chat orchestrator -----------------------------------------------
+// Wires up sidebar, conversation lifecycle, top-bar handlers, and the
+// composer submit handler. Streaming, rendering, read-aloud, composer
+// toggles, and the image lightbox live in their own modules — see
+// pwa-refactor.txt for the layout.
 
-// Per-conversation search-mode state. Search is sticky within a
-// conversation (unlike image, which is one-shot per turn) — once you
-// check it for the first follow-up, the natural flow is to keep
-// drilling in with more search-grounded questions. Auto-unchecking
-// every turn was forcing the user to re-check and they kept
-// forgetting. Keyed by conversation_id; the "brand new chat" state
-// (currentId === null) gets its own slot via the null key.
-const searchModeByConv = new Map();
-
-// ---- voice mode (voice-phase1) ----------------------------------------
-// Session-global toggle. When ON, the streaming loop in streamIntoBubble
-// segments the assistant response into sentences and fires a tool="tts"
-// /generate per sentence, then plays each returned audio_b64 in
-// submission order. Off by default; flipped via the mic button.
-//
-// Why session-global rather than per-conversation: voice mode is a UX
-// preference (do I want audio right now?), not a conversation property
-// the way search-mode is. Sticking it to a conversation would make a
-// returning user wonder why some threads spontaneously start talking.
-let voiceMode = false;
-
-// Strip the markdown formatting that small chat models routinely
-// emit. Without this, Piper reads "**bold**" as "asterisk asterisk
-// bold asterisk asterisk" and "[OpenAI](https://…)" as the whole
-// URL out loud. Aim: cover the constructs that actually show up in
-// chat answers (bold, italic, inline + fenced code, links, images,
-// bullet / numbered list markers, ATX headers, block quotes). Code
-// FENCES are dropped but the inner code is kept on the assumption
-// that a listener actually wants to hear the snippet.
-function normalizeForTTS(text) {
-  if (!text) return '';
-  let s = text;
-  // Code fences — keep body, drop the ``` markers (and optional lang).
-  s = s.replace(/```[\w-]*\s*\n?/g, '').replace(/```/g, '');
-  // Inline code: drop backticks, keep contents.
-  s = s.replace(/`([^`]+)`/g, '$1');
-  // Images first (before plain links — same bracket shape).
-  s = s.replace(/!\[[^\]]*\]\([^)]*\)/g, '');
-  // Links: keep visible text, drop URL.
-  s = s.replace(/\[([^\]]+)\]\([^)]*\)/g, '$1');
-  // Bold (**x** or __x__) — keep inner text.
-  s = s.replace(/(\*\*|__)(.+?)\1/g, '$2');
-  // Italic (*x* / _x_) — only when wrapping non-space text. The
-  // lookahead/lookbehind keep us from eating standalone "*"s or
-  // mid-word underscores like "snake_case".
-  s = s.replace(/(\*|_)(?=\S)(.+?)(?<=\S)\1/g, '$2');
-  // ATX headers: drop leading hashes; ensure terminal punctuation so
-  // Piper inserts a sentence break after the title.
-  s = s.replace(/^[ \t]*#{1,6}[ \t]+(.+?)[ \t]*#*[ \t]*$/gm, (_m, t) => {
-    const trimmed = t.trim();
-    return /[.!?:]$/.test(trimmed) ? trimmed : trimmed + '.';
-  });
-  // Bullet markers and numbered list prefixes.
-  s = s.replace(/^[ \t]*[-*+][ \t]+/gm, '');
-  s = s.replace(/^[ \t]*\d+\.[ \t]+/gm, '');
-  // Block quotes.
-  s = s.replace(/^[ \t]*>[ \t]?/gm, '');
-  // Collapse runs of blank lines into a single blank line so the
-  // paragraph chunker still sees a boundary.
-  s = s.replace(/\n[ \t]*\n[\s]*/g, '\n\n');
-  return s.trim();
-}
-
-// ---- read-aloud (single TTS path) -------------------------------------
-// One code path for both manual ("tap the speaker icon") and voice-mode
-// ("auto-fire on every completed response") read-aloud. Each invocation
-// fires ONE tool=tts job for the whole assistant message text, so
-// piper.exe pays its subprocess + ONNX cold-start exactly once per
-// response. Voice mode used to stream sentence-by-sentence to chase
-// "time to first audio", but the response itself isn't conversational
-// (model latency + Piper synth means real wait time either way), and
-// per-sentence dispatch produced audible cold-start gaps between
-// bullets — see project-gaps.md "Piper cold-starts on every TTS job"
-// for the agent-side warm-process fix that would actually make
-// streaming worthwhile.
-//
-// readAloudCache is keyed by message_id and stores the WAV base64 once
-// fetched, so re-tapping the same speaker icon replays from memory
-// without billing voice_minutes again. In-memory only — a page refresh
-// re-bills, same trade-off as msgCache (see project-gaps.md on the
-// IndexedDB-with-encryption plan that would cover both).
-const readAloudCache = new Map();
-
-// Currently-playing per-message audio. Holding a reference lets us
-// (a) stop the prior clip when a different message's button is tapped
-// and (b) toggle stop-on-second-tap of the playing button.
-let readAloudPlaying = null;  // {messageId, audio, btn} | null
-
-function stopReadAloud() {
-  if (!readAloudPlaying) return;
-  const {audio, btn} = readAloudPlaying;
-  readAloudPlaying = null;
-  try { audio.pause(); } catch (_e) {}
-  setReadAloudState(btn, 'idle');
-}
-
-function setReadAloudState(btn, state) {
-  btn.classList.remove('is-loading', 'is-playing');
-  if (state === 'loading') {
-    btn.classList.add('is-loading');
-    btn.setAttribute('aria-label', 'Loading audio…');
-    btn.title = 'Loading…';
-  } else if (state === 'playing') {
-    btn.classList.add('is-playing');
-    btn.setAttribute('aria-label', 'Stop reading');
-    btn.title = 'Stop';
-  } else {
-    btn.setAttribute('aria-label', 'Read this message aloud');
-    btn.title = 'Read aloud';
-  }
-}
-
-async function fetchReadAloudAudio(text) {
-  // Strip markdown so Piper doesn't read "asterisk asterisk bold
-  // asterisk asterisk" or speak link URLs out loud. Per-message
-  // mode sends the whole bubble as one job, so one normalize pass
-  // covers it (unlike voice mode, where chunks may split markdown
-  // across the wire).
-  const spoken = normalizeForTTS(text).trim();
-  if (!spoken) throw new Error('nothing to read');
-  const r = await fetch('/api/generate', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({prompt: spoken, tool: 'tts'}),
-  });
-  if (!r.ok) {
-    let msg = '';
-    try {
-      const body = await r.json();
-      if (body && typeof body.detail === 'string') msg = body.detail;
-    } catch (_e) { /* fallthrough */ }
-    throw new Error(msg || ('tts dispatch failed: ' + r.status));
-  }
-  const {job_id} = await r.json();
-  // Poll at the same 250ms cadence as voice mode. Piper finishes a
-  // typical paragraph in 1-3s; a long message can run 5-10s on a
-  // contributor CPU loop, which is why the README justifies the
-  // user-initiated framing here.
-  while (true) {
-    await new Promise(r => setTimeout(r, 250));
-    let res;
-    try {
-      res = await fetch('/api/result/' + job_id).then(r => r.json());
-    } catch (_e) { continue; }
-    if (res && res.audio_b64) return res.audio_b64;
-    if (res && (res.status === 'error' || res.status === 'cancelled')) {
-      throw new Error(res.error || ('tts job ' + res.status));
-    }
-  }
-}
-
-function playReadAloudAudio(messageId, b64, btn) {
-  return new Promise(resolve => {
-    const a = new Audio('data:audio/wav;base64,' + b64);
-    readAloudPlaying = {messageId, audio: a, btn};
-    setReadAloudState(btn, 'playing');
-    const done = () => {
-      // Only reset state if we're still the active clip — stopReadAloud
-      // may have already moved on to a different button.
-      if (readAloudPlaying && readAloudPlaying.audio === a) {
-        readAloudPlaying = null;
-        setReadAloudState(btn, 'idle');
-      }
-      resolve();
-    };
-    a.onended = done;
-    a.onerror = done;
-    a.play().catch(done);
-  });
-}
-
-async function onReadAloudClick(messageId, text, btn) {
-  // Tap on the button that's currently playing → stop.
-  if (readAloudPlaying && readAloudPlaying.messageId === messageId) {
-    stopReadAloud();
-    return;
-  }
-  // Tap on a different button while another is playing → stop the
-  // other, fall through to play this one.
-  stopReadAloud();
-  let b64 = readAloudCache.get(messageId);
-  if (!b64) {
-    setReadAloudState(btn, 'loading');
-    btn.disabled = true;
-    try {
-      b64 = await fetchReadAloudAudio(text);
-      readAloudCache.set(messageId, b64);
-    } catch (e) {
-      btn.disabled = false;
-      setReadAloudState(btn, 'idle');
-      // Surface quota / worker errors without an alert dialog — a
-      // hover tooltip is enough for a non-destructive failure.
-      btn.title = (e && e.message) ? `Read aloud failed: ${e.message}` : 'Read aloud failed';
-      return;
-    }
-    btn.disabled = false;
-  }
-  await playReadAloudAudio(messageId, b64, btn);
-}
-
-function makeReadAloudButton(messageId, text) {
-  const btn = document.createElement('button');
-  btn.type = 'button';
-  btn.className = 'read-aloud-btn';
-  setReadAloudState(btn, 'idle');
-  btn.innerHTML = `
-    <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
-      <path fill="currentColor" d="M3 9v6h4l5 5V4L7 9H3zm13.5 3a4.5 4.5 0 0 0-2.5-4.03v8.05a4.5 4.5 0 0 0 2.5-4.02zM14 3.23v2.06A7 7 0 0 1 14 18.7v2.06A9 9 0 0 0 14 3.23z"/>
-    </svg>
-  `;
-  btn.onclick = () => onReadAloudClick(messageId, text, btn);
-  return btn;
-}
-
-// True when a completed assistant turn carries actual readable text
-// (i.e. not an image bubble, not an error, not a cancelled bubble, not
-// empty). Used by both messageEl (history-load) and streamIntoBubble
-// (fresh completion) to decide whether to hang a speaker icon off the
-// message.
-function isAssistantTextMessage(opts, text) {
-  if (opts.image_path) return false;
-  if (opts.status === 'error') return false;
-  if (opts.status === 'pending') return false;
-  if (opts.status === 'cancelled') return false;
-  return !!(text && text.trim());
-}
-
-// Running token total (prompt + completion) for the visible conversation.
-// Recomputed from messages on render; incremented per completed turn so
-// the bottom-of-chat counter stays live mid-session.
-let convTokens = 0;
-function setConvTokens(n) {
-  convTokens = Math.max(0, n | 0);
-  const el = document.getElementById('conv-tokens');
-  if (!el) return;
-  if (convTokens > 0) {
-    el.textContent = convTokens.toLocaleString() + ' tokens this chat';
-    el.hidden = false;
-  } else {
-    el.textContent = '';
-    el.hidden = true;
-  }
-}
-function sumMessageTokens(messages) {
-  let t = 0;
-  for (const m of messages || []) {
-    t += (m.prompt_tokens || 0) + (m.completion_tokens || 0);
-  }
-  return t;
-}
+import {
+  state, msgCache, searchModeByConv,
+  setConvTokens, sumMessageTokens,
+} from './state.js';
+import { stopReadAloud } from './readAloud.js';
+import { messageEl } from './messageRenderer.js';
+import { streamIntoBubble } from './streamingEngine.js';
+import {
+  imageCheckbox, searchCheckbox,
+  selectedSearchMode, selectedImageSize,
+  IMAGE_SIZE_PRESETS,
+  refreshComposerUI,
+  restoreModeFor,
+} from './composer.js';
+import { initImageGallery } from './imageGallery.js';
 
 // ---- bootstrap --------------------------------------------------------
 async function init() {
   try {
     const r = await fetch('/api/me');
     if (!r.ok) { location.href = '/login'; return; }
-    me = await r.json();
+    state.me = await r.json();
     const whoEl = document.getElementById('who');
-    whoEl.textContent = me.username || me.email || me.member_id || 'signed in';
+    whoEl.textContent = state.me.username || state.me.email || state.me.member_id || 'signed in';
     whoEl.href = '/account';
-    if (me.role === 'admin') {
+    if (state.me.role === 'admin') {
       document.getElementById('adminlink').hidden = false;
     }
     // Show the "Contribute and invite friends" CTA only when the
     // member has no paired agent yet. Once they pair a machine, they
     // *are* a contributor — the link becomes redundant.
-    if (!me.paired_machines_count) {
+    if (!state.me.paired_machines_count) {
       document.getElementById('contributelink').hidden = false;
     }
   } catch { location.href = '/login'; return; }
   await refreshSidebar();
-  if (conversations.length > 0) {
-    openConversation(conversations[0].conversation_id);
+  if (state.conversations.length > 0) {
+    openConversation(state.conversations[0].conversation_id);
   }
 }
 init();
@@ -297,12 +51,12 @@ async function refreshSidebar() {
   const r = await fetch('/api/conversations');
   if (!r.ok) return;
   const body = await r.json();
-  conversations = body.conversations || [];
+  state.conversations = body.conversations || [];
   const list = document.getElementById('conv-list');
   list.innerHTML = '';
-  for (const c of conversations) {
+  for (const c of state.conversations) {
     const div = document.createElement('div');
-    div.className = 'conv-item' + (c.conversation_id === currentId ? ' active' : '');
+    div.className = 'conv-item' + (c.conversation_id === state.currentId ? ' active' : '');
     // Collapse whitespace runs (including newlines) so a paste-bombed
     // title from the empty-state DOM still renders as a single ellipsised
     // line instead of leaking blank space into the layout.
@@ -350,8 +104,8 @@ async function deleteConversation(id, label) {
     return;
   }
   msgCache.delete(id);
-  if (currentId === id) {
-    currentId = null;
+  if (state.currentId === id) {
+    state.currentId = null;
     stopReadAloud();
     document.getElementById('chat-pane').innerHTML =
       '<div class="empty"><h2>What\'s on your mind?</h2>' +
@@ -362,7 +116,7 @@ async function deleteConversation(id, label) {
 }
 
 document.getElementById('new-chat').onclick = () => {
-  currentId = null;
+  state.currentId = null;
   // Brand-new chat defaults to plain chat mode — don't inherit the
   // last conversation's search-on state. restoreModeFor is defined
   // below; function declarations are hoisted, so calling it from this
@@ -386,7 +140,7 @@ document.getElementById('hamburger').onclick = () => {
 
 // ---- conversation rendering ------------------------------------------
 async function openConversation(id) {
-  currentId = id;
+  state.currentId = id;
   // Restore the per-conversation search-mode state. If the user had
   // search on the last time they were in this conversation, the
   // checkbox flips back on so a follow-up automatically searches —
@@ -395,7 +149,7 @@ async function openConversation(id) {
   // Cancel any in-flight stream for the conversation we're leaving;
   // renderMessages may start a new one if the conversation we're
   // opening has a pending turn of its own.
-  activeStream = null;
+  state.activeStream = null;
   // Stop any read-aloud playback from the conversation we're leaving —
   // the speaker button it was attached to is about to be removed from
   // the DOM, so without this the audio would keep talking with no
@@ -408,7 +162,7 @@ async function openConversation(id) {
   document.getElementById('sidebar').classList.remove('open');
   // Highlight the right sidebar entry.
   document.querySelectorAll('.conv-item').forEach((el, i) => {
-    el.classList.toggle('active', conversations[i] && conversations[i].conversation_id === id);
+    el.classList.toggle('active', state.conversations[i] && state.conversations[i].conversation_id === id);
   });
   // Cache hit: render immediately, no network. We still kick off a
   // background fetch to pick up turns added from another tab/device.
@@ -428,12 +182,8 @@ async function refreshConversation(id, {render = false} = {}) {
   const body = await r.json();
   const messages = body.messages || [];
   msgCache.set(id, messages);
-  if (render || currentId === id) renderMessages(messages);
+  if (render || state.currentId === id) renderMessages(messages);
 }
-
-// Tracks the in-flight stream so a second submit (or a conversation
-// switch) doesn't leave two pollers racing on the same bubble.
-let activeStream = null;
 
 function renderMessages(messages) {
   const pane = document.getElementById('chat-pane');
@@ -470,668 +220,6 @@ function renderMessages(messages) {
   }
 }
 
-function setBubbleContent(bubbleEl, role, text) {
-  // Shared rendering for both first-render and streaming-update.
-  // Assistant text goes through marked + DOMPurify; user text stays
-  // literal so pasted code shows verbatim. DOMPurify is mandatory —
-  // skipping it would let a malicious model emit <img onerror=...>.
-  if (role === 'assistant' && window.marked && window.DOMPurify) {
-    bubbleEl.innerHTML = window.DOMPurify.sanitize(
-      window.marked.parse(text || ''),
-    );
-  } else {
-    bubbleEl.textContent = text || '';
-  }
-}
-
-function setImageBubble(bubbleEl, imagePath, captionPrompt) {
-  // Replace the bubble's contents with an <img> referencing the
-  // generated PNG. Path is the basename returned by the coordinator
-  // (job_id.png) — we proxy through /api/images so the bearer is
-  // attached server-side; <img> can't carry custom headers.
-  bubbleEl.innerHTML = '';
-  if (captionPrompt) {
-    const p = document.createElement('div');
-    p.className = 'img-prompt';
-    p.textContent = captionPrompt;
-    bubbleEl.appendChild(p);
-  }
-  const img = document.createElement('img');
-  img.className = 'generated';
-  img.alt = captionPrompt || 'generated image';
-  img.src = '/api/images/' + encodeURIComponent(imagePath);
-  bubbleEl.appendChild(img);
-}
-
-function messageEl(role, text, opts = {}) {
-  const wrap = document.createElement('div');
-  wrap.className = 'msg ' + role;
-  wrap.dataset.role = role;
-  if (opts.message_id) wrap.dataset.messageId = opts.message_id;
-  // Tag the bubble with the tool kind so the stuck-job UX can pick a
-  // sensible "this is taking longer than normal" threshold — chat
-  // streams visibly, image is opaque until the PNG arrives, so each
-  // gets its own no-progress budget.
-  if (opts.pending_kind === 'image') wrap.dataset.tool = 'image';
-  else if (opts.pending_kind === 'search') wrap.dataset.tool = 'search';
-  else if (opts.tool) wrap.dataset.tool = opts.tool;
-  const r = document.createElement('div');
-  r.className = 'role';
-  r.textContent = role;
-  const b = document.createElement('div');
-  b.className = 'bubble';
-  if (opts.status === 'error') {
-    b.classList.add('error');
-    b.textContent = text || 'Generation failed.';
-  } else if (opts.status === 'pending' && !text) {
-    // Pending bubble label by tool kind — image says "drawing…",
-    // search says "searching the web…", chat says "thinking…". The
-    // search label is a deliberate hint that the answer will take a
-    // moment longer than a normal chat reply (DDG + optional fetch
-    // before the model even starts streaming).
-    let typing = 'thinking…';
-    if (opts.pending_kind === 'image') typing = 'drawing…';
-    else if (opts.pending_kind === 'search') typing = 'searching the web…';
-    b.innerHTML = `<span class="typing">${typing}</span>`;
-  } else if (opts.image_path) {
-    // Persisted image turn — render the PNG bubble. The text field is
-    // a "[image: <prompt>]" sentinel from the coordinator so a no-CSS
-    // fallback still shows the prompt; we strip the wrapper to get
-    // the original caption.
-    const caption = (text || '').replace(/^\[image:\s*/, '').replace(/\]$/, '');
-    setImageBubble(b, opts.image_path, caption);
-  } else {
-    setBubbleContent(b, role, text);
-  }
-  wrap.appendChild(r);
-  wrap.appendChild(b);
-  if (opts.status === 'error' && role === 'assistant' && opts.message_id) {
-    wrap.appendChild(makeRetryButton(opts.message_id));
-  }
-  if (role === 'assistant' && opts.message_id
-      && isAssistantTextMessage(opts, text)) {
-    wrap.appendChild(makeReadAloudButton(opts.message_id, text));
-  }
-  return wrap;
-}
-
-function makeRetryButton(messageId) {
-  const btn = document.createElement('button');
-  btn.type = 'button';
-  btn.className = 'retry-btn';
-  btn.textContent = 'Retry';
-  btn.onclick = () => retryMessage(messageId, btn);
-  return btn;
-}
-
-function startCooldown(btn, seconds, baseLabel) {
-  btn.disabled = true;
-  let s = Math.max(1, seconds | 0);
-  const tick = () => {
-    if (s <= 0) {
-      btn.textContent = baseLabel;
-      btn.disabled = false;
-      return;
-    }
-    btn.textContent = `${baseLabel} (${s}s)`;
-    s -= 1;
-    setTimeout(tick, 1000);
-  };
-  tick();
-}
-
-async function retryMessage(messageId, btn) {
-  btn.disabled = true;
-  const originalLabel = btn.textContent;
-  btn.textContent = 'Retrying…';
-  let r;
-  try {
-    r = await fetch('/api/messages/' + messageId + '/retry', {method: 'POST'});
-  } catch (e) {
-    btn.textContent = originalLabel;
-    btn.disabled = false;
-    return;
-  }
-  if (r.status === 429) {
-    const ra = parseInt(r.headers.get('Retry-After') || '10', 10);
-    startCooldown(btn, ra, 'Retry');
-    return;
-  }
-  if (!r.ok) {
-    btn.textContent = 'Retry failed';
-    setTimeout(() => { btn.textContent = originalLabel; btn.disabled = false; }, 1500);
-    return;
-  }
-  const body = await r.json();
-  // Convert the error bubble back to a pending bubble and resume
-  // streaming under the new job_id. We deliberately drop the cache
-  // entry for this conversation so future opens re-fetch from server.
-  if (currentId) msgCache.delete(currentId);
-  const wrap = btn.closest('.msg');
-  const bubble = wrap.querySelector('.bubble');
-  bubble.classList.remove('error');
-  bubble.innerHTML = '<span class="typing">thinking…</span>';
-  btn.remove();
-  streamIntoBubble(body.job_id, wrap, null, Date.now(), messageId);
-}
-
-// Min character-reveal rate for the typewriter render. The browser
-// polls /api/result every 200ms and gets the latest accumulated text,
-// but rendering all of it at once feels jarring on a fast model and
-// invisible when the agent doesn't stream. The typewriter advances
-// the visible substring toward the latest server text at >= this
-// rate, so even an instant response shows a brief reveal animation;
-// when partials arrive faster than this rate the typewriter just
-// matches arrival (no artificial slowdown).
-const TYPEWRITER_CHARS_PER_SECOND = 90;
-// Stuck-job thresholds: how long to wait with zero progress before
-// surfacing the "this may be taking longer than normal" notice with
-// a Cancel button. Chat normally streams within a second or two so
-// 60s of dead air is suspicious; image is opaque until the PNG
-// finishes generating, so we give it 5min before warning. The
-// warning itself doesn't cancel anything — the worker keeps grinding
-// and may still finish — it just gives the user an opt-in escape
-// hatch, per project policy that the reaper extends deadlines
-// indefinitely on healthy heartbeats.
-const STUCK_MS_CHAT = 60_000;
-const STUCK_MS_IMAGE = 300_000;
-// Search has a longer pre-stream phase (DDG + optional fetch+extract
-// of 5 pages) before the LLM produces any partials. 2 minutes is
-// generous enough that comprehensive-mode jobs on a slow link don't
-// trip the "may be stuck" warning prematurely, while still bounded
-// enough that a truly hung worker is flagged.
-const STUCK_MS_SEARCH = 120_000;
-// Minimum chars revealed per animation frame, so we don't get stuck
-// at sub-pixel advance on a 60fps display when CPS is low. 1 char/
-// frame at 60fps = 60 cps floor, plenty for readability.
-const TYPEWRITER_MIN_CHARS_PER_FRAME = 1;
-
-// Poll /api/result/{jobId} and stream the accumulated text into the
-// given message element until the job reaches a terminal state. Owns
-// composer enable/disable for the duration, so both the fresh-submit
-// path and the reload-resume path lock input the same way. When
-// statusEl + startMs are passed (the fresh-submit case), updates the
-// status line with timing on completion.
-async function streamIntoBubble(jobId, wrap, statusEl, startMs, messageId) {
-  const myToken = Symbol('stream');
-  activeStream = myToken;
-  if (messageId) wrap.dataset.messageId = messageId;
-  const bubble = wrap.querySelector('.bubble');
-  const pane = document.getElementById('chat-pane');
-  const submitBtn = document.getElementById('submit');
-  const ta = document.getElementById('prompt');
-  submitBtn.disabled = true;
-  ta.disabled = true;
-  // Scroll-pin state. Single boolean updated on every pane scroll
-  // event (user OR programmatic — a programmatic scroll-to-bottom
-  // just re-confirms pinned=true, which is harmless). Replaces the
-  // old per-frame isNearBottom() check, which raced with the
-  // typewriter's 60fps innerHTML rewrites and made it nearly
-  // impossible to scroll up through a long streaming bubble — the
-  // pane reflow would fire faster than the user could drag their
-  // wheel past the 64px threshold.
-  //
-  // Initial state assumes pinned (we want auto-follow at the start
-  // of a new message). The first user scroll-up event flips it; a
-  // user scroll-back-to-bottom flips it back.
-  let isPinnedToBottom = true;
-  const onPaneScroll = () => {
-    const distFromBottom = pane.scrollHeight - pane.scrollTop - pane.clientHeight;
-    isPinnedToBottom = distFromBottom < 32;
-  };
-  pane.addEventListener('scroll', onPaneScroll, { passive: true });
-
-  // Typewriter state. ``target`` is the most recent server-side text;
-  // ``shownChars`` is how many characters we've revealed so far.
-  // A requestAnimationFrame loop advances ``shownChars`` toward
-  // ``target.length`` at TYPEWRITER_CHARS_PER_SECOND. When the server
-  // signals done, we keep the rAF loop running until the visible
-  // substring catches up to the final text, then finalize the bubble.
-  let target = '';
-  let shownChars = 0;
-  let serverDone = false;
-  let rafId = null;
-  let lastFrameTs = 0;
-  let finalizeResolver = null;
-  const finalizePromise = new Promise(r => { finalizeResolver = r; });
-
-  // Voice mode is handled entirely at terminal completion now (see the
-  // auto-fire block down in the `terminal` branch). The streaming loop
-  // itself stays read-aloud-agnostic — no per-tick chunking, no
-  // sentence regex.
-
-  function renderShown() {
-    if (activeStream !== myToken) return;
-    setBubbleContent(bubble, 'assistant', target.substring(0, shownChars));
-    if (isPinnedToBottom) pane.scrollTop = pane.scrollHeight;
-  }
-
-  function typewriterTick(ts) {
-    if (activeStream !== myToken) {
-      rafId = null;
-      return;
-    }
-    if (!lastFrameTs) lastFrameTs = ts;
-    const dtMs = ts - lastFrameTs;
-    lastFrameTs = ts;
-    if (shownChars < target.length) {
-      const advance = Math.max(
-        TYPEWRITER_MIN_CHARS_PER_FRAME,
-        Math.round((TYPEWRITER_CHARS_PER_SECOND * dtMs) / 1000),
-      );
-      shownChars = Math.min(target.length, shownChars + advance);
-      renderShown();
-    }
-    // Keep ticking while either (a) we still have chars to reveal or
-    // (b) the server hasn't said done yet (so more text may arrive).
-    if (shownChars < target.length || !serverDone) {
-      rafId = requestAnimationFrame(typewriterTick);
-    } else {
-      rafId = null;
-      if (finalizeResolver) {
-        const r = finalizeResolver; finalizeResolver = null; r();
-      }
-    }
-  }
-
-  function startTypewriter() {
-    if (rafId !== null) return;
-    lastFrameTs = 0;
-    rafId = requestAnimationFrame(typewriterTick);
-  }
-
-  // Stuck-job UX state. ``lastProgressMs`` is the wall-clock of the
-  // last time we saw any progress (text or partial bytes). Once the
-  // gap exceeds the per-tool threshold, the wrap grows a "may be
-  // taking longer than normal" notice with a Cancel button. The
-  // notice goes away if progress resumes (typewriter advances, server
-  // returns text). Cancel POSTs /api/cancel/{jobId} and lets the
-  // existing polling loop discover the terminal 'cancelled' status.
-  let lastProgressMs = Date.now();
-  let stuckNoticeShown = false;
-  let cancelRequested = false;
-  const isImage = wrap.dataset.tool === 'image';
-  const isSearch = wrap.dataset.tool === 'search';
-  let stuckThresholdMs = STUCK_MS_CHAT;
-  if (isImage) stuckThresholdMs = STUCK_MS_IMAGE;
-  else if (isSearch) stuckThresholdMs = STUCK_MS_SEARCH;
-
-  function clearStuckNotice() {
-    if (!stuckNoticeShown) return;
-    const node = wrap.querySelector('.stuck-notice');
-    if (node) node.remove();
-    stuckNoticeShown = false;
-  }
-
-  function showStuckNotice() {
-    if (stuckNoticeShown || cancelRequested) return;
-    stuckNoticeShown = true;
-    const notice = document.createElement('div');
-    notice.className = 'stuck-notice';
-    const txt = document.createElement('span');
-    txt.className = 'stuck-text';
-    if (isImage) {
-      txt.textContent = 'Image generation is taking longer than normal. Something may be wrong, or your worker just needs more time.';
-    } else if (isSearch) {
-      txt.textContent = 'The web search is taking longer than normal. The page fetches may be slow or your worker may be stuck.';
-    } else {
-      txt.textContent = 'This is taking longer than normal. Something may be wrong, or your worker just needs more time.';
-    }
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = 'cancel-btn';
-    btn.textContent = 'Cancel';
-    btn.onclick = async () => {
-      if (cancelRequested) return;
-      cancelRequested = true;
-      btn.disabled = true;
-      btn.textContent = 'Cancelling…';
-      try {
-        await fetch('/api/cancel/' + jobId, { method: 'POST' });
-      } catch (e) {
-        // Network failure here is OK — coordinator may still have
-        // cancelled before the response was returned. If not, the
-        // user can refresh and try again. We don't surface the
-        // error because the polling loop will see the terminal
-        // status either way.
-      }
-    };
-    notice.appendChild(txt);
-    notice.appendChild(btn);
-    wrap.appendChild(notice);
-  }
-
-  let finalRes = null;
-  try {
-    while (true) {
-      await new Promise(r => setTimeout(r, 200));
-      if (activeStream !== myToken) return null;  // superseded
-      let res;
-      try {
-        res = await fetch('/api/result/' + jobId).then(r => r.json());
-      } catch (e) {
-        // Network blip — don't reset the progress clock (a wedged
-        // network shouldn't suppress the stuck warning), just keep
-        // polling. The threshold check below still fires.
-        if (Date.now() - lastProgressMs > stuckThresholdMs) {
-          showStuckNotice();
-        }
-        continue;
-      }
-      const progressed = res.text && res.text.length > target.length;
-      if (progressed) {
-        target = res.text;
-        lastProgressMs = Date.now();
-        clearStuckNotice();
-        startTypewriter();
-      } else if (Date.now() - lastProgressMs > stuckThresholdMs) {
-        showStuckNotice();
-      }
-      const terminal = res.done
-        || res.status === 'complete'
-        || res.status === 'error'
-        || res.status === 'cancelled';
-      if (terminal) {
-        finalRes = res;
-        clearStuckNotice();
-        // Take the final server text as the authoritative target and
-        // let the typewriter finish revealing.
-        if (res.text) target = res.text;
-        serverDone = true;
-        startTypewriter();
-        if (rafId !== null) {
-          await finalizePromise;
-        }
-        if (res.status === 'cancelled') {
-          // The user cancelled (or someone with the same session
-          // cancelled in another tab). Render as a soft, non-retryable
-          // bubble — no error styling, no retry button.
-          bubble.classList.remove('error');
-          bubble.classList.add('cancelled');
-          bubble.textContent = res.text || 'Cancelled.';
-        } else if (res.status === 'error') {
-          bubble.classList.add('error');
-          bubble.textContent = res.text || res.error || 'Generation failed.';
-          const mid = wrap.dataset.messageId;
-          if (mid && !wrap.querySelector('.retry-btn')) {
-            wrap.appendChild(makeRetryButton(mid));
-          }
-        } else if (res.image_path) {
-          // Image job complete — swap the typewriter contents for the
-          // PNG bubble. text is the "[image: <prompt>]" sentinel; pull
-          // the prompt back out for the caption.
-          const caption = (res.text || '')
-            .replace(/^\[image:\s*/, '').replace(/\]$/, '');
-          setImageBubble(bubble, res.image_path, caption);
-        } else if (!res.text) {
-          setBubbleContent(bubble, 'assistant', '(empty)');
-        }
-        // Search jobs come back with a sources[] list. Render it once
-        // here at completion (re-rendering on every partial would
-        // flicker the bubble and the sources don't change mid-stream
-        // anyway — the server side has them in hand before the LLM
-        // starts).
-        if (res.sources && res.sources.length) {
-          renderSources(wrap, res.sources);
-        }
-        // Per-message read-aloud button. Skip for image / error /
-        // cancelled / empty turns. Uses the final target text (not
-        // the markdown-rendered HTML) so Piper synthesizes from the
-        // model's actual words. When voice mode is on, the button
-        // also auto-fires — voice mode is just "auto-tap read-aloud
-        // on every new response" now (see the read-aloud section
-        // header for why we collapsed it to one path).
-        const readMid = wrap.dataset.messageId;
-        const finalText = (target || '').trim();
-        if (readMid && finalText
-            && res.status !== 'error'
-            && res.status !== 'cancelled'
-            && !res.image_path
-            && !wrap.querySelector('.read-aloud-btn')) {
-          const readBtn = makeReadAloudButton(readMid, finalText);
-          wrap.appendChild(readBtn);
-          if (voiceMode) {
-            // Fire-and-forget — onReadAloudClick handles its own
-            // loading state, errors, and playback. We don't await
-            // because the surrounding streamIntoBubble has more
-            // work (sources, statusEl, convTokens) and the audio is
-            // independent of that bookkeeping.
-            onReadAloudClick(readMid, finalText, readBtn);
-          }
-        }
-        // Reverse-detection: if the rewrite classifier decided this
-        // follow-up didn't need a search ("That's cool!" after a news
-        // thread), the server rerouted to plain chat and set
-        // search_was_skipped. Auto-uncheck the box so the next turn
-        // defaults to chat — the user clearly winded down the search
-        // topic and our sticky-mode bet should give up gracefully.
-        if (res.search_was_skipped) {
-          searchCheckbox.checked = false;
-          searchModeByConv.set(currentId, false);
-          refreshComposerUI();
-        }
-        if (statusEl && startMs) {
-          const dt = ((Date.now() - startMs) / 1000).toFixed(1);
-          let label;
-          if (res.status === 'cancelled') label = `cancelled after ${dt}s`;
-          else if (res.status === 'error') label = `failed in ${dt}s`;
-          else label = `done in ${dt}s · ${res.completion_tokens || 0} tokens · ${res.worker_id || 'unknown worker'}`;
-          statusEl.textContent = label;
-        }
-        // Roll this turn's tokens into the running chat total. Image jobs
-        // report 0/0, so they no-op. The cache invalidation on submit
-        // means the next conv-open recomputes from server-of-record, so
-        // a wrong delta here self-heals on the next navigation.
-        setConvTokens(
-          convTokens
-          + (res.prompt_tokens || 0)
-          + (res.completion_tokens || 0),
-        );
-        return finalRes;
-      }
-    }
-  } finally {
-    clearStuckNotice();
-    pane.removeEventListener('scroll', onPaneScroll);
-    if (rafId !== null) cancelAnimationFrame(rafId);
-    if (activeStream === myToken) {
-      activeStream = null;
-      submitBtn.disabled = false;
-      ta.disabled = false;
-    }
-  }
-}
-
-// ---- image / search toggles ------------------------------------------
-// Two checkboxes, mutually exclusive (checking one hides the other —
-// there's no use case for "image of search results"). Different
-// stickiness contracts:
-//
-// - Image: one-shot per turn. Auto-clears after submit so an
-//   accidental left-on can't burn 5 contributor GPU jobs in a row.
-// - Search: STICKY per conversation. Once you've checked it for a
-//   topic, the natural drill-in flow ("what about Europe?" → "any
-//   specific examples?") wants search on every follow-up. Auto-
-//   unchecking forced re-checks every turn and the user kept
-//   forgetting. Now the checkbox stays in whatever state the user
-//   last set it for the current conversation, persisted in
-//   searchModeByConv; switching to a different conversation restores
-//   that conv's state; "+ New chat" resets to off.
-//
-// Search misfires are cheap (one DDG call + a normal chat turn), so
-// the worst case of leaving it on is much milder than the image case.
-const imageCheckbox = document.getElementById('tool-image-cb');
-const searchCheckbox = document.getElementById('tool-search-cb');
-const imageWrap = document.getElementById('image-toggle-wrap');
-const searchWrap = document.getElementById('search-toggle-wrap');
-const searchModeWrap = document.getElementById('search-mode-wrap');
-const imageSizeWrap = document.getElementById('image-size-wrap');
-const voiceToggleBtn = document.getElementById('voice-toggle');
-
-// Voice mode toggle. The click is what unlocks the browser's audio
-// autoplay restriction for this session — once the user has gestured
-// to enable voice, subsequent audio.play() calls (when the auto-fire
-// kicks in on response completion) work without further interaction.
-// Flipping voice OFF stops any currently-playing clip so the user
-// isn't stuck waiting for a long synth to finish playing back.
-if (voiceToggleBtn) {
-  voiceToggleBtn.addEventListener('click', () => {
-    voiceMode = !voiceMode;
-    voiceToggleBtn.setAttribute('aria-pressed', String(voiceMode));
-    if (!voiceMode) stopReadAloud();
-  });
-}
-
-// Image resolution buckets. The composer's three radios map to one of
-// these; the coordinator clamps and the worker renders at whatever
-// width/height we send. Cost in image-units (charged against the
-// daily image quota) scales with pixel area — see
-// coordinator.main.image_cost_multiplier. Small is the default
-// because it's ~4× faster than Large on the SDXL Lightning model
-// running on a 6 GB contributor GPU, and a one-shot left-on shouldn't
-// silently chew through a BRONZE user's whole day of credits.
-const IMAGE_SIZE_PRESETS = {
-  small:  {width:  512, height:  512},
-  medium: {width:  768, height:  768},
-  large:  {width: 1024, height: 1024},
-};
-// Sticky last choice across page loads. Validated against the preset
-// table on read so a stale/malformed localStorage value can't crash
-// the composer — it just falls through to the small default.
-const IMAGE_SIZE_STORAGE_KEY = 'gamerai.image_size';
-function loadImageSizePreference() {
-  try {
-    const v = localStorage.getItem(IMAGE_SIZE_STORAGE_KEY);
-    if (v && Object.prototype.hasOwnProperty.call(IMAGE_SIZE_PRESETS, v)) {
-      return v;
-    }
-  } catch (_) { /* private mode / disabled storage → just use default */ }
-  return 'small';
-}
-function saveImageSizePreference(v) {
-  try { localStorage.setItem(IMAGE_SIZE_STORAGE_KEY, v); }
-  catch (_) { /* ignore — preference becomes per-session only */ }
-}
-function selectedImageSize() {
-  const checked = document.querySelector('input[name="image-size"]:checked');
-  return (checked && checked.value) || 'small';
-}
-
-function refreshComposerUI() {
-  // Visibility: whichever checkbox is checked claims the row alone.
-  imageWrap.hidden = searchCheckbox.checked;
-  searchWrap.hidden = imageCheckbox.checked;
-  // Sub-toggles only show under their parent checkbox.
-  searchModeWrap.hidden = !searchCheckbox.checked;
-  imageSizeWrap.hidden = !imageCheckbox.checked;
-  // Placeholder cues the user about the active mode.
-  const ta = document.getElementById('prompt');
-  if (imageCheckbox.checked) {
-    ta.placeholder = 'Describe the image you want…';
-  } else if (searchCheckbox.checked) {
-    ta.placeholder = 'Search the web for…';
-  } else {
-    ta.placeholder = 'Message GamerAI...';
-  }
-}
-
-// Restore the sticky resolution radio before the first refresh — the
-// HTML defaults to small=checked, but a returning user may have
-// picked medium/large last time and expects that to stick.
-(function applyStickyImageSize() {
-  const want = loadImageSizePreference();
-  const r = document.querySelector(`input[name="image-size"][value="${want}"]`);
-  if (r) r.checked = true;
-  // Persist any change immediately so a refresh mid-stream picks up
-  // the latest choice instead of the value at page load.
-  document.querySelectorAll('input[name="image-size"]').forEach((el) => {
-    el.addEventListener('change', () => saveImageSizePreference(el.value));
-  });
-})();
-
-// Persist the current search-checkbox state under the current
-// conversation key. Null key is the "brand new chat" slot — most
-// users start a search and immediately submit, so capturing this
-// means the conv created on submit inherits the right mode.
-function persistSearchMode() {
-  searchModeByConv.set(currentId, searchCheckbox.checked);
-}
-
-// Restore the search checkbox for the conversation we're switching
-// to. Image is always restored to off (one-shot, never sticky).
-// Called from openConversation / new-chat / right after a brand-new
-// conversation is created on submit.
-function restoreModeFor(convId) {
-  const want = !!searchModeByConv.get(convId);
-  searchCheckbox.checked = want;
-  imageCheckbox.checked = false;
-  refreshComposerUI();
-}
-
-imageCheckbox.addEventListener('change', () => {
-  // Mutually exclusive — checking image clears search and vice versa.
-  if (imageCheckbox.checked) searchCheckbox.checked = false;
-  persistSearchMode();
-  refreshComposerUI();
-});
-searchCheckbox.addEventListener('change', () => {
-  if (searchCheckbox.checked) imageCheckbox.checked = false;
-  persistSearchMode();
-  refreshComposerUI();
-});
-refreshComposerUI();
-
-function selectedSearchMode() {
-  // Reads the radio group rather than tracking state — radios are
-  // the source of truth and there are only two of them.
-  const checked = document.querySelector(
-    'input[name="search-mode"]:checked',
-  );
-  return checked ? checked.value : 'fast';
-}
-
-// Renders the numbered sources strip below an assistant bubble. Each
-// entry links to the source URL; we render the domain (not the full
-// URL) so a long URL doesn't blow out the bubble width. The model
-// emits inline [1][2] citations that line up with these numbers.
-function renderSources(wrap, sources) {
-  if (!sources || !sources.length) return;
-  const bubble = wrap.querySelector('.bubble');
-  if (!bubble) return;
-  // Replace any prior sources block (re-render on stream completion).
-  const old = bubble.querySelector('.sources');
-  if (old) old.remove();
-  const box = document.createElement('div');
-  box.className = 'sources';
-  const label = document.createElement('div');
-  label.className = 'sources-label';
-  label.textContent = 'Sources';
-  box.appendChild(label);
-  const ol = document.createElement('ol');
-  for (const s of sources) {
-    const li = document.createElement('li');
-    li.value = s.n || 0;
-    if (s.url) {
-      const a = document.createElement('a');
-      a.href = s.url;
-      a.target = '_blank';
-      a.rel = 'noopener noreferrer';
-      a.textContent = s.title || s.domain || s.url;
-      li.appendChild(a);
-      if (s.domain && s.title && s.domain !== s.title) {
-        const dom = document.createElement('span');
-        dom.textContent = ' — ' + s.domain;
-        li.appendChild(dom);
-      }
-    } else {
-      li.textContent = s.title || '(unknown)';
-    }
-    ol.appendChild(li);
-  }
-  box.appendChild(ol);
-  bubble.appendChild(box);
-}
-
 // ---- composer ---------------------------------------------------------
 const textarea = document.getElementById('prompt');
 textarea.addEventListener('input', () => {
@@ -1163,9 +251,9 @@ document.getElementById('composer').onsubmit = async (e) => {
   // Hold the pre-create checkbox state so we can copy it onto the
   // freshly-minted conversation id below — without this, a "+ New
   // chat → check search → submit" flow would lose the sticky bit.
-  const wasNewChat = !currentId;
+  const wasNewChat = !state.currentId;
   const newChatSearchState = wasNewChat ? searchCheckbox.checked : null;
-  if (!currentId) {
+  if (!state.currentId) {
     const cr = await fetch('/api/conversations', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
@@ -1176,9 +264,9 @@ document.getElementById('composer').onsubmit = async (e) => {
       submitBtn.disabled = false; textarea.disabled = false;
       return;
     }
-    currentId = (await cr.json()).conversation_id;
+    state.currentId = (await cr.json()).conversation_id;
     if (newChatSearchState !== null) {
-      searchModeByConv.set(currentId, newChatSearchState);
+      searchModeByConv.set(state.currentId, newChatSearchState);
     }
   }
 
@@ -1221,7 +309,7 @@ document.getElementById('composer').onsubmit = async (e) => {
   else if (submitTool === 'search') statusEl.textContent = 'searching…';
   else statusEl.textContent = 'submitting…';
   const start = Date.now();
-  const body = {prompt, conversation_id: currentId};
+  const body = {prompt, conversation_id: state.currentId};
   if (submitTool === 'image') {
     body.tool = 'image';
     // Always pin width/height so the worker doesn't fall through to
@@ -1273,165 +361,14 @@ document.getElementById('composer').onsubmit = async (e) => {
   // Invalidate this conversation's cache; next openConversation will
   // pull authoritative seq + message_ids from the server. The DOM
   // already reflects the final text via the streaming updates.
-  msgCache.delete(currentId);
+  msgCache.delete(state.currentId);
   // Refresh the sidebar so the title (set from the first prompt on
   // the coordinator) shows up.
   await refreshSidebar();
   document.querySelectorAll('.conv-item').forEach((el, i) => {
-    el.classList.toggle('active', conversations[i] && conversations[i].conversation_id === currentId);
+    el.classList.toggle('active', state.conversations[i] && state.conversations[i].conversation_id === state.currentId);
   });
 };
 
-// ---- image viewer / gallery -----------------------------------------
-// Tap any inline <img.generated> in the chat to open the lightbox.
-// Swipe (touch) or ← / → (desktop) cycles through every image in the
-// current chat in DOM order — newest is bottom-most, like the chat
-// itself. Esc or backdrop tap closes. The Save action is just a plain
-// <a download>; long-pressing the image on mobile still works as the
-// browser-native fallback if download isn't honored.
-//
-// Single overlay element, lazy-built on first open, so a session with
-// no image messages adds zero DOM at startup.
-const imageViewer = (() => {
-  let root, imgEl, counterEl, downloadEl, prevBtn, nextBtn;
-  let images = [];
-  let index = 0;
-
-  function build() {
-    root = document.createElement('div');
-    root.className = 'image-viewer';
-    root.hidden = true;
-    root.setAttribute('aria-hidden', 'true');
-    root.innerHTML = `
-      <div class="iv-header">
-        <span class="iv-counter"></span>
-        <div class="iv-actions">
-          <a class="iv-action iv-download" href="#" download
-             title="Save image" aria-label="Save image">Save</a>
-          <button class="iv-action iv-close" type="button"
-                  title="Close" aria-label="Close">×</button>
-        </div>
-      </div>
-      <button class="iv-nav iv-prev" type="button"
-              aria-label="Previous image">‹</button>
-      <img class="iv-image" alt="">
-      <button class="iv-nav iv-next" type="button"
-              aria-label="Next image">›</button>
-    `;
-    document.body.appendChild(root);
-    imgEl = root.querySelector('.iv-image');
-    counterEl = root.querySelector('.iv-counter');
-    downloadEl = root.querySelector('.iv-download');
-    prevBtn = root.querySelector('.iv-prev');
-    nextBtn = root.querySelector('.iv-next');
-
-    // Backdrop tap closes. Children (image, header, nav buttons)
-    // swallow their own clicks because e.target won't be the root.
-    root.addEventListener('click', (e) => {
-      if (e.target === root) close();
-    });
-    root.querySelector('.iv-close').addEventListener('click', close);
-    prevBtn.addEventListener('click', () => step(-1));
-    nextBtn.addEventListener('click', () => step(1));
-
-    // Esc / arrow keys — only while open, so they don't fight other
-    // global handlers (or the composer textarea) when the viewer is
-    // dismissed.
-    document.addEventListener('keydown', (e) => {
-      if (root.hidden) return;
-      if (e.key === 'Escape') close();
-      else if (e.key === 'ArrowLeft') step(-1);
-      else if (e.key === 'ArrowRight') step(1);
-    });
-
-    // Swipe. Single-finger only, ≥50px horizontal travel, and the
-    // horizontal delta must dominate the vertical one — that filters
-    // out accidental swipes mid-scroll without making the gesture
-    // feel finicky on real hardware.
-    let startX = 0, startY = 0, tracking = false;
-    root.addEventListener('touchstart', (e) => {
-      if (e.touches.length !== 1) { tracking = false; return; }
-      startX = e.touches[0].clientX;
-      startY = e.touches[0].clientY;
-      tracking = true;
-    }, {passive: true});
-    root.addEventListener('touchend', (e) => {
-      if (!tracking) return;
-      tracking = false;
-      const t = e.changedTouches[0];
-      const dx = t.clientX - startX;
-      const dy = t.clientY - startY;
-      if (Math.abs(dx) < 50 || Math.abs(dx) < Math.abs(dy)) return;
-      step(dx < 0 ? 1 : -1);
-    }, {passive: true});
-  }
-
-  function refreshGallery() {
-    images = Array.from(
-      document.querySelectorAll('#chat-pane img.generated'),
-    );
-  }
-
-  function render() {
-    if (!images.length) { close(); return; }
-    // Wrap around so swiping past the last image returns to the first
-    // (and vice versa) — feels right for a finite gallery; "you've
-    // hit the end" UI would be more annoying than helpful here.
-    const n = images.length;
-    index = ((index % n) + n) % n;
-    const cur = images[index];
-    imgEl.src = cur.src;
-    imgEl.alt = cur.alt || '';
-    counterEl.textContent = `${index + 1} / ${n}`;
-    counterEl.hidden = n < 2;
-    downloadEl.href = cur.src;
-    // Friendly filename — the proxy path is /api/images/<uuid>.png; a
-    // "gamerai-" prefix makes the user's downloads folder searchable
-    // later. Falls back to "image.png" only if the URL is malformed
-    // (defensive — shouldn't happen for any image our coordinator
-    // emits).
-    const fname = (cur.src.split('/').pop() || 'image.png');
-    downloadEl.download = `gamerai-${decodeURIComponent(fname)}`;
-    const single = n < 2;
-    prevBtn.hidden = single;
-    nextBtn.hidden = single;
-  }
-
-  function open(srcImg) {
-    if (!root) build();
-    refreshGallery();
-    index = images.indexOf(srcImg);
-    if (index < 0) index = 0;
-    render();
-    root.hidden = false;
-    root.setAttribute('aria-hidden', 'false');
-    // Stop the underlying chat from scrolling while the viewer's
-    // open — otherwise a swipe-gesture miss can scroll the chat
-    // behind the backdrop, which looks broken.
-    document.body.style.overflow = 'hidden';
-  }
-
-  function close() {
-    if (!root) return;
-    root.hidden = true;
-    root.setAttribute('aria-hidden', 'true');
-    document.body.style.overflow = '';
-  }
-
-  function step(delta) {
-    if (!images.length) return;
-    index += delta;
-    render();
-  }
-
-  return {open};
-})();
-
-// Delegated click handler — one listener on the chat pane catches
-// taps on any rendered image bubble, including images appended later
-// (mid-stream completions, lazy-loaded history). No re-binding when
-// new turns arrive.
-document.getElementById('chat-pane').addEventListener('click', (e) => {
-  const img = e.target.closest('img.generated');
-  if (img) imageViewer.open(img);
-});
+// Bind the image-lightbox click delegate once at startup.
+initImageGallery();
