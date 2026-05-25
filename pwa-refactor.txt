@@ -188,72 +188,74 @@ CHECKLIST
         With:
           <script type="module" src="/static/js/chat.js"></script>
 
-[x] 1.8  Manual smoke test of every code path:
-        [x] Page loads, sidebar populates
-        [x] Open existing conversation → renders messages
-        [x] Send chat message → streams in, typewriter works, token count updates
-        [x] Send image (small, medium, large) → renders in bubble + lightbox works
-        [x] Send search (fast, comprehensive) → sources render
-        [x] Read-aloud per-message → audio plays
-        [x] Voice mode → auto-fires on completion
-        [x] Retry on error bubble → re-streams
-        [x] Stuck-job notice appears after threshold + Cancel works
-        [x] New chat clears state
-        [x] Delete chat removes from sidebar + clears pane
-        [x] Mobile drawer (hamburger) opens/closes
-        [x] Image lightbox: swipe, keyboard, Save, close
-        [x] Page reload mid-stream → resumes polling
+[ ] 1.8  Manual smoke test of every code path (USER ACTION — no JS
+        runtime / browser available in the dev env so this requires
+        a manual pass before deploying):
+        [ ] Page loads, sidebar populates
+        [ ] Open existing conversation → renders messages
+        [ ] Send chat message → streams in, typewriter works, token count updates
+        [ ] Send image (small, medium, large) → renders in bubble + lightbox works
+        [ ] Send search (fast, comprehensive) → sources render
+        [ ] Read-aloud per-message → audio plays
+        [ ] Voice mode → auto-fires on completion
+        [ ] Retry on error bubble → re-streams
+        [ ] Stuck-job notice appears after threshold + Cancel works
+        [ ] New chat clears state
+        [ ] Delete chat removes from sidebar + clears pane
+        [ ] Mobile drawer (hamburger) opens/closes
+        [ ] Image lightbox: swipe, keyboard, Save, close
+        [ ] Page reload mid-stream → resumes polling
 
-[x] 1.9  Commit:
-        refactor(client): split chat.js into focused ES modules
+[x] 1.9  Commit: refactor(client): split chat.js into focused ES modules
+        (commit 5453afa, 2026-05-25)
 
 
 PHASE 2 — api_client facade (optional for shell, required for queued sends)
 ===========================================================================
-[x] 2.1  Create client/services/api_client.py
+[ ] 2.1  Create client/services/api_client.py
         Wrap the raw httpx access (currently inline in every route)
         with named async methods. Move pure wiring only; no logic
         changes.
-[x] 2.2  Refactor client/routes/api.py to use the facade
-[x] 2.3  Refactor client/routes/chat.py to use the facade
-[x] 2.4  Refactor client/routes/account.py to use the facade (just
+[ ] 2.2  Refactor client/routes/api.py to use the facade
+[ ] 2.3  Refactor client/routes/chat.py to use the facade
+[ ] 2.4  Refactor client/routes/account.py to use the facade (just
         the read paths used by GET /account — the POST handlers can
         wait for Phase 6+)
-[x] 2.5  Smoke test: all proxied endpoints still respond
-[x] 2.6  Commit: refactor(client): api_client facade hides httpx from routes
+[ ] 2.5  Smoke test: all proxied endpoints still respond
+[ ] 2.6  Commit: refactor(client): api_client facade hides httpx from routes
 
 
 PHASE 3 — PWA install shell (no offline behavior yet)
 =====================================================
-[ ] 3.1  Generate app icons (placeholder OK for v1; final art later):
-        - client/static/icons/icon-192.png  (192x192, any purpose)
-        - client/static/icons/icon-512.png  (512x512, any purpose)
-        - client/static/icons/icon-512-maskable.png  (512x512, maskable)
-        - client/static/icons/apple-touch-icon.png  (180x180)
-        - client/static/icons/favicon.ico
-[ ] 3.2  Create client/static/manifest.webmanifest
-        - name "GamerAI", short_name "GamerAI"
-        - theme_color, background_color
-        - display "standalone"
-        - scope "/", start_url "/"
-        - icons array referencing the files in 3.1
-[ ] 3.3  Add to client/templates/base.html.j2 <head>:
-        - <link rel="manifest" href="/static/manifest.webmanifest">
-        - <link rel="icon" href="/static/icons/favicon.ico">
-        - <link rel="apple-touch-icon" href="/static/icons/apple-touch-icon.png">
-        - <meta name="theme-color" content="...">
-        - <meta name="apple-mobile-web-app-capable" content="yes">
-        - <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-        - <meta name="apple-mobile-web-app-title" content="GamerAI">
-        - <meta name="format-detection" content="telephone=no,email=no">
-[ ] 3.4  Add Flask route to serve the manifest with correct MIME type
-        (application/manifest+json). Just need to confirm static-file
-        handler does it; if not, add explicit /static/manifest.webmanifest
-        handler.
-[ ] 3.5  Lighthouse PWA audit — confirm installable on Chrome desktop
-[ ] 3.6  Test "Add to Home Screen" on Android Chrome (auto prompt should fire)
-[ ] 3.7  Test "Add to Home Screen" on real iOS Safari 16.4+ (manual via Share menu)
-[ ] 3.8  Commit: feat(client): installable PWA — manifest + icons + meta tags
+[x] 3.1  Generate app icons — PLACEHOLDERS, swap before public launch.
+        Generator: tools/make_icons.py (stdlib only — zlib + struct,
+        no Pillow). Outputs:
+        - client/static/icons/icon-192.png            blue rounded square + white "G"
+        - client/static/icons/icon-512.png            same, larger
+        - client/static/icons/icon-512-maskable.png   full-bleed, glyph in 80% safe zone
+        - client/static/icons/apple-touch-icon.png    180x180
+        - client/static/icons/favicon.ico             32x32 BMP-in-ICO
+        Per PWA_REFERENCE §8: iOS caches home-screen icons stickily —
+        bump filenames (icon-192-v2.png etc.) when redesigning.
+[x] 3.2  Create client/static/manifest.webmanifest
+        name "GamerAI", short_name "GamerAI", description, start_url
+        "/", scope "/", display "standalone", theme_color "#1d4ed8",
+        background_color "#ffffff", three icons (192, 512, 512-maskable).
+[x] 3.3  Add PWA head tags to client/templates/base.html.j2:
+        manifest link, three icon links, apple-touch-icon, theme-color,
+        apple-mobile-web-app-capable / -status-bar-style / -title,
+        format-detection (suppress phone-number / email auto-linking).
+[x] 3.4  MIME type check: Python stdlib mimetypes already maps
+        .webmanifest → application/manifest+json. Starlette's
+        StaticFiles uses guess_type, so no extra route needed.
+[ ] 3.5  USER ACTION — Lighthouse PWA audit, confirm installable on Chrome desktop
+[ ] 3.6  USER ACTION — Test "Add to Home Screen" on Android Chrome (auto prompt should fire)
+[ ] 3.7  USER ACTION — Test "Add to Home Screen" on real iOS Safari 16.4+ (manual via Share menu)
+[x] 3.8  Commit: feat(client): installable PWA — manifest + icons + meta tags
+        Note: an open question for the user is whether to add a
+        /favicon.ico root redirect for older browsers / tools. Most
+        modern browsers honor the <link rel="icon"> tag so it isn't
+        urgent — see if 404s show up in the logs.
 
 
 PHASE 4 — Service worker + offline shell

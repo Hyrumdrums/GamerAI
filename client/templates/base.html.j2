@@ -5,6 +5,23 @@
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <title>{% block title %}GamerAI{% endblock %}</title>
   <link rel="stylesheet" href="/static/css/base.css">
+
+  <!-- PWA: manifest + icons + theme. iOS Safari ignores the manifest's
+       theme_color / app title / status-bar style, so the apple-* meta
+       tags below are required to get a real installed-PWA experience
+       on iPhone (per PWA_REFERENCE §2 + §8). format-detection prevents
+       Safari from auto-linking phone numbers / emails in chat text. -->
+  <link rel="manifest" href="/static/manifest.webmanifest">
+  <link rel="icon" href="/static/icons/favicon.ico" sizes="any">
+  <link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192.png">
+  <link rel="icon" type="image/png" sizes="512x512" href="/static/icons/icon-512.png">
+  <link rel="apple-touch-icon" href="/static/icons/apple-touch-icon.png">
+  <meta name="theme-color" content="#1d4ed8">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="GamerAI">
+  <meta name="format-detection" content="telephone=no,email=no">
+
   {% block extra_css %}{% endblock %}
 </head>
 <body>
