@@ -621,6 +621,139 @@ spend, key, usage trend, or limits.
 **Fix:** post Phase 2b. Currently irrelevant — there are no
 customers.
 
+### 🟡 No image input (vision) on chat
+
+The chat tool takes text only. ChatGPT, Copilot, and Gemini all accept
+screenshots, photos, diagrams, receipts, whiteboard code. This is the
+single most-cited capability gap when comparing the suite head-to-head —
+a casual user reaches for "drop a picture in chat" before they reach for
+"better chat model."
+
+**Fix:** add a `chat-vlm` capability (either a new tool, or a `chat` job
+with an optional `image_b64` param) plus a matching Redis queue.
+Llama 3.2 11B Vision is the obvious first model — ~10–12 GB VRAM at Q4,
+so it lives on the SDXL-class contributor tier, not the entry tier.
+Workers with the weights + VRAM advertise `tools=["chat","chat-vlm"]`;
+coordinator routes accordingly. UI gets a paperclip on the composer.
+
+Scope estimate: ~2–3 days for routing + UI + agent bootstrap. Pulls the
+README Phase 4 vision item forward into Phase 3 — the perceived-IQ gap
+from "can't see images" is bigger than the gap from "small chat model."
+
+### 🟡 No document upload (PDF / DOCX / CSV)
+
+Paired with vision: ChatGPT lets you drop a PDF and ask "summarize this."
+We have no document path at all. The natural shape isn't a new tool — it
+mirrors the existing search-prepend: extract text on the coordinator,
+prepend to the chat prompt as fenced context, dispatch as a normal chat
+job. No new worker capability needed.
+
+**Fix:** `POST /uploads` accepting PDF / DOCX / TXT / MD / CSV up to a cap
+(5 MB to start). Extract with `pypdf` + `python-docx` + `pandas.read_csv`.
+Store extracted text against the conversation; `/generate` for that
+conversation prepends it inside a `<<document>> … <</document>>` fence.
+
+Explicitly out of scope for v1: image-only PDFs (needs OCR — Tesseract or
+PaddleOCR sidecar), structured spreadsheet QA (needs a code-execution
+sandbox), >20-page docs (needs chunking + retrieval). Ship the simple
+path first; revisit each only after first user complaint.
+
+Scope estimate: ~2 days. Slot alongside the vision work — "drag a thing
+into chat" is one UX gesture either way.
+
+### 🟡 Piper cold-starts on every TTS job — agent should keep it warm
+
+Each `tool=tts` job triggers a fresh `subprocess.run([piper.exe, ...])`
+in `windows-agent/agent.py:run_tts_inference` (line ~3607). Every spawn
+reloads the voice ONNX model + initializes ONNX Runtime — roughly
+1–2 seconds of dead time per job before any audio comes back.
+
+Voice mode used to dispatch one TTS job per sentence to chase "time to
+first audio" while the chat response was still streaming. The earlier-
+on-2026-05-25 chunker (paragraph + soft-buffer heuristic) reduced a
+multi-bullet response from ~7 jobs to ~3, but each chunk still paid the
+full piper.exe cold-start, so audible 1–2s gaps between chunks
+remained. Later the same day we reverted the chunker entirely and
+collapsed voice mode onto the single-job-per-message path the read-
+aloud button uses (see `chat.js` — `voiceMode` is now just an auto-
+trigger for `onReadAloudClick` on completion). Cold-start is now paid
+once per response instead of once per chunk, amortized over a full WAV
+with natural Piper inter-utterance prosody. The trade-off the user
+accepted: longer time-to-first-audio (have to wait for the whole
+response to generate + synth) for smooth delivery.
+
+Warm-Piper is still the eventual lower-bound on TTS latency — it'd cut
+~1–2s off every read-aloud request, manual or auto-fired — but it's no
+longer load-bearing for the "conversational pauses" problem.
+
+**Fix:** spawn `piper.exe` once when the tts loop starts, attach to
+its stdin/stdout, write `<text>\n` per job and read the WAV from
+stdout. The `--output-raw` flag returns raw PCM on stdout; we wrap it
+into a WAV header on the agent before base64-encoding. Single process
+across many jobs → one model load per agent lifetime.
+
+Two known costs:
+- Process-lifecycle management. If piper.exe crashes mid-job, the loop
+  needs to detect (stdout EOF or non-WAV bytes), restart, and retry
+  the current job. Today's spawn-per-job pattern hides this naturally.
+- Concurrency: the tts loop is single-threaded, so one warm process
+  is sufficient. If we ever parallelize tts (multi-voice or batched
+  requests on a beefier CPU), we'd need a small process pool.
+
+Scope estimate: ~1 day for the warm-process refactor + tests; ~½ day
+for crash-recovery hardening. Slot when TTS volume warrants it.
+
+### ~~🟢 Read-aloud is auto-fired in voice mode; want a per-message button in chat mode~~ — done (2026-05-25)
+
+Resolved. `client/static/js/chat.js` now hangs a faded speaker icon
+off every completed assistant text bubble (history-loaded and freshly-
+streamed). First tap submits a `tool=tts` job for the whole bubble,
+spinner during synthesis, audio plays when ready. Result is cached
+against `message_id` so re-taps replay from memory without re-billing
+the user's `voice_minutes` (in-memory only — page refresh re-bills).
+Tap on the playing button stops; tap on a different button stops the
+prior and plays the new one. Audio also stops when the user navigates
+to another conversation, starts a new chat, or deletes the active
+conversation. Voice mode is untouched and still streams during mic-on
+conversations.
+
+### 🟡 No cross-session memory per account — KISS, explicit only
+
+Persistent memory across conversations is a real perceived-IQ gap vs.
+ChatGPT, which remembers your name / projects / preferences across weeks.
+But the *automatic* memory ChatGPT does — quietly summarizing past chats
+and re-injecting them — is the wrong fit for us. It's noisy, opaque,
+debug-hostile, and a privacy footgun under the membership rule
+(contributors see whatever ends up in the system prompt).
+
+**Fix:** explicit memory only.
+
+- New table `member_memory(member_id, key_or_id, body, created_at)`.
+- Parsing rule on `/generate`: if the chat message starts with
+  `remember ` (case-insensitive), strip the prefix, persist the remainder
+  as a memory entry, reply with a one-line confirmation, **don't** fire a
+  chat job.
+- On every chat/search `/generate`, prepend the member's memories to the
+  system prompt as a fenced block:
+  ``<<memory>>\n- <entry 1>\n- <entry 2>\n<</memory>>``.
+- `/account` shows current memories with a per-row delete button. No
+  edit — delete + re-add.
+- Hard cap: 50 entries or 2 KB total. Over the cap → reject new
+  additions with a "delete some first" message. No silent truncation.
+
+What this deliberately *doesn't* do:
+
+- No automatic extraction from chat history (opaque, debug-hostile,
+  privacy-risky).
+- No embeddings / semantic search over memories (premature at <50
+  short entries — they fit in the system prompt for free).
+- No summarization of past conversations (different concern; lives with
+  the existing `conversation_id` context, not here).
+
+Scope estimate: ~1 day. Pairs naturally with Phase 3b.iii encrypted-
+prompts-at-rest — the memory column is just another field to encrypt
+under the same per-user key.
+
 ### 🟢 Search mode rides free `ddgs` — runway is huge but not infinite
 
 The search tool routes through `ddgs` (formerly `duckduckgo-search`),
@@ -788,6 +921,39 @@ README roadmap. Listing them here for completeness.
 - Big-model support (Petals → EXO) — Phase 4 in the roadmap.
 - Privacy tiers (client-side embedding, vetted pools, TEE) — Phase 5.
 - Energy-aware routing — Phase 4 long-tail.
+
+### Agents tier — paid-customer-only, needs PLATINUM contributors
+
+Multi-step autonomous agents (ChatGPT Operator, Claude computer-use,
+Copilot Pages agentic flows) are the highest-token-consumption category
+in the market — a single agent task can burn 100K+ tokens on planning,
+tool calls, retries, reflection. Two reasons it's not a free contributor
+perk here:
+
+1. **Token cost.** A free contributor's daily quota would evaporate in
+   one agent run. Agents are inherently a paid-customer product.
+2. **Model requirements.** Reliable agents need a real coding / tool-use
+   model — DeepSeek-Coder-V2, Qwen 2.5 Coder 32B, Llama 3.3 70B class.
+   That's 20–40 GB VRAM at Q4, i.e. the PLATINUM contributor tier
+   (3090 / 4090 / 5090 / A6000). Basic-GPU fleet can't serve these jobs
+   at all.
+
+**Plan:**
+
+- Ships in Phase 3b.ii (paid customer layer) or later, never sooner.
+- DEVELOPER paid tier gets agent access. Bill per *step* (planning,
+  tool-call, reflection), not per token, so customers can predict cost.
+- Route to a separate `job_queue:agent` served only by PLATINUM
+  contributors who (a) opt into the paid pool, (b) have advertised a
+  coding-class model, (c) passed the 1-week reliability proof.
+- Higher per-step bonus payouts — agent steps are slower, more VRAM-
+  hungry, and lower-turnover than chat tokens. Premium reflects that.
+
+Flagging now so we don't accidentally promise free agents to
+contributors. Public framing: free contributor toolbox = chat + image +
+search + read-aloud + (eventually) vision + docs + memory; **paid
+customers** get agents and frontier-model inference (the Phase 4
+Petals/EXO work).
 
 ---
 

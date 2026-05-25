@@ -36,120 +36,210 @@ const searchModeByConv = new Map();
 // returning user wonder why some threads spontaneously start talking.
 let voiceMode = false;
 
-// Sequential playback queue. Each in-flight TTS job claims a slot
-// (promise that resolves with {b64} or null on error). The playback
-// worker awaits each slot in order, so audio plays in the order
-// sentences were spoken even if a later sentence's TTS completes
-// first. Reset on voice-mode off and at the start of each new
-// streamIntoBubble session.
-const voiceQueue = {
-  slots: [],         // Promises in submission order
-  worker: null,      // The async playback loop, or null when idle
-  currentAudio: null,
-  sessionToken: 0,   // bumped each reset; in-flight jobs check it
-  reset() {
-    this.sessionToken += 1;
-    this.slots = [];
-    if (this.currentAudio) {
-      try { this.currentAudio.pause(); } catch (_e) {}
-      this.currentAudio = null;
-    }
-    this.worker = null;
-  },
-};
+// Strip the markdown formatting that small chat models routinely
+// emit. Without this, Piper reads "**bold**" as "asterisk asterisk
+// bold asterisk asterisk" and "[OpenAI](https://…)" as the whole
+// URL out loud. Aim: cover the constructs that actually show up in
+// chat answers (bold, italic, inline + fenced code, links, images,
+// bullet / numbered list markers, ATX headers, block quotes). Code
+// FENCES are dropped but the inner code is kept on the assumption
+// that a listener actually wants to hear the snippet.
+function normalizeForTTS(text) {
+  if (!text) return '';
+  let s = text;
+  // Code fences — keep body, drop the ``` markers (and optional lang).
+  s = s.replace(/```[\w-]*\s*\n?/g, '').replace(/```/g, '');
+  // Inline code: drop backticks, keep contents.
+  s = s.replace(/`([^`]+)`/g, '$1');
+  // Images first (before plain links — same bracket shape).
+  s = s.replace(/!\[[^\]]*\]\([^)]*\)/g, '');
+  // Links: keep visible text, drop URL.
+  s = s.replace(/\[([^\]]+)\]\([^)]*\)/g, '$1');
+  // Bold (**x** or __x__) — keep inner text.
+  s = s.replace(/(\*\*|__)(.+?)\1/g, '$2');
+  // Italic (*x* / _x_) — only when wrapping non-space text. The
+  // lookahead/lookbehind keep us from eating standalone "*"s or
+  // mid-word underscores like "snake_case".
+  s = s.replace(/(\*|_)(?=\S)(.+?)(?<=\S)\1/g, '$2');
+  // ATX headers: drop leading hashes; ensure terminal punctuation so
+  // Piper inserts a sentence break after the title.
+  s = s.replace(/^[ \t]*#{1,6}[ \t]+(.+?)[ \t]*#*[ \t]*$/gm, (_m, t) => {
+    const trimmed = t.trim();
+    return /[.!?:]$/.test(trimmed) ? trimmed : trimmed + '.';
+  });
+  // Bullet markers and numbered list prefixes.
+  s = s.replace(/^[ \t]*[-*+][ \t]+/gm, '');
+  s = s.replace(/^[ \t]*\d+\.[ \t]+/gm, '');
+  // Block quotes.
+  s = s.replace(/^[ \t]*>[ \t]?/gm, '');
+  // Collapse runs of blank lines into a single blank line so the
+  // paragraph chunker still sees a boundary.
+  s = s.replace(/\n[ \t]*\n[\s]*/g, '\n\n');
+  return s.trim();
+}
 
-// Matches the tail of a completed sentence — terminal punctuation
-// (with optional closing quotes/brackets) followed by whitespace, OR
-// a newline. Greedy enough that "...etc.) Then" splits after the
-// closing paren. Doesn't try to be clever about abbreviations or
-// decimals; Piper handles "3.14" or "Dr." just fine when they end up
-// inside a clause, and an occasional early break sounds like a brief
-// pause rather than a bug.
-const VOICE_SENTENCE_RE = /[.!?]+["')\]]*(?:\s+|$)|\n+/g;
+// ---- read-aloud (single TTS path) -------------------------------------
+// One code path for both manual ("tap the speaker icon") and voice-mode
+// ("auto-fire on every completed response") read-aloud. Each invocation
+// fires ONE tool=tts job for the whole assistant message text, so
+// piper.exe pays its subprocess + ONNX cold-start exactly once per
+// response. Voice mode used to stream sentence-by-sentence to chase
+// "time to first audio", but the response itself isn't conversational
+// (model latency + Piper synth means real wait time either way), and
+// per-sentence dispatch produced audible cold-start gaps between
+// bullets — see project-gaps.md "Piper cold-starts on every TTS job"
+// for the agent-side warm-process fix that would actually make
+// streaming worthwhile.
+//
+// readAloudCache is keyed by message_id and stores the WAV base64 once
+// fetched, so re-tapping the same speaker icon replays from memory
+// without billing voice_minutes again. In-memory only — a page refresh
+// re-bills, same trade-off as msgCache (see project-gaps.md on the
+// IndexedDB-with-encryption plan that would cover both).
+const readAloudCache = new Map();
 
-function extractCompletedSentences(text, fromIndex) {
-  const slice = text.slice(fromIndex);
-  const sentences = [];
-  let cursor = 0;
-  let m;
-  VOICE_SENTENCE_RE.lastIndex = 0;
-  while ((m = VOICE_SENTENCE_RE.exec(slice)) !== null) {
-    const end = m.index + m[0].length;
-    const s = slice.slice(cursor, end).trim();
-    if (s) sentences.push(s);
-    cursor = end;
+// Currently-playing per-message audio. Holding a reference lets us
+// (a) stop the prior clip when a different message's button is tapped
+// and (b) toggle stop-on-second-tap of the playing button.
+let readAloudPlaying = null;  // {messageId, audio, btn} | null
+
+function stopReadAloud() {
+  if (!readAloudPlaying) return;
+  const {audio, btn} = readAloudPlaying;
+  readAloudPlaying = null;
+  try { audio.pause(); } catch (_e) {}
+  setReadAloudState(btn, 'idle');
+}
+
+function setReadAloudState(btn, state) {
+  btn.classList.remove('is-loading', 'is-playing');
+  if (state === 'loading') {
+    btn.classList.add('is-loading');
+    btn.setAttribute('aria-label', 'Loading audio…');
+    btn.title = 'Loading…';
+  } else if (state === 'playing') {
+    btn.classList.add('is-playing');
+    btn.setAttribute('aria-label', 'Stop reading');
+    btn.title = 'Stop';
+  } else {
+    btn.setAttribute('aria-label', 'Read this message aloud');
+    btn.title = 'Read aloud';
   }
-  return { sentences, newIndex: fromIndex + cursor };
 }
 
-async function speakSentence(text) {
-  const startToken = voiceQueue.sessionToken;
-  if (!voiceMode || !text.trim()) return;
-  // Reserve the playback slot now so order is preserved even if
-  // later sentences' /generate POSTs return first.
-  let resolveSlot;
-  const slotPromise = new Promise(r => { resolveSlot = r; });
-  voiceQueue.slots.push(slotPromise);
-  ensureVoicePlaybackWorker();
-  try {
-    const r = await fetch('/api/generate', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({prompt: text, tool: 'tts'}),
-    });
-    if (!r.ok || voiceQueue.sessionToken !== startToken) {
-      resolveSlot(null); return;
+async function fetchReadAloudAudio(text) {
+  // Strip markdown so Piper doesn't read "asterisk asterisk bold
+  // asterisk asterisk" or speak link URLs out loud. Per-message
+  // mode sends the whole bubble as one job, so one normalize pass
+  // covers it (unlike voice mode, where chunks may split markdown
+  // across the wire).
+  const spoken = normalizeForTTS(text).trim();
+  if (!spoken) throw new Error('nothing to read');
+  const r = await fetch('/api/generate', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({prompt: spoken, tool: 'tts'}),
+  });
+  if (!r.ok) {
+    let msg = '';
+    try {
+      const body = await r.json();
+      if (body && typeof body.detail === 'string') msg = body.detail;
+    } catch (_e) { /* fallthrough */ }
+    throw new Error(msg || ('tts dispatch failed: ' + r.status));
+  }
+  const {job_id} = await r.json();
+  // Poll at the same 250ms cadence as voice mode. Piper finishes a
+  // typical paragraph in 1-3s; a long message can run 5-10s on a
+  // contributor CPU loop, which is why the README justifies the
+  // user-initiated framing here.
+  while (true) {
+    await new Promise(r => setTimeout(r, 250));
+    let res;
+    try {
+      res = await fetch('/api/result/' + job_id).then(r => r.json());
+    } catch (_e) { continue; }
+    if (res && res.audio_b64) return res.audio_b64;
+    if (res && (res.status === 'error' || res.status === 'cancelled')) {
+      throw new Error(res.error || ('tts job ' + res.status));
     }
-    const {job_id} = await r.json();
-    // Poll for the audio. 250ms cadence — Piper finishes a typical
-    // sentence in ~0.5-1.5s so the first poll often already has it.
-    while (true) {
-      await new Promise(r => setTimeout(r, 250));
-      if (voiceQueue.sessionToken !== startToken) { resolveSlot(null); return; }
-      let res;
-      try {
-        res = await fetch('/api/result/' + job_id).then(r => r.json());
-      } catch (_e) { continue; }
-      if (res && res.audio_b64) { resolveSlot({b64: res.audio_b64}); return; }
-      if (res && (res.status === 'error' || res.status === 'cancelled')) {
-        resolveSlot(null); return;
-      }
-    }
-  } catch (_e) {
-    resolveSlot(null);
   }
 }
 
-async function ensureVoicePlaybackWorker() {
-  if (voiceQueue.worker) return;
-  const startToken = voiceQueue.sessionToken;
-  voiceQueue.worker = (async () => {
-    while (voiceQueue.slots.length > 0) {
-      if (voiceQueue.sessionToken !== startToken) break;
-      const slot = voiceQueue.slots.shift();
-      const audio = await slot;
-      if (!audio || !voiceMode || voiceQueue.sessionToken !== startToken) continue;
-      await playAudioB64(audio.b64);
-    }
-    voiceQueue.worker = null;
-  })();
-}
-
-function playAudioB64(b64) {
+function playReadAloudAudio(messageId, b64, btn) {
   return new Promise(resolve => {
-    // Piper writes WAV; the mock branch on Linux workers also writes
-    // WAV. data: URLs work for short clips like a single sentence
-    // without exhausting browser limits.
     const a = new Audio('data:audio/wav;base64,' + b64);
-    voiceQueue.currentAudio = a;
+    readAloudPlaying = {messageId, audio: a, btn};
+    setReadAloudState(btn, 'playing');
     const done = () => {
-      if (voiceQueue.currentAudio === a) voiceQueue.currentAudio = null;
+      // Only reset state if we're still the active clip — stopReadAloud
+      // may have already moved on to a different button.
+      if (readAloudPlaying && readAloudPlaying.audio === a) {
+        readAloudPlaying = null;
+        setReadAloudState(btn, 'idle');
+      }
       resolve();
     };
     a.onended = done;
     a.onerror = done;
     a.play().catch(done);
   });
+}
+
+async function onReadAloudClick(messageId, text, btn) {
+  // Tap on the button that's currently playing → stop.
+  if (readAloudPlaying && readAloudPlaying.messageId === messageId) {
+    stopReadAloud();
+    return;
+  }
+  // Tap on a different button while another is playing → stop the
+  // other, fall through to play this one.
+  stopReadAloud();
+  let b64 = readAloudCache.get(messageId);
+  if (!b64) {
+    setReadAloudState(btn, 'loading');
+    btn.disabled = true;
+    try {
+      b64 = await fetchReadAloudAudio(text);
+      readAloudCache.set(messageId, b64);
+    } catch (e) {
+      btn.disabled = false;
+      setReadAloudState(btn, 'idle');
+      // Surface quota / worker errors without an alert dialog — a
+      // hover tooltip is enough for a non-destructive failure.
+      btn.title = (e && e.message) ? `Read aloud failed: ${e.message}` : 'Read aloud failed';
+      return;
+    }
+    btn.disabled = false;
+  }
+  await playReadAloudAudio(messageId, b64, btn);
+}
+
+function makeReadAloudButton(messageId, text) {
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'read-aloud-btn';
+  setReadAloudState(btn, 'idle');
+  btn.innerHTML = `
+    <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+      <path fill="currentColor" d="M3 9v6h4l5 5V4L7 9H3zm13.5 3a4.5 4.5 0 0 0-2.5-4.03v8.05a4.5 4.5 0 0 0 2.5-4.02zM14 3.23v2.06A7 7 0 0 1 14 18.7v2.06A9 9 0 0 0 14 3.23z"/>
+    </svg>
+  `;
+  btn.onclick = () => onReadAloudClick(messageId, text, btn);
+  return btn;
+}
+
+// True when a completed assistant turn carries actual readable text
+// (i.e. not an image bubble, not an error, not a cancelled bubble, not
+// empty). Used by both messageEl (history-load) and streamIntoBubble
+// (fresh completion) to decide whether to hang a speaker icon off the
+// message.
+function isAssistantTextMessage(opts, text) {
+  if (opts.image_path) return false;
+  if (opts.status === 'error') return false;
+  if (opts.status === 'pending') return false;
+  if (opts.status === 'cancelled') return false;
+  return !!(text && text.trim());
 }
 
 // Running token total (prompt + completion) for the visible conversation.
@@ -262,6 +352,7 @@ async function deleteConversation(id, label) {
   msgCache.delete(id);
   if (currentId === id) {
     currentId = null;
+    stopReadAloud();
     document.getElementById('chat-pane').innerHTML =
       '<div class="empty"><h2>What\'s on your mind?</h2>' +
       '<div>Start a new conversation by typing below.</div></div>';
@@ -278,6 +369,7 @@ document.getElementById('new-chat').onclick = () => {
   // click handler is fine even before the file finishes parsing.
   searchModeByConv.delete(null);
   restoreModeFor(null);
+  stopReadAloud();
   document.getElementById('chat-pane').innerHTML =
     '<div class="empty"><h2>What\'s on your mind?</h2><div>Start a new conversation by typing below.</div></div>';
   document.querySelectorAll('.conv-item').forEach(el => el.classList.remove('active'));
@@ -304,6 +396,11 @@ async function openConversation(id) {
   // renderMessages may start a new one if the conversation we're
   // opening has a pending turn of its own.
   activeStream = null;
+  // Stop any read-aloud playback from the conversation we're leaving —
+  // the speaker button it was attached to is about to be removed from
+  // the DOM, so without this the audio would keep talking with no
+  // visible way to stop it.
+  stopReadAloud();
   document.getElementById('submit').disabled = false;
   document.getElementById('prompt').disabled = false;
   // On mobile, close the drawer once a conversation is picked. CSS
@@ -451,6 +548,10 @@ function messageEl(role, text, opts = {}) {
   if (opts.status === 'error' && role === 'assistant' && opts.message_id) {
     wrap.appendChild(makeRetryButton(opts.message_id));
   }
+  if (role === 'assistant' && opts.message_id
+      && isAssistantTextMessage(opts, text)) {
+    wrap.appendChild(makeReadAloudButton(opts.message_id, text));
+  }
   return wrap;
 }
 
@@ -594,14 +695,10 @@ async function streamIntoBubble(jobId, wrap, statusEl, startMs, messageId) {
   let finalizeResolver = null;
   const finalizePromise = new Promise(r => { finalizeResolver = r; });
 
-  // Voice mode: index into ``target`` of the next character that has
-  // not yet been shipped to TTS. We dispatch one tool=tts job per
-  // completed sentence so audio starts playing while the chat is still
-  // streaming — the latency win argued for in voice-phase1. Reset the
-  // playback queue at the start of each session so a new submit
-  // doesn't talk over the tail of the previous response.
-  let ttsConsumedChars = 0;
-  if (voiceMode) voiceQueue.reset();
+  // Voice mode is handled entirely at terminal completion now (see the
+  // auto-fire block down in the `terminal` branch). The streaming loop
+  // itself stays read-aloud-agnostic — no per-tick chunking, no
+  // sentence regex.
 
   function renderShown() {
     if (activeStream !== myToken) return;
@@ -727,15 +824,6 @@ async function streamIntoBubble(jobId, wrap, statusEl, startMs, messageId) {
         lastProgressMs = Date.now();
         clearStuckNotice();
         startTypewriter();
-        // Voice mode: ship every newly-completed sentence to TTS as
-        // it lands. Skips image/search bubbles — their "text" field
-        // is either a prompt echo or the search rewrite, neither of
-        // which is meant to be read aloud.
-        if (voiceMode && !isImage && !isSearch) {
-          const out = extractCompletedSentences(target, ttsConsumedChars);
-          ttsConsumedChars = out.newIndex;
-          for (const s of out.sentences) speakSentence(s);
-        }
       } else if (Date.now() - lastProgressMs > stuckThresholdMs) {
         showStuckNotice();
       }
@@ -753,17 +841,6 @@ async function streamIntoBubble(jobId, wrap, statusEl, startMs, messageId) {
         startTypewriter();
         if (rafId !== null) {
           await finalizePromise;
-        }
-        // Voice mode tail-flush. The sentence-boundary regex only
-        // matches *completed* sentences (terminal punct + whitespace
-        // OR newline), so a response that ends mid-clause leaves a
-        // tail unspoken. On terminal, ship whatever's left.
-        if (voiceMode && !isImage && !isSearch) {
-          const tail = target.slice(ttsConsumedChars).trim();
-          if (tail) {
-            ttsConsumedChars = target.length;
-            speakSentence(tail);
-          }
         }
         if (res.status === 'cancelled') {
           // The user cancelled (or someone with the same session
@@ -796,6 +873,31 @@ async function streamIntoBubble(jobId, wrap, statusEl, startMs, messageId) {
         // starts).
         if (res.sources && res.sources.length) {
           renderSources(wrap, res.sources);
+        }
+        // Per-message read-aloud button. Skip for image / error /
+        // cancelled / empty turns. Uses the final target text (not
+        // the markdown-rendered HTML) so Piper synthesizes from the
+        // model's actual words. When voice mode is on, the button
+        // also auto-fires — voice mode is just "auto-tap read-aloud
+        // on every new response" now (see the read-aloud section
+        // header for why we collapsed it to one path).
+        const readMid = wrap.dataset.messageId;
+        const finalText = (target || '').trim();
+        if (readMid && finalText
+            && res.status !== 'error'
+            && res.status !== 'cancelled'
+            && !res.image_path
+            && !wrap.querySelector('.read-aloud-btn')) {
+          const readBtn = makeReadAloudButton(readMid, finalText);
+          wrap.appendChild(readBtn);
+          if (voiceMode) {
+            // Fire-and-forget — onReadAloudClick handles its own
+            // loading state, errors, and playback. We don't await
+            // because the surrounding streamIntoBubble has more
+            // work (sources, statusEl, convTokens) and the audio is
+            // independent of that bookkeeping.
+            onReadAloudClick(readMid, finalText, readBtn);
+          }
         }
         // Reverse-detection: if the rewrite classifier decided this
         // follow-up didn't need a search ("That's cool!" after a news
@@ -868,13 +970,15 @@ const voiceToggleBtn = document.getElementById('voice-toggle');
 
 // Voice mode toggle. The click is what unlocks the browser's audio
 // autoplay restriction for this session — once the user has gestured
-// to enable voice, subsequent audio.play() calls during streaming
-// work without further user interaction.
+// to enable voice, subsequent audio.play() calls (when the auto-fire
+// kicks in on response completion) work without further interaction.
+// Flipping voice OFF stops any currently-playing clip so the user
+// isn't stuck waiting for a long synth to finish playing back.
 if (voiceToggleBtn) {
   voiceToggleBtn.addEventListener('click', () => {
     voiceMode = !voiceMode;
     voiceToggleBtn.setAttribute('aria-pressed', String(voiceMode));
-    if (!voiceMode) voiceQueue.reset();
+    if (!voiceMode) stopReadAloud();
   });
 }
 
@@ -1049,6 +1153,11 @@ document.getElementById('composer').onsubmit = async (e) => {
   const statusEl = document.getElementById('status');
   submitBtn.disabled = true;
   textarea.disabled = true;
+  // Stop any audio still playing from the previous answer — voice
+  // mode will auto-fire on this new response's completion, and a new
+  // question while the old reply is still talking would otherwise
+  // leave the prior clip running with no obvious way to stop it.
+  stopReadAloud();
 
   // If this is a brand-new chat (no currentId), create one first.
   // Hold the pre-create checkbox state so we can copy it onto the

@@ -228,6 +228,47 @@ body { display: flex; flex-direction: column; }
 .retry-btn:hover:not(:disabled) { background: #fdecec; }
 .retry-btn:disabled { cursor: not-allowed; color: #999; border-color: #ddd; background: var(--surface); }
 
+/* Per-message read-aloud icon. Sits next to the assistant bubble
+ * (right column on desktop, below on mobile thanks to the column
+ * flex). Faded by default so it doesn't compete with the message
+ * text; brightens on hover of either the button OR its parent .msg
+ * (matching the ChatGPT-style "controls appear when you mouse over
+ * the bubble" convention). Pulses while loading the TTS job; tints
+ * accent-colored while playing so the user can tell which message
+ * they're listening to in a long chat. */
+.read-aloud-btn {
+  flex: 0 0 auto;
+  align-self: flex-end;
+  width: 1.85rem; height: 1.85rem;
+  padding: 0; margin-top: .25rem;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: transparent; border: 0; border-radius: 4px;
+  color: var(--muted);
+  opacity: .35;
+  cursor: pointer;
+  transition: opacity .12s ease, color .12s ease, background .12s ease;
+}
+.msg.assistant:hover .read-aloud-btn { opacity: .75; }
+.read-aloud-btn:hover,
+.read-aloud-btn:focus { opacity: 1; color: var(--text); background: #f1f1f1; }
+.read-aloud-btn:focus-visible {
+  outline: 2px solid var(--accent, #2d72d2);
+  outline-offset: 2px;
+}
+.read-aloud-btn:disabled { cursor: progress; }
+.read-aloud-btn.is-loading {
+  opacity: .9; color: var(--text);
+  animation: read-aloud-pulse 1.1s ease-in-out infinite;
+}
+.read-aloud-btn.is-playing {
+  opacity: 1; color: var(--accent, #2d72d2);
+  background: rgba(45, 114, 210, .08);
+}
+@keyframes read-aloud-pulse {
+  0%, 100% { opacity: .5; }
+  50%      { opacity: 1; }
+}
+
 .stuck-notice {
   margin-top: .5rem; padding: .5rem .75rem; font-size: .85rem;
   background: #fff8e1; color: #8a6500; border: 1px solid #f0d178;
