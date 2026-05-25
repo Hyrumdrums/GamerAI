@@ -729,12 +729,38 @@ class WebUISmokeTests(unittest.TestCase):
         """Belt-and-suspenders to the canary system: marked.parse
         output for assistant messages must be piped through DOMPurify
         so a malicious model can't XSS the user via raw HTML in its
-        response. The chat JS lives in /static/js/chat.js; the page
-        body just references it via <script src>."""
+        response.
+
+        chat.js is the ES-module entry point loaded by the page; the
+        DOMPurify call lives in whichever sibling module owns assistant
+        bubble rendering. To stay robust against future re-splits, walk
+        the import graph from chat.js and assert DOMPurify.sanitize
+        appears somewhere in the reachable JS — not in a hard-coded
+        file path.
+        """
+        import re
         body = self.web.get("/").text
         self.assertIn("/static/js/chat.js", body)
-        chat_js = self.web.get("/static/js/chat.js").text
-        self.assertIn("DOMPurify.sanitize", chat_js)
+
+        visited: set[str] = set()
+        stack: list[str] = ["chat.js"]
+        found = False
+        while stack:
+            fname = stack.pop()
+            if fname in visited:
+                continue
+            visited.add(fname)
+            src = self.web.get(f"/static/js/{fname}").text
+            if "DOMPurify.sanitize" in src:
+                found = True
+                break
+            for imp in re.findall(r"from\s+['\"]\./([^'\"]+)['\"]", src):
+                stack.append(imp)
+        self.assertTrue(
+            found,
+            f"DOMPurify.sanitize not found in any module reachable from "
+            f"chat.js (visited: {sorted(visited)})",
+        )
 
     def test_api_conversations_round_trip(self):
         """The new chat UI calls POST /api/conversations on the first
