@@ -260,31 +260,52 @@ PHASE 3 — PWA install shell (no offline behavior yet)
 
 PHASE 4 — Service worker + offline shell
 ========================================
-[ ] 4.1  Create client/static/sw.js
-        Handlers needed:
-          - install: precache app-shell (manifest, base.css, chat.css,
-            marked.min.js, purify.min.js, the 6 ES modules from Phase 1,
-            icons)
-          - activate: cleanup old caches
-          - fetch:
-              navigate requests → network-first, /offline fallback
-              static (CSS/JS/icons) → cache-first
-              API (/api/*) → network-only (queued sends come in Phase 5)
-        Cache versioning: const CACHE_VERSION = 'v1';  (bump on each release)
-[ ] 4.2  Create client/templates/offline.html.j2 — minimal "you're
-        offline, retry when connected" page
-[ ] 4.3  Add /offline route to serve offline.html.j2
-[ ] 4.4  Register SW from base.html.j2 (only over HTTPS or localhost):
-          if ('serviceWorker' in navigator) {
-            window.addEventListener('load', () => {
-              navigator.serviceWorker.register('/sw.js');
-            });
-          }
-[ ] 4.5  Test: open page, go offline, reload → shell loads from cache;
-        navigate to a path → offline.html shown.
-[ ] 4.6  Test: SW update flow (bump CACHE_VERSION, deploy, ensure
-        clients pick up the new shell after one reload cycle).
-[ ] 4.7  Commit: feat(client): offline shell via service worker
+[x] 4.1  Create client/static/sw.js (CACHE_VERSION='v1'; bump per release)
+        - install: precache app shell (base.css, chat.css, vendored
+          marked/purify, all 7 ES modules, manifest, every icon,
+          /offline). skipWaiting() so a deploy doesn't block on tabs.
+        - activate: delete any cache whose name doesn't match the
+          current CACHE_VERSION. clients.claim() takes over open tabs.
+        - fetch:
+            method != GET → passthrough
+            cross-origin → passthrough
+            /api/* → passthrough (Phase 5 adds Background Sync here)
+            navigate → network-first, runtime-cache 200s, fall back
+              to cached match, fall back to /offline
+            static → cache-first, runtime-cache new 200s
+[x] 4.2  Create client/templates/offline.html.j2
+        Tiny self-contained shell; extends base.html.j2 (so it uses
+        the precached base.css and icons).
+[x] 4.3  Add /offline route in client/routes/chat.py
+        No session check — must render with the coordinator unreachable.
+[x] 4.4  Register SW from client/templates/base.html.j2
+        Gated on 'serviceWorker' in navigator && window.isSecureContext
+        (so plain http:// dev origins don't throw). Explicit scope: '/'.
+[x] 4.5  Add /sw.js root route in client/app.py
+        FileResponse from client/static/sw.js with:
+          - Content-Type: application/javascript
+          - Service-Worker-Allowed: / (so root-scope works despite
+            the file being mounted under /static)
+          - Cache-Control: no-cache (browsers byte-compare the SW
+            source to detect updates; a stale CDN copy could trap
+            users on old code)
+[ ] 4.6  USER ACTION — Test offline shell:
+        a) Open chat in browser, let SW register (check DevTools →
+           Application → Service Workers). Wait for the precache to
+           finish (check Cache Storage for gamerai-shell-v1).
+        b) DevTools → Network → check "Offline".
+        c) Reload → chat shell should render with the cached HTML.
+        d) Navigate to a non-cached path (e.g. /tos) → /offline shown.
+        e) Toggle online, reload — fresh fetches resume.
+        WARNING: if Phase 1 has any browser-side bugs, the SW will
+        cache the buggy version. Test Phase 1 with SW unregistered
+        first (or in incognito), confirm green, THEN enable SW.
+[ ] 4.7  USER ACTION — Test SW update flow:
+        a) Bump CACHE_VERSION to 'v2' in sw.js, redeploy.
+        b) Reload the app — new SW installs in parallel.
+        c) Reload again — new SW takes over (skipWaiting+claim are
+           on). Cache Storage should show only gamerai-shell-v2.
+[x] 4.8  Commit: feat(client): offline shell via service worker
 
 
 PHASE 5 — Background sync: queued message sends

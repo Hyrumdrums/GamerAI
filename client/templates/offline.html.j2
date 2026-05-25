@@ -1,0 +1,16 @@
+{% extends "base.html.j2" %}
+{% block title %}Offline — GamerAI{% endblock %}
+{% block content %}
+<main style="max-width: 32rem; margin: 4rem auto; padding: 0 1.5rem; text-align: center; font-family: system-ui, -apple-system, sans-serif;">
+  <h1 style="font-size: 1.5rem; margin-bottom: 0.75rem;">You're offline</h1>
+  <p style="color: #555; line-height: 1.5;">
+    GamerAI needs a network connection to reach the coordinator and the
+    contributor GPUs that run your prompts. Reconnect and reload to keep going.
+  </p>
+  <p style="margin-top: 2rem;">
+    <a href="/" style="display: inline-block; padding: 0.6rem 1.2rem;
+        background: #1d4ed8; color: white; text-decoration: none;
+        border-radius: 0.4rem;">Retry</a>
+  </p>
+</main>
+{% endblock %}

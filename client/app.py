@@ -23,6 +23,7 @@ Where to add a new page:
 from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from client.routes import account, admin_ui, api, auth, chat, invites
@@ -37,6 +38,29 @@ app = FastAPI(title="GamerAI Web UI")
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
 if _STATIC_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
+
+
+@app.get("/sw.js", include_in_schema=False)
+async def service_worker():
+    # The service worker source lives under /static for normal asset
+    # organization, but a SW's scope is the path of the file it's
+    # served from — /static/sw.js could only control /static/*. We
+    # need root scope (/) so the SW intercepts navigations to /,
+    # /login, /chat history, etc. Serving from /sw.js with the
+    # Service-Worker-Allowed: / header gets us that.
+    return FileResponse(
+        _STATIC_DIR / "sw.js",
+        media_type="application/javascript",
+        headers={
+            "Service-Worker-Allowed": "/",
+            # No long-term caching of the SW itself — browsers
+            # byte-compare the SW source to detect updates, so a
+            # stale-while-revalidate CDN response could trap users
+            # on an old version.
+            "Cache-Control": "no-cache",
+        },
+    )
+
 
 app.include_router(auth.router)
 app.include_router(chat.router)

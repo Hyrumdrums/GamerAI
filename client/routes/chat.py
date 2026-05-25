@@ -20,6 +20,16 @@ async def index(request: Request):
     return templates.TemplateResponse(request, "chat.html.j2", {})
 
 
+@router.get("/offline", response_class=HTMLResponse)
+async def offline(request: Request):
+    # Static fallback page returned by the service worker when a
+    # navigation can't reach the network. Has no session check — the
+    # whole point is that we can render it without contacting the
+    # coordinator. Lives here (not in app.py) so it can extend
+    # base.html.j2 with the rest of the templates.
+    return templates.TemplateResponse(request, "offline.html.j2", {})
+
+
 @router.get("/admin")
 def admin_redirect():
     return RedirectResponse(url="/dashboard")

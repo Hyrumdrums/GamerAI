@@ -28,5 +28,19 @@
 {% block topbar %}{% endblock %}
 {% block content %}{% endblock %}
 {% block extra_js %}{% endblock %}
+<script>
+  // Service worker registration. Browsers only allow SWs over HTTPS
+  // (or localhost for dev), so this is a no-op on plain http://
+  // origins — the API check + the secure-context check below mean we
+  // never throw on the public bits of the app. Registered with explicit
+  // scope: '/' so the SW (served from /sw.js) can intercept navigations
+  // to every path on the origin.
+  if ('serviceWorker' in navigator && window.isSecureContext) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('/sw.js', { scope: '/' })
+        .catch((err) => console.warn('SW registration failed', err));
+    });
+  }
+</script>
 </body>
 </html>
