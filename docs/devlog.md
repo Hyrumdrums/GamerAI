@@ -5,6 +5,89 @@ entries on top. Skim for context before resuming work.
 
 ---
 
+## 2026-05-26 — Prod chat regression: image-only contributor + missing Ollama mirror
+
+Two-cause incident traced in a single session. User reported a
+chat submission coming back as `[mock] Tell me about string theory`.
+
+**Cause 1 (the symptom):** `coordinator/main.py` `/jobs/next` was
+blindly trusting the worker's requested `tools` list. A freshly-
+paired Windows contributor (`win-DESKTOP-SFE5TBP`) had advertised
+`tools=["image"]` at `/register` but its dual-loop polling layer
+was still BLPOP'ing the chat queue. Image-only worker grabbed the
+chat job, ran it in mock mode, posted the result. Canary system
+caught ~25% of these as `canary_failed` over the previous five
+hours; users felt the rest.
+
+  Fix (commit `d8eedd7`): `/jobs/next` now intersects requested
+  tools with what the worker actually advertised at `/register`
+  (via `db.worker_tools(worker_id)`). Empty intersection → 
+  `{"job": None}` instead of a 4xx so the long-poll loop stays
+  quiet on overreaching agents. Legacy workers without a tools_json
+  default to `["chat"]` so the historical contract holds. Two
+  regression tests added; whole suite 442/442 still green.
+
+**Cause 2 (the underlying root cause):** When Carol restarted her
+agent we got a log line:
+
+```
+bootstrap: download of https://ai.dallinlayton.com/download/ollama-setup.exe
+  failed: Client error '404 Not Found'
+bootstrap: ollama not available — mock inference only
+```
+
+The Ollama installer was never on the VPS mirror.
+`/var/www/downloads/` had `agent.exe`, `sd.exe`, `piper-runtime.zip`,
+sd-models, tts-voices — but no Ollama installer and no chat model
+GGUF. `infra/setup-mirror.sh` had never been run on this VPS, and
+`infra/bootstrap.sh` doesn't call it automatically. So **every**
+contributor agent that connected to this server fell into the
+image-only partial state after its chat bootstrap 404'd.
+
+  Fix (no commit — server-side ops): `sudo bash
+  /opt/gamerai/infra/setup-mirror.sh` on the VPS downloaded
+  ollama-setup.exe (2.0 GB) + llama3.2-1b.gguf (1.3 GB) and wrote
+  the matching Modelfile. All three URLs that the agent's chat
+  bootstrap probes now return HTTP/2 200.
+
+**Doc + ops gap that allowed this:** `bootstrap.sh` doesn't run any
+of the three mirror scripts, and the existing `infra/README.md`
+didn't mention they were required for contributor onboarding to
+work. The current VPS only has image and TTS mirror seeds because
+someone manually ran the image/TTS scripts at some earlier point;
+nobody ever ran the Ollama one.
+
+  Decision (operator pick): keep mirror seeding manual + visible
+  rather than rolling it into `bootstrap.sh`. ~8 GB of bandwidth
+  per VPS bootstrap is steep, and the binaries occasionally pin
+  to upstream versions that the operator wants to control. But
+  document it loudly so the next fresh server doesn't repeat the
+  mistake.
+
+  Changes:
+  - `infra/README.md`: new "Mandatory follow-up: seed the contributor
+    mirrors" section right after the bootstrap command, with all
+    three commands + a single curl loop to verify all ten download
+    URLs return 200.
+  - `infra/bootstrap.sh`: summary block now prints a "⚠ REQUIRED
+    next step" callout with the three commands so an operator
+    sees it immediately after bootstrap finishes.
+  - `docs/OPERATOR.md`: new §6.55 "Contributor download mirror"
+    explaining what each script seeds, what breaks if you skip
+    one, verification curl, and `FORCE=1` for refreshing an asset
+    after a model bump.
+
+**Carol-machine specifics (not the root cause, but adjacent):**
+She launched `agent.exe` via the foreground Start Menu shortcut
+(`installer.iss:65`), not the `(tray)` variant on line 66. The
+agent is doing exactly what the installer offered — two shortcuts,
+foreground vs hidden. The autostart-at-boot task (`installer.iss:71`)
+DOES use `--tray`, so if she re-runs the installer with "Run at
+Windows startup" checked, the agent goes hidden on every login.
+No code change needed.
+
+---
+
 ## 2026-05-25 — PWA shell + service worker + Web Push (pwa-refactor.txt Phases 1/3/4/6)
 
 Twelve-commit arc that turned the web client into an installable

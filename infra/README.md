@@ -86,6 +86,68 @@ curl https://coordinator.example.com/health
 
 ---
 
+## Mandatory follow-up: seed the contributor mirrors
+
+The bootstrap **does not** seed `/var/www/downloads/` with the Ollama
+installer, the default chat model, the stable-diffusion binaries,
+or the Piper TTS runtime. Without these, every contributor agent
+that connects to this VPS falls into a **partial-contributor state**
+— the agent's bootstrap chain 404s on the missing files, falls
+back to mock inference for the affected tool, and `/register`s with
+only the capabilities that *did* bootstrap. Real symptom seen in
+prod 2026-05-26: contributors registered as `tools=["image"]` only,
+chat jobs raced into them, users got `[mock] ...` responses.
+
+Three mirror scripts; each is idempotent and re-running is safe.
+Run **all three** after the first bootstrap:
+
+```bash
+# Ollama installer (~700 MB) + default llama3.2:1b GGUF (~1.3 GB).
+# Without this, agents fall back to mock chat.
+sudo bash /opt/gamerai/infra/setup-mirror.sh
+
+# stable-diffusion.cpp Windows binary + DLLs (~30 MB) + default
+# SDXL Lightning GGUF (~6 GB).
+sudo bash /opt/gamerai/infra/setup-image-mirror.sh
+
+# Piper runtime (~22 MB) + default voice model (~75 MB).
+sudo bash /opt/gamerai/infra/setup-tts-mirror.sh
+```
+
+Total: ~8 GB downloaded into `/var/www/downloads/`. Disk-check
+first with `df -h /var/www/downloads`.
+
+Verify each URL the agent will probe:
+
+```bash
+DOMAIN=coordinator.example.com
+for path in \
+  /download/ollama-setup.exe \
+  /download/models/llama3.2-1b.gguf \
+  /download/models/llama3.2-1b.Modelfile \
+  /download/sd.exe \
+  /download/stable-diffusion.dll \
+  /download/sd-models/dreamshaperXL-lightning.gguf \
+  /download/sd-models/dreamshaperXL-lightning.json \
+  /download/piper-runtime.zip \
+  /download/tts-voices/piper__en_us-libritts-high.onnx \
+  /download/tts-voices/piper__en_us-libritts-high.onnx.json
+do
+  printf "%-65s %s\n" "$path" "$(curl -sI "https://$DOMAIN$path" | head -1)"
+done
+```
+
+All ten should print `HTTP/2 200`. Anything else (especially `404`)
+means a contributor agent will fail to bootstrap that tool.
+
+Why this isn't auto-run by `bootstrap.sh`: ~8 GB of bandwidth on
+every VPS bootstrap is expensive, and these binaries occasionally
+need pinning to specific versions (sd.cpp CLI flag changes, Piper
+voice format updates). Keeping mirror seeding explicit lets the
+operator decide *when* to refresh and *which* assets to update.
+
+---
+
 ## Re-deploying after a code change
 
 **The current preferred workflow is push-to-main + a manual deploy.sh.**

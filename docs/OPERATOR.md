@@ -346,6 +346,69 @@ Until then: `du -sh /opt/gamerai/data/images/` is the canary.
 
 ---
 
+## 6.55 Contributor download mirror — keep it seeded
+
+Three scripts in `infra/` keep `/var/www/downloads/` populated with
+the binaries every Windows agent pulls during its first-run
+bootstrap chain:
+
+| script                       | what it seeds                                   | size  |
+| ---------------------------- | ----------------------------------------------- | ----- |
+| `setup-mirror.sh`            | Ollama installer + default llama3.2:1b GGUF     | ~2 GB |
+| `setup-image-mirror.sh`      | sd.exe + DLLs + default SDXL Lightning GGUF     | ~6 GB |
+| `setup-tts-mirror.sh`        | Piper runtime + default voice ONNX              | ~100 MB |
+
+**`bootstrap.sh` does NOT run any of these automatically** (deliberate
+— ~8 GB bandwidth per VPS is steep and the binaries occasionally
+pin to specific upstream versions). After every fresh bootstrap,
+the operator must run all three.
+
+What goes wrong if you skip one: the contributor agent's bootstrap
+chain 404s on the missing files, falls back to `mock` for that tool,
+and registers with capabilities that exclude it. Specifically:
+
+- **Skip `setup-mirror.sh`** (the one we hit in prod on 2026-05-26):
+  Ollama installer 404s → no chat model → agent registers
+  `tools=["image"]` or `tools=["image", "tts"]` only → coordinator
+  routes chat jobs to other workers, OR (pre-`d8eedd7`) the partial
+  agent claims chat jobs from the queue and answers `[mock] ...`.
+- **Skip `setup-image-mirror.sh`**: sd.exe 404s → image bootstrap
+  fails → loud "PARTIAL CONTRIBUTOR" banner in the agent log (the
+  user-facing direction we already documented) → no image jobs.
+- **Skip `setup-tts-mirror.sh`**: voice ONNX 404s → no TTS → voice
+  feature degraded for invitees of that contributor.
+
+### Verifying the mirror after seeding
+
+```bash
+DOMAIN=ai.dallinlayton.com
+for p in \
+  /download/ollama-setup.exe \
+  /download/models/llama3.2-1b.gguf \
+  /download/sd.exe \
+  /download/sd-models/dreamshaperXL-lightning.gguf \
+  /download/piper-runtime.zip \
+  /download/tts-voices/piper__en_us-libritts-high.onnx; do
+  printf "%-65s %s\n" "$p" "$(curl -sI "https://$DOMAIN$p" | head -1)"
+done
+```
+
+All six should print `HTTP/2 200`. If any 404s, run the matching
+`setup-*-mirror.sh` script again.
+
+### Refreshing a single asset after a model bump
+
+Each script reads `FORCE=1` to redownload existing files. E.g. to
+bump the chat model after editing `setup-mirror.sh`'s
+`MODEL_GGUF_URL`:
+
+```bash
+sudo MODEL_SLUG=llama3.2-3b FORCE=1 \
+  bash /opt/gamerai/infra/setup-mirror.sh
+```
+
+---
+
 ## 6.6 PWA + Push notifications
 
 Since `pwa-refactor.txt` Phase 3/4/6, the web client is an installable
