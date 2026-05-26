@@ -138,13 +138,26 @@ JOB_PARTIALS = "job_partials"
 # is a single HGETALL on the polling read path.
 JOB_AUDIO_CHUNKS = "job_audio_chunks"
 
+# Tail-window cap on chat history shipped to the model. Prompt eval on
+# a long context is the single biggest contributor to submit-to-first-
+# token latency — small consumer models prefill at ~500-1500 tok/sec, so
+# a 25K-token history costs 20-40s before the first generated token
+# arrives. Newest turns are kept; older turns are dropped (or replaced
+# by a summary once the summarizer fires). 4000 tokens ≈ 1000 words ≈
+# 4-6 normal turns, generous for short-thread continuity without making
+# prefill the dominant cost. Tunable via env if a contributor wants to
+# trade latency for memory in a long thread.
+import os as _os
+MAX_HISTORY_TOKENS = int(_os.getenv("MAX_HISTORY_TOKENS", "4000"))
+del _os
+
 # Single source of truth for the PWA shell-cache version. The service
 # worker's CACHE_VERSION and the chat-header version indicator both
 # read this — bumping it here invalidates the cached JS for every
 # browser on next page load AND surfaces the new number in the UI so
 # operator and user can confirm at-a-glance which build is live.
 # Format: bare integer string. Display widget renders "v1.0.{N}".
-CLIENT_CACHE_VERSION = "8"
+CLIENT_CACHE_VERSION = "9"
 WORKER_REGISTRY = "worker_registry"
 WORKER_HEARTBEATS = "worker_heartbeats"
 WORKER_STATUS = "worker_status"
@@ -172,6 +185,13 @@ IMAGE_REWRITE_PENDING = "image_rewrite_pending"
 # only (no rewrite on first-turn searches — same skip-paths as
 # image rewrite). Consumed by /jobs/complete; deleted after dispatch.
 SEARCH_REWRITE_PENDING = "search_rewrite_pending"
+# Conversation-summary job linkage. Same pattern as the rewrite pending
+# hashes: when /generate fires a "summarize the older turns" chat job,
+# it stashes {conversation_id, through_seq} here keyed by the summary
+# job's id. /jobs/complete looks the entry up and, on success, writes
+# the result text to conversations.summary_text. Avoids threading a
+# conversation_id back through the orphan job row.
+SUMMARY_PENDING = "summary_pending"
 # Reverse-detection marker. When the rewrite chat job classifies a
 # follow-up as "not search-worthy" (a closure like "thanks" / "that's
 # cool!" after a search thread), the dispatcher reroutes the job to

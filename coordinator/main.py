@@ -37,10 +37,12 @@ from shared.config import (
     IMAGE_UNIT_COST_BASE,
     SEARCH_REWRITE_PENDING,
     SEARCH_AUTO_DISABLED,
+    SUMMARY_PENDING,
     CANARY_SCORE_WINDOW,
     IDEMPOTENCY_TTL_SECONDS,
     JOB_AUDIO_CHUNKS,
     JOB_PARTIALS,
+    MAX_HISTORY_TOKENS,
     JOB_PROCESSING,
     JOB_QUEUE,
     JOB_RESULTS,
@@ -1727,6 +1729,7 @@ def generate(req: GenerateRequest, request: Request):
     # interleaved with chat in the sidebar.
     conversation_id: Optional[str] = req.conversation_id
     worker_messages: Optional[list[dict]] = None
+    history_info: Optional[dict] = None
     if conversation_id:
         conv_row = db.get_conversation(conversation_id)
         if conv_row is None:
@@ -1754,7 +1757,34 @@ def generate(req: GenerateRequest, request: Request):
             # summary in (handy for follow-ups like "what about in
             # Europe?"). The worker prepends its own search-results
             # system message before calling Ollama.
-            worker_messages = _build_chat_messages(prior, req.prompt)
+            summary_text = (
+                conv_row["summary_text"]
+                if "summary_text" in conv_row.keys()
+                else None
+            )
+            summary_through_seq = (
+                conv_row["summary_through_seq"]
+                if "summary_through_seq" in conv_row.keys()
+                else None
+            )
+            worker_messages, history_info = _build_chat_messages_with_info(
+                prior, req.prompt,
+                summary_text=summary_text,
+                summary_through_seq=summary_through_seq,
+            )
+            # Fire-and-forget summarization for any newly-dropped turns.
+            # The summary job runs through the normal worker pool; its
+            # completion replaces conversations.summary_text so the
+            # NEXT /generate gets the benefit. The current turn pays
+            # only the cap-truncated prefill cost (the summary it
+            # eventually produces won't help this request).
+            try:
+                _maybe_enqueue_summary_job(conv_row, prior, history_info)
+            except Exception as e:
+                log.warning(
+                    "summary enqueue failed (non-fatal): %s", e,
+                    extra={"event": "summary_enqueue_failed"},
+                )
         # Conversation may pin a default model; honor it when the call
         # didn't override. For image jobs we DO NOT inherit a
         # chat-conversation's pinned LLM (that would re-trigger the
@@ -1937,43 +1967,244 @@ def generate(req: GenerateRequest, request: Request):
         },
     )
     return GenerateResponse(
-        job_id=job_id, assistant_message_id=assistant_message_id,
+        job_id=job_id,
+        assistant_message_id=assistant_message_id,
+        history_info=history_info,
     )
 
 
-def _build_chat_messages(prior_messages, new_user_text: str) -> list[dict]:
-    """Build the Ollama /api/chat messages[] array from the persisted
-    conversation rows plus the new user turn. Pending/empty assistant
-    rows from a previous-failed-but-not-yet-retried turn are skipped so
-    the model doesn't see a stray empty-assistant message in the middle
-    of the history.
+_SUMMARY_SYSTEM_PROMPT = (
+    "You are a conversation summarizer. Compress the conversation "
+    "below into 2-3 short paragraphs of plain prose. Capture key "
+    "facts, decisions, and ongoing context the next response will "
+    "need; drop pleasantries and repetition. Do not address the "
+    "user, do not add meta commentary — just the summary itself."
+)
+
+
+def _maybe_enqueue_summary_job(conv_row, prior_messages, history_info) -> None:
+    """Fire an async chat job that summarizes the oldest turns the
+    truncation pass just dropped. The job runs through the normal
+    worker pool; on /jobs/complete the result text replaces
+    conversations.summary_text and bumps summary_through_seq, so the
+    next /generate ships a short summary + recent turns instead of
+    the full transcript. No-op when nothing fresh needs summarizing
+    (no drops, or the existing summary already covers them)."""
+    if not history_info:
+        return
+    if history_info.get("messages_dropped", 0) < 2:
+        return
+    conv_id = conv_row["conversation_id"]
+    existing_through = (
+        conv_row["summary_through_seq"]
+        if "summary_through_seq" in conv_row.keys()
+        else None
+    ) or 0
+    # Reconstruct the eligible-and-sorted view that the build path used,
+    # so messages_dropped tracks the same chronologically-ordered set.
+    eligible: list = []
+    for m in prior_messages:
+        role = m["role"]
+        status = m["status"] if "status" in m.keys() else "complete"
+        text = (m["text"] or "").strip()
+        seq = m["seq"] if "seq" in m.keys() else None
+        if role not in ("user", "assistant"):
+            continue
+        if role == "assistant" and (status != "complete" or not text):
+            continue
+        if seq is None:
+            continue
+        eligible.append(m)
+    if not eligible:
+        return
+    eligible.sort(key=lambda m: m["seq"])
+    dropped_count = history_info["messages_dropped"]
+    dropped_msgs = eligible[:dropped_count]
+    if not dropped_msgs:
+        return
+    new_through_seq = int(dropped_msgs[-1]["seq"])
+    if new_through_seq <= existing_through:
+        return  # already summarized this far
+    # Build the summarizer's input: existing summary as a system prefix
+    # (so the new one chains forward), then every persisted turn up
+    # through new_through_seq.
+    existing_summary = (
+        conv_row["summary_text"]
+        if "summary_text" in conv_row.keys()
+        else None
+    )
+    summary_input: list[dict] = [
+        {"role": "system", "content": _SUMMARY_SYSTEM_PROMPT},
+    ]
+    if existing_summary:
+        summary_input.append({
+            "role": "system",
+            "content": "Summary so far:\n" + existing_summary,
+        })
+    for m in eligible:
+        if m["seq"] > new_through_seq:
+            break
+        role = m["role"]
+        text = (m["text"] or "").strip()
+        if role == "assistant":
+            text = _scrub_citations(text)
+        if text:
+            summary_input.append({"role": role, "content": text})
+    # Orphan chat job — no conversation_id link, no submitter, no
+    # placeholder message row. Runs through the same worker pool as
+    # any other chat job; the worker can't tell it apart, which is
+    # fine because the summary system prompt does all the steering.
+    job_id = str(uuid.uuid4())
+    submitted_at = time.time()
+    envelope = {
+        "job_id": job_id,
+        "prompt": _SUMMARY_SYSTEM_PROMPT,
+        "messages": summary_input,
+        "model": None,
+        "submitted_at": submitted_at,
+        "tool": "chat",
+    }
+    db.insert_job(
+        job_id,
+        _SUMMARY_SYSTEM_PROMPT,
+        None,
+        submitted_at,
+        None,
+        conversation_id=None,
+        tool="chat",
+        status="pending",
+    )
+    r.hset(
+        SUMMARY_PENDING,
+        job_id,
+        json.dumps({
+            "conversation_id": conv_id,
+            "through_seq": new_through_seq,
+        }),
+    )
+    r.rpush(job_queue_for("chat"), json.dumps(envelope))
+    log.info(
+        "summary job enqueued",
+        extra={
+            "event": "summary_enqueued",
+            "job_id": job_id,
+            "conversation_id": conv_id,
+            "through_seq": new_through_seq,
+            "input_turns": len(summary_input) - 1,
+        },
+    )
+
+
+def _estimate_history_tokens(text: str) -> int:
+    """Coarse token estimator for the history-cap math. chars/4 lines up
+    with how the worker bills tokens elsewhere; perfect parity with the
+    model's tokenizer isn't necessary because the cap is a soft target
+    aimed at "submit-to-first-token doesn't grow O(history)", not a
+    hard quota."""
+    return max(1, len(text) // 4) if text else 0
+
+
+def _build_chat_messages_with_info(
+    prior_messages,
+    new_user_text: str,
+    summary_text: Optional[str] = None,
+    summary_through_seq: Optional[int] = None,
+    cap_tokens: int = MAX_HISTORY_TOKENS,
+) -> tuple[list[dict], dict]:
+    """Build the Ollama /api/chat messages[] array from persisted
+    conversation rows plus the new user turn, applying a tail-window
+    cap so a many-turn thread doesn't pin model prefill to O(history).
+
+    Newest turns are kept verbatim. Once the accumulated estimate hits
+    ``cap_tokens`` we stop folding in older turns. If a ``summary_text``
+    is supplied it's prepended as a system message and any persisted
+    turn with seq <= summary_through_seq is excluded (those turns are
+    represented by the summary). Returns the messages array AND an
+    info dict the response can surface to the client so the UI can
+    display "older turns aren't in context".
+
+    Pending/empty assistant rows from a previous-failed-but-not-yet-
+    retried turn are skipped so the model doesn't see a stray empty-
+    assistant message in the middle of the history.
 
     Citation markers (``[1]``, ``[2, 3]``) are scrubbed from prior
-    assistant content. They're meaningful to the human reader of a
-    rendered bubble (paired with the Sources strip) but actively
-    confusing when handed back to a model as conversation context —
-    the new search step's system message also numbers sources [1]
-    [2]..., creating a namespace collision where ``[1]`` in the
-    history points to a different source than ``[1]`` in the new
-    system prompt. Small models squint at the conflict and
-    panic-recant ("my new [1] doesn't back the old [1] claim, so I
-    was wrong before, sorry"). Real bug, observed in manual testing
-    after the chat-reroute citation scrub already shipped — the
-    summarizer needed the same treatment."""
-    out: list[dict] = []
+    assistant content — see _scrub_citations for the bug they caused
+    when handed back to a model alongside a new search step's sources."""
+    # Filter + normalize, keeping seq so we can apply summary_through_seq.
+    eligible: list[dict] = []
     for m in prior_messages:
         role = m["role"]
         text = (m["text"] or "").strip()
         status = m["status"] if "status" in m.keys() else "complete"
+        seq = m["seq"] if "seq" in m.keys() else None
         if role not in ("user", "assistant", "system"):
             continue
         if role == "assistant" and (status != "complete" or not text):
             continue
+        if (
+            summary_through_seq is not None
+            and seq is not None
+            and seq <= summary_through_seq
+        ):
+            # Replaced by the summary; do not include the raw turn too.
+            continue
         if role == "assistant":
             text = _scrub_citations(text)
-        out.append({"role": role, "content": text})
+        eligible.append({"role": role, "content": text, "seq": seq})
+
+    # Walk newest → oldest, keeping turns until the cap is hit. Stop at
+    # the first overshoot so we don't half-include a long turn (e.g.,
+    # a 3000-token paste). The newest turn always lands even if it
+    # alone exceeds cap_tokens — dropping it would defeat the point.
+    kept_rev: list[dict] = []
+    tokens_used = 0
+    for m in reversed(eligible):
+        cost = _estimate_history_tokens(m["content"])
+        if kept_rev and tokens_used + cost > cap_tokens:
+            break
+        tokens_used += cost
+        kept_rev.append(m)
+    kept = list(reversed(kept_rev))
+    dropped_count = len(eligible) - len(kept)
+    tokens_dropped = sum(
+        _estimate_history_tokens(m["content"])
+        for m in eligible[: len(eligible) - len(kept)]
+    )
+
+    out: list[dict] = []
+    if summary_text:
+        # Anchor the model with the earlier-history summary first so it
+        # has continuity without paying the full token cost. Phrased as
+        # a system message because it's editorial context, not user or
+        # assistant words.
+        out.append({
+            "role": "system",
+            "content": (
+                "Earlier in this conversation (summarized):\n" + summary_text
+            ),
+        })
+    for m in kept:
+        out.append({"role": m["role"], "content": m["content"]})
     out.append({"role": "user", "content": (new_user_text or "").strip()})
-    return out
+
+    info = {
+        "messages_total": len(eligible) + (1 if summary_text else 0),
+        "messages_kept": len(kept),
+        "messages_dropped": dropped_count,
+        "tokens_kept": tokens_used,
+        "tokens_dropped": tokens_dropped,
+        "summary_in_use": bool(summary_text),
+        "cap_tokens": cap_tokens,
+    }
+    return out, info
+
+
+def _build_chat_messages(prior_messages, new_user_text: str) -> list[dict]:
+    """Back-compat wrapper that discards the truncation info dict.
+    Used by the requeue path, where there's no /generate response to
+    surface stats on."""
+    msgs, _info = _build_chat_messages_with_info(prior_messages, new_user_text)
+    return msgs
 
 
 def _job_row_to_envelope(row) -> dict:
@@ -2723,6 +2954,45 @@ def complete(req: JobCompleteRequest, request: Request):
                 except Exception:
                     pass
                 r.hdel(SEARCH_REWRITE_PENDING, req.job_id)
+
+    # Conversation-summary linkage. Same shape as the rewrite paths
+    # above: if this job_id is mapped in SUMMARY_PENDING, persist the
+    # produced text as the conversation's summary, then fall through
+    # to the normal complete flow so the worker is paid and the job
+    # row is marked. The job is orphan (no conversation_id on it) so
+    # no message-row writes happen downstream.
+    summary_link_raw = r.hget(SUMMARY_PENDING, req.job_id)
+    if summary_link_raw:
+        try:
+            slink = json.loads(summary_link_raw)
+        except json.JSONDecodeError:
+            slink = None
+        if slink and req.status == "complete" and (req.text or "").strip():
+            try:
+                db.set_conversation_summary(
+                    slink["conversation_id"],
+                    req.text.strip(),
+                    int(slink["through_seq"]),
+                )
+                log.info(
+                    "summary stored",
+                    extra={
+                        "event": "summary_stored",
+                        "conversation_id": slink["conversation_id"],
+                        "through_seq": slink["through_seq"],
+                        "job_id": req.job_id,
+                        "chars": len(req.text.strip()),
+                    },
+                )
+            except Exception as e:
+                log.warning(
+                    "summary store failed: %s", e,
+                    extra={
+                        "event": "summary_store_failed",
+                        "job_id": req.job_id,
+                    },
+                )
+        r.hdel(SUMMARY_PENDING, req.job_id)
 
     # Look up the original job row so we can branch image vs. chat
     # before touching earnings + storage.

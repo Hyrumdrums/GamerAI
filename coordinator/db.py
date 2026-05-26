@@ -477,6 +477,20 @@ class DB:
             "CREATE INDEX IF NOT EXISTS idx_member_tokens_member "
             "ON member_tokens(member_id);"
         )
+        # History summarization (Phase 3 of the long-context fix).
+        # ``summary_text`` is a short natural-language recap of every
+        # turn up through ``summary_through_seq``. _build_chat_messages
+        # prepends it as a system message and skips the turns it
+        # covers, so a 25K-token thread gets shipped to Ollama as a
+        # ~200-token summary + the last ~4K tokens of context.
+        for ddl in (
+            "ALTER TABLE conversations ADD COLUMN summary_text TEXT",
+            "ALTER TABLE conversations ADD COLUMN summary_through_seq INTEGER",
+        ):
+            try:
+                self._conn.execute(ddl)
+            except sqlite3.OperationalError:
+                pass
 
     # ---------- jobs ----------
     def insert_job(
@@ -1705,6 +1719,21 @@ class DB:
                 "UPDATE conversations SET title=? "
                 "WHERE conversation_id=? AND (title IS NULL OR title='')",
                 (title, conversation_id),
+            )
+
+    def set_conversation_summary(
+        self, conversation_id: str, summary_text: str, through_seq: int,
+    ) -> None:
+        """Persist a recap of every turn up through through_seq.
+        _build_chat_messages_with_info prepends this as a system
+        message and excludes any persisted turn at seq <= through_seq,
+        keeping prefill cost bounded on a long thread."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE conversations "
+                "SET summary_text=?, summary_through_seq=? "
+                "WHERE conversation_id=?",
+                (summary_text, int(through_seq), conversation_id),
             )
 
     # ---------- messages ----------

@@ -219,6 +219,13 @@ body { display: flex; flex-direction: column; }
 }
 .status { color: var(--muted); font-size: .8rem; text-align: center; min-height: 1em; margin-top: .35rem; }
 .conv-tokens { color: var(--muted); font-size: .75rem; text-align: center; margin-top: .15rem; opacity: .8; }
+/* History-cap indicator. Sits directly under the token meter so the
+   user has a one-glance answer to "why is this slow?" — the long
+   thread can hit a 25K-token meter while only ~4K are actually being
+   shipped to the model. .has-truncation amps the contrast a touch so
+   the line reads as a callout rather than fade-into-footer chrome. */
+.conv-context { color: var(--muted); font-size: .7rem; text-align: center; margin-top: .1rem; opacity: .7; }
+.conv-context.has-truncation { color: var(--brand); opacity: .85; }
 
 .retry-btn {
   margin-top: .5rem; padding: .35rem .7rem; font-size: .85rem;

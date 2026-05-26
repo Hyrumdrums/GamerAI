@@ -136,6 +136,7 @@ document.getElementById('new-chat').onclick = () => {
   document.querySelectorAll('.conv-item').forEach(el => el.classList.remove('active'));
   document.getElementById('sidebar').classList.remove('open');
   setConvTokens(0);
+  renderHistoryInfo(null);
   document.getElementById('prompt').focus();
 };
 
@@ -159,6 +160,42 @@ document.addEventListener('click', (e) => {
   sidebar.classList.remove('open');
 });
 
+// Render the history-cap indicator under the token meter so the user
+// understands why a long thread's first-token wait is bounded — the
+// model only sees the most recent ~4K tokens (plus a summary, once
+// the summarizer fires). Cleared on conversation switch + new chat.
+export function renderHistoryInfo(info) {
+  const el = document.getElementById('conv-context');
+  if (!el) return;
+  if (!info) {
+    el.hidden = true;
+    el.textContent = '';
+    el.classList.remove('has-truncation');
+    return;
+  }
+  const dropped = info.messages_dropped | 0;
+  const kept = info.messages_kept | 0;
+  const summarized = !!info.summary_in_use;
+  if (dropped === 0 && !summarized) {
+    el.hidden = true;
+    el.textContent = '';
+    el.classList.remove('has-truncation');
+    return;
+  }
+  let parts = [];
+  if (summarized && dropped > 0) {
+    parts.push(`earlier ${dropped} turn${dropped === 1 ? '' : 's'} summarized`);
+  } else if (summarized) {
+    parts.push('earlier turns summarized');
+  } else if (dropped > 0) {
+    parts.push(`older ${dropped} turn${dropped === 1 ? '' : 's'} not in context`);
+  }
+  parts.push(`context: last ${kept} turn${kept === 1 ? '' : 's'}`);
+  el.textContent = parts.join(' · ');
+  el.classList.toggle('has-truncation', dropped > 0 && !summarized);
+  el.hidden = false;
+}
+
 // ---- conversation rendering ------------------------------------------
 async function openConversation(id) {
   state.currentId = id;
@@ -176,6 +213,9 @@ async function openConversation(id) {
   // the DOM, so without this the audio would keep talking with no
   // visible way to stop it.
   stopReadAloud();
+  // Stale truncation pill from the previous chat — clears here and
+  // the next /generate response refills it for the new conversation.
+  renderHistoryInfo(null);
   document.getElementById('submit').disabled = false;
   document.getElementById('prompt').disabled = false;
   // On mobile, close the drawer once a conversation is picked. CSS
@@ -439,7 +479,9 @@ document.getElementById('composer').onsubmit = async (e) => {
     submitBtn.disabled = false; textarea.disabled = false;
     return;
   }
-  const {job_id, assistant_message_id} = await gr.json();
+  const grBody = await gr.json();
+  const {job_id, assistant_message_id, history_info} = grBody;
+  renderHistoryInfo(history_info);
   await streamIntoBubble(job_id, typing, statusEl, start, assistant_message_id);
   textarea.focus();
   // Invalidate this conversation's cache; next openConversation will
@@ -552,7 +594,9 @@ async function drainQueue() {
         await offlineQueue.remove(entry.id).catch(() => {});
         continue;
       }
-      const {job_id, assistant_message_id} = await gr.json();
+      const drainBody = await gr.json();
+      const {job_id, assistant_message_id, history_info} = drainBody;
+      renderHistoryInfo(history_info);
       await offlineQueue.remove(entry.id).catch(() => {});
       const bubble = typing.querySelector('.bubble');
       bubble.classList.remove('queued');

@@ -65,6 +65,13 @@ class GenerateResponse(BaseModel):
     # reload. The id is returned here so the active client can also
     # track the in-progress bubble without re-fetching the conversation.
     assistant_message_id: Optional[str] = None
+    # Chat-mode history-cap stats. Populated when the request carried a
+    # conversation_id; null for canary / no-history dispatches. The
+    # client uses this to surface "older turns not in context" in the
+    # token-meter footer so a long thread's submit-to-first-token wait
+    # has a visible explanation rather than feeling like a hang. Keys
+    # mirror _build_chat_messages_with_info's info dict.
+    history_info: Optional[dict] = None
 
 
 class JobPartialRequest(BaseModel):
