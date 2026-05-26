@@ -93,7 +93,13 @@
           <div class="stats-row" id="stats-row-tokens"></div>
           <div class="stats-row" id="stats-row-context"></div>
           <div class="stats-section" id="stats-section-summary" hidden>
-            <div class="stats-label">Rolling summary</div>
+            <div class="stats-label">
+              <span>Rolling summary</span>
+              <span class="stats-label-status" id="stats-summary-status" hidden>
+                <span class="stats-spinner"></span>
+                <span>summarizing now…</span>
+              </span>
+            </div>
             <div class="stats-summary" id="stats-summary-text"></div>
           </div>
           <div class="stats-explainer">

@@ -218,17 +218,14 @@ body { display: flex; flex-direction: column; }
   outline-offset: 2px;
 }
 .status { color: var(--muted); font-size: .8rem; text-align: center; min-height: 1em; margin-top: .35rem; }
-/* Collapsible context-stats panel. Replaces the prior conv-tokens +
-   conv-context pair: collapsed it's a single-line token meter with a
-   "stats ▴" affordance; tapping anywhere on the button expands into a
-   full breakdown (current cap, kept vs dropped turns, the rolling
-   summary if any, and a one-line strategy explainer). The whole panel
-   is a <button> so keyboard + screen-reader navigation works without
-   extra ARIA wiring. */
+/* Collapsible context-stats panel. Collapsed shows the token total
+   dead-center with a "stats ▴" affordance pinned right; tap anywhere
+   on the strip to expand. The whole panel is a <button> so keyboard
+   + screen-reader navigation works without extra ARIA wiring. */
 .stats-panel {
   width: 100%; background: transparent; border: none;
-  text-align: center; color: var(--muted); font-size: .75rem;
-  margin-top: .15rem; padding: .2rem;
+  text-align: center; color: var(--text); font-size: .75rem;
+  margin-top: .15rem; padding: .25rem 0;
   cursor: pointer; font-family: inherit;
 }
 .stats-panel:focus-visible {
@@ -236,27 +233,45 @@ body { display: flex; flex-direction: column; }
   border-radius: var(--radius);
 }
 .stats-collapsed {
+  position: relative;
   display: flex; justify-content: center; align-items: center;
-  gap: .8rem; opacity: .85;
+  min-height: 1.1em;
 }
-.stats-collapsed-text.has-truncation { color: var(--brand); opacity: 1; }
-.stats-toggle { opacity: .55; font-size: .65rem; }
-.stats-panel[aria-expanded="true"] .stats-collapsed { opacity: 1; }
+.stats-collapsed-text { color: var(--text); }
+.stats-toggle {
+  position: absolute; right: .5rem;
+  color: var(--text);
+}
 .stats-expanded {
-  text-align: left; padding: .55rem .8rem;
-  background: var(--surface); border: 1px solid var(--border-soft);
-  border-radius: var(--radius); margin-top: .35rem;
-  cursor: default;
+  text-align: left; padding: .55rem .2rem .3rem;
+  margin-top: .25rem; cursor: default;
 }
 .stats-row {
-  margin: .2rem 0; line-height: 1.4; font-size: .75rem;
-  color: var(--text); opacity: .85;
+  margin: .25rem 0; line-height: 1.4; font-size: .75rem;
+  color: var(--text);
 }
-.stats-row.has-truncation { color: var(--brand); opacity: 1; }
-.stats-section { margin: .55rem 0 .35rem; }
+.stats-section { margin: .65rem 0 .35rem; }
 .stats-label {
   font-size: .65rem; text-transform: uppercase; letter-spacing: .04em;
   opacity: .55; margin-bottom: .25rem; font-weight: 600;
+  display: flex; align-items: center; gap: .35rem;
+}
+.stats-label-status {
+  text-transform: none; letter-spacing: 0; font-weight: normal;
+  font-style: italic; opacity: .85; font-size: .65rem;
+  display: inline-flex; align-items: center; gap: .25rem;
+}
+.stats-spinner {
+  display: inline-block;
+  width: .65rem; height: .65rem;
+  border: 1.5px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: stats-spin .8s linear infinite;
+}
+@keyframes stats-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
 }
 .stats-summary {
   font-size: .75rem; opacity: .9; white-space: pre-wrap;

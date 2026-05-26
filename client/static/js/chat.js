@@ -162,6 +162,20 @@ document.addEventListener('click', (e) => {
   sidebar.classList.remove('open');
 });
 
+// Tap-outside-to-collapse for the stats tray. Same pattern: only
+// closes when the click lands outside the panel element. The panel's
+// own click handler still handles its toggle-on-collapsed-strip
+// behavior; this listener only fires the close branch when the user
+// has clicked elsewhere on the page entirely.
+document.addEventListener('click', (e) => {
+  if (!state.statsExpanded) return;
+  const panel = document.getElementById('stats-panel');
+  if (!panel) return;
+  if (panel.contains(e.target)) return;
+  state.statsExpanded = false;
+  renderStatsPanel();
+});
+
 // Push the /generate response's history_info into state and re-render
 // the footer stats panel. The summary text is fetched lazily on
 // conversation open (so refreshConversation owns its persistence);

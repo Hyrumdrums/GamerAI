@@ -86,6 +86,7 @@ export function renderStatsPanel() {
   const rowContext = document.getElementById('stats-row-context');
   const sectionSummary = document.getElementById('stats-section-summary');
   const summaryText = document.getElementById('stats-summary-text');
+  const summaryStatus = document.getElementById('stats-summary-status');
 
   // Nothing to show when there are no tokens and no conversation.
   if (state.convTokens <= 0) {
@@ -95,11 +96,6 @@ export function renderStatsPanel() {
   panel.hidden = false;
   const tokensFmt = state.convTokens.toLocaleString();
   collapsedText.textContent = `${tokensFmt} tokens this chat`;
-  collapsedText.classList.toggle(
-    'has-truncation',
-    !!(state.historyInfo && state.historyInfo.messages_dropped > 0
-        && !state.historyInfo.summary_in_use),
-  );
   toggle.textContent = state.statsExpanded ? 'stats ▾' : 'stats ▴';
   panel.setAttribute('aria-expanded', String(state.statsExpanded));
 
@@ -127,21 +123,31 @@ export function renderStatsPanel() {
     }
     line += ').';
     rowContext.textContent = line;
-    rowContext.classList.toggle('has-truncation', dropped > 0 && !summarized);
   } else {
     rowContext.textContent = 'Send a message to see what gets shipped to the model.';
-    rowContext.classList.remove('has-truncation');
   }
 
+  // Summary section: visible when we have summary text in hand OR
+  // when truncation has happened and a summary job is presumed to be
+  // running. The "summarizing now…" indicator shows during the gap
+  // between the summary job firing (history_info.messages_dropped > 0
+  // && summary_in_use=false) and the next conversation fetch picking
+  // up the new summary text. Inline so it doesn't take extra rows.
+  const dropped = (state.historyInfo && state.historyInfo.messages_dropped) || 0;
+  const inUse = !!(state.historyInfo && state.historyInfo.summary_in_use);
+  const isSummarizing = dropped > 0 && !inUse;
   if (state.summary) {
     sectionSummary.hidden = false;
     summaryText.textContent = state.summary;
-  } else if (state.historyInfo && state.historyInfo.messages_dropped > 0) {
+    summaryStatus.hidden = !isSummarizing;
+  } else if (isSummarizing) {
     sectionSummary.hidden = false;
-    summaryText.textContent = '(summary will appear once the background summarizer finishes — usually after the next reply)';
+    summaryText.textContent = '';
+    summaryStatus.hidden = false;
   } else {
     sectionSummary.hidden = true;
     summaryText.textContent = '';
+    summaryStatus.hidden = true;
   }
 }
 
