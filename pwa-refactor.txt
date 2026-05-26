@@ -338,81 +338,80 @@ Mapping from PWA_REFERENCE (React/Express/Postgres) → our stack
   Postgres            →  SQLite (already)
   Express endpoints   →  FastAPI on coordinator
   usePushNotifications.js (React hook)  →  notifications.js (vanilla module)
-  PushNotificationBanner.jsx            →  banner DOM + handler in chat.js
+  PushNotificationBanner.jsx            →  banner DOM in installPrompt.js
   InstallPrompt.jsx                     →  installPrompt.js (iOS/Android UI)
 
-[ ] 6.1  Generate VAPID keys:
-          python -c "from pywebpush import generate_vapid_private_key; ..."
-        Store in coordinator env (docker-compose.yml):
-          VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY, VAPID_SUBJECT
-[ ] 6.2  Add pywebpush to requirements (coordinator)
-[ ] 6.3  Schema additions in coordinator/db.py (translate
-        PWA_REFERENCE §6 to SQLite):
-          - push_subscriptions (member_id, endpoint, p256dh, auth, ua, created_at)
-            UNIQUE(member_id, endpoint)
-          - notifications (member_id, type, title, body, data JSON,
-            read, pushed, created_at)
-            INDEX (member_id, read), INDEX (created_at DESC)
-          - notification_preferences (member_id, category, enabled)
-            UNIQUE(member_id, category)
-[ ] 6.4  Create coordinator/notifications.py
-        - subscribe_member(member_id, sub_dict, ua)
-        - unsubscribe_member(member_id, endpoint)
-        - list_for_member(member_id, limit, offset)
-        - unread_count(member_id)
-        - mark_read(member_id, notification_id)
-        - mark_all_read(member_id)
-        - get_preferences(member_id) / update_preferences(...)
-        - send(member_id, type, title, body, data)
-            → check prefs (skip if opted out)
-            → INSERT into notifications
-            → for each subscription: pywebpush.webpush(...)
-              on WebPushException with 404/410 → delete subscription
-[ ] 6.5  Add 8 endpoints to coordinator/main.py (per PWA_REFERENCE §7):
-          GET   /notifications/vapid-key       (public)
-          POST  /notifications/subscribe       (member auth)
-          DELETE /notifications/subscribe      (member auth)
-          GET   /notifications                  (paginated)
-          GET   /notifications/unread-count
-          PUT   /notifications/{id}/read
-          PUT   /notifications/read-all
-          GET   /notifications/preferences
-          PUT   /notifications/preferences
-[ ] 6.6  Add Flask proxy routes in client/routes/api.py for the same paths
-[ ] 6.7  Add push + notificationclick handlers to sw.js
-        - Validate notification.data.url starts with '/' (open-redirect
-          guard per PWA_REFERENCE §3 / §14)
-        - userVisibleOnly: true is implicit in subscribe; just make
-          sure we always call showNotification on push
-        - vibrate [200, 100, 200] (iOS ignores, fine)
-[ ] 6.8  Create client/static/js/notifications.js (vanilla port of
-        usePushNotifications.js):
-          - subscribe(): permission → vapid-key → subscribe → POST
-          - unsubscribe()
-          - urlBase64ToUint8Array helper (verbatim from PWA_REFERENCE §4)
-          - Support detection: 'serviceWorker' in navigator && 'PushManager' in window
-[ ] 6.9  Create client/static/js/installPrompt.js:
-          - isPWA detection (matchMedia + iOS navigator.standalone — both!)
-          - beforeinstallprompt capture (Android)
-          - iOS manual instructions UI ("Share → Add to Home Screen")
-          - Stash dismissal in localStorage['push-prompted']
-[ ] 6.10 Add opt-in banner to chat.html.j2 (hidden by default; shown
-        only when isPWA && Notification.permission === 'default' &&
-        !localStorage['push-prompted'])
-[ ] 6.11 Generate use-cases for what we actually push:
-        - Voice/image quota refilled at midnight (probably noisy — opt-out
-          by default)
-        - Worker came online (relevant only if user is the contributor)
-        - Long-running image job finished (most likely target)
-        - Cross-device: same convo updated elsewhere
-        Decide before wiring; users hate spam.
-[ ] 6.12 Test on real iPhone (PWA_REFERENCE §14: "the simulator lies")
-        - Add to Home Screen first (iOS only delivers push to installed PWAs)
-        - Permission prompt → enable → trigger event → notification shows
-[ ] 6.13 Test on Android Chrome (works in-browser + installed)
-[ ] 6.14 Commit (multiple): feat(coordinator): push subscriptions schema
-        + endpoints; feat(client): push opt-in banner + service worker
-        push handler
+[x] 6.1  pywebpush added to coordinator/requirements.txt (commit dafa6da).
+        VAPID keys NOT yet generated — see action items at the
+        bottom of Phase 6.
+[x] 6.2  pywebpush dependency declared (commit dafa6da).
+[x] 6.3  Schema additions in coordinator/db.py _SCHEMA (commit dafa6da):
+        push_subscriptions, notifications, notification_preferences,
+        plus the matching indexes. CRUD methods added to the DB class.
+[x] 6.4  coordinator/notifications.py with send_to_member +
+        build_router (commit dafa6da). Closure pattern so the router
+        captures db without circular imports.
+[x] 6.5  8 endpoints registered via build_router(db) and
+        app.include_router(...) in coordinator/main.py. /vapid-key
+        added to _is_public (commit dafa6da). PUT /read-all registered
+        BEFORE PUT /{id}/read so the path matcher doesn't swallow
+        the literal.
+[x] 6.6  Flask proxy routes in client/routes/api.py (commit 4409b45).
+        Same ordering. vapid-key uses _public_client.
+[x] 6.7  push + notificationclick handlers in sw.js (commit 4409b45).
+        URL whitelisted to '/' prefix. vibrate set; iOS ignores it.
+        CACHE_VERSION bumped v1→v2 to ship the new precache list.
+[x] 6.8  client/static/js/notifications.js — vanilla port (4409b45).
+        urlBase64ToUint8Array verbatim from PWA_REFERENCE §4. Rollback
+        on server-side save failure so a sub the server doesn't know
+        about doesn't accumulate.
+[x] 6.9  client/static/js/installPrompt.js (4409b45):
+          - isStandalonePWA: matchMedia + iOS navigator.standalone
+          - isIOS for manual-install copy
+          - beforeinstallprompt capture + appinstalled cleanup
+          - localStorage dismissal so 'not now' sticks
+[x] 6.10 Opt-in banner: built on demand in installPrompt.js (4409b45).
+        Conditions: isPWA + push supported + permission default + not
+        dismissed. Tap Enable → notifications.subscribe(); tap Not
+        now → localStorage flag. CSS in base.css .pwa-banner*.
+[x] 6.11 Trigger decision: image_done + voice_done (commit cb0ca5c).
+        Chat skipped — streams visibly, would be noise. Future
+        candidates documented in TODO below.
+[ ] 6.12 USER ACTION — Generate VAPID keys + set env (BEFORE deploy):
+          python -c "from py_vapid import Vapid; v=Vapid(); v.generate_keys();
+          import base64; print('public:', base64.urlsafe_b64encode(v.public_key.public_bytes(
+              __import__('cryptography.hazmat.primitives.serialization',
+                fromlist=['Encoding']).Encoding.X962,
+              __import__('cryptography.hazmat.primitives.serialization',
+                fromlist=['PublicFormat']).PublicFormat.UncompressedPoint
+          )).decode('utf-8').rstrip('='))
+          print('private:', base64.urlsafe_b64encode(v.private_key.private_numbers().private_value.to_bytes(32, 'big')).decode('utf-8').rstrip('='))"
+        Then set in coordinator env (docker-compose.yml or .env.prod):
+          VAPID_PUBLIC_KEY=<public>
+          VAPID_PRIVATE_KEY=<private>
+          VAPID_SUBJECT=mailto:admin@dallinlayton.com
+        Without these, send_to_member persists the in-app row and
+        returns 0 — push gracefully no-ops.
+[ ] 6.13 USER ACTION — Real-device test (PWA_REFERENCE §14:
+        "the simulator lies"):
+        - iPhone Safari 16.4+: Share → Add to Home Screen FIRST
+          (iOS only delivers push to installed PWAs). Then tap
+          Enable on the opt-in banner. Trigger an image job from
+          another tab — phone should buzz/show notification.
+        - Android Chrome: works in-browser AND installed. Install
+          for the better lifecycle (notifications survive browser
+          close).
+[ ] 6.14 USER ACTION — Future notification triggers to consider:
+        - Friend invited me (member sees a "[name] joined" notif)
+        - Tier promotion (member moved BRONZE → SILVER)
+        - Daily quota refilled (probably opt-out by default — noisy)
+        - Cross-device sync (same conv updated on phone, laptop pings)
+        Don't ship all of these — users hate notification spam. Pick
+        the ones that meaningfully change behavior.
+
+PHASE 6 STATUS: structurally complete (3 commits, 440/440 tests
+pass). User-action items 6.12 + 6.13 + 6.14 need to be done by hand;
+nothing else blocks shipping.
 
 
 PHASE 7 — Post-PWA cleanup (defer until PWA ships)
