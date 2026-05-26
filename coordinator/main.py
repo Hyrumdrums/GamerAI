@@ -4066,8 +4066,19 @@ def get_conversation(conversation_id: str, request: Request):
         raise HTTPException(status_code=404, detail="conversation not found")
     _require_conversation_owner(request, row)
     messages = db.list_messages(conversation_id)
+    # Stash the latest summary on the detail response so the client's
+    # collapsible stats panel can render it without an extra round-trip.
+    # Deliberately not on the list endpoint — the per-row payload would
+    # balloon with thousand-char summaries no sidebar entry uses.
+    keys = row.keys()
+    summary_text = row["summary_text"] if "summary_text" in keys else None
+    summary_through_seq = (
+        row["summary_through_seq"] if "summary_through_seq" in keys else None
+    )
     return {
         **_conv_row_to_summary(row),
+        "summary_text": summary_text,
+        "summary_through_seq": summary_through_seq,
         "messages": [_message_row_to_dict(m) for m in messages],
     }
 

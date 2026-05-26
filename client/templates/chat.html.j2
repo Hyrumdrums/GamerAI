@@ -79,8 +79,32 @@
         <button type="submit" id="submit">Send</button>
       </div>
       <div class="status" id="status"></div>
-      <div class="conv-tokens" id="conv-tokens" hidden></div>
-      <div class="conv-context" id="conv-context" hidden></div>
+      <!-- Collapsible stats panel. Collapsed shows just the running
+           token total; tap anywhere on the row to expand and see
+           context-window stats, the rolling summary, and a one-line
+           explainer of how the coordinator manages history. -->
+      <button type="button" class="stats-panel" id="stats-panel"
+              aria-expanded="false" aria-controls="stats-expanded" hidden>
+        <div class="stats-collapsed">
+          <span class="stats-collapsed-text" id="stats-collapsed-text">0 tokens this chat</span>
+          <span class="stats-toggle" id="stats-toggle">stats ▴</span>
+        </div>
+        <div class="stats-expanded" id="stats-expanded" hidden>
+          <div class="stats-row" id="stats-row-tokens"></div>
+          <div class="stats-row" id="stats-row-context"></div>
+          <div class="stats-section" id="stats-section-summary" hidden>
+            <div class="stats-label">Rolling summary</div>
+            <div class="stats-summary" id="stats-summary-text"></div>
+          </div>
+          <div class="stats-explainer">
+            Older turns are dropped once the context exceeds the
+            per-turn token cap. A summary of dropped turns is generated
+            in the background and prepended to the model's context on
+            subsequent turns, so long threads stay coherent without
+            paying full-history prefill on every reply.
+          </div>
+        </div>
+      </button>
     </form>
   </main>
 </div>

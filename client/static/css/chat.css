@@ -218,14 +218,54 @@ body { display: flex; flex-direction: column; }
   outline-offset: 2px;
 }
 .status { color: var(--muted); font-size: .8rem; text-align: center; min-height: 1em; margin-top: .35rem; }
-.conv-tokens { color: var(--muted); font-size: .75rem; text-align: center; margin-top: .15rem; opacity: .8; }
-/* History-cap indicator. Sits directly under the token meter so the
-   user has a one-glance answer to "why is this slow?" — the long
-   thread can hit a 25K-token meter while only ~4K are actually being
-   shipped to the model. .has-truncation amps the contrast a touch so
-   the line reads as a callout rather than fade-into-footer chrome. */
-.conv-context { color: var(--muted); font-size: .7rem; text-align: center; margin-top: .1rem; opacity: .7; }
-.conv-context.has-truncation { color: var(--brand); opacity: .85; }
+/* Collapsible context-stats panel. Replaces the prior conv-tokens +
+   conv-context pair: collapsed it's a single-line token meter with a
+   "stats ▴" affordance; tapping anywhere on the button expands into a
+   full breakdown (current cap, kept vs dropped turns, the rolling
+   summary if any, and a one-line strategy explainer). The whole panel
+   is a <button> so keyboard + screen-reader navigation works without
+   extra ARIA wiring. */
+.stats-panel {
+  width: 100%; background: transparent; border: none;
+  text-align: center; color: var(--muted); font-size: .75rem;
+  margin-top: .15rem; padding: .2rem;
+  cursor: pointer; font-family: inherit;
+}
+.stats-panel:focus-visible {
+  outline: 2px solid var(--brand); outline-offset: 2px;
+  border-radius: var(--radius);
+}
+.stats-collapsed {
+  display: flex; justify-content: center; align-items: center;
+  gap: .8rem; opacity: .85;
+}
+.stats-collapsed-text.has-truncation { color: var(--brand); opacity: 1; }
+.stats-toggle { opacity: .55; font-size: .65rem; }
+.stats-panel[aria-expanded="true"] .stats-collapsed { opacity: 1; }
+.stats-expanded {
+  text-align: left; padding: .55rem .8rem;
+  background: var(--surface); border: 1px solid var(--border-soft);
+  border-radius: var(--radius); margin-top: .35rem;
+  cursor: default;
+}
+.stats-row {
+  margin: .2rem 0; line-height: 1.4; font-size: .75rem;
+  color: var(--text); opacity: .85;
+}
+.stats-row.has-truncation { color: var(--brand); opacity: 1; }
+.stats-section { margin: .55rem 0 .35rem; }
+.stats-label {
+  font-size: .65rem; text-transform: uppercase; letter-spacing: .04em;
+  opacity: .55; margin-bottom: .25rem; font-weight: 600;
+}
+.stats-summary {
+  font-size: .75rem; opacity: .9; white-space: pre-wrap;
+  line-height: 1.45;
+}
+.stats-explainer {
+  margin-top: .55rem; font-size: .7rem; opacity: .55;
+  line-height: 1.4; font-style: italic;
+}
 
 .retry-btn {
   margin-top: .5rem; padding: .35rem .7rem; font-size: .85rem;

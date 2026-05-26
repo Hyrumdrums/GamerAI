@@ -30,6 +30,14 @@ export const state = {
   activeStream: null,
   readAloudPlaying: null,
   activeVoicePlayback: null,
+  // Stats panel state. historyInfo is the most recent /generate
+  // truncation report (messages_kept/dropped/tokens etc); summary
+  // is the rolling summary text the coordinator generates for older
+  // turns. statsExpanded persists the user's expand-collapse choice
+  // across renders within a session.
+  historyInfo: null,
+  summary: null,
+  statsExpanded: false,
 };
 
 // In-memory message cache so switching between already-opened
@@ -61,14 +69,79 @@ export const readAloudCache = new Map();
 // the bottom-of-chat counter stays live mid-session.
 export function setConvTokens(n) {
   state.convTokens = Math.max(0, n | 0);
-  const el = document.getElementById('conv-tokens');
-  if (!el) return;
-  if (state.convTokens > 0) {
-    el.textContent = state.convTokens.toLocaleString() + ' tokens this chat';
-    el.hidden = false;
+  renderStatsPanel();
+}
+
+// Single render entry-point for the collapsible footer stats panel.
+// Reads state.convTokens / historyInfo / summary / statsExpanded and
+// re-paints the panel. Called whenever any of those fields change
+// (conv switch, /generate response, expand toggle).
+export function renderStatsPanel() {
+  const panel = document.getElementById('stats-panel');
+  if (!panel) return;
+  const collapsedText = document.getElementById('stats-collapsed-text');
+  const toggle = document.getElementById('stats-toggle');
+  const expanded = document.getElementById('stats-expanded');
+  const rowTokens = document.getElementById('stats-row-tokens');
+  const rowContext = document.getElementById('stats-row-context');
+  const sectionSummary = document.getElementById('stats-section-summary');
+  const summaryText = document.getElementById('stats-summary-text');
+
+  // Nothing to show when there are no tokens and no conversation.
+  if (state.convTokens <= 0) {
+    panel.hidden = true;
+    return;
+  }
+  panel.hidden = false;
+  const tokensFmt = state.convTokens.toLocaleString();
+  collapsedText.textContent = `${tokensFmt} tokens this chat`;
+  collapsedText.classList.toggle(
+    'has-truncation',
+    !!(state.historyInfo && state.historyInfo.messages_dropped > 0
+        && !state.historyInfo.summary_in_use),
+  );
+  toggle.textContent = state.statsExpanded ? 'stats ▾' : 'stats ▴';
+  panel.setAttribute('aria-expanded', String(state.statsExpanded));
+
+  if (!state.statsExpanded) {
+    expanded.hidden = true;
+    return;
+  }
+  expanded.hidden = false;
+
+  rowTokens.textContent = `${tokensFmt} tokens recorded in this conversation.`;
+
+  if (state.historyInfo) {
+    const h = state.historyInfo;
+    const kept = h.messages_kept | 0;
+    const dropped = h.messages_dropped | 0;
+    const cap = h.cap_tokens | 0;
+    const used = h.tokens_kept | 0;
+    const summarized = !!h.summary_in_use;
+    let line = `Last /generate sent ~${used.toLocaleString()} of ${cap.toLocaleString()} token cap to the model `;
+    line += `(kept ${kept} turn${kept === 1 ? '' : 's'}`;
+    if (dropped > 0 && summarized) {
+      line += `, ${dropped} earlier turn${dropped === 1 ? '' : 's'} represented by summary`;
+    } else if (dropped > 0) {
+      line += `, dropped ${dropped} older turn${dropped === 1 ? '' : 's'}`;
+    }
+    line += ').';
+    rowContext.textContent = line;
+    rowContext.classList.toggle('has-truncation', dropped > 0 && !summarized);
   } else {
-    el.textContent = '';
-    el.hidden = true;
+    rowContext.textContent = 'Send a message to see what gets shipped to the model.';
+    rowContext.classList.remove('has-truncation');
+  }
+
+  if (state.summary) {
+    sectionSummary.hidden = false;
+    summaryText.textContent = state.summary;
+  } else if (state.historyInfo && state.historyInfo.messages_dropped > 0) {
+    sectionSummary.hidden = false;
+    summaryText.textContent = '(summary will appear once the background summarizer finishes — usually after the next reply)';
+  } else {
+    sectionSummary.hidden = true;
+    summaryText.textContent = '';
   }
 }
 

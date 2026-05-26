@@ -6,7 +6,7 @@
 
 import {
   state, msgCache, searchModeByConv,
-  setConvTokens, sumMessageTokens,
+  setConvTokens, sumMessageTokens, renderStatsPanel,
 } from './state.js';
 import { stopReadAloud } from './readAloud.js';
 import { messageEl } from './messageRenderer.js';
@@ -136,7 +136,9 @@ document.getElementById('new-chat').onclick = () => {
   document.querySelectorAll('.conv-item').forEach(el => el.classList.remove('active'));
   document.getElementById('sidebar').classList.remove('open');
   setConvTokens(0);
-  renderHistoryInfo(null);
+  applyHistoryInfo(null);
+  state.summary = null;
+  renderStatsPanel();
   document.getElementById('prompt').focus();
 };
 
@@ -160,41 +162,33 @@ document.addEventListener('click', (e) => {
   sidebar.classList.remove('open');
 });
 
-// Render the history-cap indicator under the token meter so the user
-// understands why a long thread's first-token wait is bounded — the
-// model only sees the most recent ~4K tokens (plus a summary, once
-// the summarizer fires). Cleared on conversation switch + new chat.
-export function renderHistoryInfo(info) {
-  const el = document.getElementById('conv-context');
-  if (!el) return;
-  if (!info) {
-    el.hidden = true;
-    el.textContent = '';
-    el.classList.remove('has-truncation');
-    return;
-  }
-  const dropped = info.messages_dropped | 0;
-  const kept = info.messages_kept | 0;
-  const summarized = !!info.summary_in_use;
-  if (dropped === 0 && !summarized) {
-    el.hidden = true;
-    el.textContent = '';
-    el.classList.remove('has-truncation');
-    return;
-  }
-  let parts = [];
-  if (summarized && dropped > 0) {
-    parts.push(`earlier ${dropped} turn${dropped === 1 ? '' : 's'} summarized`);
-  } else if (summarized) {
-    parts.push('earlier turns summarized');
-  } else if (dropped > 0) {
-    parts.push(`older ${dropped} turn${dropped === 1 ? '' : 's'} not in context`);
-  }
-  parts.push(`context: last ${kept} turn${kept === 1 ? '' : 's'}`);
-  el.textContent = parts.join(' · ');
-  el.classList.toggle('has-truncation', dropped > 0 && !summarized);
-  el.hidden = false;
+// Push the /generate response's history_info into state and re-render
+// the footer stats panel. The summary text is fetched lazily on
+// conversation open (so refreshConversation owns its persistence);
+// here we only refresh the truncation/cap counters.
+export function applyHistoryInfo(info) {
+  state.historyInfo = info || null;
+  renderStatsPanel();
 }
+
+// Wire the stats panel's click → toggle expand/collapse. Idempotent
+// so a hot-reload of chat.js doesn't double-bind. Single document
+// listener via the panel element itself (not a wider delegation)
+// since the panel is the explicit affordance and we don't want
+// stray clicks elsewhere to trigger it.
+(() => {
+  const panel = document.getElementById('stats-panel');
+  if (!panel) return;
+  panel.addEventListener('click', (e) => {
+    // Clicks inside the expanded area shouldn't re-collapse — the user
+    // may be selecting text to copy a summary, etc. Only the collapsed
+    // strip and the toggle word are "click anywhere" targets.
+    const expanded = document.getElementById('stats-expanded');
+    if (state.statsExpanded && expanded && expanded.contains(e.target)) return;
+    state.statsExpanded = !state.statsExpanded;
+    renderStatsPanel();
+  });
+})();
 
 // ---- conversation rendering ------------------------------------------
 async function openConversation(id) {
@@ -215,7 +209,9 @@ async function openConversation(id) {
   stopReadAloud();
   // Stale truncation pill from the previous chat — clears here and
   // the next /generate response refills it for the new conversation.
-  renderHistoryInfo(null);
+  applyHistoryInfo(null);
+  state.summary = null;  // refreshConversation refills if present
+  renderStatsPanel();
   document.getElementById('submit').disabled = false;
   document.getElementById('prompt').disabled = false;
   // On mobile, close the drawer once a conversation is picked. CSS
@@ -243,6 +239,14 @@ async function refreshConversation(id, {render = false} = {}) {
   const body = await r.json();
   const messages = body.messages || [];
   msgCache.set(id, messages);
+  // Surface the rolling summary on the stats panel as soon as the
+  // conversation opens — no extra round-trip needed. summary_text is
+  // null until the background summarizer fires; the panel hides the
+  // section in that case.
+  if (state.currentId === id) {
+    state.summary = body.summary_text || null;
+    renderStatsPanel();
+  }
   if (render || state.currentId === id) renderMessages(messages);
 }
 
@@ -481,7 +485,7 @@ document.getElementById('composer').onsubmit = async (e) => {
   }
   const grBody = await gr.json();
   const {job_id, assistant_message_id, history_info} = grBody;
-  renderHistoryInfo(history_info);
+  applyHistoryInfo(history_info);
   await streamIntoBubble(job_id, typing, statusEl, start, assistant_message_id);
   textarea.focus();
   // Invalidate this conversation's cache; next openConversation will
@@ -596,7 +600,7 @@ async function drainQueue() {
       }
       const drainBody = await gr.json();
       const {job_id, assistant_message_id, history_info} = drainBody;
-      renderHistoryInfo(history_info);
+      applyHistoryInfo(history_info);
       await offlineQueue.remove(entry.id).catch(() => {});
       const bubble = typing.querySelector('.bubble');
       bubble.classList.remove('queued');

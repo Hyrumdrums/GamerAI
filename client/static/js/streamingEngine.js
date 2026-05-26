@@ -601,7 +601,12 @@ export async function streamIntoBubble(jobId, wrap, statusEl, startMs, messageId
           let label;
           if (res.status === 'cancelled') label = `cancelled after ${dt}s`;
           else if (res.status === 'error') label = `failed in ${dt}s`;
-          else label = `done in ${dt}s · ${res.completion_tokens || 0} tokens · ${res.worker_id || 'unknown worker'}`;
+          // Intentionally NO worker_id in the user-facing label — the
+          // backend stamps job rows with hostname-derived IDs like
+          // "win-DESKTOP-SFE5TBP-…" that leak the contributor's
+          // machine name. Worker provenance still lives on the result
+          // row for admin / debugging via the dashboard.
+          else label = `done in ${dt}s · ${res.completion_tokens || 0} tokens`;
           statusEl.textContent = label;
         }
         // Roll this turn's tokens into the running chat total. Image jobs
