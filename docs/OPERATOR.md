@@ -502,6 +502,48 @@ file; endpoints in `coordinator/notifications.py`.
 
 ---
 
+## 6.7 Working with Claude — the commit → push → deploy loop
+
+This repo is solo-maintained. The standing workflow Claude (or any
+agent operating on Dallin's behalf) is authorized to run end-to-end,
+without per-step approval, once a change is finished and on `main`:
+
+1. **Commit.** Stage specific files (not `git add -A`). HEREDOC body.
+   Trailer:
+   ```
+   Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+   ```
+   New commit per logical unit — never `--amend` a pushed commit.
+2. **Push to `origin main`.** No PR for solo work.
+3. **Watch CI.** `gh run watch <run_id> --exit-status`. Block on
+   green. If red, fix the root cause and recommit before deploying —
+   never `--no-verify` past a failing hook.
+4. **Deploy.** From the laptop:
+   ```bash
+   ssh -i ~/.ssh/id_ed25519_gamerai root@ai.dallinlayton.com \
+     'cd /opt/gamerai && bash infra/deploy.sh'
+   ```
+   The script does `git pull --ff-only` → `docker compose ... up -d
+   --build` → restart `gamerai-caddy`. Allow ~5 min for cold image
+   builds.
+5. **Smoke-check** the touched surface area:
+   ```bash
+   curl -fsS -o /dev/null -w "%{http_code}\n" https://ai.dallinlayton.com/
+   ```
+   A 303 on `/` is expected (login redirect for anonymous curl).
+   Add the specific routes/assets the change touched (e.g.
+   `/sw.js`, `/static/js/<new_module>.js`, `/api/notifications/vapid-key`).
+
+Skip steps 4–5 when the change is docs-only (`*.md`,
+`pwa-refactor.txt`, `todo.txt`) — those are read from the repo, not
+the VPS.
+
+Force-pushes to `main`, secret rotation, and prod data mutation are
+**not** covered by the standing authorization — get a thumbs-up
+before each of those.
+
+---
+
 ## 7. Things deferred (intentionally not in this doc / repo yet)
 
 - **"+ Invite a friend" button on `/dashboard`.** Form: email, daily-quota
