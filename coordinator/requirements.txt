@@ -12,3 +12,9 @@ argon2-cffi==23.1.0
 # installed (it's pulled in by the production Dockerfile only via
 # requirements.txt → here).
 nudenet==3.4.2
+# Web Push (Phase 6 of pwa-refactor.txt). Required for the
+# coordinator to deliver push notifications via the user's browser
+# Push service. Lazy-loaded: if VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY
+# env vars are missing the push send becomes a no-op, so dev/test
+# without VAPID still passes.
+pywebpush==2.0.0

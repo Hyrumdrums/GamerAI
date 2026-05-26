@@ -17,7 +17,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTex
 from fastapi.staticfiles import StaticFiles
 
 from coordinator import canaries as canary_lib
-from coordinator import member_auth, model_registry
+from coordinator import member_auth, model_registry, notifications
 from coordinator.canaries import CanaryInjector
 from coordinator.db import DB
 from coordinator.idempotency import IdempotencyStore
@@ -1245,6 +1245,19 @@ if _COORD_STATIC_DIR.is_dir():
         name="static",
     )
 
+# Push-notification endpoints (Phase 6 of pwa-refactor.txt). The router
+# is built via a closure that captures the module-level ``db`` so we
+# don't have to import db from this module into notifications.py
+# (circular) or instantiate a fresh DB() per request.
+app.include_router(notifications.build_router(db))
+if not notifications.is_vapid_configured():
+    log.info(
+        "VAPID keys not configured — push delivery disabled "
+        "(in-app notifications row still persists). Set "
+        "VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY to enable.",
+        extra={"event": "push_disabled"},
+    )
+
 
 def _is_public(method: str, path: str) -> bool:
     """Path+method auth exemption. ``/health`` is fully open. The
@@ -1284,6 +1297,11 @@ def _is_public(method: str, path: str) -> bool:
         and parts[0] == "invites"
         and parts[2] == "accept"
     ):
+        return True
+    # The VAPID public key is meant to be distributed (it's PUBLIC by
+    # design — the private half is what enables signing pushes). The
+    # client fetches it before they can subscribe to push.
+    if method == "GET" and path == "/notifications/vapid-key":
         return True
     return False
 
