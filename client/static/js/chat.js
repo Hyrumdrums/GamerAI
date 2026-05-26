@@ -341,6 +341,17 @@ document.getElementById('composer').onsubmit = async (e) => {
     body.tool = 'search';
     body.search_mode = submitSearchMode;
   }
+  if (submitTool === 'chat' && state.voiceMode) {
+    // Voice-mode chat: tell the coordinator+agent to pipeline TTS so
+    // first-sentence audio ships alongside the streaming text. Without
+    // this flag the agent falls through to its plain text path; the
+    // client then has to fire a second /api/generate tool=tts (the
+    // pre-Phase-A flow) which paid the LLM-complete-before-TTS-starts
+    // tax. Search/image submits never carry voice_mode — search summary
+    // streams the same way but speaking the synthesized summary plus
+    // sources strip is out of scope for Phase A.
+    body.voice_mode = true;
+  }
   // Tag the typing bubble with a UUID up front so an offline-enqueue
   // can match the queue row back to its visible bubble on drain.
   const queueId = (crypto && crypto.randomUUID)

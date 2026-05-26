@@ -45,6 +45,16 @@ class GenerateRequest(BaseModel):
     # the conversation on completion. Requires ownership: the caller's
     # member_id must match the conversation's owner_member_id.
     conversation_id: Optional[str] = None
+    # Chat-only flag. When true, the agent's chat handler pipelines
+    # Piper TTS with LLM inference: as soon as the first sentence is
+    # emitted, it spawns a CPU-side synth in parallel and ships the
+    # audio back on a partial result alongside the streaming text;
+    # the rest of the response is synthesized once the LLM finishes
+    # and attached to the final result. The client buffers text
+    # rendering until first audio is in hand so voice + text reveal
+    # together. Ignored for tool != "chat". Default false keeps the
+    # text-only path bit-identical to before.
+    voice_mode: bool = False
 
 
 class GenerateResponse(BaseModel):
@@ -71,6 +81,15 @@ class JobPartialRequest(BaseModel):
     job_id: str
     text: str
     claim_token: Optional[str] = None
+    # Voice-mode chat pipelining: when the agent's chat handler
+    # finishes synthesizing the first sentence in parallel with the
+    # still-streaming LLM, it pushes the audio on a partial so the
+    # client can start playback before the response is done. Coordinator
+    # stuffs these into the partials hash; /api/result/{job_id} returns
+    # them like any other partial field. None on every non-voice-mode
+    # partial.
+    audio_b64_first: Optional[str] = None
+    audio_seconds_first: Optional[float] = None
 
 
 class WorkerCapabilities(BaseModel):
@@ -170,6 +189,20 @@ class JobCompleteRequest(BaseModel):
     # real cost — client-side segmentation produces a lot of short
     # clauses that would round to zero in integer minutes.
     audio_seconds: Optional[float] = None
+    # For voice-mode chat jobs: the response is split into two TTS
+    # chunks so first-audio can ship while the LLM is still streaming.
+    # audio_b64_first carries the synthesized first sentence (already
+    # delivered via a partial — re-sent here so the final JOB_RESULTS
+    # row also has it for late-arriving / reloaded clients), and
+    # audio_b64_rest carries everything after the first sentence
+    # synthesized once the LLM completed. Empty/absent for non-voice
+    # chat / image / search / tool=tts jobs. voice_minutes billing sums
+    # _first + _rest (NOT audio_seconds, which the chat path leaves
+    # unset because no single bill-bearing field could represent both).
+    audio_b64_first: Optional[str] = None
+    audio_seconds_first: Optional[float] = None
+    audio_b64_rest: Optional[str] = None
+    audio_seconds_rest: Optional[float] = None
     # For search jobs: ordered list of citations matching the [1][2]
     # references in ``text``. Each entry is {"n": int, "title": str,
     # "url": str, "domain": str}. Coordinator stores these on

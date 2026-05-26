@@ -24,6 +24,7 @@ import logging.handlers
 import os
 import platform
 import queue
+import re
 import socket
 import subprocess
 import sys
@@ -2054,15 +2055,26 @@ class Coordinator:
         job_id: str,
         text: str,
         claim_token: Optional[str] = None,
+        audio_b64_first: Optional[str] = None,
+        audio_seconds_first: Optional[float] = None,
     ) -> None:
         """Push the accumulated streaming text so far. Fire-and-forget:
         the coordinator overwrites with the latest call (text is the
         FULL accumulated output, not a delta), and a dropped partial
         just means the next one carries the full state. The final
-        ``/jobs/complete`` is the source of truth."""
+        ``/jobs/complete`` is the source of truth.
+
+        ``audio_b64_first`` / ``audio_seconds_first`` (voice-mode chat
+        only): set when the agent has just finished synthesizing the
+        first sentence in parallel with the still-streaming LLM. The
+        coordinator stores the audio in a sibling hash so the polling
+        client can start playback before the chat job completes."""
         body = {"worker_id": self.worker_id, "job_id": job_id, "text": text}
         if claim_token is not None:
             body["claim_token"] = claim_token
+        if audio_b64_first is not None:
+            body["audio_b64_first"] = audio_b64_first
+            body["audio_seconds_first"] = float(audio_seconds_first or 0.0)
         self._post("/jobs/partial", body, timeout=3)
 
     def abandon(
@@ -3575,6 +3587,64 @@ def _mock_image_b64() -> str:
 TTS_TIMEOUT_SECONDS = 60
 
 
+# Voice-mode chat sentence boundary. Ported verbatim from the client's
+# VOICE_SENTENCE_RE at client/static/js/chat.js:48 — same shape on both
+# sides keeps "sentence" defined identically wherever it's split. Used
+# by the chat handler to detect the first complete sentence in the
+# streaming LLM output so it can fire a CPU-side Piper synth in
+# parallel with the rest of the response.
+_VOICE_SENTENCE_RE = re.compile(r"""[.!?]+["')\]]*(?:\s+|$)|\n+""")
+
+
+def find_first_sentence(text: str) -> tuple[Optional[str], int]:
+    """Return ``(sentence, end_index)`` for the first complete sentence
+    in ``text``, or ``(None, 0)`` if no terminator has arrived yet.
+
+    ``end_index`` points just past the terminator's trailing whitespace,
+    so ``text[end_index:]`` is the "rest of the response so far" that
+    will be synthesized after the LLM completes."""
+    if not text:
+        return None, 0
+    m = _VOICE_SENTENCE_RE.search(text)
+    if m is None:
+        return None, 0
+    end = m.start() + len(m.group(0))
+    sentence = text[:end].strip()
+    if not sentence:
+        return None, 0
+    return sentence, end
+
+
+def normalize_text_for_tts(text: str) -> str:
+    """Strip markdown formatting before piping to Piper. Mirrors the
+    client-side ``normalizeForTTS`` at client/static/js/readAloud.js:23
+    so the manual speaker-icon path and the voice-mode chat path produce
+    the same spoken output for the same model text. Without this Piper
+    reads ``**bold**`` as "asterisk asterisk bold asterisk asterisk".
+    """
+    if not text:
+        return ""
+    s = text
+    s = re.sub(r"```[\w-]*\s*\n?", "", s)
+    s = s.replace("```", "")
+    s = re.sub(r"`([^`]+)`", r"\1", s)
+    s = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", s)
+    s = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", s)
+    s = re.sub(r"(\*\*|__)(.+?)\1", r"\2", s)
+    s = re.sub(r"(\*|_)(?=\S)(.+?)(?<=\S)\1", r"\2", s)
+
+    def _strip_atx(m: "re.Match[str]") -> str:
+        body = m.group(1).strip()
+        return body if re.search(r"[.!?:]$", body) else body + "."
+
+    s = re.sub(r"^[ \t]*#{1,6}[ \t]+(.+?)[ \t]*#*[ \t]*$", _strip_atx, s, flags=re.MULTILINE)
+    s = re.sub(r"^[ \t]*[-*+][ \t]+", "", s, flags=re.MULTILINE)
+    s = re.sub(r"^[ \t]*\d+\.[ \t]+", "", s, flags=re.MULTILINE)
+    s = re.sub(r"^[ \t]*>[ \t]?", "", s, flags=re.MULTILINE)
+    s = re.sub(r"\n[ \t]*\n[\s]*", "\n\n", s)
+    return s.strip()
+
+
 def run_tts_inference(
     prompt: str,
     job: dict,
@@ -4095,9 +4165,81 @@ def process_one(
             #     the rewrite job would fall through to run_inference's
             #     hardcoded backstop on misconfigured installs.
             use_model = cfg.model or job.get("model") or cfg.bootstrap_model
-            on_partial = lambda text: coord.partial(  # noqa: E731
-                job_id, text, claim_token=claim_token,
-            )
+            # Voice-mode chat pipelining (Phase A). When the job carries
+            # voice_mode=true, watch the streaming LLM output for the
+            # first complete sentence and fire a parallel Piper synth
+            # on the CPU side as soon as one is detected. The audio
+            # gets pushed to the coordinator on a partial so the client
+            # can start playback before the LLM finishes. The "rest"
+            # of the response is synthesized synchronously below after
+            # run_inference returns. Search jobs ignore voice_mode —
+            # the streaming portion of a search response is just the
+            # final-summary LLM call, and the search-mode UX isn't a
+            # candidate for voice in Phase A.
+            voice_mode = bool(job.get("voice_mode")) and tool == "chat"
+            voice_state: dict = {
+                "first_started": False,
+                "first_end_idx": 0,
+                "audio_b64_first": None,
+                "audio_seconds_first": 0.0,
+                "thread": None,
+                "current_text": "",
+                "synth_error": None,
+            }
+
+            def _synth_first(sentence: str) -> None:
+                # Runs on a daemon thread spawned from on_partial. The
+                # main GPU loop keeps streaming the LLM while Piper
+                # synthesizes sentence 1 on CPU. On completion, re-post
+                # a partial with the audio attached so the polling
+                # client picks it up before the chat job completes.
+                try:
+                    spoken = normalize_text_for_tts(sentence)
+                    if not spoken:
+                        return
+                    b64, secs, _model = run_tts_inference(
+                        spoken, {"job_id": job_id}, cfg, log,
+                    )
+                    voice_state["audio_b64_first"] = b64
+                    voice_state["audio_seconds_first"] = secs
+                    # Re-post with the latest accumulated text so the
+                    # coordinator's JOB_PARTIALS isn't rolled back to an
+                    # earlier snapshot. A 410 here is harmless (job was
+                    # cancelled / superseded) — the partial helper is
+                    # already fire-and-forget.
+                    try:
+                        coord.partial(
+                            job_id,
+                            voice_state["current_text"],
+                            claim_token=claim_token,
+                            audio_b64_first=b64,
+                            audio_seconds_first=secs,
+                        )
+                    except Exception as post_exc:
+                        log.warning(
+                            "voice-mode first-audio partial post failed: %s",
+                            post_exc,
+                        )
+                except Exception as e:
+                    voice_state["synth_error"] = str(e)
+                    log.warning("voice-mode sentence-1 synth failed: %s", e)
+
+            def on_partial(text: str) -> None:
+                voice_state["current_text"] = text
+                coord.partial(job_id, text, claim_token=claim_token)
+                if voice_mode and not voice_state["first_started"]:
+                    sentence, end_idx = find_first_sentence(text)
+                    if sentence:
+                        voice_state["first_started"] = True
+                        voice_state["first_end_idx"] = end_idx
+                        t = threading.Thread(
+                            target=_synth_first,
+                            args=(sentence,),
+                            daemon=True,
+                        )
+                        voice_state["thread"] = t
+                        t.start()
+
             if tool == "search":
                 # Search jobs do the DDG fetch + extract first, then
                 # pipe the assembled context through the same Ollama
@@ -4129,6 +4271,57 @@ def process_one(
             }
             if result.get("sources"):
                 complete_payload["sources"] = result["sources"]
+            # Voice-mode finishing: wait for the sentence-1 TTS thread
+            # (if any) and synthesize the rest of the response. Three
+            # cases: (a) sentence-1 fired and there's a rest — synth
+            # rest as audio_b64_rest; (b) sentence-1 fired but the
+            # whole response was just that sentence — only ship _first;
+            # (c) the response was so short no boundary ever fired —
+            # collapse the whole text into audio_b64_first.
+            if voice_mode:
+                t = voice_state.get("thread")
+                if t is not None:
+                    t.join(timeout=TTS_TIMEOUT_SECONDS)
+                full_text = result.get("text") or ""
+                first_b64 = voice_state["audio_b64_first"]
+                first_secs = voice_state["audio_seconds_first"]
+                if first_b64:
+                    complete_payload["audio_b64_first"] = first_b64
+                    complete_payload["audio_seconds_first"] = first_secs
+                    rest_raw = full_text[voice_state["first_end_idx"]:].strip()
+                    spoken_rest = normalize_text_for_tts(rest_raw)
+                    if spoken_rest:
+                        try:
+                            b64r, secsr, _m = run_tts_inference(
+                                spoken_rest, {"job_id": job_id}, cfg, log,
+                            )
+                            complete_payload["audio_b64_rest"] = b64r
+                            complete_payload["audio_seconds_rest"] = secsr
+                        except Exception as e:
+                            log.warning(
+                                "voice-mode rest-synth failed: %s — "
+                                "client will only have first-sentence audio",
+                                e,
+                            )
+                else:
+                    # No first-sentence boundary detected (or synth
+                    # errored before posting). Synthesize the whole
+                    # response as audio_b64_first and skip _rest. Tagged
+                    # as _first so the client's audio-arrival hook fires
+                    # the same way for short and long responses.
+                    spoken_full = normalize_text_for_tts(full_text)
+                    if spoken_full:
+                        try:
+                            b64f, secsf, _m = run_tts_inference(
+                                spoken_full, {"job_id": job_id}, cfg, log,
+                            )
+                            complete_payload["audio_b64_first"] = b64f
+                            complete_payload["audio_seconds_first"] = secsf
+                        except Exception as e:
+                            log.warning(
+                                "voice-mode whole-response synth failed: %s",
+                                e,
+                            )
             accepted, out = coord.complete(
                 complete_payload,
                 claim_token=claim_token,

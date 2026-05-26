@@ -129,6 +129,13 @@ JOB_PROCESSING = "job_processing"
 # reads from here while the job is mid-stream and falls back to
 # JOB_RESULTS once it completes.
 JOB_PARTIALS = "job_partials"
+# Voice-mode chat: the agent pipelines first-sentence TTS with LLM
+# streaming and pushes the audio on a partial so the client can start
+# playback before the LLM completes. Audio is kept in its own hash
+# (rather than JSON-merged into JOB_PARTIALS) so the existing text-only
+# partial reader stays a plain hget. JSON-encoded {"audio_b64_first":
+# str, "audio_seconds_first": float}.
+JOB_PARTIAL_AUDIO = "job_partial_audio"
 WORKER_REGISTRY = "worker_registry"
 WORKER_HEARTBEATS = "worker_heartbeats"
 WORKER_STATUS = "worker_status"

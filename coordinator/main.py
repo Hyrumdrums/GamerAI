@@ -39,6 +39,7 @@ from shared.config import (
     SEARCH_AUTO_DISABLED,
     CANARY_SCORE_WINDOW,
     IDEMPOTENCY_TTL_SECONDS,
+    JOB_PARTIAL_AUDIO,
     JOB_PARTIALS,
     JOB_PROCESSING,
     JOB_QUEUE,
@@ -1799,6 +1800,12 @@ def generate(req: GenerateRequest, request: Request):
         # envelope backward-compatible with any worker that's still on
         # the old build.
         job["messages"] = worker_messages
+    if tool == "chat" and req.voice_mode:
+        # Tell the agent to pipeline first-sentence TTS in parallel with
+        # LLM streaming. Only meaningful on chat; image/search/tts agents
+        # ignore the field. Omitted (rather than set false) so a legacy
+        # agent on an older build never sees an unknown key.
+        job["voice_mode"] = True
     if tool == "image":
         # Image-only knobs. Only include fields the user explicitly
         # pinned so the worker can fall through to the model's sidecar
@@ -2064,6 +2071,19 @@ def result(job_id: str):
     # latest accumulated text so the polling client can render it.
     # status stays 'pending'/'running' so the client keeps polling.
     partial_text = r.hget(JOB_PARTIALS, job_id)
+    # Voice-mode chat: the agent ships first-sentence audio on a partial
+    # before the LLM completes. Merge it in so the polling client can
+    # start playback during streaming (and reveal text in sync).
+    partial_audio_first: Optional[str] = None
+    partial_audio_seconds_first: Optional[float] = None
+    partial_audio_raw = r.hget(JOB_PARTIAL_AUDIO, job_id)
+    if partial_audio_raw:
+        try:
+            pa = json.loads(partial_audio_raw)
+            partial_audio_first = pa.get("audio_b64_first")
+            partial_audio_seconds_first = pa.get("audio_seconds_first")
+        except json.JSONDecodeError:
+            pass
     status = row["status"]
     # Image jobs persist their result as messages.image_path (not on
     # the jobs row). Look it up so the polling path can surface the
@@ -2099,6 +2119,8 @@ def result(job_id: str):
         # has long since acted on it (or missed it). Defaulting to
         # null is harmless.
         "search_was_skipped": False,
+        "audio_b64_first": partial_audio_first,
+        "audio_seconds_first": partial_audio_seconds_first,
         "done": status in ("complete", "error"),
     }
 
@@ -2479,6 +2501,7 @@ def abandon(req: JobClaimRequest, request: Request):
         )
     r.hdel(JOB_PROCESSING, req.job_id)
     r.hdel(JOB_PARTIALS, req.job_id)
+    r.hdel(JOB_PARTIAL_AUDIO, req.job_id)
     r.hset(WORKER_STATUS, req.worker_id, "idle")
     db.requeue_job(req.job_id)
     log.info(
@@ -2518,6 +2541,20 @@ def partial(req: JobPartialRequest, request: Request):
         raise
     text = req.text or ""
     r.hset(JOB_PARTIALS, req.job_id, text)
+    if req.audio_b64_first:
+        # Voice-mode chat: agent finished synthesizing the first sentence
+        # in parallel with the still-streaming LLM. Park it in a sibling
+        # hash so the polling /result/{job_id} can return it pre-complete.
+        # Kept separate from JOB_PARTIALS so the existing text-only
+        # reader stays an hget (no JSON shape change).
+        r.hset(
+            JOB_PARTIAL_AUDIO,
+            req.job_id,
+            json.dumps({
+                "audio_b64_first": req.audio_b64_first,
+                "audio_seconds_first": float(req.audio_seconds_first or 0.0),
+            }),
+        )
     msg = db.get_message_by_job(req.job_id)
     if msg is not None:
         db.update_message_partial(msg["message_id"], text)
@@ -2755,6 +2792,21 @@ def complete(req: JobCompleteRequest, request: Request):
         # round-trip per sentence, which matters for voice-mode latency.
         payload["audio_b64"] = req.audio_b64
         payload["audio_seconds"] = float(req.audio_seconds or 0.0)
+    if pre_complete_tool == "chat" and (
+        req.audio_b64_first or req.audio_b64_rest
+    ):
+        # Voice-mode chat: the agent pipelined sentence-1 TTS during LLM
+        # streaming and synthesized the rest after the LLM completed. We
+        # re-attach both chunks to the final JOB_RESULTS payload (even
+        # though _first already shipped on a partial) so a client that
+        # reloaded the page after completion still gets full audio. A
+        # late-arriving polling tick sees both chunks in one read.
+        if req.audio_b64_first:
+            payload["audio_b64_first"] = req.audio_b64_first
+            payload["audio_seconds_first"] = float(req.audio_seconds_first or 0.0)
+        if req.audio_b64_rest:
+            payload["audio_b64_rest"] = req.audio_b64_rest
+            payload["audio_seconds_rest"] = float(req.audio_seconds_rest or 0.0)
     if req.sources:
         # Render-only data: the polling client reads it from
         # /result/{job_id} and shows it under the bubble. We don't
@@ -2772,6 +2824,7 @@ def complete(req: JobCompleteRequest, request: Request):
     r.hset(JOB_RESULTS, req.job_id, json.dumps(payload))
     r.hdel(JOB_PROCESSING, req.job_id)
     r.hdel(JOB_PARTIALS, req.job_id)
+    r.hdel(JOB_PARTIAL_AUDIO, req.job_id)
     r.hset(WORKER_STATUS, req.worker_id, "idle")
     db.mark_job_complete(
         job_id=req.job_id,
@@ -2882,6 +2935,23 @@ def complete(req: JobCompleteRequest, request: Request):
                 tokens_in=int(req.prompt_tokens or 0),
                 tokens_out=tokens,
             )
+            # Voice-mode chat: the worker also produced TTS audio inline
+            # with the LLM stream. Bill the user's voice_minutes ledger
+            # for both chunks (first sentence + rest). Earnings for the
+            # TTS work itself stay with the chat job's per-token credit
+            # rather than re-priced as standalone TTS — Phase A is the
+            # MVP and a separate ledger line per chunk is more bookkeeping
+            # than we want until per-tool pricing lands (project_open_
+            # strategy_questions § 6).
+            voice_secs_first = float(req.audio_seconds_first or 0.0)
+            voice_secs_rest = float(req.audio_seconds_rest or 0.0)
+            voice_secs_total = voice_secs_first + voice_secs_rest
+            if voice_secs_total > 0:
+                db.add_member_voice_usage(
+                    submitter,
+                    now,
+                    seconds=voice_secs_total,
+                )
     elif is_image_complete:
         # Earnings still posts USD for the image; the synthesized 200
         # is preserved here ONLY as a tokens-equivalent so the
@@ -3047,6 +3117,7 @@ def cancel_job(req: JobCancelRequest, request: Request):
     # active claim and returns 410. Also blow away any stale partials.
     r.hdel(JOB_PROCESSING, req.job_id)
     r.hdel(JOB_PARTIALS, req.job_id)
+    r.hdel(JOB_PARTIAL_AUDIO, req.job_id)
     db.mark_job_complete(
         job_id=req.job_id,
         worker_id=row["worker_id"] or "",
@@ -3922,6 +3993,7 @@ def delete_conversation(conversation_id: str, request: Request):
         r.hdel(JOB_RESULTS, jid)
         r.hdel(JOB_PROCESSING, jid)
         r.hdel(JOB_PARTIALS, jid)
+        r.hdel(JOB_PARTIAL_AUDIO, jid)
     log.info(
         "conversation deleted",
         extra={

@@ -1,11 +1,16 @@
 """Worker: pulls jobs, simulates a gamer machine, posts results to coordinator."""
+import base64
 import datetime as dt
+import io
 import json
 import logging
 import random
+import re
 import socket
+import threading
 import time
 import uuid
+import wave
 from typing import Optional
 
 import httpx
@@ -177,6 +182,53 @@ _MOCK_RESPONSE = (
 # stall the demo, slow enough that the client poll loop sees multiple
 # intermediate states and renders a real type-in effect.
 _MOCK_CHAR_DELAY = 0.0025
+
+
+# Voice-mode chat sentence boundary. Mirrors the agent's _VOICE_SENTENCE_RE
+# (and the client's VOICE_SENTENCE_RE) so first-sentence is the same span
+# everywhere it's split.
+_VOICE_SENTENCE_RE = re.compile(r"""[.!?]+["')\]]*(?:\s+|$)|\n+""")
+
+
+def find_first_sentence(text: str) -> tuple[Optional[str], int]:
+    if not text:
+        return None, 0
+    m = _VOICE_SENTENCE_RE.search(text)
+    if m is None:
+        return None, 0
+    end = m.start() + len(m.group(0))
+    sentence = text[:end].strip()
+    if not sentence:
+        return None, 0
+    return sentence, end
+
+
+def _build_mock_wav() -> bytes:
+    # 1 second of silence at 22050 Hz mono 16-bit. Identical to the
+    # agent's mock-Piper output so the wire shape is the same on dev
+    # and on a real contributor box that's missing piper.exe.
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(22050)
+        wf.writeframes(b"\x00\x00" * 22050)
+    return buf.getvalue()
+
+
+_MOCK_AUDIO_B64 = base64.b64encode(_build_mock_wav()).decode("ascii")
+
+
+def mock_tts_synth(text: str) -> tuple[str, float]:
+    """Stand-in for Piper on the dev worker. Returns a 1-second silent
+    WAV and a 1.0-second duration regardless of input length so the
+    Phase-A end-to-end wire flow can be exercised on Linux without
+    real synthesis. Sleeps briefly to simulate Piper's ~1-2s cold-start
+    so the client's "first audio appears mid-stream" UX is observable."""
+    # Synthesis-time simulation: enough that the audio arrives noticeably
+    # later than the first partial text, mirroring the real Piper cost.
+    time.sleep(0.8)
+    return _MOCK_AUDIO_B64, 1.0
 
 
 def run_inference(
@@ -474,19 +526,60 @@ def process_job(r: redis.Redis, http: httpx.Client, job: dict, last_job_finished
     )
     claim_token: Optional[str] = (claim_resp or {}).get("claim_token")
 
+    tool = (job.get("tool") or "chat").lower()
+    voice_mode = bool(job.get("voice_mode")) and tool == "chat"
+    voice_state: dict = {
+        "first_started": False,
+        "first_end_idx": 0,
+        "audio_b64_first": None,
+        "audio_seconds_first": 0.0,
+        "thread": None,
+        "current_text": "",
+    }
+
+    def _synth_first(sentence: str) -> None:
+        try:
+            b64, secs = mock_tts_synth(sentence)
+            voice_state["audio_b64_first"] = b64
+            voice_state["audio_seconds_first"] = secs
+            body = {
+                "worker_id": WORKER_ID,
+                "job_id": job_id,
+                "text": voice_state["current_text"],
+                "audio_b64_first": b64,
+                "audio_seconds_first": secs,
+            }
+            if claim_token is not None:
+                body["claim_token"] = claim_token
+            post(http, "/jobs/partial", body, timeout=3)
+        except Exception as e:
+            log.warning("voice-mode first-synth failed: %s", e)
+
     def push_partial(text: str) -> None:
         # Fire-and-forget: a dropped partial isn't worth retrying since
         # the next one carries the full text anyway, and the final
         # /jobs/complete is the source of truth.
+        voice_state["current_text"] = text
         body = {"worker_id": WORKER_ID, "job_id": job_id, "text": text}
         if claim_token is not None:
             body["claim_token"] = claim_token
         post(http, "/jobs/partial", body, timeout=3)
+        if voice_mode and not voice_state["first_started"]:
+            sentence, end_idx = find_first_sentence(text)
+            if sentence:
+                voice_state["first_started"] = True
+                voice_state["first_end_idx"] = end_idx
+                t = threading.Thread(
+                    target=_synth_first,
+                    args=(sentence,),
+                    daemon=True,
+                )
+                voice_state["thread"] = t
+                t.start()
 
     try:
         maybe_simulate_cold_start(last_job_finished)
         simulate_network_delay()
-        tool = (job.get("tool") or "chat").lower()
         if tool == "search":
             result = run_search_inference(
                 job["prompt"], job, http, on_partial=push_partial,
@@ -514,6 +607,36 @@ def process_job(r: redis.Redis, http: httpx.Client, job: dict, last_job_finished
             complete_body["sources"] = result["sources"]
         if claim_token is not None:
             complete_body["claim_token"] = claim_token
+        # Voice-mode finishing (dev mock). Wait for the first-sentence
+        # synth thread (if any), then mock-synth the rest of the
+        # response. Same three-case logic as the agent: pipelined
+        # first + rest, first-only short response, or whole-response
+        # if no boundary fired.
+        if voice_mode:
+            t = voice_state.get("thread")
+            if t is not None:
+                t.join(timeout=60.0)
+            full_text = result.get("text") or ""
+            first_b64 = voice_state["audio_b64_first"]
+            first_secs = voice_state["audio_seconds_first"]
+            if first_b64:
+                complete_body["audio_b64_first"] = first_b64
+                complete_body["audio_seconds_first"] = first_secs
+                rest_text = full_text[voice_state["first_end_idx"]:].strip()
+                if rest_text:
+                    try:
+                        b64r, secsr = mock_tts_synth(rest_text)
+                        complete_body["audio_b64_rest"] = b64r
+                        complete_body["audio_seconds_rest"] = secsr
+                    except Exception as e:
+                        log.warning("voice-mode rest-synth failed: %s", e)
+            elif full_text.strip():
+                try:
+                    b64f, secsf = mock_tts_synth(full_text)
+                    complete_body["audio_b64_first"] = b64f
+                    complete_body["audio_seconds_first"] = secsf
+                except Exception as e:
+                    log.warning("voice-mode whole-synth failed: %s", e)
         post(http, "/jobs/complete", complete_body, timeout=30)
         log.info(
             "complete tokens=%d duration=%.2fs",
