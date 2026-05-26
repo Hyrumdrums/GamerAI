@@ -19,7 +19,7 @@ from typing import Optional
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
-from client.services import coordinator_client
+from client.services import api_client, coordinator_client
 from client.services.session import (
     identify,
     login_redirect,
@@ -30,15 +30,6 @@ from client.templating import templates
 router = APIRouter()
 
 
-async def _coord_get(bearer: str, path: str) -> tuple[int, dict]:
-    async with coordinator_client._client(bearer=bearer) as c:
-        r = await c.get(path, timeout=5)
-    try:
-        return r.status_code, r.json()
-    except ValueError:
-        return r.status_code, {"detail": r.text}
-
-
 @router.get("/account", response_class=HTMLResponse)
 async def account_page(request: Request, flash: Optional[str] = None):
     bearer = session_bearer(request)
@@ -46,10 +37,14 @@ async def account_page(request: Request, flash: Optional[str] = None):
     if me is None:
         return login_redirect("/account")
 
-    status, friends = await _coord_get(bearer, "/me/friends")
+    status, friends = await api_client.fetch_safe(
+        bearer=bearer, path="/me/friends",
+    )
     if status != 200:
         friends = {"open_invites": [], "accepted": []}
-    machines_status, machines_body = await _coord_get(bearer, "/me/machines")
+    machines_status, machines_body = await api_client.fetch_safe(
+        bearer=bearer, path="/me/machines",
+    )
     machines = machines_body.get("machines", []) if machines_status == 200 else []
     owned_workers = (
         machines_body.get("owned_workers", []) if machines_status == 200 else []
@@ -66,8 +61,8 @@ async def account_page(request: Request, flash: Optional[str] = None):
     # below-threshold grace timer. The account page renders a
     # "Contribution status" card from this. Admins get a synthetic
     # response that the template treats as "engine does not apply".
-    contrib_status_code, contrib_status = await _coord_get(
-        bearer, "/me/contributor-status",
+    contrib_status_code, contrib_status = await api_client.fetch_safe(
+        bearer=bearer, path="/me/contributor-status",
     )
     if contrib_status_code != 200:
         contrib_status = {}

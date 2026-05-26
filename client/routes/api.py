@@ -5,11 +5,15 @@ session cookie is the only credential the page ever has to handle.
 Every /api/* proxy forwards the caller's session bearer to the
 coordinator. Requests without a session are rejected 401; the JS will
 notice and redirect to /login.
+
+All the underlying httpx wiring lives in
+``client/services/api_client.py`` — these handlers should stay short
+data-shaping wrappers that name the path and let the facade do the
+forwarding.
 """
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import JSONResponse, Response
 
-from client.services import coordinator_client
+from client.services import api_client
 from client.services.guards import require_session_bearer
 from client.services.session import identify
 
@@ -18,27 +22,23 @@ router = APIRouter(prefix="/api")
 
 @router.post("/generate")
 async def proxy_generate(payload: dict, request: Request):
-    bearer = require_session_bearer(request)
-    async with coordinator_client._client(bearer=bearer) as c:
-        r = await c.post("/generate", json=payload, timeout=10)
-    # Forward the coordinator's body verbatim instead of wrapping it
-    # in another HTTPException — otherwise a 503 like
-    # `{"detail":"No community members are available..."}` would come
-    # out as `{"detail":"{\"detail\":\"No community...\"}"}` (double-
-    # encoded) and the chat UI couldn't render the message cleanly.
-    try:
-        body = r.json()
-    except ValueError:
-        body = {"detail": r.text}
-    return JSONResponse(body, status_code=r.status_code)
+    # text_fallback so a 503 like {"detail":"No community members are
+    # available right now"} reaches the chat UI verbatim even if the
+    # coordinator's body parser hiccups — without that, the UI
+    # double-encodes and shows raw JSON instead of the message.
+    return await api_client.proxy_json(
+        bearer=require_session_bearer(request),
+        method="POST", path="/generate",
+        json=payload, text_fallback=True,
+    )
 
 
 @router.get("/result/{job_id}")
 async def proxy_result(job_id: str, request: Request):
-    bearer = require_session_bearer(request)
-    async with coordinator_client._client(bearer=bearer) as c:
-        r = await c.get(f"/result/{job_id}", timeout=10)
-    return JSONResponse(r.json(), status_code=r.status_code)
+    return await api_client.proxy_json(
+        bearer=require_session_bearer(request),
+        method="GET", path=f"/result/{job_id}",
+    )
 
 
 @router.post("/cancel/{job_id}")
@@ -46,14 +46,11 @@ async def proxy_cancel(job_id: str, request: Request):
     """Member-initiated cancel. The coordinator marks the job
     cancelled and the worker's eventual /complete gets 410'd, so
     even though the worker keeps grinding the result is dropped."""
-    bearer = require_session_bearer(request)
-    async with coordinator_client._client(bearer=bearer) as c:
-        r = await c.post("/jobs/cancel", json={"job_id": job_id}, timeout=10)
-    try:
-        body = r.json()
-    except ValueError:
-        body = {"detail": r.text}
-    return JSONResponse(body, status_code=r.status_code)
+    return await api_client.proxy_json(
+        bearer=require_session_bearer(request),
+        method="POST", path="/jobs/cancel",
+        json={"job_id": job_id}, text_fallback=True,
+    )
 
 
 @router.get("/images/{name}")
@@ -62,37 +59,31 @@ async def proxy_image(name: str, request: Request):
     can't send Authorization headers from <img> tags, so the chat UI
     references images at /api/images/<name>; this proxy attaches the
     coordinator bearer the same way other /api/* routes do. Coordinator
-    enforces conversation ownership before returning the bytes.
-
-    No need to JSON-decode the body — pass the PNG through as raw bytes
-    with the upstream content-type."""
-    bearer = require_session_bearer(request)
-    async with coordinator_client._client(bearer=bearer) as c:
-        r = await c.get(f"/images/{name}", timeout=30)
-    return Response(
-        content=r.content,
-        status_code=r.status_code,
-        media_type=r.headers.get("content-type", "image/png"),
+    enforces conversation ownership before returning the bytes."""
+    return await api_client.proxy_raw(
+        bearer=require_session_bearer(request),
+        method="GET", path=f"/images/{name}",
+        timeout=30, default_content_type="image/png",
     )
 
 
 @router.get("/me")
 async def proxy_me(request: Request):
-    bearer = require_session_bearer(request)
-    async with coordinator_client._client(bearer=bearer) as c:
-        r = await c.get("/me", timeout=5)
-    return JSONResponse(r.json(), status_code=r.status_code)
+    return await api_client.proxy_json(
+        bearer=require_session_bearer(request),
+        method="GET", path="/me", timeout=5,
+    )
 
 
 # Workers / earnings / metrics are operational data — admin only.
-async def _admin_only_proxy(request: Request, path: str) -> JSONResponse:
+async def _admin_only_proxy(request: Request, path: str):
     bearer = require_session_bearer(request)
     me = await identify(bearer)
     if me is None or me.get("role") != "admin":
         raise HTTPException(status_code=403, detail="admin only")
-    async with coordinator_client._client(bearer=bearer) as c:
-        r = await c.get(path, timeout=10)
-    return JSONResponse(r.json(), status_code=r.status_code)
+    return await api_client.proxy_json(
+        bearer=bearer, method="GET", path=path,
+    )
 
 
 @router.get("/workers")
@@ -112,46 +103,45 @@ async def proxy_metrics(request: Request):
 
 @router.get("/conversations")
 async def proxy_list_conversations(request: Request):
-    bearer = require_session_bearer(request)
-    async with coordinator_client._client(bearer=bearer) as c:
-        r = await c.get("/conversations", timeout=10)
-    return JSONResponse(r.json(), status_code=r.status_code)
+    return await api_client.proxy_json(
+        bearer=require_session_bearer(request),
+        method="GET", path="/conversations",
+    )
 
 
 @router.post("/conversations")
 async def proxy_create_conversation(payload: dict, request: Request):
-    bearer = require_session_bearer(request)
-    async with coordinator_client._client(bearer=bearer) as c:
-        r = await c.post("/conversations", json=payload, timeout=10)
-    return JSONResponse(r.json(), status_code=r.status_code)
+    return await api_client.proxy_json(
+        bearer=require_session_bearer(request),
+        method="POST", path="/conversations", json=payload,
+    )
 
 
 @router.get("/conversations/{conversation_id}")
 async def proxy_get_conversation(conversation_id: str, request: Request):
-    bearer = require_session_bearer(request)
-    async with coordinator_client._client(bearer=bearer) as c:
-        r = await c.get(f"/conversations/{conversation_id}", timeout=10)
-    return JSONResponse(r.json(), status_code=r.status_code)
+    return await api_client.proxy_json(
+        bearer=require_session_bearer(request),
+        method="GET", path=f"/conversations/{conversation_id}",
+    )
 
 
 @router.delete("/conversations/{conversation_id}")
 async def proxy_archive_conversation(conversation_id: str, request: Request):
-    bearer = require_session_bearer(request)
-    async with coordinator_client._client(bearer=bearer) as c:
-        r = await c.delete(f"/conversations/{conversation_id}", timeout=10)
-    return JSONResponse(r.json(), status_code=r.status_code)
+    return await api_client.proxy_json(
+        bearer=require_session_bearer(request),
+        method="DELETE", path=f"/conversations/{conversation_id}",
+    )
 
 
 @router.post("/messages/{message_id}/retry")
 async def proxy_retry_message(message_id: str, request: Request):
-    bearer = require_session_bearer(request)
-    async with coordinator_client._client(bearer=bearer) as c:
-        r = await c.post(f"/messages/{message_id}/retry", timeout=10)
-    # Surface the Retry-After header straight through so the JS can read it.
-    headers = {}
-    if "retry-after" in r.headers:
-        headers["Retry-After"] = r.headers["retry-after"]
-    return JSONResponse(r.json(), status_code=r.status_code, headers=headers)
+    # forward_response_headers so the JS retry cooldown can read
+    # Retry-After off the 429 response (see streamingEngine.js).
+    return await api_client.proxy_json(
+        bearer=require_session_bearer(request),
+        method="POST", path=f"/messages/{message_id}/retry",
+        forward_response_headers=("retry-after",),
+    )
 
 
 # ---------- push notifications (Phase 6 of pwa-refactor.txt) ----------
@@ -165,59 +155,54 @@ async def proxy_vapid_key():
     ``{key: null}`` when VAPID isn't configured, which the JS uses to
     skip showing the opt-in banner instead of attempting a doomed
     subscribe."""
-    async with coordinator_client._public_client() as c:
-        r = await c.get("/notifications/vapid-key", timeout=5)
-    return JSONResponse(r.json(), status_code=r.status_code)
+    return await api_client.proxy_json(
+        bearer=None, method="GET", path="/notifications/vapid-key",
+        timeout=5,
+    )
 
 
 @router.post("/notifications/subscribe")
 async def proxy_subscribe(payload: dict, request: Request):
-    bearer = require_session_bearer(request)
     # Forward the browser's User-Agent so the coordinator can label
     # which device this subscription belongs to (Chrome on Pixel vs.
     # Safari on iPhone) — useful for the future "manage devices" view
     # and harmless if the header is absent.
     ua = request.headers.get("user-agent")
-    headers = {"User-Agent": ua} if ua else None
-    async with coordinator_client._client(bearer=bearer) as c:
-        r = await c.post(
-            "/notifications/subscribe",
-            json=payload, headers=headers, timeout=10,
-        )
-    return JSONResponse(r.json(), status_code=r.status_code)
+    return await api_client.proxy_json(
+        bearer=require_session_bearer(request),
+        method="POST", path="/notifications/subscribe",
+        json=payload,
+        headers={"User-Agent": ua} if ua else None,
+    )
 
 
 @router.delete("/notifications/subscribe")
 async def proxy_unsubscribe(payload: dict, request: Request):
-    bearer = require_session_bearer(request)
-    async with coordinator_client._client(bearer=bearer) as c:
-        r = await c.request(
-            "DELETE", "/notifications/subscribe",
-            json=payload, timeout=10,
-        )
-    return JSONResponse(r.json(), status_code=r.status_code)
+    return await api_client.proxy_json(
+        bearer=require_session_bearer(request),
+        method="DELETE", path="/notifications/subscribe",
+        json=payload,
+    )
 
 
 @router.get("/notifications")
 async def proxy_list_notifications(
     request: Request, limit: int = 50, offset: int = 0,
 ):
-    bearer = require_session_bearer(request)
-    async with coordinator_client._client(bearer=bearer) as c:
-        r = await c.get(
-            "/notifications",
-            params={"limit": limit, "offset": offset},
-            timeout=10,
-        )
-    return JSONResponse(r.json(), status_code=r.status_code)
+    return await api_client.proxy_json(
+        bearer=require_session_bearer(request),
+        method="GET", path="/notifications",
+        params={"limit": limit, "offset": offset},
+    )
 
 
 @router.get("/notifications/unread-count")
 async def proxy_unread_count(request: Request):
-    bearer = require_session_bearer(request)
-    async with coordinator_client._client(bearer=bearer) as c:
-        r = await c.get("/notifications/unread-count", timeout=5)
-    return JSONResponse(r.json(), status_code=r.status_code)
+    return await api_client.proxy_json(
+        bearer=require_session_bearer(request),
+        method="GET", path="/notifications/unread-count",
+        timeout=5,
+    )
 
 
 @router.put("/notifications/read-all")
@@ -225,35 +210,33 @@ async def proxy_mark_all_read(request: Request):
     # NOTE: registered before /{id}/read so FastAPI doesn't capture
     # 'read-all' as a notification_id. Matches the ordering in
     # coordinator/notifications.py.
-    bearer = require_session_bearer(request)
-    async with coordinator_client._client(bearer=bearer) as c:
-        r = await c.put("/notifications/read-all", timeout=5)
-    return JSONResponse(r.json(), status_code=r.status_code)
+    return await api_client.proxy_json(
+        bearer=require_session_bearer(request),
+        method="PUT", path="/notifications/read-all", timeout=5,
+    )
 
 
 @router.put("/notifications/{notification_id}/read")
 async def proxy_mark_read(notification_id: str, request: Request):
-    bearer = require_session_bearer(request)
-    async with coordinator_client._client(bearer=bearer) as c:
-        r = await c.put(
-            f"/notifications/{notification_id}/read", timeout=5,
-        )
-    return JSONResponse(r.json(), status_code=r.status_code)
+    return await api_client.proxy_json(
+        bearer=require_session_bearer(request),
+        method="PUT", path=f"/notifications/{notification_id}/read",
+        timeout=5,
+    )
 
 
 @router.get("/notifications/preferences")
 async def proxy_get_preferences(request: Request):
-    bearer = require_session_bearer(request)
-    async with coordinator_client._client(bearer=bearer) as c:
-        r = await c.get("/notifications/preferences", timeout=5)
-    return JSONResponse(r.json(), status_code=r.status_code)
+    return await api_client.proxy_json(
+        bearer=require_session_bearer(request),
+        method="GET", path="/notifications/preferences", timeout=5,
+    )
 
 
 @router.put("/notifications/preferences")
 async def proxy_put_preferences(payload: dict, request: Request):
-    bearer = require_session_bearer(request)
-    async with coordinator_client._client(bearer=bearer) as c:
-        r = await c.put(
-            "/notifications/preferences", json=payload, timeout=5,
-        )
-    return JSONResponse(r.json(), status_code=r.status_code)
+    return await api_client.proxy_json(
+        bearer=require_session_bearer(request),
+        method="PUT", path="/notifications/preferences",
+        json=payload, timeout=5,
+    )

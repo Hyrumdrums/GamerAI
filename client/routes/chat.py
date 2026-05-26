@@ -4,7 +4,7 @@ requires the admin role."""
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
-from client.services import coordinator_client
+from client.services import api_client
 from client.services.guards import require_admin_session
 from client.services.session import identify, login_redirect, session_bearer
 from client.templating import templates
@@ -47,10 +47,14 @@ async def dashboard(request: Request):
             '<p><a href="/">Back to chat</a></p>',
             status_code=403,
         )
-    async with coordinator_client._client(bearer=bearer) as c:
-        metrics = (await c.get("/metrics", timeout=5)).json()
-        workers_body = (await c.get("/workers", timeout=5)).json()
-        earnings_body = (await c.get("/earnings", timeout=5)).json()
+    # Three sequential reads — fetch_safe gives us a status check we
+    # don't currently act on but lets the facade own all the httpx
+    # plumbing. If any starts feeling slow, parallelize with
+    # asyncio.gather() in a follow-up; for now sequential matches
+    # the historical behavior exactly.
+    _, metrics = await api_client.fetch_safe(bearer=bearer, path="/metrics")
+    _, workers_body = await api_client.fetch_safe(bearer=bearer, path="/workers")
+    _, earnings_body = await api_client.fetch_safe(bearer=bearer, path="/earnings")
 
     workers = workers_body["workers"]
     active_workers_count = sum(1 for w in workers if w["status"] == "online")
