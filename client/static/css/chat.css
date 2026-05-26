@@ -285,6 +285,10 @@ body { display: flex; flex-direction: column; }
   font-style: italic; opacity: .85; font-size: .65rem;
   display: inline-flex; align-items: center; gap: .25rem;
 }
+/* Author CSS above ties UA specificity for the `hidden` attribute,
+   so without this rule el.hidden = true had no visual effect — the
+   spinner stayed on screen forever after the summary landed. */
+.stats-label-status[hidden] { display: none; }
 .stats-spinner {
   display: inline-block;
   width: .65rem; height: .65rem;

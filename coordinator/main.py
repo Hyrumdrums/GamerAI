@@ -1974,11 +1974,21 @@ def generate(req: GenerateRequest, request: Request):
 
 
 _SUMMARY_SYSTEM_PROMPT = (
-    "You are a conversation summarizer. Compress the conversation "
-    "below into 2-3 short paragraphs of plain prose. Capture key "
-    "facts, decisions, and ongoing context the next response will "
-    "need; drop pleasantries and repetition. Do not address the "
-    "user, do not add meta commentary — just the summary itself."
+    "You produce CONVERSATION RECAPS for a chat assistant. Your "
+    "output is prepended to the next reply's context so the "
+    "assistant remembers who they're talking to and what they "
+    "discussed — it is NOT a content summary of any document, "
+    "article, code, or text that happens to appear in the "
+    "transcript.\n\n"
+    "Capture: what the user is working on or interested in, "
+    "personal details they shared (name, location, preferences, "
+    "projects), questions they asked, decisions or opinions they "
+    "expressed, and any unresolved threads. If a document or piece "
+    "of content came up, just note that it came up — do not "
+    "summarize the document itself. Drop pleasantries, restated "
+    "questions, and any quoted/generated text. Write 2-3 short "
+    "paragraphs of plain prose as if briefing a colleague taking "
+    "over the conversation."
 )
 
 
@@ -2055,14 +2065,20 @@ def _maybe_enqueue_summary_job(conv_row, prior_messages, history_info) -> None:
     summary_input: list[dict] = [
         {"role": "system", "content": _SUMMARY_SYSTEM_PROMPT},
         {"role": "user", "content": (
-            "Below is a conversation. Summarize it in 2-3 short "
-            "paragraphs of plain prose so it can be prepended as "
-            "context for the next reply.\n\n"
+            "Below is a conversation between a User and Assistant. "
+            "Recap it in 2-3 short paragraphs so the next reply "
+            "remembers the USER — what they want help with, who "
+            "they are, what they've shared about themselves. Do "
+            "NOT summarize any documents, articles, code, or text "
+            "that appears in the transcript; just note that they "
+            "came up (e.g. 'the user asked for the Declaration of "
+            "Independence', not 'the Declaration of Independence "
+            "is a foundational document…').\n\n"
             "--- BEGIN CONVERSATION ---\n\n"
             + conversation_text +
             "\n\n--- END CONVERSATION ---\n\n"
-            "Provide only the summary text. No preamble, no meta "
-            "commentary, no markdown headers."
+            "Provide only the recap text. No preamble, no headers, "
+            "no lists, no meta commentary."
         )},
     ]
     # Orphan chat job — no conversation_id link, no submitter, no
