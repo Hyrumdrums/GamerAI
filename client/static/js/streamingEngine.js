@@ -91,7 +91,7 @@ export async function retryMessage(messageId, btn) {
 // rate, so even an instant response shows a brief reveal animation;
 // when partials arrive faster than this rate the typewriter just
 // matches arrival (no artificial slowdown).
-const TYPEWRITER_CHARS_PER_SECOND = 90;
+const TYPEWRITER_CHARS_PER_SECOND = 125;
 // Stuck-job thresholds: how long to wait with zero progress before
 // surfacing the "this may be taking longer than normal" notice with
 // a Cancel button. Chat normally streams within a second or two so
