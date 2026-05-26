@@ -772,6 +772,64 @@ class ClaimTokenEnforcementTests(unittest.TestCase):
         self.assertEqual(out["job"]["job_id"], job_id)
         self.assertIn("claim_token", out)
 
+    def test_jobs_next_filters_to_advertised_tools(self):
+        # Regression for the 2026-05-26 prod incident: an image-only
+        # worker (tools=["image"] at /register) was BLPOP'ing the chat
+        # queue too, picking up chat jobs and answering them with
+        # [mock] responses. Coordinator now filters the requested
+        # tools list to the intersection with what /register declared
+        # — image-only worker asking for chat gets null, not a chat
+        # job in mock mode.
+        worker_id = "wkr-image-only"
+        # Put a chat job on the queue so we can prove image-only
+        # doesn't claim it.
+        chat_job_id = self.client.post(
+            "/generate", json={"prompt": "chat-only please"},
+        ).json()["job_id"]
+        self.client.post(
+            "/register",
+            json={
+                "worker_id": worker_id,
+                "capabilities": {"tools": ["image"]},
+            },
+        )
+        # Ask for both — image-only should drop chat from the BLPOP set.
+        out = self.client.post(
+            "/jobs/next",
+            json={
+                "worker_id": worker_id,
+                "tools": ["chat", "image"],
+                "wait": 0,
+            },
+        ).json()
+        self.assertIsNone(
+            out["job"],
+            "image-only worker should not have received the chat job",
+        )
+        # And the chat job is still on the queue waiting for a chat-
+        # capable worker.
+        chat_capable = "wkr-chat-capable"
+        self.client.post("/register", json={"worker_id": chat_capable})
+        out2 = self.client.post(
+            "/jobs/next",
+            json={"worker_id": chat_capable, "tool": "chat"},
+        ).json()
+        self.assertEqual(out2["job"]["job_id"], chat_job_id)
+
+    def test_jobs_next_legacy_worker_with_no_capabilities_still_gets_chat(self):
+        # Legacy contract: a worker that never advertised capabilities
+        # (tools_json IS NULL) is treated as chat-only. /jobs/next with
+        # tool="chat" still works for those workers — important so a
+        # contributor on a pre-tools-column agent isn't silently locked
+        # out of the chat queue.
+        worker_id = "wkr-legacy"
+        job_id = self._submit_and_pop(worker_id)  # registers w/o caps
+        out = self.client.post(
+            "/jobs/next",
+            json={"worker_id": worker_id, "tool": "chat"},
+        ).json()
+        self.assertEqual(out["job"]["job_id"], job_id)
+
     def test_jobs_next_wait_capped_at_server_max(self):
         # A worker requesting an absurdly long wait gets capped at
         # MAX_LONGPOLL_SECONDS rather than holding a coordinator

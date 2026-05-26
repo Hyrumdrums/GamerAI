@@ -2345,6 +2345,26 @@ def next_job(req: JobNextRequest, request: Request):
         tools = [(req.tool or "chat").lower()]
     if not tools:
         return {"job": None}
+    # Defensive: never hand a worker a tool it didn't advertise at
+    # /register. Without this, an image-only agent whose dual-loop
+    # polling layer still BLPOPs the chat queue can pick up a chat
+    # job and run it in mock mode (canary system catches some of
+    # these as canary_failed; users feel the rest as mock responses
+    # mid-conversation). worker_tools() returns None for legacy
+    # workers that never advertised — those keep the historical
+    # chat-only behavior implicitly via the chat-default fallback
+    # below.
+    advertised = db.worker_tools(req.worker_id)
+    if advertised is None:
+        advertised = ["chat"]
+    advertised_set = {t.lower() for t in advertised}
+    filtered = [t for t in tools if t in advertised_set]
+    if not filtered:
+        # Worker is asking for queues it can't actually serve. Treat
+        # as no-job-available rather than a 4xx — keeps the
+        # long-poll loop quiet on legacy agents that overshoot.
+        return {"job": None}
+    tools = filtered
     queues = [job_queue_for(t) for t in tools]
 
     wait = max(0.0, min(float(req.wait or 0.0), MAX_LONGPOLL_SECONDS))
