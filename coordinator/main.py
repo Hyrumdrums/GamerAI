@@ -2025,31 +2025,46 @@ def _maybe_enqueue_summary_job(conv_row, prior_messages, history_info) -> None:
     new_through_seq = int(dropped_msgs[-1]["seq"])
     if new_through_seq <= existing_through:
         return  # already summarized this far
-    # Build the summarizer's input: existing summary as a system prefix
-    # (so the new one chains forward), then every persisted turn up
-    # through new_through_seq.
+    # Build the summarizer's input. Originally this was the system
+    # prompt + the raw user/assistant turns as separate messages, but
+    # small models (llama3.2:3b) returned empty text when the message
+    # array ended on an assistant turn — Ollama had no "what should I
+    # say next?" cue. The conversation-as-single-user-message shape
+    # gives the model an unambiguous "user asks for summary" turn to
+    # respond to, which yields a non-empty assistant reply every time.
     existing_summary = (
         conv_row["summary_text"]
         if "summary_text" in conv_row.keys()
         else None
     )
-    summary_input: list[dict] = [
-        {"role": "system", "content": _SUMMARY_SYSTEM_PROMPT},
-    ]
+    conv_lines: list[str] = []
     if existing_summary:
-        summary_input.append({
-            "role": "system",
-            "content": "Summary so far:\n" + existing_summary,
-        })
+        conv_lines.append("Summary so far:\n" + existing_summary + "\n")
     for m in eligible:
         if m["seq"] > new_through_seq:
             break
         role = m["role"]
         text = (m["text"] or "").strip()
+        if not text:
+            continue
         if role == "assistant":
             text = _scrub_citations(text)
-        if text:
-            summary_input.append({"role": role, "content": text})
+        label = "User" if role == "user" else "Assistant"
+        conv_lines.append(f"{label}: {text}")
+    conversation_text = "\n\n".join(conv_lines)
+    summary_input: list[dict] = [
+        {"role": "system", "content": _SUMMARY_SYSTEM_PROMPT},
+        {"role": "user", "content": (
+            "Below is a conversation. Summarize it in 2-3 short "
+            "paragraphs of plain prose so it can be prepended as "
+            "context for the next reply.\n\n"
+            "--- BEGIN CONVERSATION ---\n\n"
+            + conversation_text +
+            "\n\n--- END CONVERSATION ---\n\n"
+            "Provide only the summary text. No preamble, no meta "
+            "commentary, no markdown headers."
+        )},
+    ]
     # Orphan chat job — no conversation_id link, no submitter, no
     # placeholder message row. Runs through the same worker pool as
     # any other chat job; the worker can't tell it apart, which is
@@ -2967,11 +2982,12 @@ def complete(req: JobCompleteRequest, request: Request):
             slink = json.loads(summary_link_raw)
         except json.JSONDecodeError:
             slink = None
-        if slink and req.status == "complete" and (req.text or "").strip():
+        clean_text = (req.text or "").strip()
+        if slink and req.status == "complete" and clean_text:
             try:
                 db.set_conversation_summary(
                     slink["conversation_id"],
-                    req.text.strip(),
+                    clean_text,
                     int(slink["through_seq"]),
                 )
                 log.info(
@@ -2981,7 +2997,7 @@ def complete(req: JobCompleteRequest, request: Request):
                         "conversation_id": slink["conversation_id"],
                         "through_seq": slink["through_seq"],
                         "job_id": req.job_id,
-                        "chars": len(req.text.strip()),
+                        "chars": len(clean_text),
                     },
                 )
             except Exception as e:
@@ -2992,6 +3008,21 @@ def complete(req: JobCompleteRequest, request: Request):
                         "job_id": req.job_id,
                     },
                 )
+        elif slink:
+            # Distinguishes "agent returned empty text" (prompt-shape bug,
+            # model refusal, etc.) from "agent failed loudly". Without
+            # this log, an empty-text summary just silently drops on the
+            # floor and the client's spinner spins forever.
+            log.warning(
+                "summary job returned empty/non-complete result — skipping store",
+                extra={
+                    "event": "summary_empty_result",
+                    "job_id": req.job_id,
+                    "conversation_id": slink["conversation_id"],
+                    "status": req.status,
+                    "chars": len(clean_text),
+                },
+            )
         r.hdel(SUMMARY_PENDING, req.job_id)
 
     # Look up the original job row so we can branch image vs. chat
