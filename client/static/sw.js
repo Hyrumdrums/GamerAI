@@ -24,7 +24,7 @@
 // every path on the origin even though the source file lives under
 // /static/sw.js.
 
-const CACHE_VERSION = 'v2';
+const CACHE_VERSION = 'v3';
 const SHELL_CACHE = `gamerai-shell-${CACHE_VERSION}`;
 const RUNTIME_CACHE = `gamerai-runtime-${CACHE_VERSION}`;
 
@@ -46,6 +46,7 @@ const SHELL_ASSETS = [
   '/static/js/imageGallery.js',
   '/static/js/notifications.js',
   '/static/js/installPrompt.js',
+  '/static/js/offlineQueue.js',
   '/static/manifest.webmanifest',
   '/static/icons/icon-192.png',
   '/static/icons/icon-512.png',
@@ -89,9 +90,9 @@ self.addEventListener('fetch', (event) => {
   if (req.method !== 'GET') return;
   if (url.origin !== self.location.origin) return;
 
-  // API: always network. Phase 5 will add a Background Sync queue
-  // for offline submits; until then, /api/* failures bubble to the
-  // app's existing error handling.
+  // API: always network. The Phase 5 Background Sync queue lives on
+  // the page side (chat.js + offlineQueue.js); /api/* responses are
+  // never cached or intercepted here.
   if (url.pathname.startsWith('/api/')) return;
 
   // Navigations (HTML pages): network-first so users always get the
@@ -200,5 +201,35 @@ self.addEventListener('notificationclick', (event) => {
       }
     }
     if (clients.openWindow) return clients.openWindow(url);
+  })());
+});
+
+// ---- background sync (Phase 5 of pwa-refactor.txt) -------------------
+// chat.js registers a 'send-message' sync when /api/generate fails
+// offline. The browser fires this event once connectivity is restored
+// (even if the tab was backgrounded in the meantime). We forward a
+// `drain-queue` postMessage to every open client so the page-side
+// drain loop runs — the actual /api/generate retry + streamIntoBubble
+// orchestration lives in chat.js, not here, because the SW can't
+// drive the DOM and the polling state machine is already wired up
+// page-side.
+//
+// If no client is open when the sync fires, the queue stays put and
+// drains on the next page load via init() → drainQueue(). That path
+// is the reliable one; this handler is the bonus for already-open
+// tabs.
+//
+// Browsers without SyncManager (Safari) never fire this — the
+// chat.js 'online' + visibilitychange listeners cover them.
+self.addEventListener('sync', (event) => {
+  if (event.tag !== 'send-message') return;
+  event.waitUntil((async () => {
+    const wins = await self.clients.matchAll({
+      type: 'window', includeUncontrolled: true,
+    });
+    for (const c of wins) {
+      try { c.postMessage({ type: 'drain-queue' }); }
+      catch (_e) { /* one dead client shouldn't kill the broadcast */ }
+    }
   })());
 });

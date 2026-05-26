@@ -312,19 +312,32 @@ PHASE 5 — Background sync: queued message sends
 ================================================
 Depends on: Phase 2 (api_client facade simplifies the rewrite)
 
-[ ] 5.1  Create client/static/js/offlineQueue.js
-        - IndexedDB wrapper for storing pending sends
-          {id, conversation_id, prompt, tool, ...}
-        - drain() — iterate queue, POST to /api/generate, remove on success
-[ ] 5.2  Update streamingEngine.js / chat.js submit handler:
-        - On fetch fail (offline) → enqueue + register 'send-message' sync
-        - On reconnect → drain queue, dispatch results into bubbles
-[ ] 5.3  Update sw.js: sync handler for tag 'send-message' → call drain
-[ ] 5.4  Update messageRenderer.js: pending bubble shows "queued — will
-        send when online" if message is queued, swaps to "thinking…"
-        on dispatch
-[ ] 5.5  Test: airplane mode → submit → message shows "queued"; back
-        online → dispatches and streams normally
+[x] 5.1  Created client/static/js/offlineQueue.js
+        - IndexedDB wrapper exposing enqueue/list/remove/removeByConversation
+        - registerSync() helper that asks the SW to register the
+          'send-message' background sync (graceful no-op on Safari).
+        - Drain is page-side (in chat.js), not in this module — the SW
+          can't drive the typing-bubble DOM and the polling state
+          machine is already wired up in streamingEngine.js.
+[x] 5.2  chat.js submit handler:
+        - /api/generate fetch is now in a try/catch; TypeError →
+          offlineQueue.enqueue + markBubbleQueued + registerSync +
+          re-enable composer.
+        - Brand-new chats can't queue (no conversation_id yet) — the
+          /api/conversations create catches separately and shows
+          "can't start a new chat while offline".
+[x] 5.3  sw.js 'sync' handler for 'send-message' tag postMessages
+        'drain-queue' to every open client. Page-side listener in
+        chat.js calls drainQueue() in response. CACHE_VERSION bumped
+        v2→v3 to ship the new precache list (added offlineQueue.js).
+[x] 5.4  chat.js drainQueue() also re-creates optimistic user + typing
+        bubbles when the queued entry's conversation matches what the
+        user has open (covers the page-reload-while-queued case).
+        Queued bubble shows the muted "queued — will send when online"
+        label via the existing .typing span; swaps to "thinking…" on
+        successful drain, then streamIntoBubble takes over.
+[ ] 5.5  USER ACTION — Test: airplane mode → submit → message shows
+        "queued"; back online → dispatches and streams normally.
 [ ] 5.6  Commit: feat(client): queued sends via background sync
 
 

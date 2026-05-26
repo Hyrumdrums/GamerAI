@@ -20,6 +20,7 @@ import {
 } from './composer.js';
 import { initImageGallery } from './imageGallery.js';
 import { initPWAPrompts } from './installPrompt.js';
+import * as offlineQueue from './offlineQueue.js';
 
 // ---- bootstrap --------------------------------------------------------
 async function init() {
@@ -105,6 +106,11 @@ async function deleteConversation(id, label) {
     return;
   }
   msgCache.delete(id);
+  // Drop any offline-queued sends that targeted this conversation —
+  // re-POSTing them once we're online would hit a deleted conv_id and
+  // produce confusing error bubbles for prompts the user has already
+  // walked away from.
+  offlineQueue.removeByConversation(id).catch(() => {});
   if (state.currentId === id) {
     state.currentId = null;
     stopReadAloud();
@@ -255,11 +261,23 @@ document.getElementById('composer').onsubmit = async (e) => {
   const wasNewChat = !state.currentId;
   const newChatSearchState = wasNewChat ? searchCheckbox.checked : null;
   if (!state.currentId) {
-    const cr = await fetch('/api/conversations', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({}),
-    });
+    let cr;
+    try {
+      cr = await fetch('/api/conversations', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({}),
+      });
+    } catch (_netErr) {
+      // Brand-new chats can't be queued — we need a conversation_id
+      // before we have somewhere to attach the queued send. Drafts
+      // into an *existing* conversation queue fine below; this case
+      // only loses if the user opens the app, hits "+ New chat", and
+      // submits while offline. Telling them to try again is honest.
+      statusEl.textContent = "can't start a new chat while offline";
+      submitBtn.disabled = false; textarea.disabled = false;
+      return;
+    }
     if (!cr.ok) {
       statusEl.textContent = 'failed to create conversation';
       submitBtn.disabled = false; textarea.disabled = false;
@@ -323,11 +341,48 @@ document.getElementById('composer').onsubmit = async (e) => {
     body.tool = 'search';
     body.search_mode = submitSearchMode;
   }
-  const gr = await fetch('/api/generate', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(body),
-  });
+  // Tag the typing bubble with a UUID up front so an offline-enqueue
+  // can match the queue row back to its visible bubble on drain.
+  const queueId = (crypto && crypto.randomUUID)
+    ? crypto.randomUUID()
+    : ('q-' + Date.now() + '-' + Math.random().toString(36).slice(2));
+  typing.dataset.queueId = queueId;
+  let gr;
+  try {
+    gr = await fetch('/api/generate', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+  } catch (_netErr) {
+    // Network unreachable (offline, DNS down, captive portal). Stash
+    // the send in IndexedDB and let the drain loop POST it once
+    // connectivity comes back. We re-enable the composer immediately
+    // so the user can keep drafting; the queued bubble stays put.
+    try {
+      await offlineQueue.enqueue({
+        id: queueId,
+        enqueued_at: Date.now(),
+        conversation_id: state.currentId,
+        payload: body,
+      });
+    } catch (_storeErr) {
+      // IndexedDB refused (private window, quota, …). Surface the
+      // original network failure instead of pretending the queue
+      // worked — the user's prompt would otherwise vanish silently.
+      const bubble = typing.querySelector('.bubble');
+      bubble.classList.add('error');
+      bubble.textContent = "Can't reach the server, and offline queue isn't available in this browser.";
+      statusEl.textContent = '';
+      submitBtn.disabled = false; textarea.disabled = false;
+      return;
+    }
+    markBubbleQueued(typing);
+    offlineQueue.registerSync();
+    statusEl.textContent = 'queued — will send when online';
+    submitBtn.disabled = false; textarea.disabled = false;
+    return;
+  }
   if (gr.status === 401) { location.href = '/login'; return; }
   if (!gr.ok) {
     // Try to read a JSON `detail` first — the coordinator and the
@@ -371,6 +426,136 @@ document.getElementById('composer').onsubmit = async (e) => {
   });
 };
 
+// ---- offline send queue (Phase 5 of pwa-refactor.txt) ---------------
+// When /api/generate fails because the browser is offline, the submit
+// handler stashes the payload in IndexedDB and stamps the pending
+// bubble with a queueId. The helpers below render the queued state
+// and drain the queue once connectivity is restored.
+
+function markBubbleQueued(wrap) {
+  // Reuses the same .typing span the pending bubble normally shows so
+  // styling stays consistent (muted italic). Adds a .queued class on
+  // the bubble itself so a future stylesheet tweak could distinguish
+  // them without restructuring the DOM.
+  const bubble = wrap.querySelector('.bubble');
+  if (!bubble) return;
+  bubble.classList.add('queued');
+  bubble.innerHTML = '<span class="typing">queued — will send when online</span>';
+}
+
+let drainInFlight = false;
+async function drainQueue() {
+  if (drainInFlight) return;
+  if (!navigator.onLine) return;
+  drainInFlight = true;
+  try {
+    let entries;
+    try { entries = await offlineQueue.list(); }
+    catch (_e) { return; }  // IDB unavailable; nothing we can do here
+    if (!entries.length) return;
+    // Oldest first so the user sees their sends drained in submit
+    // order. getAll() doesn't guarantee insertion order across
+    // browsers — sort explicitly.
+    entries.sort((a, b) => (a.enqueued_at || 0) - (b.enqueued_at || 0));
+    for (const entry of entries) {
+      let typing = document.querySelector(
+        `[data-queue-id="${entry.id}"]`,
+      );
+      // Bubble missing → either (a) we reloaded since enqueuing, or
+      // (b) the user is looking at a different conversation. In case
+      // (a) re-create the optimistic DOM if we're currently in the
+      // matching conv; in case (b) skip this entry until they
+      // navigate back (next openConversation triggers drainQueue
+      // again).
+      if (!typing) {
+        if (state.currentId !== entry.conversation_id) continue;
+        const pane = document.getElementById('chat-pane');
+        const empty = document.getElementById('empty-state');
+        if (empty) empty.remove();
+        pane.appendChild(messageEl('user', entry.payload.prompt));
+        typing = messageEl('assistant', '', {
+          status: 'pending',
+          pending_kind: entry.payload.tool || 'chat',
+        });
+        typing.dataset.queueId = entry.id;
+        markBubbleQueued(typing);
+        pane.appendChild(typing);
+        pane.scrollTop = pane.scrollHeight;
+      }
+      let gr;
+      try {
+        gr = await fetch('/api/generate', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(entry.payload),
+        });
+      } catch (_netErr) {
+        // Still offline — leave this entry (and any after it) in the
+        // queue for the next drain. Don't process the rest; if the
+        // network just dropped again, hammering it is pointless.
+        return;
+      }
+      if (gr.status === 401) {
+        // Session expired between enqueue and drain. Surface as an
+        // error bubble so the user understands the prompt didn't go
+        // through; remove from queue (no amount of retrying fixes a
+        // missing session).
+        const bubble = typing.querySelector('.bubble');
+        bubble.classList.remove('queued');
+        bubble.classList.add('error');
+        bubble.textContent = 'Session expired — please reload and sign in.';
+        await offlineQueue.remove(entry.id).catch(() => {});
+        continue;
+      }
+      if (!gr.ok) {
+        // Server-side rejection (deleted conv, quota, validation, …).
+        // Show the detail if there is one and drop the entry.
+        let msg = '';
+        try {
+          const body = await gr.json();
+          msg = (body && typeof body.detail === 'string')
+            ? body.detail
+            : JSON.stringify(body || {});
+        } catch (_e) { try { msg = await gr.text(); } catch { msg = ''; } }
+        const bubble = typing.querySelector('.bubble');
+        bubble.classList.remove('queued');
+        bubble.classList.add('error');
+        bubble.textContent = 'error: ' + gr.status + (msg ? ' ' + msg : '');
+        await offlineQueue.remove(entry.id).catch(() => {});
+        continue;
+      }
+      const {job_id, assistant_message_id} = await gr.json();
+      await offlineQueue.remove(entry.id).catch(() => {});
+      const bubble = typing.querySelector('.bubble');
+      bubble.classList.remove('queued');
+      bubble.innerHTML = '<span class="typing">thinking…</span>';
+      // Fire-and-forget — streamIntoBubble owns its own composer
+      // lock and we want to start the next entry's POST while this
+      // one is streaming (each is independent on the server side).
+      streamIntoBubble(
+        job_id, typing, null, Date.now(), assistant_message_id,
+      );
+    }
+  } finally {
+    drainInFlight = false;
+  }
+}
+
+// Drain triggers, in priority order:
+//   1. SW 'sync' wakeup → postMessage 'drain-queue' (Chrome/Android).
+//   2. Browser 'online' event when connectivity comes back (everyone).
+//   3. Tab regains focus while online (Safari especially — no Sync).
+//   4. Initial page load (run after init() has resolved state.me).
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.addEventListener('message', (e) => {
+    if (e.data && e.data.type === 'drain-queue') drainQueue();
+  });
+}
+window.addEventListener('online', () => drainQueue());
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') drainQueue();
+});
+
 // Bind the image-lightbox click delegate once at startup.
 initImageGallery();
 
@@ -378,3 +563,10 @@ initImageGallery();
 // default) and Android install prompt capture (beforeinstallprompt).
 // No-op everywhere else. See installPrompt.js for the conditions.
 initPWAPrompts();
+
+// Kick off an initial drain so any sends queued from a previous tab
+// session get retried as soon as the user opens the app. Deferred via
+// setTimeout so init() (which is also async-scheduled at module load)
+// has a chance to populate state.me + state.currentId before drain
+// looks at them.
+setTimeout(() => drainQueue(), 0);
