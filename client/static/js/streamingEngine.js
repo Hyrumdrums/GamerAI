@@ -92,6 +92,12 @@ export async function retryMessage(messageId, btn) {
 // when partials arrive faster than this rate the typewriter just
 // matches arrival (no artificial slowdown).
 const TYPEWRITER_CHARS_PER_SECOND = 250;
+// Flip to true to restore the char-by-char reveal. With it off, the
+// bubble repaints to the latest server text on every poll — long
+// replies feel snappier and a refresh mid-stream resumes instantly
+// instead of replaying from char 0. Voice mode keeps the rAF path
+// either way because it gates text on first-audio.
+const TYPEWRITER_ENABLED = false;
 // Stuck-job thresholds: how long to wait with zero progress before
 // surfacing the "this may be taking longer than normal" notice with
 // a Cancel button. Chat normally streams within a second or two so
@@ -375,6 +381,11 @@ export async function streamIntoBubble(jobId, wrap, statusEl, startMs, messageId
 
   function startTypewriter() {
     if (rafId !== null) return;
+    if (!TYPEWRITER_ENABLED && !voice.enabled) {
+      shownChars = target.length;
+      renderShown();
+      return;
+    }
     lastFrameTs = 0;
     rafId = requestAnimationFrame(typewriterTick);
   }
