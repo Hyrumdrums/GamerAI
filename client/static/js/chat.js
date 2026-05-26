@@ -19,6 +19,7 @@ import {
   restoreModeFor,
 } from './composer.js';
 import { initImageGallery } from './imageGallery.js';
+import { initPWAPrompts } from './installPrompt.js';
 
 // ---- bootstrap --------------------------------------------------------
 async function init() {
@@ -372,3 +373,8 @@ document.getElementById('composer').onsubmit = async (e) => {
 
 // Bind the image-lightbox click delegate once at startup.
 initImageGallery();
+
+// PWA banners: push opt-in (when installed + push supported + permission
+// default) and Android install prompt capture (beforeinstallprompt).
+// No-op everywhere else. See installPrompt.js for the conditions.
+initPWAPrompts();

@@ -810,6 +810,54 @@ class WebUISmokeTests(unittest.TestCase):
         self.assertIn("queue_depth", body)
 
     # ------------------------------------------------------------------
+    # /api/notifications/* BFF proxies (Phase 6 of pwa-refactor.txt).
+    # The coordinator-side endpoint logic is covered in
+    # test_notifications.py; here we just confirm the proxy passes the
+    # bearer through and the response shape survives the round-trip.
+    # ------------------------------------------------------------------
+    def test_api_notifications_vapid_key_proxy_is_public(self):
+        # No bearer — vapid-key is public on the coordinator and on
+        # the BFF.
+        resp = self.web.get("/api/notifications/vapid-key")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("key", resp.json())
+
+    def test_api_notifications_subscribe_proxy_round_trips(self):
+        payload = {
+            "endpoint": "https://push.example.com/round-trip-test",
+            "keys": {"p256dh": "p256x", "auth": "authx"},
+        }
+        resp = self.web.post(
+            "/api/notifications/subscribe", json=payload,
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        body = resp.json()
+        self.assertTrue(body["ok"])
+        self.assertIsInstance(body["id"], int)
+
+    def test_api_notifications_list_proxy(self):
+        # Empty list for a member that hasn't received any pushes yet.
+        resp = self.web.get("/api/notifications")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["limit"], 50)
+        self.assertEqual(body["notifications"], [])
+
+    def test_api_notifications_preferences_round_trip(self):
+        # Defaults should come back enabled for every known category.
+        get1 = self.web.get("/api/notifications/preferences").json()
+        self.assertTrue(all(v for v in get1["preferences"].values()))
+        # Flip image_done off; read back and confirm.
+        put = self.web.put(
+            "/api/notifications/preferences",
+            json={"preferences": {"image_done": False}},
+        )
+        self.assertEqual(put.status_code, 200)
+        get2 = self.web.get("/api/notifications/preferences").json()
+        self.assertFalse(get2["preferences"]["image_done"])
+        self.assertTrue(get2["preferences"]["system"])  # untouched
+
+    # ------------------------------------------------------------------
     # tier UX — the Contribution status card + the invite form's
     # tier-allowance hint + forget-worker round-trip.
     # ------------------------------------------------------------------

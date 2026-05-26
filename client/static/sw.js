@@ -24,7 +24,7 @@
 // every path on the origin even though the source file lives under
 // /static/sw.js.
 
-const CACHE_VERSION = 'v1';
+const CACHE_VERSION = 'v2';
 const SHELL_CACHE = `gamerai-shell-${CACHE_VERSION}`;
 const RUNTIME_CACHE = `gamerai-runtime-${CACHE_VERSION}`;
 
@@ -44,6 +44,8 @@ const SHELL_ASSETS = [
   '/static/js/streamingEngine.js',
   '/static/js/composer.js',
   '/static/js/imageGallery.js',
+  '/static/js/notifications.js',
+  '/static/js/installPrompt.js',
   '/static/manifest.webmanifest',
   '/static/icons/icon-192.png',
   '/static/icons/icon-512.png',
@@ -136,5 +138,67 @@ self.addEventListener('fetch', (event) => {
       // failure mode (and DOMPurify / marked would behave oddly).
       throw _e;
     }
+  })());
+});
+
+// ---- push (Phase 6 of pwa-refactor.txt) ------------------------------
+// The browser delivers a 'push' event when the OS-level Push service
+// hands off a payload encrypted with the subscription's VAPID keys.
+// Chrome requires every push to show a notification (userVisibleOnly:
+// true was set at subscribe time), so we always call showNotification
+// even if the payload is empty.
+//
+// The payload shape matches what coordinator/notifications.send_to_member
+// sends: { title, body, tag, data: { url?, conversation_id?, ... } }.
+
+self.addEventListener('push', (event) => {
+  let payload = {};
+  if (event.data) {
+    try { payload = event.data.json(); }
+    catch (_e) {
+      try { payload = { title: 'GamerAI', body: event.data.text() }; }
+      catch (_e2) { payload = { title: 'GamerAI', body: '' }; }
+    }
+  }
+  const title = payload.title || 'GamerAI';
+  const opts = {
+    body: payload.body || '',
+    // `tag` collapses duplicates — a second "image done" push replaces
+    // the first instead of stacking, so a user who left the app
+    // overnight doesn't wake to a wall of notifications.
+    tag: payload.tag || 'gamerai',
+    data: payload.data || {},
+    icon: '/static/icons/icon-192.png',
+    badge: '/static/icons/icon-192.png',
+    // iOS Safari ignores vibrate; Android honors it. Harmless either way.
+    vibrate: [200, 100, 200],
+  };
+  event.waitUntil(self.registration.showNotification(title, opts));
+});
+
+// When the user taps the notification, focus an existing tab on the
+// linked URL, or open a new window if none is open. data.url comes
+// from the coordinator's notification payload (e.g. /?conv=abc123).
+//
+// Security: validate data.url starts with '/' before navigating —
+// otherwise this is an open-redirect (PWA_REFERENCE §3 + §14).
+self.addEventListener('notificationclick', (event) => {
+  event.notification.close();
+  const raw = (event.notification.data && event.notification.data.url) || '/';
+  const url = (typeof raw === 'string' && raw.startsWith('/')) ? raw : '/';
+  event.waitUntil((async () => {
+    const wins = await clients.matchAll({
+      type: 'window', includeUncontrolled: true,
+    });
+    for (const c of wins) {
+      // Same-origin tab open → focus + navigate. Use includes() rather
+      // than equality so a tab at /account or /dashboard still gets
+      // reused (and navigated to the linked path).
+      if (c.url && c.url.includes(self.location.origin)) {
+        try { await c.navigate(url); } catch (_e) {}
+        return c.focus();
+      }
+    }
+    if (clients.openWindow) return clients.openWindow(url);
   })());
 });

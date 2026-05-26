@@ -152,3 +152,108 @@ async def proxy_retry_message(message_id: str, request: Request):
     if "retry-after" in r.headers:
         headers["Retry-After"] = r.headers["retry-after"]
     return JSONResponse(r.json(), status_code=r.status_code, headers=headers)
+
+
+# ---------- push notifications (Phase 6 of pwa-refactor.txt) ----------
+# Eight BFF proxies sitting in front of coordinator/notifications.py.
+# The VAPID public-key fetch is public (coordinator marks it so too);
+# everything else attaches the session bearer.
+
+@router.get("/notifications/vapid-key")
+async def proxy_vapid_key():
+    """Public — no session required. The coordinator returns
+    ``{key: null}`` when VAPID isn't configured, which the JS uses to
+    skip showing the opt-in banner instead of attempting a doomed
+    subscribe."""
+    async with coordinator_client._public_client() as c:
+        r = await c.get("/notifications/vapid-key", timeout=5)
+    return JSONResponse(r.json(), status_code=r.status_code)
+
+
+@router.post("/notifications/subscribe")
+async def proxy_subscribe(payload: dict, request: Request):
+    bearer = require_session_bearer(request)
+    # Forward the browser's User-Agent so the coordinator can label
+    # which device this subscription belongs to (Chrome on Pixel vs.
+    # Safari on iPhone) — useful for the future "manage devices" view
+    # and harmless if the header is absent.
+    ua = request.headers.get("user-agent")
+    headers = {"User-Agent": ua} if ua else None
+    async with coordinator_client._client(bearer=bearer) as c:
+        r = await c.post(
+            "/notifications/subscribe",
+            json=payload, headers=headers, timeout=10,
+        )
+    return JSONResponse(r.json(), status_code=r.status_code)
+
+
+@router.delete("/notifications/subscribe")
+async def proxy_unsubscribe(payload: dict, request: Request):
+    bearer = require_session_bearer(request)
+    async with coordinator_client._client(bearer=bearer) as c:
+        r = await c.request(
+            "DELETE", "/notifications/subscribe",
+            json=payload, timeout=10,
+        )
+    return JSONResponse(r.json(), status_code=r.status_code)
+
+
+@router.get("/notifications")
+async def proxy_list_notifications(
+    request: Request, limit: int = 50, offset: int = 0,
+):
+    bearer = require_session_bearer(request)
+    async with coordinator_client._client(bearer=bearer) as c:
+        r = await c.get(
+            "/notifications",
+            params={"limit": limit, "offset": offset},
+            timeout=10,
+        )
+    return JSONResponse(r.json(), status_code=r.status_code)
+
+
+@router.get("/notifications/unread-count")
+async def proxy_unread_count(request: Request):
+    bearer = require_session_bearer(request)
+    async with coordinator_client._client(bearer=bearer) as c:
+        r = await c.get("/notifications/unread-count", timeout=5)
+    return JSONResponse(r.json(), status_code=r.status_code)
+
+
+@router.put("/notifications/read-all")
+async def proxy_mark_all_read(request: Request):
+    # NOTE: registered before /{id}/read so FastAPI doesn't capture
+    # 'read-all' as a notification_id. Matches the ordering in
+    # coordinator/notifications.py.
+    bearer = require_session_bearer(request)
+    async with coordinator_client._client(bearer=bearer) as c:
+        r = await c.put("/notifications/read-all", timeout=5)
+    return JSONResponse(r.json(), status_code=r.status_code)
+
+
+@router.put("/notifications/{notification_id}/read")
+async def proxy_mark_read(notification_id: str, request: Request):
+    bearer = require_session_bearer(request)
+    async with coordinator_client._client(bearer=bearer) as c:
+        r = await c.put(
+            f"/notifications/{notification_id}/read", timeout=5,
+        )
+    return JSONResponse(r.json(), status_code=r.status_code)
+
+
+@router.get("/notifications/preferences")
+async def proxy_get_preferences(request: Request):
+    bearer = require_session_bearer(request)
+    async with coordinator_client._client(bearer=bearer) as c:
+        r = await c.get("/notifications/preferences", timeout=5)
+    return JSONResponse(r.json(), status_code=r.status_code)
+
+
+@router.put("/notifications/preferences")
+async def proxy_put_preferences(payload: dict, request: Request):
+    bearer = require_session_bearer(request)
+    async with coordinator_client._client(bearer=bearer) as c:
+        r = await c.put(
+            "/notifications/preferences", json=payload, timeout=5,
+        )
+    return JSONResponse(r.json(), status_code=r.status_code)
