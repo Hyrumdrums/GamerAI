@@ -24,6 +24,18 @@ ten minutes for ~$10/month.
   (`shared/auth.py`) requires `Authorization: Bearer <API_TOKEN>` on every
   request except `/health`. Disable by setting `API_TOKEN=` (empty) in
   `.env.prod` and restarting — useful for testing.
+- **Installable PWA** (since `pwa-refactor.txt` Phase 3): manifest +
+  icons + service worker. The site shows an "Add to Home Screen"
+  prompt on Android Chrome / Edge / Samsung; iOS Safari users
+  install via Share → Add to Home Screen.
+- **Offline shell**: the SW precaches the app shell at first visit;
+  navigations fall back to `/offline` when the network is down.
+- **Web Push** (Phase 6): the bootstrap auto-generates a VAPID
+  keypair into `/opt/gamerai/.secrets/`, wires it into `.env.prod`,
+  and the coordinator delivers a push on image / TTS job completion.
+  Members opt in via the banner that appears after install. See
+  the "Push notifications + VAPID" section below for rotation +
+  per-environment specifics.
 - Idempotent re-runs: re-running the bootstrap is safe.
 
 ---
@@ -215,6 +227,94 @@ above and updating each gamer's `windows-agent/config.json`.
 
 ---
 
+## Push notifications + VAPID
+
+Web Push uses **VAPID** (Voluntary Application Server Identification) —
+a per-deployment EC keypair. The browser's Push service uses the
+public half to verify our notifications; the private half stays on
+the coordinator and signs every push.
+
+**On a fresh bootstrap, the keys are generated automatically.** No
+action needed unless something is wrong.
+
+### Where the keys live
+
+```
+/opt/gamerai/.secrets/                  (chmod 700, gitignored)
+├── vapid_private.pem               chmod 600, never leaves the host
+├── vapid_public.pem                public PEM (same key as below, PEM-encoded)
+└── application_server_key.txt      base64url public key (= VAPID_PUBLIC_KEY)
+```
+
+`docker-compose.yml` bind-mounts `./.secrets` into the coordinator
+container at `/secrets:ro`, and `.env.prod` carries the matching
+env vars:
+
+```
+VAPID_PUBLIC_KEY=<contents of application_server_key.txt>
+VAPID_PRIVATE_KEY_PATH=/secrets/vapid_private.pem   # path INSIDE the container
+VAPID_SUBJECT=mailto:<your --email from bootstrap>
+```
+
+### Verifying push is armed
+
+```bash
+curl https://<your-domain>/api/notifications/vapid-key
+# expected: {"key":"BX...64-ish-base64url-chars..."}
+```
+
+If the response is `{"key":null}`, push delivery is disabled — either
+the env vars aren't set, or the coordinator can't read the PEM file.
+Coordinator logs print a one-shot warning at startup
+(`grep VAPID_PRIVATE_KEY_PATH` in `docker logs gamerai-coordinator`).
+Even when push is disabled, the coordinator still persists an in-app
+notifications row on every trigger; nothing breaks.
+
+### Rotating the keypair
+
+Bumping VAPID **invalidates every existing browser subscription** —
+all installed PWAs lose push until each user re-subscribes from the
+banner. Do this only when the private key has been compromised, or
+when intentionally cycling.
+
+```bash
+ssh root@<your-domain>
+cd /opt/gamerai
+# 1. nuke the old keypair
+rm .secrets/vapid_private.pem .secrets/vapid_public.pem \
+   .secrets/application_server_key.txt
+# 2. regenerate (the bootstrap-script step, in one line)
+docker run --rm -v /opt/gamerai/.secrets:/work -w /work \
+  --entrypoint vapid gamerai-coordinator:latest \
+  --gen --applicationServerKey > /tmp/v.out 2>&1
+mv .secrets/private_key.pem .secrets/vapid_private.pem
+mv .secrets/public_key.pem  .secrets/vapid_public.pem
+grep "Application Server Key" /tmp/v.out | sed 's/^.*= //' \
+  > .secrets/application_server_key.txt
+chmod 600 .secrets/vapid_private.pem
+rm /tmp/v.out
+# 3. swap the public key in .env.prod
+NEW=$(cat .secrets/application_server_key.txt)
+sed -i "s|^VAPID_PUBLIC_KEY=.*|VAPID_PUBLIC_KEY=$NEW|" .env.prod
+# 4. recreate the coordinator container
+docker compose --env-file .env.prod -f docker-compose.yml \
+  -f infra/docker-compose.prod.yml up -d --no-deps coordinator
+# 5. (optional) clear any dead subscriptions — the next push attempt
+# will delete each one on 404/410 automatically, but you can also
+# truncate the table directly:
+docker exec gamerai-coordinator sqlite3 /data/gamerai.db \
+  'DELETE FROM push_subscriptions;'
+```
+
+### Separate keys per environment
+
+Dev (your laptop) and prod (the VPS) **must use different keypairs**.
+A dev mistake hitting prod subscribers would surface as cross-env
+push noise. The local dev keypair lives under your repo's `.secrets/`
+(also gitignored); the bootstrap on each VPS generates its own.
+
+---
+
 ## Common ops
 
 ```bash
@@ -257,8 +357,16 @@ of Caddy.
 
 | file                       | purpose                                                |
 | -------------------------- | ------------------------------------------------------ |
-| `bootstrap.sh`             | one-shot VPS installer (run as root, idempotent)       |
+| `bootstrap.sh`             | one-shot VPS installer (run as root, idempotent). Generates VAPID on first run. |
 | `deploy.sh`                | re-pull + rebuild after a code change                  |
-| `Caddyfile`                | TLS reverse proxy (auth lives in the coordinator)      |
+| `Caddyfile`                | TLS reverse proxy (auth lives in the coordinator). Routes `/sw.js`, `/offline`, `/api/*`, `/static/*` to the client container. |
 | `docker-compose.prod.yml`  | overlay: adds Caddy, restricts internal ports          |
 | `README.md`                | this file                                              |
+
+## Per-host state files (created at runtime, NOT in this repo)
+
+| path                                | purpose                                                       |
+| ----------------------------------- | ------------------------------------------------------------- |
+| `/opt/gamerai/.env.prod`            | `API_TOKEN`, `DOMAIN`, `EMAIL`, `VAPID_*`. chmod 600.        |
+| `/opt/gamerai/.secrets/`            | VAPID PEMs + Application Server Key. chmod 700.              |
+| `/opt/gamerai/data/`                | SQLite ledger (`gamerai.db`), generated images. Back up.     |

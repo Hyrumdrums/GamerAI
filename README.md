@@ -162,6 +162,35 @@ Nothing in the architecture assumes a single host beyond the default
 The coordinator is the only writer to SQLite. Workers go through the
 coordinator's `/jobs/claim` and `/jobs/complete` endpoints.
 
+### Client = Progressive Web App
+
+The chat UI ships as an installable PWA — manifest, icons, head tags
+on every page (`client/templates/base.html.j2`), and a hand-rolled
+service worker (`client/static/sw.js`) registered from root scope.
+
+- **Install**: Android Chrome / Edge / Samsung fire the auto install
+  prompt; iOS Safari 16.4+ uses Share → Add to Home Screen. The
+  client JS captures `beforeinstallprompt` and shows a banner on
+  Android; iOS gets a manual-instructions banner.
+- **Offline shell**: the SW precaches every CSS, JS module, icon, and
+  the offline fallback template at install. Navigations to uncached
+  paths render `/offline` when the network is down.
+- **Push notifications**: members opt in via a second banner shown
+  only after install (per `PWA_REFERENCE.md` §8 — iOS requires it).
+  The coordinator delivers a push on image / TTS job completion via
+  `coordinator/notifications.send_to_member` → `pywebpush`. Requires
+  a per-deployment VAPID keypair (see `infra/README.md`).
+
+The JS is split into focused ES modules in `client/static/js/`:
+`state.js` (shared mutable state), `readAloud.js` (TTS),
+`messageRenderer.js` (DOM), `streamingEngine.js` (polling +
+typewriter + retry), `composer.js` (tool toggles), `imageGallery.js`
+(lightbox), `notifications.js` (Web Push subscribe hook),
+`installPrompt.js` (PWA detection + banners), and `chat.js`
+(orchestrator). `chat.html.j2` loads `chat.js` as `type="module"`;
+the SW versions all of them together via a single `CACHE_VERSION`
+constant that operators bump per release.
+
 ### Scheduler
 
 Jobs are pulled (`BLPOP`) by workers — but workers only poll while their local

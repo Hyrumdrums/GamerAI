@@ -174,6 +174,63 @@ docker compose \
   "${PROFILE_ARGS[@]}" \
   up -d --build
 
+# ---------- 6b. VAPID keys (Phase 6 of pwa-refactor.txt) ----------
+# Web Push needs a per-deployment EC keypair. Without it, push
+# subscriptions still record but no actual browser notifications are
+# delivered. We generate once at first bootstrap and leave the keys
+# alone on subsequent runs — rotating invalidates every existing
+# subscription, which is a deliberate operator action (see docs/OPERATOR.md).
+SECRETS_DIR="$INSTALL_DIR/.secrets"
+mkdir -p "$SECRETS_DIR"
+chmod 700 "$SECRETS_DIR"
+if [[ ! -f "$SECRETS_DIR/vapid_private.pem" ]]; then
+  log "generating VAPID keypair (one-time)..."
+  # `vapid --gen` writes private_key.pem + public_key.pem into the
+  # CWD inside the container, then prints the base64url public key
+  # ("Application Server Key") to stdout. The coordinator image
+  # already has pywebpush + the `vapid` CLI; reusing it avoids
+  # installing py-vapid on the host.
+  docker run --rm \
+    -v "$SECRETS_DIR:/work" \
+    -w /work \
+    --entrypoint vapid \
+    gamerai-coordinator:latest --gen --applicationServerKey \
+    > /tmp/vapid.out 2>&1
+  mv "$SECRETS_DIR/private_key.pem" "$SECRETS_DIR/vapid_private.pem"
+  mv "$SECRETS_DIR/public_key.pem"  "$SECRETS_DIR/vapid_public.pem"
+  grep "Application Server Key" /tmp/vapid.out | sed 's/^.*= //' \
+    > "$SECRETS_DIR/application_server_key.txt"
+  chmod 600 "$SECRETS_DIR/vapid_private.pem"
+  rm /tmp/vapid.out
+fi
+
+# Append VAPID env to .env.prod if not already configured. Subject
+# defaults to the operator's --email so the Push service has a real
+# contact channel if our notifications start misbehaving.
+if ! grep -q '^VAPID_PUBLIC_KEY=' "$ENV_FILE"; then
+  log "wiring VAPID into $ENV_FILE..."
+  PUBKEY=$(cat "$SECRETS_DIR/application_server_key.txt")
+  cat >> "$ENV_FILE" <<EOF
+
+# ---------- VAPID (Phase 6 of pwa-refactor.txt) ----------
+# Public Application Server Key, served at /notifications/vapid-key.
+VAPID_PUBLIC_KEY=$PUBKEY
+# Path resolved INSIDE the coordinator container; ./.secrets is bind-
+# mounted to /secrets:ro by docker-compose.yml.
+VAPID_PRIVATE_KEY_PATH=/secrets/vapid_private.pem
+VAPID_SUBJECT=mailto:$EMAIL
+EOF
+  # Recreate just the coordinator container so it picks up the new env
+  # vars (we built + started above without them, so push was a no-op
+  # for the first ~30s of life).
+  log "restarting coordinator with VAPID enabled..."
+  docker compose \
+    --env-file "$ENV_FILE" \
+    -f docker-compose.yml \
+    -f infra/docker-compose.prod.yml \
+    up -d --no-deps coordinator >/dev/null
+fi
+
 # ---------- 7. summary ----------
 TOKEN=$(grep '^API_TOKEN=' "$ENV_FILE" | cut -d= -f2-)
 echo
@@ -194,4 +251,10 @@ echo
 echo "  NOTE: bearer auth is ON (API_TOKEN set in .env.prod)."
 echo "        Workers/agents must send 'Authorization: Bearer <token>'"
 echo "        — see infra/README.md for client config."
+echo
+echo "  PWA + Push:       Service worker, manifest, and push delivery are"
+echo "                    live by default. The VAPID keypair lives in"
+echo "                    $INSTALL_DIR/.secrets/ (gitignored, chmod 600)."
+echo "                    Public key is also in .env.prod for reference."
+echo "                    To rotate, see docs/OPERATOR.md \"§ Push notifications\"."
 echo "============================================================"

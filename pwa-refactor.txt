@@ -377,21 +377,31 @@ Mapping from PWA_REFERENCE (React/Express/Postgres) → our stack
 [x] 6.11 Trigger decision: image_done + voice_done (commit cb0ca5c).
         Chat skipped — streams visibly, would be noise. Future
         candidates documented in TODO below.
-[ ] 6.12 USER ACTION — Generate VAPID keys + set env (BEFORE deploy):
-          python -c "from py_vapid import Vapid; v=Vapid(); v.generate_keys();
-          import base64; print('public:', base64.urlsafe_b64encode(v.public_key.public_bytes(
-              __import__('cryptography.hazmat.primitives.serialization',
-                fromlist=['Encoding']).Encoding.X962,
-              __import__('cryptography.hazmat.primitives.serialization',
-                fromlist=['PublicFormat']).PublicFormat.UncompressedPoint
-          )).decode('utf-8').rstrip('='))
-          print('private:', base64.urlsafe_b64encode(v.private_key.private_numbers().private_value.to_bytes(32, 'big')).decode('utf-8').rstrip('='))"
-        Then set in coordinator env (docker-compose.yml or .env.prod):
-          VAPID_PUBLIC_KEY=<public>
-          VAPID_PRIVATE_KEY=<private>
-          VAPID_SUBJECT=mailto:admin@dallinlayton.com
-        Without these, send_to_member persists the in-app row and
-        returns 0 — push gracefully no-ops.
+[x] 6.12 VAPID key generation:
+        - FRESH SERVERS: infra/bootstrap.sh §6b auto-generates the
+          keypair into /opt/gamerai/.secrets/ and wires VAPID_* into
+          .env.prod on first run. Zero manual action.
+        - EXISTING SERVERS that pre-date Phase 6: run the same recipe
+          by hand. Full copy-paste in infra/README.md "Push notifications
+          + VAPID". Performed on ai.dallinlayton.com on 2026-05-25.
+        - LOCAL DEV: .secrets/ and .env are gitignored. To enable push
+          locally, run:
+            mkdir -p .secrets
+            docker compose build coordinator   # ensure the image exists
+            docker run --rm -v $PWD/.secrets:/work -w /work \
+              --entrypoint vapid gamerai-coordinator:latest \
+              --gen --applicationServerKey > /tmp/v.out 2>&1
+            mv .secrets/private_key.pem .secrets/vapid_private.pem
+            mv .secrets/public_key.pem  .secrets/vapid_public.pem
+            grep "Application Server Key" /tmp/v.out | sed 's/^.*= //' \
+              > .secrets/application_server_key.txt
+            chmod 600 .secrets/vapid_private.pem && rm /tmp/v.out
+          Then create .env (gitignored) with:
+            VAPID_PUBLIC_KEY=<contents of application_server_key.txt>
+            VAPID_PRIVATE_KEY_PATH=/secrets/vapid_private.pem
+            VAPID_SUBJECT=mailto:you@yourdomain.com
+        Coordinator without VAPID configured: send_to_member persists
+        the in-app row and returns 0 — push gracefully no-ops.
 [ ] 6.13 USER ACTION — Real-device test (PWA_REFERENCE §14:
         "the simulator lies"):
         - iPhone Safari 16.4+: Share → Add to Home Screen FIRST

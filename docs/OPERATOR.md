@@ -346,6 +346,99 @@ Until then: `du -sh /opt/gamerai/data/images/` is the canary.
 
 ---
 
+## 6.6 PWA + Push notifications
+
+Since `pwa-refactor.txt` Phase 3/4/6, the web client is an installable
+Progressive Web App with an offline shell and Web Push delivery on
+image / TTS job completion.
+
+### What an installed user gets
+- App icon on their home screen (manifest at `/static/manifest.webmanifest`).
+- App-shell renders offline (`client/static/sw.js` precaches everything
+  needed and falls back to `/offline` for navigations the cache misses).
+- Push notification when an image / TTS job they submitted completes
+  (in-app `notifications` row always; browser push only if they
+  granted permission AND VAPID is configured on the coordinator).
+
+### Where the VAPID keypair lives on prod
+
+```
+/opt/gamerai/.secrets/                   chmod 700, gitignored
+├── vapid_private.pem                chmod 600 — never read by hand
+├── vapid_public.pem                 PEM form of the public key
+└── application_server_key.txt       base64url public key (= VAPID_PUBLIC_KEY env)
+```
+
+`docker-compose.yml` bind-mounts `./.secrets` → `/secrets:ro` inside
+the coordinator. `.env.prod` carries:
+
+```
+VAPID_PUBLIC_KEY=<copied from application_server_key.txt>
+VAPID_PRIVATE_KEY_PATH=/secrets/vapid_private.pem  (container path)
+VAPID_SUBJECT=mailto:hyrumdrums@gmail.com
+```
+
+`infra/bootstrap.sh` generates this whole tree automatically on first
+run, so a brand-new VPS bootstraps with push delivery live. Existing
+servers that pre-date Phase 6 need a one-time backfill — same recipe
+as bootstrap.sh §6b, or see `infra/README.md` "Push notifications +
+VAPID" for a copy-paste.
+
+### Verifying push is armed
+
+```bash
+curl https://ai.dallinlayton.com/api/notifications/vapid-key
+# expected: {"key":"BX..."} (~88 base64url chars)
+# {"key":null} means push is disabled — check coordinator logs:
+ssh root@ai.dallinlayton.com 'docker logs gamerai-coordinator 2>&1 | grep -i vapid'
+```
+
+### Rotating the keypair
+
+**This invalidates every existing browser subscription** — installed
+PWAs all lose push until each user re-subscribes from the banner.
+Only do this if the private key has leaked, or you're intentionally
+cycling. Full recipe in `infra/README.md` "Push notifications +
+VAPID → Rotating the keypair".
+
+### Notification triggers (what fires a push)
+
+Today, two events:
+- `image_done` — `coordinator/main.py:/jobs/complete` fires this after
+  a successful image job, with the submitter as the recipient.
+- `voice_done` — same handler, for TTS jobs.
+
+Chat completions deliberately don't push (they stream visibly).
+Members can opt out per category via `PUT /notifications/preferences`.
+
+### Service worker versioning
+
+`client/static/sw.js` has a `CACHE_VERSION` constant (currently
+`'v2'`). **Bump it on any deploy that changes a precached asset**
+(any CSS, vendored JS, or `client/static/js/*.js` change). Without
+the bump, returning users keep serving the old cached assets even
+after the new SW installs. `git diff origin/main -- 'client/static/**'`
+is the canary — if any file in there changed, bump the version.
+
+The new SW takes over on the next page load via `skipWaiting()` +
+`clients.claim()`. The old shell cache is dropped in the `activate`
+handler.
+
+### Per-user data
+
+Push subscriptions and notification preferences are member-scoped:
+
+| table                       | what                                                |
+| --------------------------- | --------------------------------------------------- |
+| `push_subscriptions`        | one row per (member_id, browser/device endpoint)    |
+| `notifications`             | persistent in-app row for every send (read/pushed)  |
+| `notification_preferences`  | per-category opt-out (default = enabled)            |
+
+Schema in `coordinator/db.py` `_SCHEMA`; CRUD methods in the same
+file; endpoints in `coordinator/notifications.py`.
+
+---
+
 ## 7. Things deferred (intentionally not in this doc / repo yet)
 
 - **"+ Invite a friend" button on `/dashboard`.** Form: email, daily-quota

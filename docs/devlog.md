@@ -5,6 +5,162 @@ entries on top. Skim for context before resuming work.
 
 ---
 
+## 2026-05-25 — PWA shell + service worker + Web Push (pwa-refactor.txt Phases 1/3/4/6)
+
+Twelve-commit arc that turned the web client into an installable
+Progressive Web App with an offline shell and Web Push notifications
+on long-running tool completion. Drove from an architecture review
+that flagged `chat.js` (1437 LOC) as the biggest blocker to anything
+PWA-shaped — a service worker can't cleanly cache or version a
+monolith every UI concern touches.
+
+### What shipped
+
+- **Phase 1 — `chat.js` split.** 1437 LOC → 7 focused ES modules
+  under `client/static/js/`: `state.js`, `readAloud.js`,
+  `messageRenderer.js`, `streamingEngine.js`, `composer.js`,
+  `imageGallery.js`, `chat.js` (orchestrator). `chat.html.j2`
+  now loads `chat.js` with `type="module"`. Renderer ↔ streaming
+  engine are a deliberate circular import — safe because every
+  cross-module reference is inside a function body, never at
+  module-evaluation time. The `test_chat_ui_sanitizes_assistant_markdown`
+  smoke test walks the import graph instead of hard-coding the
+  file path so it stays robust through future splits.
+- **Phase 3 — install shell.** `client/static/manifest.webmanifest`
+  + five icons in `client/static/icons/` (generator at
+  `tools/make_icons.py` — pure stdlib `zlib` + `struct`, no Pillow)
+  + iOS/Android head tags on every page via `base.html.j2`. iOS
+  needs the full apple-mobile-web-app-* trio per `PWA_REFERENCE.md` §2,
+  including format-detection to stop Safari auto-linking phone
+  numbers in chat output.
+- **Phase 4 — service worker.** `client/static/sw.js` is hand-rolled
+  (no Workbox — no build step in this stack), served from `/sw.js`
+  (root) via a FastAPI route in `client/app.py` with
+  `Service-Worker-Allowed: /` so root scope works despite the file
+  living under `/static/`. Three fetch strategies: passthrough for
+  `/api/*` and cross-origin; network-first → cache → `/offline` for
+  navigations; cache-first for static assets. `CACHE_VERSION`
+  constant must be bumped on every release that touches a precached
+  asset.
+- **Phase 6 — push notifications.** Three SQLite tables
+  (`push_subscriptions`, `notifications`, `notification_preferences`),
+  eight endpoints in `coordinator/notifications.py` (mapped from
+  `PWA_REFERENCE.md` §7 Express → FastAPI), `pywebpush` for delivery.
+  Client-side: `notifications.js` (subscribe hook),
+  `installPrompt.js` (PWA detection + opt-in banner — only shown
+  when running standalone, per `PWA_REFERENCE.md` §8 iOS rules),
+  `sw.js` push + notificationclick handlers (URL whitelisted to
+  `/` prefix, open-redirect guard). First trigger wired: image and
+  TTS job completion fire from `/jobs/complete`. Chat completions
+  deliberately don't push (they stream visibly — would be noise).
+
+### VAPID + deployment
+
+Per-deployment EC keypair lives in `/opt/gamerai/.secrets/` (chmod
+700, gitignored), bind-mounted into the coordinator at `/secrets:ro`.
+Three approaches were considered for the private key: raw env var
+(awkward multi-line PEM), env var pointing at file path (winner),
+file-only with hardcoded path (too rigid). Final shape: both
+`VAPID_PRIVATE_KEY` and `VAPID_PRIVATE_KEY_PATH` are accepted; the
+file path is what `bootstrap.sh` and prod use.
+
+`infra/bootstrap.sh` §6b now auto-generates the keypair on first
+run via a one-off `docker run` against the coordinator image (which
+has `pywebpush` + the `vapid` CLI installed). Subsequent re-runs
+of bootstrap are idempotent — the existing key is left alone.
+Rotation is intentionally manual because it invalidates every live
+browser subscription (see `infra/README.md` "Push notifications +
+VAPID → Rotating the keypair").
+
+ai.dallinlayton.com was bootstrapped before §6b existed, so the
+backfill ran by hand: `docker run --rm` against the coordinator
+image, mounted RW at `.secrets/`, then appended VAPID env vars to
+`.env.prod` and recreated just the coordinator container.
+
+### Post-deploy hotfix
+
+`/sw.js` and `/offline` (both new client routes) fell through to
+Caddy's catch-all that proxies to the coordinator, which returned
+401 from the auth middleware. Fixed with two new `path` matchers
+in `infra/Caddyfile`. `deploy.sh` restarts Caddy unconditionally
+on every redeploy (the Caddyfile is bind-mounted as a file, not a
+directory, so the orphaned-inode problem requires the restart) —
+no separate process for Caddyfile-only updates.
+
+### Tests
+
+- 23 new tests in `tests/test_notifications.py` covering the
+  endpoints, send_to_member opt-out + dead-subscription cleanup,
+  and the /jobs/complete trigger for image/voice (with negative
+  cases for chat-only and error completions).
+- 4 new tests in `tests/test_web_ui_smoke.py` for the BFF proxies.
+- Whole suite: 440/440 pass.
+- Per-test-file isolation pattern intact, but combining specific
+  pairs of test files in one `python -m unittest` invocation
+  surfaces a pre-existing env-leak (auth state leaking from one
+  module's setUp into another). CI runs `discover` which doesn't
+  hit the bug. Worth tracking as a cleanup later — for now,
+  per-file invocations during development are the workaround.
+
+### What's still pending
+
+`pwa-refactor.txt` Phases 2 (api_client facade) and 5 (queued
+sends via Background Sync) didn't ship in this arc. Phase 5 was
+the obvious extension of Phase 4 but touches the hot composer-submit
+path, so it's deferred until Phase 1 has bake-in time. The full
+Phase 7 (god-file splits of `coordinator/main.py`, `coordinator/db.py`,
+`windows-agent/agent.py` + asymmetric idempotency fix + regex DoS
+guard + atomic conversation delete + CSRF + worker unit tests) is
+also pending — that's the broader backend cleanup, independent of
+PWA work, that the original review surfaced.
+
+### Files touched
+
+```
+README.md                                  (PWA section in §4)
+docs/devlog.md                             (this entry)
+docs/OPERATOR.md                           (new §6.6 PWA + Push)
+infra/README.md                            (PWA + VAPID section)
+infra/bootstrap.sh                         (§6b VAPID auto-gen)
+infra/Caddyfile                            (/sw.js + /offline routes)
+docker-compose.yml                         (VAPID env + .secrets mount)
+.gitignore                                 (.secrets/)
+client/app.py                              (/sw.js route)
+client/routes/api.py                       (9 notification BFF proxies)
+client/routes/chat.py                      (/offline route)
+client/services/coordinator_client.py      (no change — facade is Phase 2)
+client/templates/base.html.j2              (head tags + SW register)
+client/templates/chat.html.j2              (type="module" on chat.js)
+client/templates/offline.html.j2           (new)
+client/static/manifest.webmanifest         (new)
+client/static/sw.js                        (new)
+client/static/css/base.css                 (.pwa-banner)
+client/static/icons/                       (new — 5 placeholder PNGs)
+client/static/js/state.js                  (new)
+client/static/js/readAloud.js              (new)
+client/static/js/messageRenderer.js        (new)
+client/static/js/streamingEngine.js        (new)
+client/static/js/composer.js               (new)
+client/static/js/imageGallery.js           (new)
+client/static/js/notifications.js          (new)
+client/static/js/installPrompt.js          (new)
+client/static/js/chat.js                   (rewrote as orchestrator)
+coordinator/db.py                          (3 new tables + CRUD)
+coordinator/main.py                        (push trigger in /jobs/complete)
+coordinator/notifications.py               (new — send + 8 endpoints)
+coordinator/requirements.txt               (pywebpush)
+pwa-refactor.txt                           (new — phase checklist)
+PWA_REFERENCE.md                           (new — user-provided spec)
+tools/make_icons.py                        (new — stdlib PNG generator)
+tests/test_notifications.py                (new)
+tests/test_web_ui_smoke.py                 (DOMPurify check + 4 proxy tests)
+```
+
+Commits: `5453afa`, `101449b`, `c0ca395`, `cd23deb`, `dafa6da`,
+`4409b45`, `cb0ca5c`, `1c7e11a`, `6be236e`, `524f26a`.
+
+---
+
 ## 2026-05-21 — Image generation end-to-end + auto-update hardening (v1.1.0 → v1.1.6)
 
 Two-day arc that shipped Phase 3a's multi-tool foundation: image

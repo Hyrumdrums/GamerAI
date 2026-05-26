@@ -257,19 +257,31 @@ history on whichever workstation typed the command. Pairs naturally
 with the GHCR migration above — same direction, just covers the
 *invocation* side as well as the *source* side.
 
-### 🟢 No persistent client-side cache (offline / reload-resilience)
+### 🟢 No persistent client-side cache for *conversation history* (offline read)
 
 The chat UI keeps an in-memory `Map` of loaded conversation messages
 so switching back and forth between threads in the same tab is
 instant. **Page refresh wipes it** — every new tab pays one
 `/api/conversations` + one `/api/conversations/<id>` round trip
-before any text appears. Two things this *doesn't* give us:
+before any text appears.
 
-- **Reload-resilience.** If the coordinator is slow or briefly
-  unreachable, the user sees a blank UI even though their history
-  exists on disk in their browser nowhere.
-- **Offline read.** A user on a flaky train connection can't review
-  a past conversation while the network is dropping.
+**Status (2026-05-25):** PWA shell-cache is now LIVE — see
+`pwa-refactor.txt` Phases 3 + 4. The service worker
+(`client/static/sw.js`) precaches all CSS / JS / icons / fonts /
+the offline fallback at install; navigations to uncached pages
+render `/offline` when the network is down. So the **app shell**
+opens offline. What still doesn't is the *conversation data* —
+nothing's in IndexedDB yet, so an offline user opening the app
+sees the shell but no past messages.
+
+Two things still missing:
+
+- **Reload-resilience.** A slow coordinator still leaves history
+  blank on first paint (the shell loads from cache; the
+  `/api/conversations` round-trip is still gated on a live
+  network).
+- **Offline read of past conversations.** Past prompts/responses
+  aren't cached anywhere durable.
 
 **Fix candidates (in order of cost):**
 
@@ -285,10 +297,12 @@ before any text appears. Two things this *doesn't* give us:
    When the encryption work derives a key from the bearer for
    server-side ciphertext, the same key works for IndexedDB write.
    The user's bearer is the cryptographic gate everywhere. ~2 days
-   on top of the encryption work.
-3. PWA shell (service worker, offline cache, install-to-home-screen).
-   ~3–5 days. Real offline mode. Only worth it after we have real
-   users complaining.
+   on top of the encryption work. **Likely paired with
+   `pwa-refactor.txt` Phase 5** (queued sends via Background Sync) —
+   both need IndexedDB and the queue half is partially blocked on
+   the data-cache decision.
+3. ~~PWA shell~~ — **DONE** (Phases 3+4, commits `101449b`
+   `c0ca395`).
 
 Recommend: bundle #1 and #2 together, ship neither until Phase
 3b.iii lands so the privacy story stays consistent. Decision
