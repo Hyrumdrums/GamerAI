@@ -138,6 +138,7 @@ document.getElementById('new-chat').onclick = () => {
   setConvTokens(0);
   applyHistoryInfo(null);
   state.summary = null;
+  cancelSummaryPoll();
   renderStatsPanel();
   document.getElementById('prompt').focus();
 };
@@ -185,6 +186,50 @@ export function applyHistoryInfo(info) {
   renderStatsPanel();
 }
 
+// Short bounded poll for a fresh rolling summary. The summarizer is
+// an orphan chat job that runs on the same worker pool as the user's
+// reply, so it usually lands within seconds of /generate but no
+// further client event would trigger a refetch on its own. Cleared
+// on conversation switch; bounded at ~60s so a wedged summary job
+// doesn't leak a forever-interval.
+let _summaryPollTimer = null;
+let _summaryPollAttempts = 0;
+let _summaryPollConvId = null;
+function maybePollForSummary(convId) {
+  if (!state.historyInfo) return;
+  if (state.historyInfo.summary_in_use) return;
+  if ((state.historyInfo.messages_dropped | 0) === 0) return;
+  if (_summaryPollTimer && _summaryPollConvId === convId) return;
+  if (_summaryPollTimer) clearTimeout(_summaryPollTimer);
+  _summaryPollAttempts = 0;
+  _summaryPollConvId = convId;
+  const tick = async () => {
+    _summaryPollTimer = null;
+    if (state.currentId !== convId) return;  // user navigated away
+    _summaryPollAttempts += 1;
+    try {
+      const r = await fetch('/api/conversations/' + convId);
+      if (r.ok) {
+        const body = await r.json();
+        const newSummary = body.summary_text || null;
+        if (newSummary && newSummary !== state.summary) {
+          state.summary = newSummary;
+          renderStatsPanel();
+          return;  // got it; stop polling
+        }
+      }
+    } catch (_e) { /* try again on next tick */ }
+    if (_summaryPollAttempts >= 12) return;  // ~60s budget
+    _summaryPollTimer = setTimeout(tick, 5000);
+  };
+  _summaryPollTimer = setTimeout(tick, 3000);
+}
+function cancelSummaryPoll() {
+  if (_summaryPollTimer) { clearTimeout(_summaryPollTimer); _summaryPollTimer = null; }
+  _summaryPollAttempts = 0;
+  _summaryPollConvId = null;
+}
+
 // Wire the stats panel's click → toggle expand/collapse. Idempotent
 // so a hot-reload of chat.js doesn't double-bind. Single document
 // listener via the panel element itself (not a wider delegation)
@@ -201,6 +246,16 @@ export function applyHistoryInfo(info) {
     if (state.statsExpanded && expanded && expanded.contains(e.target)) return;
     state.statsExpanded = !state.statsExpanded;
     renderStatsPanel();
+    // Keep the last message visible after the tray expands. The tray
+    // pushes the composer up and the chat-pane shrinks — without this
+    // the bottom of the chat would slide off-screen. KISS: just jam
+    // scroll to bottom; if the user was reading older history they
+    // can scroll back. (Symmetric collapse doesn't need this — the
+    // pane grows so the same line stays visible naturally.)
+    if (state.statsExpanded) {
+      const pane = document.getElementById('chat-pane');
+      if (pane) pane.scrollTop = pane.scrollHeight;
+    }
   });
 })();
 
@@ -225,6 +280,7 @@ async function openConversation(id) {
   // the next /generate response refills it for the new conversation.
   applyHistoryInfo(null);
   state.summary = null;  // refreshConversation refills if present
+  cancelSummaryPoll();
   renderStatsPanel();
   document.getElementById('submit').disabled = false;
   document.getElementById('prompt').disabled = false;
@@ -501,6 +557,12 @@ document.getElementById('composer').onsubmit = async (e) => {
   const {job_id, assistant_message_id, history_info} = grBody;
   applyHistoryInfo(history_info);
   await streamIntoBubble(job_id, typing, statusEl, start, assistant_message_id);
+  // After the chat reply finishes, the background summarizer the
+  // coordinator fired at /generate time may still be running. Poll
+  // /conversations/{id} on a short backoff to pick up the summary
+  // text — without this the spinner sits forever because no other
+  // event triggers a re-fetch.
+  if (state.currentId) maybePollForSummary(state.currentId);
   textarea.focus();
   // Invalidate this conversation's cache; next openConversation will
   // pull authoritative seq + message_ids from the server. The DOM
