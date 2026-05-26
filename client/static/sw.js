@@ -24,7 +24,10 @@
 // every path on the origin even though the source file lives under
 // /static/sw.js.
 
-const CACHE_VERSION = 'v4';
+// @@CACHE_VERSION@@ is substituted at serve time from
+// shared.config.CLIENT_CACHE_VERSION — the single source of truth that
+// also drives the version chip in the chat header.
+const CACHE_VERSION = '@@CACHE_VERSION@@';
 const SHELL_CACHE = `gamerai-shell-${CACHE_VERSION}`;
 const RUNTIME_CACHE = `gamerai-runtime-${CACHE_VERSION}`;
 

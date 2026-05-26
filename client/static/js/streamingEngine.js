@@ -114,20 +114,13 @@ const STUCK_MS_SEARCH = 120_000;
 // frame at 60fps = 60 cps floor, plenty for readability.
 const TYPEWRITER_MIN_CHARS_PER_FRAME = 1;
 
-// Voice-mode chat: server splits the response into two TTS chunks
-// (first sentence + rest) and ships them with the streaming text. The
-// client suppresses text reveal until first-sentence audio actually
-// plays, then reveals up through the sentence boundary so listener +
-// reader stay in lockstep. Ports the same VOICE_SENTENCE_RE the agent
-// uses on its side so "first sentence" is the same span on both sides.
-const VOICE_SENTENCE_RE = /[.!?]+["')\]]*(?:\s+|$)|\n+/;
-
-function firstSentenceEndIndex(text) {
-  if (!text) return 0;
-  const m = VOICE_SENTENCE_RE.exec(text);
-  if (!m) return 0;
-  return m.index + m[0].length;
-}
+// Voice-mode chat: the server emits N audio chunks (exponentially-
+// batched sentences) as they're synthesized, and ships them on
+// /result.audio_chunks. The client suppresses text reveal until the
+// first chunk actually plays — beyond that, voice mode is no longer
+// karaoke-synced (the audio is one batch ahead of where the eye is
+// usually reading anyway). See the in-function voice block for the
+// per-chunk play queue.
 
 // Poll /api/result/{jobId} and stream the accumulated text into the
 // given message element until the job reaches a terminal state. Owns
@@ -178,87 +171,89 @@ export async function streamIntoBubble(jobId, wrap, statusEl, startMs, messageId
   let finalizeResolver = null;
   const finalizePromise = new Promise(r => { finalizeResolver = r; });
 
-  // Voice-mode pipelining. When the user submitted with voice mode on,
-  // the agent ships first-sentence audio as a partial result alongside
-  // the streaming text and "rest" audio in the final result. We hold
-  // text rendering until first audio actually plays — voice mode is
-  // explicitly the "slower but synchronized" mode, and showing text
-  // ahead of audio breaks the illusion the user opted into. Snapshot
-  // at start so a mid-stream toggle of voiceMode doesn't change this
-  // run's behavior.
+  // Voice-mode chat exponential-batched playback. The agent streams
+  // sentence-batches (1, 2, 4, 8, ...) as they're synthesized; each
+  // lands in res.audio_chunks as {seq, audio_b64, audio_seconds}. The
+  // client maintains its own play queue and reveals text the moment
+  // the first chunk starts playing — voice mode is the "buffered
+  // until audio is ready" contract, not karaoke-synced.
+  const VOICE_LOG_T0 = Date.now();
+  const voiceLog = (msg) => {
+    if (!voice || !voice.enabled) return;
+    const dt = ((Date.now() - VOICE_LOG_T0) / 1000).toFixed(2);
+    // Single namespaced console line so the user can filter the
+    // browser console by "[voice]" and see the full timeline.
+    console.log(`[voice +${dt}s] ${msg}`);
+  };
   const voice = {
     enabled: !!state.voiceMode,
-    firstB64: null,        // base64 audio for sentence 1 (or whole short response)
-    restB64: null,         // base64 audio for the rest, when present
-    firstStarted: false,   // first chunk's <audio> has fired 'play'
-    restStarted: false,
-    revealEndIdx: 0,       // how far text reveal is allowed to advance
-    audioEl: null,         // currently-playing element (so we can stop on cancel)
+    queuedSeqs: new Set(),   // chunks we've enqueued so we never double-play
+    playQueue: [],           // chunks pending playback (FIFO by arrival)
+    playing: false,          // a chunk is currently in flight
+    started: false,          // at least one chunk has fired 'play' — gates DOM paint
+    audioEl: null,           // currently-playing element (for cancel)
+    chunksDoneResolver: null,
+    chunksDonePromise: null,
   };
+  voice.chunksDonePromise = new Promise(r => { voice.chunksDoneResolver = r; });
+  if (voice.enabled) voiceLog('voice mode enabled — buffering text until first audio');
 
   function renderShown() {
     if (state.activeStream !== myToken) return;
     // Voice mode pre-audio: leave the pending "thinking…" placeholder
-    // in place. The first audio's 'play' event lifts revealEndIdx and
-    // re-enters renderShown, at which point the bubble swaps to the
-    // model text.
-    if (voice.enabled && !voice.firstStarted) return;
-    const limit = voice.enabled
-      ? Math.min(shownChars, voice.revealEndIdx)
-      : shownChars;
-    setBubbleContent(bubble, 'assistant', target.substring(0, limit));
+    // in place. The first chunk's 'play' event flips voice.started and
+    // re-enters renderShown.
+    if (voice.enabled && !voice.started) return;
+    setBubbleContent(bubble, 'assistant', target.substring(0, shownChars));
     if (isPinnedToBottom) pane.scrollTop = pane.scrollHeight;
   }
 
-  function playVoiceChunk(b64, which) {
-    // Wraps an HTMLAudioElement around a base64 WAV and resolves when
-    // playback ends (or errors — voice mode degrades to text-only on
-    // any audio failure so the user isn't stranded). 'which' is 'first'
-    // or 'rest' for state book-keeping. The promise resolution drives
-    // the rest-chunk handoff and the final reveal.
+  function playOneChunk(chunk) {
     return new Promise(resolve => {
-      const a = new Audio('data:audio/wav;base64,' + b64);
+      const a = new Audio('data:audio/wav;base64,' + chunk.audio_b64);
       voice.audioEl = a;
-      const done = () => {
+      voiceLog(`chunk ${chunk.seq} loaded (audio_seconds=${(chunk.audio_seconds || 0).toFixed(2)}) — calling play()`);
+      const done = (why) => {
         if (voice.audioEl === a) voice.audioEl = null;
+        voiceLog(`chunk ${chunk.seq} ${why}`);
         resolve();
       };
-      a.onended = done;
-      a.onerror = done;
+      a.onended = () => done('ended');
+      a.onerror = () => done('errored');
       a.onplay = () => {
-        if (which === 'first') {
-          voice.firstStarted = true;
-          // Reveal up through the first sentence boundary in whatever
-          // text has accumulated so far. If the agent's partial hasn't
-          // caught up with the sentence yet (small race), fall back to
-          // revealing everything we have — better to show extra than
-          // to lock the bubble visually.
-          const idx = firstSentenceEndIndex(target);
-          voice.revealEndIdx = idx > 0 ? idx : target.length;
-        } else {
-          voice.restStarted = true;
-          voice.revealEndIdx = target.length;
-        }
+        voice.started = true;
+        // First-chunk play also unlocks text reveal up to whatever has
+        // streamed in so far. Later chunks bump the ceiling as more
+        // text arrives between play events.
         renderShown();
+        voiceLog(`chunk ${chunk.seq} onplay fired`);
       };
-      a.play().catch(done);
+      a.play().catch((e) => done(`play() rejected: ${e && e.message || e}`));
     });
   }
 
-  async function runVoicePlayback() {
-    // Sequencer: first chunk plays to completion, then rest chunk
-    // (when available) plays. If first audio finishes before _rest
-    // has landed yet (agent still synthesizing it while sentence 1
-    // plays), poll briefly until either _rest arrives or the job
-    // reaches terminal. The polling loop sets serverDone in the
-    // terminal branch before awaiting voicePromise, so no deadlock.
-    if (voice.firstB64) await playVoiceChunk(voice.firstB64, 'first');
-    while (!voice.restB64 && !serverDone) {
-      await new Promise(r => setTimeout(r, 100));
+  async function voicePump() {
+    // Drains the play queue in order. Started when the first chunk
+    // arrives. Subsequent chunks just get appended to playQueue and
+    // the pump picks them up after the current one ends.
+    voice.playing = true;
+    while (true) {
+      if (voice.playQueue.length === 0) {
+        // Are more chunks coming? If serverDone and queue empty, we're
+        // out. Otherwise wait briefly for the next chunk.
+        if (serverDone) break;
+        await new Promise(r => setTimeout(r, 100));
+        continue;
+      }
+      const chunk = voice.playQueue.shift();
+      await playOneChunk(chunk);
     }
-    if (voice.restB64) await playVoiceChunk(voice.restB64, 'rest');
+    voice.playing = false;
+    if (voice.chunksDoneResolver) {
+      voice.chunksDoneResolver();
+      voice.chunksDoneResolver = null;
+    }
   }
-  let voicePromise = null;
 
   function typewriterTick(ts) {
     if (state.activeStream !== myToken) {
@@ -268,12 +263,15 @@ export async function streamIntoBubble(jobId, wrap, statusEl, startMs, messageId
     if (!lastFrameTs) lastFrameTs = ts;
     const dtMs = ts - lastFrameTs;
     lastFrameTs = ts;
-    // In voice mode the per-chunk audio 'play' event sets the reveal
-    // ceiling; the typewriter just races toward that ceiling instead
-    // of target.length. Pre-first-audio the ceiling is 0, so reveal
-    // stays parked — letting the "thinking…" placeholder hold.
+    // Voice mode: typewriter is gated by voice.started. Pre-first-
+    // chunk, ceiling is 0 (so the "thinking…" placeholder holds). Once
+    // first audio plays, reveal everything streamed so far and keep
+    // racing target.length as more text arrives — exponential batching
+    // means audio + text aren't strictly synced anyway, so prioritize
+    // "user can read along while listening" over "reveal one sentence
+    // at a time".
     const ceiling = voice.enabled
-      ? Math.min(target.length, voice.revealEndIdx)
+      ? (voice.started ? target.length : 0)
       : target.length;
     if (shownChars < ceiling) {
       const advance = Math.max(
@@ -283,13 +281,8 @@ export async function streamIntoBubble(jobId, wrap, statusEl, startMs, messageId
       shownChars = Math.min(ceiling, shownChars + advance);
       renderShown();
     }
-    // Keep ticking while either (a) we still have chars to reveal or
-    // (b) the server hasn't said done yet (so more text may arrive).
-    // In voice mode we also keep ticking until revealEndIdx catches up
-    // to target.length, since audio events bump the ceiling between
-    // ticks.
     const moreReveal = shownChars < ceiling
-      || (voice.enabled && voice.revealEndIdx < target.length);
+      || (voice.enabled && !voice.started);
     if (moreReveal || !serverDone) {
       rafId = requestAnimationFrame(typewriterTick);
     } else {
@@ -393,19 +386,21 @@ export async function streamIntoBubble(jobId, wrap, statusEl, startMs, messageId
       } else if (Date.now() - lastProgressMs > stuckThresholdMs) {
         showStuckNotice();
       }
-      // Voice-mode chunks may arrive on a partial (audio_b64_first
-      // mid-stream) or on the terminal payload (both _first and _rest).
-      // Kick off the sequencer the moment _first lands; the rest chunk
-      // is just stashed and the sequencer picks it up after _first ends.
-      if (voice.enabled) {
-        if (!voice.firstB64 && res.audio_b64_first) {
-          voice.firstB64 = res.audio_b64_first;
-          if (voicePromise === null) {
-            voicePromise = runVoicePlayback();
+      // Voice-mode audio chunks arrive on partials AND on the terminal
+      // payload (the agent re-attaches all chunks at /complete so a
+      // freshly-loaded client gets everything). For each new seq we
+      // haven't queued yet, push onto the play queue. The pump runs
+      // sequentially.
+      if (voice.enabled && Array.isArray(res.audio_chunks)) {
+        for (const chunk of res.audio_chunks) {
+          if (!chunk || typeof chunk.seq !== 'number') continue;
+          if (voice.queuedSeqs.has(chunk.seq)) continue;
+          voice.queuedSeqs.add(chunk.seq);
+          voice.playQueue.push(chunk);
+          voiceLog(`received chunk ${chunk.seq} (${(chunk.audio_seconds || 0).toFixed(2)}s audio)`);
+          if (!voice.playing) {
+            voicePump();
           }
-        }
-        if (!voice.restB64 && res.audio_b64_rest) {
-          voice.restB64 = res.audio_b64_rest;
         }
       }
       const terminal = res.done
@@ -419,32 +414,23 @@ export async function streamIntoBubble(jobId, wrap, statusEl, startMs, messageId
         // let the typewriter finish revealing.
         if (res.text) target = res.text;
         serverDone = true;
-        // Voice-mode fallback: if we got terminal without ever seeing
-        // an audio chunk (older agent, voice quota exhausted, synth
-        // error), unlock reveal so the user isn't left staring at the
-        // "thinking…" placeholder.
-        if (voice.enabled && !voice.firstB64) {
-          voice.firstStarted = true;
-          voice.revealEndIdx = target.length;
+        voiceLog(`terminal | chunks_received=${voice.queuedSeqs.size} | text_len=${target.length}`);
+        // Voice-mode fallback: terminal arrived with no chunks at all
+        // (older agent, voice quota exhausted, synth error). Unlock
+        // reveal so the user isn't left staring at "thinking…".
+        if (voice.enabled && voice.queuedSeqs.size === 0) {
+          voiceLog('no chunks ever arrived — falling back to text-only reveal');
+          voice.started = true;
         }
         startTypewriter();
-        // Voice mode: wait for inline audio playback to finish (or
-        // bail immediately if there isn't any). The sequencer's
-        // while-loop on !restB64 && !serverDone unblocks now that
-        // serverDone is set, so we never hang here. Audio promises
-        // never reject — playVoiceChunk swallows errors as 'ended'.
-        if (voicePromise) {
-          try { await voicePromise; } catch (_e) { /* unreachable */ }
+        // Wait for the chunk pump to drain. It exits when serverDone
+        // is true and the queue is empty. Audio promises never reject —
+        // playOneChunk swallows errors as 'ended'.
+        if (voice.enabled && voice.playing) {
+          voiceLog('waiting for chunk pump to drain…');
+          await voice.chunksDonePromise;
+          voiceLog('chunk pump drained');
         }
-        // After audio is done (or skipped), release any remaining text
-        // reveal: short responses with no _rest chunk leave revealEndIdx
-        // parked at the sentence-1 boundary, and trailing LLM tokens
-        // that arrived after the 'play' event need to land too. Also
-        // mark firstStarted true so renderShown actually paints — covers
-        // the corner case where Audio.play() resolved without ever
-        // firing 'play' (autoplay blocked, decoder error after .catch).
-        voice.firstStarted = true;
-        voice.revealEndIdx = target.length;
         if (rafId !== null) {
           await finalizePromise;
         }
@@ -506,10 +492,12 @@ export async function streamIntoBubble(jobId, wrap, statusEl, startMs, messageId
           wrap.appendChild(readBtn);
           // Voice-mode auto-fire only when the agent did NOT supply
           // inline audio (e.g., older agent build, voice synth failed).
-          // When inline audio shipped via _first/_rest we already played
-          // it; firing a second TTS job here would double-bill the user
-          // and double-play the response.
-          if (state.voiceMode && !res.audio_b64_first && !res.audio_b64_rest) {
+          // When inline audio shipped via audio_chunks we already
+          // played it; firing a second TTS job here would double-bill
+          // the user and double-play the response.
+          const hasInlineAudio = Array.isArray(res.audio_chunks)
+            && res.audio_chunks.length > 0;
+          if (state.voiceMode && !hasInlineAudio) {
             onReadAloudClick(readMid, finalText, readBtn);
           }
         }

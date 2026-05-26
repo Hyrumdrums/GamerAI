@@ -129,13 +129,22 @@ JOB_PROCESSING = "job_processing"
 # reads from here while the job is mid-stream and falls back to
 # JOB_RESULTS once it completes.
 JOB_PARTIALS = "job_partials"
-# Voice-mode chat: the agent pipelines first-sentence TTS with LLM
-# streaming and pushes the audio on a partial so the client can start
-# playback before the LLM completes. Audio is kept in its own hash
-# (rather than JSON-merged into JOB_PARTIALS) so the existing text-only
-# partial reader stays a plain hget. JSON-encoded {"audio_b64_first":
-# str, "audio_seconds_first": float}.
-JOB_PARTIAL_AUDIO = "job_partial_audio"
+
+# Voice-mode chat: ordered list of synthesized audio chunks for an
+# in-flight job. Stored as a Redis hash where field=seq (stringified
+# int) and value=JSON {seq, audio_b64, audio_seconds}. Per-job keys
+# (suffixed with :{job_id}) so cleanup is a single DELETE. The hash
+# form lets us write idempotently if a chunk is retried, and reading
+# is a single HGETALL on the polling read path.
+JOB_AUDIO_CHUNKS = "job_audio_chunks"
+
+# Single source of truth for the PWA shell-cache version. The service
+# worker's CACHE_VERSION and the chat-header version indicator both
+# read this — bumping it here invalidates the cached JS for every
+# browser on next page load AND surfaces the new number in the UI so
+# operator and user can confirm at-a-glance which build is live.
+# Format: bare integer string. Display widget renders "v1.0.{N}".
+CLIENT_CACHE_VERSION = "5"
 WORKER_REGISTRY = "worker_registry"
 WORKER_HEARTBEATS = "worker_heartbeats"
 WORKER_STATUS = "worker_status"

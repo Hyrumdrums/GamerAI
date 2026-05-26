@@ -23,7 +23,7 @@ Where to add a new page:
 from pathlib import Path
 
 from fastapi import FastAPI
-from fastapi.responses import FileResponse
+from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
 
 from client.routes import account, admin_ui, api, auth, chat, invites
@@ -48,8 +48,17 @@ async def service_worker():
     # need root scope (/) so the SW intercepts navigations to /,
     # /login, /chat history, etc. Serving from /sw.js with the
     # Service-Worker-Allowed: / header gets us that.
-    return FileResponse(
-        _STATIC_DIR / "sw.js",
+    #
+    # Template-substitute @@CACHE_VERSION@@ with the canonical value
+    # from shared/config.py so a single bump in Python invalidates the
+    # cache for every PWA install. Without this we'd have to bump
+    # sw.js manually every release — the May 26 voice-mode ship was
+    # served stale JS for exactly that reason.
+    from shared.config import CLIENT_CACHE_VERSION
+    src = (_STATIC_DIR / "sw.js").read_text(encoding="utf-8")
+    src = src.replace("@@CACHE_VERSION@@", f"v{CLIENT_CACHE_VERSION}")
+    return Response(
+        content=src,
         media_type="application/javascript",
         headers={
             "Service-Worker-Allowed": "/",

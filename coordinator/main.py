@@ -39,7 +39,7 @@ from shared.config import (
     SEARCH_AUTO_DISABLED,
     CANARY_SCORE_WINDOW,
     IDEMPOTENCY_TTL_SECONDS,
-    JOB_PARTIAL_AUDIO,
+    JOB_AUDIO_CHUNKS,
     JOB_PARTIALS,
     JOB_PROCESSING,
     JOB_QUEUE,
@@ -2071,19 +2071,18 @@ def result(job_id: str):
     # latest accumulated text so the polling client can render it.
     # status stays 'pending'/'running' so the client keeps polling.
     partial_text = r.hget(JOB_PARTIALS, job_id)
-    # Voice-mode chat: the agent ships first-sentence audio on a partial
-    # before the LLM completes. Merge it in so the polling client can
-    # start playback during streaming (and reveal text in sync).
-    partial_audio_first: Optional[str] = None
-    partial_audio_seconds_first: Optional[float] = None
-    partial_audio_raw = r.hget(JOB_PARTIAL_AUDIO, job_id)
-    if partial_audio_raw:
+    # Voice-mode chat: the agent ships audio chunks on partials before
+    # the LLM completes. Read the per-seq hash, sort by seq, and surface
+    # the ordered list so the polling client can queue new chunks as
+    # they arrive.
+    audio_chunks_list: list[dict] = []
+    chunks_raw = r.hgetall(f"{JOB_AUDIO_CHUNKS}:{job_id}")
+    if chunks_raw:
         try:
-            pa = json.loads(partial_audio_raw)
-            partial_audio_first = pa.get("audio_b64_first")
-            partial_audio_seconds_first = pa.get("audio_seconds_first")
-        except json.JSONDecodeError:
-            pass
+            audio_chunks_list = [json.loads(v) for v in chunks_raw.values()]
+            audio_chunks_list.sort(key=lambda c: int(c.get("seq", 0)))
+        except (json.JSONDecodeError, ValueError):
+            audio_chunks_list = []
     status = row["status"]
     # Image jobs persist their result as messages.image_path (not on
     # the jobs row). Look it up so the polling path can surface the
@@ -2119,8 +2118,7 @@ def result(job_id: str):
         # has long since acted on it (or missed it). Defaulting to
         # null is harmless.
         "search_was_skipped": False,
-        "audio_b64_first": partial_audio_first,
-        "audio_seconds_first": partial_audio_seconds_first,
+        "audio_chunks": audio_chunks_list,
         "done": status in ("complete", "error"),
     }
 
@@ -2501,7 +2499,7 @@ def abandon(req: JobClaimRequest, request: Request):
         )
     r.hdel(JOB_PROCESSING, req.job_id)
     r.hdel(JOB_PARTIALS, req.job_id)
-    r.hdel(JOB_PARTIAL_AUDIO, req.job_id)
+    r.delete(f"{JOB_AUDIO_CHUNKS}:{req.job_id}")
     r.hset(WORKER_STATUS, req.worker_id, "idle")
     db.requeue_job(req.job_id)
     log.info(
@@ -2541,19 +2539,36 @@ def partial(req: JobPartialRequest, request: Request):
         raise
     text = req.text or ""
     r.hset(JOB_PARTIALS, req.job_id, text)
-    if req.audio_b64_first:
-        # Voice-mode chat: agent finished synthesizing the first sentence
-        # in parallel with the still-streaming LLM. Park it in a sibling
-        # hash so the polling /result/{job_id} can return it pre-complete.
-        # Kept separate from JOB_PARTIALS so the existing text-only
-        # reader stays an hget (no JSON shape change).
+    if req.audio_chunk_b64 is not None and req.audio_chunk_seq is not None:
+        # Voice-mode chat exponential batching: each Piper synth for a
+        # sentence-batch lands here keyed by seq. Storing per-seq means
+        # a retried partial overwrites idempotently and the result
+        # endpoint can HGETALL → sort by seq → return ordered chunks.
+        # Audio kept in its own hash (not JSON-merged into JOB_PARTIALS)
+        # so the text-only partial reader stays an hget.
+        chunks_key = f"{JOB_AUDIO_CHUNKS}:{req.job_id}"
         r.hset(
-            JOB_PARTIAL_AUDIO,
-            req.job_id,
+            chunks_key,
+            str(req.audio_chunk_seq),
             json.dumps({
-                "audio_b64_first": req.audio_b64_first,
-                "audio_seconds_first": float(req.audio_seconds_first or 0.0),
+                "seq": int(req.audio_chunk_seq),
+                "audio_b64": req.audio_chunk_b64,
+                "audio_seconds": float(req.audio_chunk_seconds or 0.0),
             }),
+        )
+        # Expire the chunk set after a generous TTL so a cancelled or
+        # orphaned job doesn't leak audio bytes in Redis forever.
+        # Re-sets the TTL on every chunk write, which is harmless and
+        # keeps the key alive while the job is still streaming.
+        r.expire(chunks_key, 24 * 3600)
+        log.info(
+            "voice chunk received",
+            extra={
+                "event": "voice_chunk_partial",
+                "job_id": req.job_id,
+                "seq": req.audio_chunk_seq,
+                "audio_seconds": float(req.audio_chunk_seconds or 0.0),
+            },
         )
     msg = db.get_message_by_job(req.job_id)
     if msg is not None:
@@ -2792,21 +2807,16 @@ def complete(req: JobCompleteRequest, request: Request):
         # round-trip per sentence, which matters for voice-mode latency.
         payload["audio_b64"] = req.audio_b64
         payload["audio_seconds"] = float(req.audio_seconds or 0.0)
-    if pre_complete_tool == "chat" and (
-        req.audio_b64_first or req.audio_b64_rest
-    ):
-        # Voice-mode chat: the agent pipelined sentence-1 TTS during LLM
-        # streaming and synthesized the rest after the LLM completed. We
-        # re-attach both chunks to the final JOB_RESULTS payload (even
-        # though _first already shipped on a partial) so a client that
-        # reloaded the page after completion still gets full audio. A
-        # late-arriving polling tick sees both chunks in one read.
-        if req.audio_b64_first:
-            payload["audio_b64_first"] = req.audio_b64_first
-            payload["audio_seconds_first"] = float(req.audio_seconds_first or 0.0)
-        if req.audio_b64_rest:
-            payload["audio_b64_rest"] = req.audio_b64_rest
-            payload["audio_seconds_rest"] = float(req.audio_seconds_rest or 0.0)
+    if pre_complete_tool == "chat" and req.audio_chunks:
+        # Voice-mode chat: agent emitted N chunks during the LLM stream
+        # (exponential batching). The complete request carries the full
+        # ordered list so a client that reloaded the page after the
+        # job finished still gets every chunk. Sort by seq defensively;
+        # the agent emits in order but a future retry path or merge of
+        # late partials might not.
+        chunks = list(req.audio_chunks)
+        chunks.sort(key=lambda c: int(c.get("seq", 0)))
+        payload["audio_chunks"] = chunks
     if req.sources:
         # Render-only data: the polling client reads it from
         # /result/{job_id} and shows it under the bubble. We don't
@@ -2824,7 +2834,7 @@ def complete(req: JobCompleteRequest, request: Request):
     r.hset(JOB_RESULTS, req.job_id, json.dumps(payload))
     r.hdel(JOB_PROCESSING, req.job_id)
     r.hdel(JOB_PARTIALS, req.job_id)
-    r.hdel(JOB_PARTIAL_AUDIO, req.job_id)
+    r.delete(f"{JOB_AUDIO_CHUNKS}:{req.job_id}")
     r.hset(WORKER_STATUS, req.worker_id, "idle")
     db.mark_job_complete(
         job_id=req.job_id,
@@ -2937,15 +2947,14 @@ def complete(req: JobCompleteRequest, request: Request):
             )
             # Voice-mode chat: the worker also produced TTS audio inline
             # with the LLM stream. Bill the user's voice_minutes ledger
-            # for both chunks (first sentence + rest). Earnings for the
-            # TTS work itself stay with the chat job's per-token credit
-            # rather than re-priced as standalone TTS — Phase A is the
-            # MVP and a separate ledger line per chunk is more bookkeeping
-            # than we want until per-tool pricing lands (project_open_
-            # strategy_questions § 6).
-            voice_secs_first = float(req.audio_seconds_first or 0.0)
-            voice_secs_rest = float(req.audio_seconds_rest or 0.0)
-            voice_secs_total = voice_secs_first + voice_secs_rest
+            # for the sum of all chunks. Earnings for the TTS work
+            # itself stay with the chat job's per-token credit rather
+            # than re-priced as standalone TTS — separate ledger lines
+            # per chunk is more bookkeeping than we want until per-tool
+            # pricing lands (project_open_strategy_questions § 6).
+            voice_secs_total = 0.0
+            for c in (req.audio_chunks or []):
+                voice_secs_total += float(c.get("audio_seconds") or 0.0)
             if voice_secs_total > 0:
                 db.add_member_voice_usage(
                     submitter,
@@ -3117,7 +3126,7 @@ def cancel_job(req: JobCancelRequest, request: Request):
     # active claim and returns 410. Also blow away any stale partials.
     r.hdel(JOB_PROCESSING, req.job_id)
     r.hdel(JOB_PARTIALS, req.job_id)
-    r.hdel(JOB_PARTIAL_AUDIO, req.job_id)
+    r.delete(f"{JOB_AUDIO_CHUNKS}:{req.job_id}")
     db.mark_job_complete(
         job_id=req.job_id,
         worker_id=row["worker_id"] or "",
@@ -3993,7 +4002,7 @@ def delete_conversation(conversation_id: str, request: Request):
         r.hdel(JOB_RESULTS, jid)
         r.hdel(JOB_PROCESSING, jid)
         r.hdel(JOB_PARTIALS, jid)
-        r.hdel(JOB_PARTIAL_AUDIO, jid)
+        r.delete(f"{JOB_AUDIO_CHUNKS}:{jid}")
     log.info(
         "conversation deleted",
         extra={

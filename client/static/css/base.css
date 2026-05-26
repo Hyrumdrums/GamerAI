@@ -93,6 +93,20 @@ input:focus, textarea:focus { outline: 0; border-color: var(--brand); }
   gap: .5rem;
 }
 .topbar .brand { font-weight: 600; color: var(--text); }
+/* Version chip: small transparent text tucked under the GamerAI title,
+   right-aligned against it. Tracks shared.config.CLIENT_CACHE_VERSION
+   so a deploy is visually verifiable from any tab without opening
+   devtools. The display intentionally crowds the title (line-height: 1,
+   negative margin-top) so the chip reads as a subtitle, not as its
+   own row taking up vertical space. */
+.topbar .brand-stack {
+  display: flex; flex-direction: column; align-items: flex-end; line-height: 1;
+}
+.topbar .brand-version {
+  font-size: .65rem; color: var(--text); opacity: .35;
+  margin-top: .1rem; font-variant-numeric: tabular-nums;
+  user-select: none;
+}
 .topbar .topbar-actions { display: flex; gap: .9rem; align-items: center; }
 .topbar a { color: var(--brand); }
 /* On phones, hide non-essential topbar items; admin/terms/logout still

@@ -528,32 +528,83 @@ def process_job(r: redis.Redis, http: httpx.Client, job: dict, last_job_finished
 
     tool = (job.get("tool") or "chat").lower()
     voice_mode = bool(job.get("voice_mode")) and tool == "chat"
+    voice_t0 = time.time()
     voice_state: dict = {
-        "first_started": False,
-        "first_end_idx": 0,
-        "audio_b64_first": None,
-        "audio_seconds_first": 0.0,
-        "thread": None,
+        "cursor": 0,
+        "next_batch_size": 1,
+        "next_seq": 0,
+        "queue": __import__("queue").Queue(),
         "current_text": "",
+        "audio_chunks": [],
+        "chunks_lock": threading.Lock(),
+        "drained": threading.Event(),
+        "thread": None,
     }
 
-    def _synth_first(sentence: str) -> None:
-        try:
-            b64, secs = mock_tts_synth(sentence)
-            voice_state["audio_b64_first"] = b64
-            voice_state["audio_seconds_first"] = secs
-            body = {
-                "worker_id": WORKER_ID,
-                "job_id": job_id,
-                "text": voice_state["current_text"],
-                "audio_b64_first": b64,
-                "audio_seconds_first": secs,
-            }
-            if claim_token is not None:
-                body["claim_token"] = claim_token
-            post(http, "/jobs/partial", body, timeout=3)
-        except Exception as e:
-            log.warning("voice-mode first-synth failed: %s", e)
+    def _voice_synth_worker() -> None:
+        while True:
+            item = voice_state["queue"].get()
+            if item is None:
+                voice_state["drained"].set()
+                return
+            seq, batch_text = item
+            t_start = time.time()
+            try:
+                b64, secs = mock_tts_synth(batch_text)
+                log.info(
+                    "voice-mode chunk synth done | seq=%d | %.2fs synth | %.2fs audio | t+%.2fs",
+                    seq, time.time() - t_start, secs, time.time() - voice_t0,
+                )
+                with voice_state["chunks_lock"]:
+                    voice_state["audio_chunks"].append({
+                        "seq": seq, "audio_b64": b64, "audio_seconds": secs,
+                    })
+                body = {
+                    "worker_id": WORKER_ID,
+                    "job_id": job_id,
+                    "text": voice_state["current_text"],
+                    "audio_chunk_b64": b64,
+                    "audio_chunk_seconds": secs,
+                    "audio_chunk_seq": seq,
+                }
+                if claim_token is not None:
+                    body["claim_token"] = claim_token
+                post(http, "/jobs/partial", body, timeout=3)
+                log.info("voice-mode chunk posted | seq=%d | t+%.2fs",
+                         seq, time.time() - voice_t0)
+            except Exception as e:
+                log.warning("voice chunk %d failed: %s", seq, e)
+            finally:
+                voice_state["queue"].task_done()
+
+    def _enqueue_batch_if_ready(text: str) -> None:
+        unsynth = text[voice_state["cursor"]:]
+        n = voice_state["next_batch_size"]
+        pos = 0
+        found = 0
+        end_in_unsynth: Optional[int] = None
+        while pos < len(unsynth):
+            m = _VOICE_SENTENCE_RE.search(unsynth[pos:])
+            if not m:
+                break
+            end = pos + m.start() + len(m.group(0))
+            found += 1
+            if found == n:
+                end_in_unsynth = end
+                break
+            pos = end
+        if end_in_unsynth is None:
+            return
+        batch_text = unsynth[:end_in_unsynth].strip()
+        if not batch_text:
+            return
+        voice_state["cursor"] += end_in_unsynth
+        seq = voice_state["next_seq"]
+        voice_state["next_seq"] += 1
+        voice_state["queue"].put((seq, batch_text))
+        log.info("voice-mode batch ready | seq=%d | sentences=%d | t+%.2fs",
+                 seq, n, time.time() - voice_t0)
+        voice_state["next_batch_size"] *= 2
 
     def push_partial(text: str) -> None:
         # Fire-and-forget: a dropped partial isn't worth retrying since
@@ -564,18 +615,18 @@ def process_job(r: redis.Redis, http: httpx.Client, job: dict, last_job_finished
         if claim_token is not None:
             body["claim_token"] = claim_token
         post(http, "/jobs/partial", body, timeout=3)
-        if voice_mode and not voice_state["first_started"]:
-            sentence, end_idx = find_first_sentence(text)
-            if sentence:
-                voice_state["first_started"] = True
-                voice_state["first_end_idx"] = end_idx
-                t = threading.Thread(
-                    target=_synth_first,
-                    args=(sentence,),
-                    daemon=True,
-                )
-                voice_state["thread"] = t
-                t.start()
+        if voice_mode:
+            while True:
+                prev = voice_state["next_seq"]
+                _enqueue_batch_if_ready(text)
+                if voice_state["next_seq"] == prev:
+                    break
+
+    if voice_mode:
+        voice_state["thread"] = threading.Thread(
+            target=_voice_synth_worker, daemon=True,
+        )
+        voice_state["thread"].start()
 
     try:
         maybe_simulate_cold_start(last_job_finished)
@@ -607,36 +658,29 @@ def process_job(r: redis.Redis, http: httpx.Client, job: dict, last_job_finished
             complete_body["sources"] = result["sources"]
         if claim_token is not None:
             complete_body["claim_token"] = claim_token
-        # Voice-mode finishing (dev mock). Wait for the first-sentence
-        # synth thread (if any), then mock-synth the rest of the
-        # response. Same three-case logic as the agent: pipelined
-        # first + rest, first-only short response, or whole-response
-        # if no boundary fired.
         if voice_mode:
-            t = voice_state.get("thread")
-            if t is not None:
-                t.join(timeout=60.0)
             full_text = result.get("text") or ""
-            first_b64 = voice_state["audio_b64_first"]
-            first_secs = voice_state["audio_seconds_first"]
-            if first_b64:
-                complete_body["audio_b64_first"] = first_b64
-                complete_body["audio_seconds_first"] = first_secs
-                rest_text = full_text[voice_state["first_end_idx"]:].strip()
-                if rest_text:
-                    try:
-                        b64r, secsr = mock_tts_synth(rest_text)
-                        complete_body["audio_b64_rest"] = b64r
-                        complete_body["audio_seconds_rest"] = secsr
-                    except Exception as e:
-                        log.warning("voice-mode rest-synth failed: %s", e)
-            elif full_text.strip():
-                try:
-                    b64f, secsf = mock_tts_synth(full_text)
-                    complete_body["audio_b64_first"] = b64f
-                    complete_body["audio_seconds_first"] = secsf
-                except Exception as e:
-                    log.warning("voice-mode whole-synth failed: %s", e)
+            voice_state["current_text"] = full_text
+            while True:
+                prev = voice_state["next_seq"]
+                _enqueue_batch_if_ready(full_text)
+                if voice_state["next_seq"] == prev:
+                    break
+            leftover = full_text[voice_state["cursor"]:].strip()
+            if leftover:
+                seq = voice_state["next_seq"]
+                voice_state["next_seq"] += 1
+                voice_state["queue"].put((seq, leftover))
+                log.info("voice-mode leftover queued | seq=%d | t+%.2fs",
+                         seq, time.time() - voice_t0)
+            voice_state["queue"].put(None)
+            voice_state["drained"].wait(timeout=120.0)
+            with voice_state["chunks_lock"]:
+                chunks = sorted(voice_state["audio_chunks"], key=lambda c: c["seq"])
+            if chunks:
+                complete_body["audio_chunks"] = chunks
+            log.info("voice-mode all chunks done | count=%d | t+%.2fs",
+                     len(chunks), time.time() - voice_t0)
         post(http, "/jobs/complete", complete_body, timeout=30)
         log.info(
             "complete tokens=%d duration=%.2fs",

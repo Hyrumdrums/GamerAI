@@ -4,6 +4,8 @@ requires the admin role."""
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
+from shared.config import CLIENT_CACHE_VERSION
+
 from client.services import api_client
 from client.services.guards import require_admin_session
 from client.services.session import identify, login_redirect, session_bearer
@@ -17,7 +19,10 @@ async def index(request: Request):
     bearer = session_bearer(request)
     if not bearer or not await identify(bearer):
         return login_redirect("/")
-    return templates.TemplateResponse(request, "chat.html.j2", {})
+    return templates.TemplateResponse(
+        request, "chat.html.j2",
+        {"cache_version": CLIENT_CACHE_VERSION},
+    )
 
 
 @router.get("/offline", response_class=HTMLResponse)

@@ -2055,8 +2055,9 @@ class Coordinator:
         job_id: str,
         text: str,
         claim_token: Optional[str] = None,
-        audio_b64_first: Optional[str] = None,
-        audio_seconds_first: Optional[float] = None,
+        audio_chunk_b64: Optional[str] = None,
+        audio_chunk_seconds: Optional[float] = None,
+        audio_chunk_seq: Optional[int] = None,
     ) -> None:
         """Push the accumulated streaming text so far. Fire-and-forget:
         the coordinator overwrites with the latest call (text is the
@@ -2064,17 +2065,18 @@ class Coordinator:
         just means the next one carries the full state. The final
         ``/jobs/complete`` is the source of truth.
 
-        ``audio_b64_first`` / ``audio_seconds_first`` (voice-mode chat
-        only): set when the agent has just finished synthesizing the
-        first sentence in parallel with the still-streaming LLM. The
-        coordinator stores the audio in a sibling hash so the polling
-        client can start playback before the chat job completes."""
+        ``audio_chunk_b64`` / ``audio_chunk_seconds`` / ``audio_chunk_seq``
+        (voice-mode chat only): set when the agent has just finished
+        synthesizing a sentence batch. Each chunk is keyed by its seq
+        (0, 1, 2, ...) so the coordinator can store per-seq and the
+        polling client receives an ordered list."""
         body = {"worker_id": self.worker_id, "job_id": job_id, "text": text}
         if claim_token is not None:
             body["claim_token"] = claim_token
-        if audio_b64_first is not None:
-            body["audio_b64_first"] = audio_b64_first
-            body["audio_seconds_first"] = float(audio_seconds_first or 0.0)
+        if audio_chunk_b64 is not None and audio_chunk_seq is not None:
+            body["audio_chunk_b64"] = audio_chunk_b64
+            body["audio_chunk_seconds"] = float(audio_chunk_seconds or 0.0)
+            body["audio_chunk_seq"] = int(audio_chunk_seq)
         self._post("/jobs/partial", body, timeout=3)
 
     def abandon(
@@ -4177,68 +4179,156 @@ def process_one(
             # final-summary LLM call, and the search-mode UX isn't a
             # candidate for voice in Phase A.
             voice_mode = bool(job.get("voice_mode")) and tool == "chat"
+            # Voice-mode chat exponential batching (Phase B). State is
+            # shared between the GPU thread (on_partial detects sentence
+            # boundaries and enqueues batches) and a single CPU-side
+            # synth worker that drains the queue serially through Piper.
+            # Batch sizes double: 1, 2, 4, 8, ... — first audio plays
+            # fast and later batches have more playback time to absorb
+            # their longer Piper synth. Every transition logs a wall-
+            # clock delta from t0 so the gap source is observable from
+            # the agent log alone (see Phase A field report where 40s
+            # of "rest" synth made the feature feel broken).
+            voice_t0 = time.time()
             voice_state: dict = {
-                "first_started": False,
-                "first_end_idx": 0,
-                "audio_b64_first": None,
-                "audio_seconds_first": 0.0,
-                "thread": None,
+                "cursor": 0,            # text-index past last enqueued sentence
+                "next_batch_size": 1,
+                "next_seq": 0,
+                "queue": queue.Queue(),
                 "current_text": "",
-                "synth_error": None,
+                "audio_chunks": [],     # collected for /complete payload
+                "chunks_lock": threading.Lock(),
+                "drained": threading.Event(),
+                "first_sentence_t": None,
+                "thread": None,
             }
 
-            def _synth_first(sentence: str) -> None:
-                # Runs on a daemon thread spawned from on_partial. The
-                # main GPU loop keeps streaming the LLM while Piper
-                # synthesizes sentence 1 on CPU. On completion, re-post
-                # a partial with the audio attached so the polling
-                # client picks it up before the chat job completes.
-                try:
-                    spoken = normalize_text_for_tts(sentence)
-                    if not spoken:
+            def _voice_synth_worker() -> None:
+                # Single CPU-side consumer that pulls batches off the
+                # queue in order and runs Piper sequentially. Sequential
+                # because concurrent piper.exe spawns just thrash CPU
+                # and each subprocess pays the ONNX cold-start anyway —
+                # warm-Piper is the Phase C fix for that. Each completed
+                # synth posts a partial with the chunk attached so the
+                # client picks it up on its next /result poll.
+                while True:
+                    item = voice_state["queue"].get()
+                    if item is None:
+                        voice_state["drained"].set()
                         return
-                    b64, secs, _model = run_tts_inference(
-                        spoken, {"job_id": job_id}, cfg, log,
-                    )
-                    voice_state["audio_b64_first"] = b64
-                    voice_state["audio_seconds_first"] = secs
-                    # Re-post with the latest accumulated text so the
-                    # coordinator's JOB_PARTIALS isn't rolled back to an
-                    # earlier snapshot. A 410 here is harmless (job was
-                    # cancelled / superseded) — the partial helper is
-                    # already fire-and-forget.
+                    seq, batch_text = item
+                    t_start = time.time()
                     try:
-                        coord.partial(
-                            job_id,
-                            voice_state["current_text"],
-                            claim_token=claim_token,
-                            audio_b64_first=b64,
-                            audio_seconds_first=secs,
+                        spoken = normalize_text_for_tts(batch_text)
+                        if not spoken:
+                            continue
+                        log.info(
+                            "voice-mode chunk synth start | seq=%d | chars=%d | t+%.2fs",
+                            seq, len(spoken), t_start - voice_t0,
                         )
-                    except Exception as post_exc:
-                        log.warning(
-                            "voice-mode first-audio partial post failed: %s",
-                            post_exc,
+                        b64, secs, _model = run_tts_inference(
+                            spoken, {"job_id": job_id}, cfg, log,
                         )
-                except Exception as e:
-                    voice_state["synth_error"] = str(e)
-                    log.warning("voice-mode sentence-1 synth failed: %s", e)
+                        t_done = time.time()
+                        log.info(
+                            "voice-mode chunk synth done  | seq=%d | %.2fs synth | %.2fs audio | t+%.2fs",
+                            seq, t_done - t_start, secs, t_done - voice_t0,
+                        )
+                        with voice_state["chunks_lock"]:
+                            voice_state["audio_chunks"].append({
+                                "seq": seq,
+                                "audio_b64": b64,
+                                "audio_seconds": secs,
+                            })
+                        try:
+                            coord.partial(
+                                job_id, voice_state["current_text"],
+                                claim_token=claim_token,
+                                audio_chunk_b64=b64,
+                                audio_chunk_seconds=secs,
+                                audio_chunk_seq=seq,
+                            )
+                            log.info(
+                                "voice-mode chunk posted     | seq=%d | t+%.2fs",
+                                seq, time.time() - voice_t0,
+                            )
+                        except Exception as post_exc:
+                            log.warning(
+                                "voice-mode chunk %d post failed: %s",
+                                seq, post_exc,
+                            )
+                    except Exception as e:
+                        log.warning("voice-mode chunk %d synth failed: %s", seq, e)
+                    finally:
+                        voice_state["queue"].task_done()
+
+            def _enqueue_batch_if_ready(text: str) -> None:
+                # Try to slice out the next exponential batch from text.
+                # The Nth batch needs next_batch_size more completed
+                # sentences past cursor. If they're all there, slice and
+                # enqueue; the queue worker handles Piper and posting.
+                unsynth = text[voice_state["cursor"]:]
+                n = voice_state["next_batch_size"]
+                pos = 0
+                found = 0
+                end_in_unsynth: Optional[int] = None
+                while pos < len(unsynth):
+                    m = _VOICE_SENTENCE_RE.search(unsynth[pos:])
+                    if not m:
+                        break
+                    end = pos + m.start() + len(m.group(0))
+                    found += 1
+                    if found == n:
+                        end_in_unsynth = end
+                        break
+                    pos = end
+                if end_in_unsynth is None:
+                    return
+                batch_text = unsynth[:end_in_unsynth].strip()
+                if not batch_text:
+                    return
+                voice_state["cursor"] += end_in_unsynth
+                seq = voice_state["next_seq"]
+                voice_state["next_seq"] += 1
+                voice_state["queue"].put((seq, batch_text))
+                now = time.time()
+                if voice_state["first_sentence_t"] is None:
+                    voice_state["first_sentence_t"] = now
+                    log.info(
+                        "voice-mode first sentence found | seq=%d | chars=%d | t+%.2fs",
+                        seq, len(batch_text), now - voice_t0,
+                    )
+                else:
+                    log.info(
+                        "voice-mode batch ready          | seq=%d | sentences=%d | chars=%d | t+%.2fs",
+                        seq, n, len(batch_text), now - voice_t0,
+                    )
+                voice_state["next_batch_size"] *= 2
 
             def on_partial(text: str) -> None:
                 voice_state["current_text"] = text
                 coord.partial(job_id, text, claim_token=claim_token)
-                if voice_mode and not voice_state["first_started"]:
-                    sentence, end_idx = find_first_sentence(text)
-                    if sentence:
-                        voice_state["first_started"] = True
-                        voice_state["first_end_idx"] = end_idx
-                        t = threading.Thread(
-                            target=_synth_first,
-                            args=(sentence,),
-                            daemon=True,
-                        )
-                        voice_state["thread"] = t
-                        t.start()
+                if voice_mode:
+                    # A single partial may carry text past multiple batch
+                    # boundaries (e.g., the LLM emitted 4 sentences while
+                    # on_partial slept 250ms and we're already at batch
+                    # size 2). Loop so each batch goes out as the text
+                    # crosses its sentence count.
+                    while True:
+                        prev_seq = voice_state["next_seq"]
+                        _enqueue_batch_if_ready(text)
+                        if voice_state["next_seq"] == prev_seq:
+                            break
+
+            if voice_mode:
+                log.info(
+                    "voice-mode chat job claimed   | job=%s | t+0.00s",
+                    job_id,
+                )
+                voice_state["thread"] = threading.Thread(
+                    target=_voice_synth_worker, daemon=True,
+                )
+                voice_state["thread"].start()
 
             if tool == "search":
                 # Search jobs do the DDG fetch + extract first, then
@@ -4271,57 +4361,53 @@ def process_one(
             }
             if result.get("sources"):
                 complete_payload["sources"] = result["sources"]
-            # Voice-mode finishing: wait for the sentence-1 TTS thread
-            # (if any) and synthesize the rest of the response. Three
-            # cases: (a) sentence-1 fired and there's a rest — synth
-            # rest as audio_b64_rest; (b) sentence-1 fired but the
-            # whole response was just that sentence — only ship _first;
-            # (c) the response was so short no boundary ever fired —
-            # collapse the whole text into audio_b64_first.
+            # Voice-mode finishing: after the LLM is done, run on_partial
+            # one last time on the FINAL text so any trailing batch the
+            # 250ms-cadence callback missed gets enqueued. Then drain
+            # whatever text sits past the cursor as a final undersized
+            # chunk (the last batch might want 16 sentences but we only
+            # produced 11 — synth those 11 immediately, don't wait).
+            # Finally poison-pill the worker and wait for it to drain.
             if voice_mode:
-                t = voice_state.get("thread")
-                if t is not None:
-                    t.join(timeout=TTS_TIMEOUT_SECONDS)
                 full_text = result.get("text") or ""
-                first_b64 = voice_state["audio_b64_first"]
-                first_secs = voice_state["audio_seconds_first"]
-                if first_b64:
-                    complete_payload["audio_b64_first"] = first_b64
-                    complete_payload["audio_seconds_first"] = first_secs
-                    rest_raw = full_text[voice_state["first_end_idx"]:].strip()
-                    spoken_rest = normalize_text_for_tts(rest_raw)
-                    if spoken_rest:
-                        try:
-                            b64r, secsr, _m = run_tts_inference(
-                                spoken_rest, {"job_id": job_id}, cfg, log,
-                            )
-                            complete_payload["audio_b64_rest"] = b64r
-                            complete_payload["audio_seconds_rest"] = secsr
-                        except Exception as e:
-                            log.warning(
-                                "voice-mode rest-synth failed: %s — "
-                                "client will only have first-sentence audio",
-                                e,
-                            )
-                else:
-                    # No first-sentence boundary detected (or synth
-                    # errored before posting). Synthesize the whole
-                    # response as audio_b64_first and skip _rest. Tagged
-                    # as _first so the client's audio-arrival hook fires
-                    # the same way for short and long responses.
-                    spoken_full = normalize_text_for_tts(full_text)
-                    if spoken_full:
-                        try:
-                            b64f, secsf, _m = run_tts_inference(
-                                spoken_full, {"job_id": job_id}, cfg, log,
-                            )
-                            complete_payload["audio_b64_first"] = b64f
-                            complete_payload["audio_seconds_first"] = secsf
-                        except Exception as e:
-                            log.warning(
-                                "voice-mode whole-response synth failed: %s",
-                                e,
-                            )
+                voice_state["current_text"] = full_text
+                # Drain any remaining sentences. _enqueue_batch_if_ready
+                # advances cursor, so loop until it can no longer find
+                # next_batch_size more sentences.
+                while True:
+                    prev = voice_state["next_seq"]
+                    _enqueue_batch_if_ready(full_text)
+                    if voice_state["next_seq"] == prev:
+                        break
+                # Leftover past cursor: enqueue regardless of count, so
+                # the last few sentences (or trailing fragment) still
+                # get synthesized. Or, if no boundary ever fired, this
+                # is the whole short response collapsed into chunk 0.
+                leftover = full_text[voice_state["cursor"]:].strip()
+                if leftover:
+                    seq = voice_state["next_seq"]
+                    voice_state["next_seq"] += 1
+                    voice_state["queue"].put((seq, leftover))
+                    log.info(
+                        "voice-mode final leftover queued | seq=%d | chars=%d | t+%.2fs",
+                        seq, len(leftover), time.time() - voice_t0,
+                    )
+                # Poison pill + wait for drain. Generous timeout: a
+                # long final chunk on a slow CPU can take ~30s. We
+                # bound at 8× TTS_TIMEOUT_SECONDS to avoid hanging the
+                # job loop on a wedged Piper.
+                voice_state["queue"].put(None)
+                voice_state["drained"].wait(timeout=TTS_TIMEOUT_SECONDS * 8)
+                with voice_state["chunks_lock"]:
+                    chunks = list(voice_state["audio_chunks"])
+                chunks.sort(key=lambda c: c["seq"])
+                if chunks:
+                    complete_payload["audio_chunks"] = chunks
+                total_audio = sum(c.get("audio_seconds", 0.0) for c in chunks)
+                log.info(
+                    "voice-mode all chunks done    | count=%d | total_audio=%.2fs | t+%.2fs",
+                    len(chunks), total_audio, time.time() - voice_t0,
+                )
             accepted, out = coord.complete(
                 complete_payload,
                 claim_token=claim_token,

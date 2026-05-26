@@ -8,7 +8,10 @@
 <div class="topbar">
   <div style="display:flex;align-items:center;gap:.6rem">
     <button class="hamburger" id="hamburger" type="button" aria-label="Toggle conversations">☰</button>
-    <div class="brand">GamerAI</div>
+    <div class="brand-stack">
+      <div class="brand">GamerAI</div>
+      <div class="brand-version" title="PWA shell cache version (single source of truth in shared/config.py)">v1.0.{{ cache_version }}</div>
+    </div>
     <a id="contributelink" href="/contribute" class="contribute-cta" hidden>
       <span class="hide-mobile">Contribute and invite friends</span>
       <span class="hide-desktop">Invite friends</span>
