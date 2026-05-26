@@ -448,6 +448,156 @@ class NotificationsTests(unittest.TestCase):
             "410 should have triggered subscription cleanup",
         )
 
+    # ------------------------------------------------------------------
+    # /jobs/complete trigger — the actual integration point.
+    # ------------------------------------------------------------------
+    # 1x1 transparent PNG: mirrors the constant in test_coordinator_e2e
+    # so the image-complete path passes its magic-header check.
+    _MOCK_PNG_B64 = (
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+        "+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    )
+
+    def test_image_complete_fires_push_for_submitter(self):
+        """Submitting an image, then completing it as a worker, must
+        leave an 'image_done' notification row for the submitter."""
+        import uuid
+        # Use the admin token directly as the submitter — same auth
+        # path as a real member token (admin is just a member with
+        # role=admin), and self.admin_member_id is already cached.
+        headers = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
+        worker_id = "wkr-notif-" + uuid.uuid4().hex[:6]
+        self.client.post(
+            "/register",
+            json={
+                "worker_id": worker_id,
+                "capabilities": {"tools": ["chat", "image"]},
+            },
+            headers=headers,
+        )
+        gr = self.client.post(
+            "/generate",
+            json={"prompt": "draw a cat", "tool": "image"},
+            headers=headers,
+        )
+        self.assertEqual(gr.status_code, 200, gr.text)
+        job_id = gr.json()["job_id"]
+        nxt = self.client.post(
+            "/jobs/next",
+            json={"worker_id": worker_id, "tool": "image"},
+            headers=headers,
+        ).json()
+        claim_token = nxt["claim_token"]
+        comp = self.client.post(
+            "/jobs/complete",
+            json={
+                "worker_id": worker_id,
+                "job_id": job_id,
+                "text": "a cat",
+                "model": "dreamshaper8",
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "duration_seconds": 1.0,
+                "status": "complete",
+                "image_b64": self._MOCK_PNG_B64,
+                "claim_token": claim_token,
+            },
+            headers=headers,
+        )
+        self.assertEqual(comp.status_code, 200, comp.text)
+        rows = self.db.list_notifications(self.admin_member_id, 10, 0)
+        self.assertEqual(len(rows), 1, "expected one notification row")
+        self.assertEqual(rows[0]["type"], notifications.CATEGORY_IMAGE_DONE)
+        self.assertEqual(rows[0]["title"], "Your image is ready")
+        # data should at least carry url so the click navigates back.
+        data = json.loads(rows[0]["data"]) if rows[0]["data"] else None
+        self.assertIsNotNone(data)
+        self.assertEqual(data["url"], "/")
+        self.assertEqual(data["job_id"], job_id)
+
+    def test_image_error_does_not_fire_push(self):
+        """Failed image completions don't deserve a push — the user
+        already sees the error bubble. No notification row."""
+        import uuid
+        headers = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
+        worker_id = "wkr-notiferr-" + uuid.uuid4().hex[:6]
+        self.client.post(
+            "/register",
+            json={
+                "worker_id": worker_id,
+                "capabilities": {"tools": ["chat", "image"]},
+            },
+            headers=headers,
+        )
+        gr = self.client.post(
+            "/generate",
+            json={"prompt": "doomed image", "tool": "image"},
+            headers=headers,
+        )
+        job_id = gr.json()["job_id"]
+        nxt = self.client.post(
+            "/jobs/next",
+            json={"worker_id": worker_id, "tool": "image"},
+            headers=headers,
+        ).json()
+        claim_token = nxt["claim_token"]
+        self.client.post(
+            "/jobs/complete",
+            json={
+                "worker_id": worker_id,
+                "job_id": job_id,
+                "text": "",
+                "model": "dreamshaper8",
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "duration_seconds": 0.5,
+                "status": "error",
+                "error": "worker bombed",
+                "claim_token": claim_token,
+            },
+            headers=headers,
+        )
+        rows = self.db.list_notifications(self.admin_member_id, 10, 0)
+        self.assertEqual(rows, [])
+
+    def test_chat_complete_does_not_fire_push(self):
+        """Chat is streamed live; pushing for a chat completion would
+        be noise. Only image / voice trigger."""
+        import uuid
+        headers = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
+        worker_id = "wkr-notifchat-" + uuid.uuid4().hex[:6]
+        self.client.post(
+            "/register",
+            json={"worker_id": worker_id},
+            headers=headers,
+        )
+        gr = self.client.post(
+            "/generate", json={"prompt": "hi"}, headers=headers,
+        )
+        job_id = gr.json()["job_id"]
+        # /jobs/next defaults to chat; no need to pass tool.
+        nxt = self.client.post(
+            "/jobs/next", json={"worker_id": worker_id}, headers=headers,
+        ).json()
+        claim_token = nxt["claim_token"]
+        self.client.post(
+            "/jobs/complete",
+            json={
+                "worker_id": worker_id,
+                "job_id": job_id,
+                "text": "hello",
+                "model": "mock",
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "duration_seconds": 0.1,
+                "status": "complete",
+                "claim_token": claim_token,
+            },
+            headers=headers,
+        )
+        rows = self.db.list_notifications(self.admin_member_id, 10, 0)
+        self.assertEqual(rows, [])
+
     def test_send_succeeds_when_webpush_returns_normally(self):
         self._subscribe(ADMIN_TOKEN, endpoint="https://e1")
         self._subscribe(ADMIN_TOKEN, endpoint="https://e2")

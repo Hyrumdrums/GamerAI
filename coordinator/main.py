@@ -2919,6 +2919,46 @@ def complete(req: JobCompleteRequest, request: Request):
         cur["worker_id"] = req.worker_id
         r.hset(WORKER_EARNINGS, req.worker_id, json.dumps(cur))
 
+    # Phase 6: push notification on long-running tool completion. Chat
+    # is streamed live so the user is presumably watching; image and
+    # voice often run for many seconds and the user switches away.
+    # The notification deep-links back to "/" — chat.js auto-opens the
+    # most-recent conversation on load, which is the one that just
+    # completed. The delivery is best-effort: send_to_member persists
+    # the in-app row regardless of push success, respects per-member
+    # opt-out, and short-circuits to a no-op when VAPID isn't configured.
+    if submitter and req.status == "complete":
+        push_title = None
+        push_body = None
+        push_category = None
+        if is_image_complete:
+            push_category = notifications.CATEGORY_IMAGE_DONE
+            push_title = "Your image is ready"
+            push_body = "Tap to view it."
+        elif is_tts_complete:
+            push_category = notifications.CATEGORY_VOICE_DONE
+            push_title = "Your audio is ready"
+            push_body = "Tap to listen."
+        if push_category:
+            try:
+                notifications.send_to_member(
+                    db, submitter, push_category,
+                    title=push_title, body=push_body,
+                    data={
+                        "url": "/",
+                        "conversation_id": conv_id,
+                        "job_id": req.job_id,
+                    },
+                )
+            except Exception as e:
+                # Never let a push-delivery hiccup fail /jobs/complete —
+                # the worker already did its work and the caller
+                # depends on a 200 to release its claim token.
+                log.warning(
+                    "push send failed: %s",
+                    e, extra={"event": "push_send_failed"},
+                )
+
     log.info(
         "job complete" if req.status == "complete" else "job error",
         extra={
