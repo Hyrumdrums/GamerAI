@@ -228,18 +228,35 @@ body { display: flex; flex-direction: column; }
   margin-top: .15rem; padding: .25rem 0;
   cursor: pointer; font-family: inherit;
 }
+/* base.css paints every button with brand-hover on :hover — override
+   here so the collapsible footer stays transparent through hover,
+   focus, and active. Without these the strip flashed pink as the user
+   moved the mouse over it / mid-click. */
+.stats-panel:hover,
+.stats-panel:focus,
+.stats-panel:active { background: transparent; }
 .stats-panel:focus-visible {
   outline: 2px solid var(--brand); outline-offset: 2px;
   border-radius: var(--radius);
 }
+/* Three-column grid centers the token count by force (1fr equal slots
+   on either side of the auto-sized middle) and parks the toggle in the
+   right slot. Position:absolute had the toggle pulled out of flow so
+   the collapsed strip's flex centering only accounted for the token
+   count itself — visually off when the toggle was visible at the
+   right edge but the token count was centered against a slot that
+   didn't include the toggle's width. Grid solves it cleanly. */
 .stats-collapsed {
-  position: relative;
-  display: flex; justify-content: center; align-items: center;
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
   min-height: 1.1em;
 }
-.stats-collapsed-text { color: var(--text); }
+.stats-collapsed-text {
+  grid-column: 2; color: var(--text);
+}
 .stats-toggle {
-  position: absolute; right: .5rem;
+  grid-column: 3; justify-self: end; padding-right: .5rem;
   color: var(--text);
 }
 .stats-expanded {
