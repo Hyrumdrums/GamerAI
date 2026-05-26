@@ -17,6 +17,10 @@
 //   pollers racing on the same bubble
 // - readAloudPlaying: {messageId, audio, btn} | null — currently-playing
 //   per-message audio; reference held so we can stop / toggle
+// - activeVoicePlayback: {stop, btn} | null — handle to the in-flight
+//   voice-mode chat audio chain so a navigation-away (chat switch, new
+//   chat, voice toggle off) can stop it. The streamIntoBubble loop
+//   owns the audio elements; this just exposes a callable stop.
 export const state = {
   me: null,
   conversations: [],   // [{conversation_id, title, updated_at, ...}]
@@ -25,6 +29,7 @@ export const state = {
   convTokens: 0,
   activeStream: null,
   readAloudPlaying: null,
+  activeVoicePlayback: null,
 };
 
 // In-memory message cache so switching between already-opened

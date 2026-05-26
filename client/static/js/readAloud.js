@@ -74,11 +74,24 @@ export function normalizeForTTS(text) {
 // see/mutate it — was a top-level `let` in chat.js.)
 
 export function stopReadAloud() {
-  if (!state.readAloudPlaying) return;
-  const {audio, btn} = state.readAloudPlaying;
-  state.readAloudPlaying = null;
-  try { audio.pause(); } catch (_e) {}
-  setReadAloudState(btn, 'idle');
+  // Manual-speaker-icon playback: pause the audio element and reset
+  // the button. The function used to short-circuit on no
+  // readAloudPlaying, but now we also have to stop the voice-mode
+  // chunk chain that streamingEngine owns, so we keep going.
+  if (state.readAloudPlaying) {
+    const {audio, btn} = state.readAloudPlaying;
+    state.readAloudPlaying = null;
+    try { audio.pause(); } catch (_e) {}
+    setReadAloudState(btn, 'idle');
+  }
+  // Voice-mode chunked playback (streamingEngine.js). The handle was
+  // published when the first chunk arrived; calling stop() flips the
+  // pump's stopRequested flag and pauses whatever chunk is mid-play.
+  if (state.activeVoicePlayback) {
+    const handle = state.activeVoicePlayback;
+    state.activeVoicePlayback = null;
+    try { handle.stop(); } catch (_e) {}
+  }
 }
 
 export function setReadAloudState(btn, state) {

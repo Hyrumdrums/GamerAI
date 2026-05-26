@@ -145,6 +145,20 @@ document.getElementById('hamburger').onclick = () => {
   document.getElementById('sidebar').classList.toggle('open');
 };
 
+// Tap-outside-to-close. Before this, the user had to pick a chat or
+// New chat to dismiss the drawer — annoying when you opened it just
+// to peek at your history. Document-level listener (capture phase off)
+// so we run AFTER per-element handlers like the conv-item click, which
+// already remove .open on their own; a no-op double-remove is fine.
+document.addEventListener('click', (e) => {
+  const sidebar = document.getElementById('sidebar');
+  if (!sidebar.classList.contains('open')) return;
+  const hamburger = document.getElementById('hamburger');
+  if (sidebar.contains(e.target)) return;        // tap inside drawer
+  if (hamburger && hamburger.contains(e.target)) return;  // tap on the toggle itself
+  sidebar.classList.remove('open');
+});
+
 // ---- conversation rendering ------------------------------------------
 async function openConversation(id) {
   state.currentId = id;

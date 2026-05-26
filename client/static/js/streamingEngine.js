@@ -16,7 +16,7 @@ import {
   state, msgCache, searchModeByConv, setConvTokens,
 } from './state.js';
 import {
-  makeReadAloudButton, onReadAloudClick,
+  makeReadAloudButton, onReadAloudClick, setReadAloudState,
 } from './readAloud.js';
 import {
   setBubbleContent, setImageBubble, renderSources,
@@ -192,11 +192,72 @@ export async function streamIntoBubble(jobId, wrap, statusEl, startMs, messageId
     playing: false,          // a chunk is currently in flight
     started: false,          // at least one chunk has fired 'play' — gates DOM paint
     audioEl: null,           // currently-playing element (for cancel)
+    stopRequested: false,    // user clicked stop / navigated away
+    readBtn: null,           // the bubble's read-aloud button (acts as stop)
     chunksDoneResolver: null,
     chunksDonePromise: null,
   };
   voice.chunksDonePromise = new Promise(r => { voice.chunksDoneResolver = r; });
   if (voice.enabled) voiceLog('voice mode enabled — buffering text until first audio');
+
+  function stopVoicePlayback() {
+    if (voice.stopRequested) return;
+    voice.stopRequested = true;
+    voiceLog('stopVoicePlayback() invoked');
+    if (voice.audioEl) {
+      try { voice.audioEl.pause(); } catch (_e) {}
+      voice.audioEl = null;
+    }
+    // pause() doesn't fire 'ended', so the in-flight playOneChunk
+    // promise won't resolve naturally. Force-resolve it so the pump's
+    // await returns and the while-loop sees stopRequested=true.
+    if (voice.currentChunkResolve) {
+      const r = voice.currentChunkResolve;
+      voice.currentChunkResolve = null;
+      r();
+    }
+    // Drain any unplayed chunks so the pump's "wait for more" loop
+    // exits immediately on the next tick.
+    voice.playQueue.length = 0;
+    // Reveal whatever text is in hand — the user stopped the audio,
+    // but they probably still want to read the rest.
+    voice.started = true;
+    if (state.activeVoicePlayback && state.activeVoicePlayback.token === voice) {
+      state.activeVoicePlayback = null;
+    }
+    // The pump's finishing block resets the button + onclick. If the
+    // pump hasn't started yet (stopped before first chunk drew), do it
+    // here so the button doesn't get stuck in 'playing'.
+    if (voice.readBtn && !voice.playing) {
+      setReadAloudState(voice.readBtn, 'idle');
+    }
+  }
+
+  function ensureVoiceStopButton() {
+    if (voice.readBtn) return;
+    const readMid = wrap.dataset.messageId;
+    if (!readMid) return;
+    let btn = wrap.querySelector('.read-aloud-btn');
+    if (!btn) {
+      btn = makeReadAloudButton(readMid, '');
+      wrap.appendChild(btn);
+    }
+    voice.readBtn = btn;
+    setReadAloudState(btn, 'playing');
+    // Override the default onclick: while voice chunks are playing,
+    // tapping the speaker icon stops them. The default onReadAloudClick
+    // behavior is restored when the chunk pump finishes (or is stopped).
+    btn.onclick = (e) => {
+      e.preventDefault();
+      stopVoicePlayback();
+    };
+    // Publish the stop hook globally so chat switching / new-chat /
+    // voice-mode-off can also trigger it (stopReadAloud calls .stop()).
+    state.activeVoicePlayback = {
+      token: voice,
+      stop: stopVoicePlayback,
+    };
+  }
 
   function renderShown() {
     if (state.activeStream !== myToken) return;
@@ -212,9 +273,14 @@ export async function streamIntoBubble(jobId, wrap, statusEl, startMs, messageId
     return new Promise(resolve => {
       const a = new Audio('data:audio/wav;base64,' + chunk.audio_b64);
       voice.audioEl = a;
+      // Save the resolver so stopVoicePlayback can force-resolve the
+      // chunk's promise when the user stops mid-playback —
+      // audio.pause() alone does NOT fire 'ended'.
+      voice.currentChunkResolve = resolve;
       voiceLog(`chunk ${chunk.seq} loaded (audio_seconds=${(chunk.audio_seconds || 0).toFixed(2)}) — calling play()`);
       const done = (why) => {
         if (voice.audioEl === a) voice.audioEl = null;
+        if (voice.currentChunkResolve === resolve) voice.currentChunkResolve = null;
         voiceLog(`chunk ${chunk.seq} ${why}`);
         resolve();
       };
@@ -235,9 +301,11 @@ export async function streamIntoBubble(jobId, wrap, statusEl, startMs, messageId
   async function voicePump() {
     // Drains the play queue in order. Started when the first chunk
     // arrives. Subsequent chunks just get appended to playQueue and
-    // the pump picks them up after the current one ends.
+    // the pump picks them up after the current one ends. Exits early
+    // on stopRequested so the user-stop path can short-circuit any
+    // remaining audio (incl. chunks not yet pulled off the queue).
     voice.playing = true;
-    while (true) {
+    while (!voice.stopRequested) {
       if (voice.playQueue.length === 0) {
         // Are more chunks coming? If serverDone and queue empty, we're
         // out. Otherwise wait briefly for the next chunk.
@@ -249,6 +317,18 @@ export async function streamIntoBubble(jobId, wrap, statusEl, startMs, messageId
       await playOneChunk(chunk);
     }
     voice.playing = false;
+    // Restore the read-aloud button to its default replay behavior.
+    // After voice playback, tapping the speaker re-fires the standard
+    // TTS path on the final message text (the existing onReadAloudClick).
+    if (voice.readBtn) {
+      const finalText = (target || '').trim();
+      const mid = wrap.dataset.messageId;
+      setReadAloudState(voice.readBtn, 'idle');
+      voice.readBtn.onclick = () => onReadAloudClick(mid, finalText, voice.readBtn);
+    }
+    if (state.activeVoicePlayback && state.activeVoicePlayback.token === voice) {
+      state.activeVoicePlayback = null;
+    }
     if (voice.chunksDoneResolver) {
       voice.chunksDoneResolver();
       voice.chunksDoneResolver = null;
@@ -398,6 +478,10 @@ export async function streamIntoBubble(jobId, wrap, statusEl, startMs, messageId
           voice.queuedSeqs.add(chunk.seq);
           voice.playQueue.push(chunk);
           voiceLog(`received chunk ${chunk.seq} (${(chunk.audio_seconds || 0).toFixed(2)}s audio)`);
+          // First arrival: hang a stop button (the read-aloud speaker)
+          // off the bubble so the user has an obvious way to abort
+          // playback mid-response without having to switch chats.
+          ensureVoiceStopButton();
           if (!voice.playing) {
             voicePump();
           }
