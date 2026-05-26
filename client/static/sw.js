@@ -24,7 +24,7 @@
 // every path on the origin even though the source file lives under
 // /static/sw.js.
 
-const CACHE_VERSION = 'v3';
+const CACHE_VERSION = 'v4';
 const SHELL_CACHE = `gamerai-shell-${CACHE_VERSION}`;
 const RUNTIME_CACHE = `gamerai-runtime-${CACHE_VERSION}`;
 
