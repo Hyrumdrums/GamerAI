@@ -67,8 +67,29 @@ KNOWN_CATEGORIES = frozenset({
 # the browser's Push service uses to contact the application server if
 # something looks abusive. Default falls back to the project email so a
 # missing env var doesn't fail the send with a confusing 400.
+#
+# Private key can be supplied two ways:
+#   VAPID_PRIVATE_KEY       — raw PEM string (awkward inline since
+#                             it's multi-line, but supported)
+#   VAPID_PRIVATE_KEY_PATH  — path to a .pem file the coordinator
+#                             reads at module-import time. Preferred,
+#                             because the file permissions are a
+#                             separate trust boundary from the env.
 VAPID_PUBLIC_KEY = os.environ.get("VAPID_PUBLIC_KEY") or None
 VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY") or None
+_VAPID_PRIVATE_KEY_PATH = os.environ.get("VAPID_PRIVATE_KEY_PATH") or None
+if not VAPID_PRIVATE_KEY and _VAPID_PRIVATE_KEY_PATH:
+    try:
+        with open(_VAPID_PRIVATE_KEY_PATH) as _f:
+            VAPID_PRIVATE_KEY = _f.read()
+    except OSError as _e:
+        # Don't crash startup if the path is misconfigured —
+        # is_vapid_configured() will return False and push gracefully
+        # no-ops. Log loudly so the operator notices in /health logs.
+        log.warning(
+            "VAPID_PRIVATE_KEY_PATH=%s could not be read: %s",
+            _VAPID_PRIVATE_KEY_PATH, _e,
+        )
 VAPID_SUBJECT = (
     os.environ.get("VAPID_SUBJECT")
     or "mailto:admin@gamerai.app"

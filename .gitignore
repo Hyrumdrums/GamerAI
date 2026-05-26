@@ -12,6 +12,9 @@ __pycache__/
 data/
 ollama-models/
 .env.prod
+# VAPID private key + any other ops secrets the coordinator reads
+# at startup via VAPID_PRIVATE_KEY_PATH etc.
+.secrets/
 
 # windows-agent build outputs — produced by CI (and locally if you run
 # build.bat). version.txt is generated at build time and bundled into

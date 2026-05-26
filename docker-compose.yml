@@ -46,8 +46,20 @@ services:
       RATE_LIMIT_PER_MIN: ${RATE_LIMIT_PER_MIN:-0}
       IDEMPOTENCY_TTL_SECONDS: ${IDEMPOTENCY_TTL_SECONDS:-86400}
       REQUIRE_LIVE_WORKER: ${REQUIRE_LIVE_WORKER:-false}
+      # Web Push (Phase 6 of pwa-refactor.txt). All three are optional
+      # — coordinator gracefully no-ops push delivery when unset.
+      # Defaults preserve the "unset" sentinel, not a literal empty
+      # string, so notifications.is_vapid_configured() returns False.
+      VAPID_PUBLIC_KEY: ${VAPID_PUBLIC_KEY:-}
+      VAPID_PRIVATE_KEY_PATH: ${VAPID_PRIVATE_KEY_PATH:-}
+      VAPID_SUBJECT: ${VAPID_SUBJECT:-}
     volumes:
       - ./data:/data
+      # Read-only mount for the VAPID private key. The key file lives
+      # outside the image (gitignored .secrets/) so rebuilding the
+      # coordinator image doesn't bake a secret in. VAPID_PRIVATE_KEY_PATH
+      # in .env should point at /secrets/vapid_private.pem to match.
+      - ./.secrets:/secrets:ro
     ports:
       - "8000:8000"
 
