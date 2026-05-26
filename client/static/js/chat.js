@@ -331,6 +331,9 @@ document.getElementById('composer').onsubmit = async (e) => {
   const typing = messageEl('assistant', '', {
     status: 'pending',
     pending_kind: submitTool,
+    // Voice-mode chat gets its own placeholder — Piper warm-up
+    // syllables instead of "thinking…" so the wait feels purposeful.
+    voice_mode: submitTool === 'chat' && state.voiceMode,
   });
   pane.appendChild(typing);
   pane.scrollTop = pane.scrollHeight;

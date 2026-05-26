@@ -79,6 +79,7 @@ export function messageEl(role, text, opts = {}) {
     let typing = 'thinking…';
     if (opts.pending_kind === 'image') typing = 'drawing…';
     else if (opts.pending_kind === 'search') typing = 'searching the web…';
+    else if (opts.voice_mode) typing = 'me ma mo, me ma mo…';
     b.innerHTML = `<span class="typing">${typing}</span>`;
   } else if (opts.image_path) {
     // Persisted image turn — render the PNG bubble. The text field is

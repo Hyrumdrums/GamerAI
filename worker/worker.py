@@ -189,6 +189,9 @@ _MOCK_CHAR_DELAY = 0.0025
 # everywhere it's split.
 _VOICE_SENTENCE_RE = re.compile(r"""[.!?]+["')\]]*(?:\s+|$)|\n+""")
 
+# See VOICE_FIRST_CHUNK_MIN_CHARS in windows-agent/agent.py.
+VOICE_FIRST_CHUNK_MIN_CHARS = 40
+
 
 def find_first_sentence(text: str) -> tuple[Optional[str], int]:
     if not text:
@@ -580,6 +583,11 @@ def process_job(r: redis.Redis, http: httpx.Client, job: dict, last_job_finished
     def _enqueue_batch_if_ready(text: str) -> None:
         unsynth = text[voice_state["cursor"]:]
         n = voice_state["next_batch_size"]
+        min_chars = (
+            VOICE_FIRST_CHUNK_MIN_CHARS
+            if voice_state["next_seq"] == 0
+            else 0
+        )
         pos = 0
         found = 0
         end_in_unsynth: Optional[int] = None
@@ -589,7 +597,7 @@ def process_job(r: redis.Redis, http: httpx.Client, job: dict, last_job_finished
                 break
             end = pos + m.start() + len(m.group(0))
             found += 1
-            if found == n:
+            if found >= n and end >= min_chars:
                 end_in_unsynth = end
                 break
             pos = end

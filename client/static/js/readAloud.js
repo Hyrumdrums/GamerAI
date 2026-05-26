@@ -94,17 +94,35 @@ export function stopReadAloud() {
   }
 }
 
+// Speaker icon (idle / loading) and stop-square icon (playing). Swapping
+// the SVG, not just CSS color, makes the affordance obvious: the user
+// sees a STOP shape and knows tapping it stops the audio, without having
+// to read a tooltip.
+const READ_ALOUD_SPEAKER_SVG = (
+  '<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">' +
+  '<path fill="currentColor" d="M3 9v6h4l5 5V4L7 9H3zm13.5 3a4.5 4.5 0 0 0-2.5-4.03v8.05a4.5 4.5 0 0 0 2.5-4.02zM14 3.23v2.06A7 7 0 0 1 14 18.7v2.06A9 9 0 0 0 14 3.23z"/>' +
+  '</svg>'
+);
+const READ_ALOUD_STOP_SVG = (
+  '<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">' +
+  '<rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor"/>' +
+  '</svg>'
+);
+
 export function setReadAloudState(btn, state) {
   btn.classList.remove('is-loading', 'is-playing');
   if (state === 'loading') {
     btn.classList.add('is-loading');
+    btn.innerHTML = READ_ALOUD_SPEAKER_SVG;
     btn.setAttribute('aria-label', 'Loading audio…');
     btn.title = 'Loading…';
   } else if (state === 'playing') {
     btn.classList.add('is-playing');
+    btn.innerHTML = READ_ALOUD_STOP_SVG;
     btn.setAttribute('aria-label', 'Stop reading');
     btn.title = 'Stop';
   } else {
+    btn.innerHTML = READ_ALOUD_SPEAKER_SVG;
     btn.setAttribute('aria-label', 'Read this message aloud');
     btn.title = 'Read aloud';
   }
@@ -202,12 +220,8 @@ export function makeReadAloudButton(messageId, text) {
   const btn = document.createElement('button');
   btn.type = 'button';
   btn.className = 'read-aloud-btn';
+  // setReadAloudState writes the SVG, so no separate innerHTML init.
   setReadAloudState(btn, 'idle');
-  btn.innerHTML = `
-    <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
-      <path fill="currentColor" d="M3 9v6h4l5 5V4L7 9H3zm13.5 3a4.5 4.5 0 0 0-2.5-4.03v8.05a4.5 4.5 0 0 0 2.5-4.02zM14 3.23v2.06A7 7 0 0 1 14 18.7v2.06A9 9 0 0 0 14 3.23z"/>
-    </svg>
-  `;
   btn.onclick = () => onReadAloudClick(messageId, text, btn);
   return btn;
 }

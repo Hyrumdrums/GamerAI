@@ -3617,6 +3617,18 @@ def find_first_sentence(text: str) -> tuple[Optional[str], int]:
     return sentence, end
 
 
+# Minimum characters in the first voice-mode chunk. A 1-2 word
+# response ("Yes.", "I agree.") produces a ~0.3s audio clip while
+# Piper still pays its ~1.5s ONNX cold-start, so the cold-start
+# becomes most of the perceived wait. Extending the first chunk past
+# this threshold buys enough playback time to mask the cold-start
+# AND give the second batch (typically 2 sentences) time to synthesize
+# before the speaker runs out of audio. Later batches are sized
+# exponentially and naturally exceed this, so the constraint only
+# kicks in for seq=0.
+VOICE_FIRST_CHUNK_MIN_CHARS = 40
+
+
 def normalize_text_for_tts(text: str) -> str:
     """Strip markdown formatting before piping to Piper. Mirrors the
     client-side ``normalizeForTTS`` at client/static/js/readAloud.js:23
@@ -4265,10 +4277,19 @@ def process_one(
             def _enqueue_batch_if_ready(text: str) -> None:
                 # Try to slice out the next exponential batch from text.
                 # The Nth batch needs next_batch_size more completed
-                # sentences past cursor. If they're all there, slice and
-                # enqueue; the queue worker handles Piper and posting.
+                # sentences past cursor. For the very first batch we
+                # ALSO require at least VOICE_FIRST_CHUNK_MIN_CHARS of
+                # text so a one-word lead-in ("Sure!") doesn't get
+                # synthesized alone behind Piper's cold-start. Later
+                # batches grow exponentially and exceed the threshold
+                # naturally, so this only adds work on seq=0.
                 unsynth = text[voice_state["cursor"]:]
                 n = voice_state["next_batch_size"]
+                min_chars = (
+                    VOICE_FIRST_CHUNK_MIN_CHARS
+                    if voice_state["next_seq"] == 0
+                    else 0
+                )
                 pos = 0
                 found = 0
                 end_in_unsynth: Optional[int] = None
@@ -4278,7 +4299,7 @@ def process_one(
                         break
                     end = pos + m.start() + len(m.group(0))
                     found += 1
-                    if found == n:
+                    if found >= n and end >= min_chars:
                         end_in_unsynth = end
                         break
                     pos = end
