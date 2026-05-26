@@ -69,6 +69,12 @@
     # which has its own copy). We route to the client since both
     # containers serve identical bytes.
     @web_ui_static path /static/*
+    # PWA: service worker must be served from root scope, and the SW
+    # source lives in the client. The corresponding FastAPI route in
+    # client/app.py adds Service-Worker-Allowed: / so root-scope works.
+    # The offline fallback page also lives in the client.
+    @web_ui_sw path /sw.js
+    @web_ui_offline path /offline
     handle @web_ui {
         reverse_proxy client:8080
     }
@@ -100,6 +106,12 @@
         reverse_proxy client:8080
     }
     handle @web_ui_static {
+        reverse_proxy client:8080
+    }
+    handle @web_ui_sw {
+        reverse_proxy client:8080
+    }
+    handle @web_ui_offline {
         reverse_proxy client:8080
     }
 
