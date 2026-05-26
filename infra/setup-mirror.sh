@@ -18,15 +18,27 @@ set -euo pipefail
 MIRROR_ROOT="${MIRROR_ROOT:-/var/www/downloads-chroot/uploads}"
 MODELS_DIR="${MIRROR_ROOT}/models"
 OLLAMA_INSTALLER="${MIRROR_ROOT}/ollama-setup.exe"
-MODEL_NAME="${MODEL_NAME:-llama3.2:1b}"
-MODEL_SLUG="${MODEL_SLUG:-llama3.2-1b}"
+# These must match windows-agent/agent.py _CURRENT_CHAT_MODEL. The
+# agent enforces a single canonical model across every contributor
+# (KISS uniform-model policy) and falls back to ollama's CDN — a
+# 10-30 min download — when the mirror doesn't serve it. Keep them
+# in lockstep when rolling a new canonical.
+#
+# Operators on a low-VRAM dev VPS can pin to a smaller model:
+#   sudo MODEL_NAME=llama3.2:1b MODEL_SLUG=llama3.2-1b \
+#     MODEL_GGUF_URL=https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q8_0.gguf \
+#     bash setup-mirror.sh
+# but be aware that breaks the uniform-model contract — every
+# connecting agent then hits the CDN fallback for the canonical model.
+MODEL_NAME="${MODEL_NAME:-llama3.2:3b}"
+MODEL_SLUG="${MODEL_SLUG:-llama3.2-3b}"
 MODEL_GGUF="${MODELS_DIR}/${MODEL_SLUG}.gguf"
 MODEL_MODELFILE="${MODELS_DIR}/${MODEL_SLUG}.Modelfile"
 
 OLLAMA_INSTALLER_URL="${OLLAMA_INSTALLER_URL:-https://ollama.com/download/OllamaSetup.exe}"
-# Public HF mirror of the Meta llama-3.2 1B Instruct weights at Q8_0.
-# Q8_0 matches Ollama's default quantization for llama3.2:1b (~1.3 GB).
-MODEL_GGUF_URL="${MODEL_GGUF_URL:-https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q8_0.gguf}"
+# Public HF mirror of the Meta llama-3.2 3B Instruct weights at Q8_0.
+# Q8_0 matches Ollama's default quantization for llama3.2:3b (~2.0 GB).
+MODEL_GGUF_URL="${MODEL_GGUF_URL:-https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q8_0.gguf}"
 
 mkdir -p "${MODELS_DIR}"
 

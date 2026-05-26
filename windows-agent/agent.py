@@ -1342,16 +1342,15 @@ DEFAULTS = {
         # model. Best-effort: on failure the agent still runs and
         # returns mock inference (preserves pre-bootstrap behavior).
         "enabled": True,
-        # v1.1.26 default. Previously llama3.2:1b — the 1B was a "dev
-        # default" that turned out to be too small for the
-        # context-aware image-prompt rewrite job to interpret intent
-        # ("Yes" → use the assistant's last suggestion) reliably. 3B
-        # is ~3x slower per token but still well under a second per
-        # response on modest hardware and produces dramatically better
-        # rewrites. Existing v1.1.x configs that still carry the old
-        # 1B value are auto-upgraded by ``_migrate_legacy_chat_model``
-        # in ``Config.load_from_disk`` so users don't have to hand-
-        # edit their config.json.
+        # KISS uniform-model policy: every contributor runs the same
+        # canonical model so any chat job behaves identically no matter
+        # which worker claims it. ``Config.load`` overwrites whatever
+        # this field holds with ``_CURRENT_CHAT_MODEL`` below — leaving
+        # it as documentation in DEFAULTS so an operator browsing
+        # config.json understands what's installed by default. To roll
+        # out a new canonical (e.g. 3B → 7B), bump _CURRENT_CHAT_MODEL,
+        # update the mirror via setup-mirror.sh, ship the new agent,
+        # contributors self-update within ~6 h.
         "model": "llama3.2:3b",
         "ollama_url": "http://localhost:11434",
         "mirror_base_url": None,  # null = use coordinator_url
@@ -1427,17 +1426,19 @@ class Config:
                     with open(path, "w", encoding="utf-8") as f:
                         json.dump(data, f, indent=2)
                     print(
-                        "config migration: bootstrap.model upgraded "
-                        "from 'llama3.2:1b' to 'llama3.2:3b' "
-                        "(v1.1.26 default — better at interpreting "
-                        f"image-rewrite intent). Edit {path} to "
-                        "override.",
+                        f"config migration: bootstrap.model normalized "
+                        f"to '{_CURRENT_CHAT_MODEL}' (KISS uniform-model "
+                        f"policy — every contributor runs the same model "
+                        f"so chat jobs behave identically regardless of "
+                        f"which worker claims them). The file at {path} "
+                        f"has been rewritten; this message won't repeat.",
                         flush=True,
                     )
                 except OSError:
                     # Best effort: agent still runs against the
-                    # migrated in-memory value, but the migration
-                    # will re-attempt the rewrite on next startup.
+                    # canonical in-memory value (Config.load forces it
+                    # below) — the on-disk migration just retries on
+                    # next startup.
                     pass
         idle = data["idle"]
         power = data.get("power", DEFAULTS["power"])
@@ -1462,7 +1463,16 @@ class Config:
                 update.get("check_interval_hours", 6)
             ),
             bootstrap_enabled=bool(bootstrap.get("enabled", True)),
-            bootstrap_model=str(bootstrap.get("model", "llama3.2:3b")),
+            # KISS uniform-model: ignore whatever the on-disk config
+            # carries and always advertise the canonical model. A
+            # contributor who hand-edited bootstrap.model to something
+            # exotic (mistral, qwen, custom GGUF) would otherwise show
+            # up as a worker advertising llama3.2:3b but actually
+            # serving a different model, which the coordinator can't
+            # distinguish — that asymmetry is exactly what we're
+            # avoiding. _migrate_legacy_chat_model rewrites the on-disk
+            # value too so the next config.json read is consistent.
+            bootstrap_model=_CURRENT_CHAT_MODEL,
             bootstrap_ollama_url=str(
                 bootstrap.get("ollama_url", "http://localhost:11434")
             ).rstrip("/"),
@@ -1491,28 +1501,33 @@ def _deep_merge(into: dict, src: dict) -> None:
             into[k] = v
 
 
-# v1.1.x legacy chat-model default. Carried in every installer-created
-# config.json from pre-v1.1.26; auto-upgraded by
-# _migrate_legacy_chat_model on first load of v1.1.26+.
+# The single canonical chat model every contributor runs. ``Config.load``
+# enforces this — bootstrap_model on the dataclass is always equal to
+# this constant regardless of what config.json carries. To roll out a
+# new canonical, bump the constant, re-seed the mirror via
+# setup-mirror.sh, ship a new agent build, contributors self-update
+# within ~6 h. _LEGACY_CHAT_MODEL is kept for the migration log message
+# below — it's the most common old value we expect to see in the wild.
 _LEGACY_CHAT_MODEL = "llama3.2:1b"
 _CURRENT_CHAT_MODEL = "llama3.2:3b"
 
 
 def _migrate_legacy_chat_model(data: dict) -> bool:
-    """One-shot migration: if the loaded config still carries the
-    v1.1.x default llama3.2:1b under bootstrap.model, upgrade it to
-    the v1.1.26 default llama3.2:3b in-place and return True. The
-    caller persists ``data`` back to disk so the migration runs at
-    most once.
+    """One-shot migration: if the loaded config has a bootstrap.model
+    that doesn't match the canonical _CURRENT_CHAT_MODEL, rewrite it
+    in-place and return True. The caller persists ``data`` back to
+    disk so the next load sees the canonical value with no churn.
 
-    The 1B model was a 'dev default' that turned out too small for
-    the image-prompt rewrite step's intent inference. 3B is the
-    smallest size where 'yes/that one/use the assistant's
-    suggestion' agreement detection works reliably."""
+    Broader than the original 1B → 3B migration since the KISS
+    uniform-model policy landed: any non-canonical value (custom
+    GGUFs, mistral, qwen, …) is overwritten because Config.load
+    ignores it at runtime anyway. Persisting the migration keeps the
+    on-disk file honest so a contributor inspecting config.json sees
+    the model that's actually being advertised."""
     bs = data.get("bootstrap")
     if not isinstance(bs, dict):
         return False
-    if bs.get("model") == _LEGACY_CHAT_MODEL:
+    if bs.get("model") != _CURRENT_CHAT_MODEL:
         bs["model"] = _CURRENT_CHAT_MODEL
         return True
     return False
@@ -2337,11 +2352,18 @@ def _install_ollama(mirror_base: str, log: logging.Logger) -> Optional[Path]:
         return None
     log.info("bootstrap: running ollama installer (silent)")
     try:
-        # Squirrel-based installer; /S is the silent flag.
+        # Squirrel-based installer; /S is the silent flag. CREATE_NO_WINDOW
+        # is the Windows-only piece that actually keeps the launcher
+        # window from surfacing on first-run machines — without it, /S
+        # suppresses the install dialogs but Python still hands the
+        # child its own console window. Same pattern as _start_ollama_server
+        # below. getattr() falls back to 0 on non-Windows so the agent's
+        # unit tests (which import this module on Linux CI) stay green.
         rc = subprocess.run(
             [str(setup_dest), "/S"],
             timeout=600,
             check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         log.info("bootstrap: ollama installer exited rc=%s", rc.returncode)
     except Exception as e:

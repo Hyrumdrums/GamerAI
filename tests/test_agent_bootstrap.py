@@ -98,6 +98,13 @@ class ConfigBootstrapTests(unittest.TestCase):
             cfg_path.unlink()
 
     def test_user_overrides_merge(self, tmp_path=None):
+        # User overrides for most bootstrap fields still merge, but
+        # bootstrap.model is intentionally clamped to the canonical
+        # _CURRENT_CHAT_MODEL by Config.load (KISS uniform-model
+        # policy — see the comment on bootstrap_model in DEFAULTS).
+        # A contributor who hand-edited config.json to "mistral:7b"
+        # gets silently overridden so they don't end up advertising
+        # the canonical model while serving a different one.
         import json, tempfile
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             json.dump(
@@ -114,12 +121,20 @@ class ConfigBootstrapTests(unittest.TestCase):
         try:
             cfg = agent.Config.load(path)
             self.assertFalse(cfg.bootstrap_enabled)
-            self.assertEqual(cfg.bootstrap_model, "mistral:7b")
+            # The custom model is dropped; runtime always uses canonical.
+            self.assertEqual(cfg.bootstrap_model, agent._CURRENT_CHAT_MODEL)
             self.assertEqual(
                 cfg.bootstrap_mirror_base_url, "https://mirror.example.com"
             )
             # Untouched bootstrap keys keep their defaults.
             self.assertEqual(cfg.bootstrap_ollama_url, "http://localhost:11434")
+            # And the migration writes the canonical back to disk so
+            # next launch reads a consistent file.
+            with open(path) as f:
+                on_disk = json.load(f)
+            self.assertEqual(
+                on_disk["bootstrap"]["model"], agent._CURRENT_CHAT_MODEL,
+            )
         finally:
             path.unlink(missing_ok=True)
 
