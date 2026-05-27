@@ -79,6 +79,7 @@ from shared.models import (
     JobCancelRequest,
     JobClaimRequest,
     JobCompleteRequest,
+    JobDisplayedRequest,
     JobNextRequest,
     JobPartialRequest,
     LoginRequest,
@@ -2801,6 +2802,10 @@ def partial(req: JobPartialRequest, request: Request):
         raise
     text = req.text or ""
     r.hset(JOB_PARTIALS, req.job_id, text)
+    # Stamp first-partial wall-clock on the jobs row. The WHERE-NULL
+    # guard in mark_job_first_partial means only the first partial of
+    # each job wins; subsequent partials are no-ops.
+    db.mark_job_first_partial(req.job_id, time.time())
     if req.audio_chunk_b64 is not None and req.audio_chunk_seq is not None:
         # Voice-mode chat exponential batching: each Piper synth for a
         # sentence-batch lands here keyed by seq. Storing per-seq means
@@ -3469,6 +3474,34 @@ def cancel_job(req: JobCancelRequest, request: Request):
         extra={"event": "job_cancelled", "job_id": req.job_id},
     )
     return {"ok": True, "status": "cancelled"}
+
+
+@app.post("/jobs/displayed")
+def displayed(req: JobDisplayedRequest, request: Request):
+    """Client signals it rendered the final text. Closes the end-to-end
+    timing trail (submitted_at → started_at → first_partial_at →
+    completed_at → client_displayed_at) on the jobs row. Ownership-
+    gated like /jobs/cancel; idempotent so a duplicate POST from a
+    queue replay can't move the first-display moment."""
+    row = db.get_job(req.job_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    if AUTH_ENABLED:
+        member = getattr(request.state, "member", None)
+        if member is None:
+            raise HTTPException(status_code=401, detail="unauthorized")
+        submitted_by = (
+            row["submitted_by_member_id"]
+            if "submitted_by_member_id" in row.keys() else None
+        )
+        if (
+            submitted_by is not None
+            and submitted_by != member.member_id
+            and member.role != "admin"
+        ):
+            raise HTTPException(status_code=404, detail="job not found")
+    db.mark_job_displayed(req.job_id, float(req.displayed_at_ms) / 1000.0)
+    return {"ok": True}
 
 
 # ---------- observability ----------

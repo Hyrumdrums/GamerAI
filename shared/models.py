@@ -317,6 +317,16 @@ class JobCancelRequest(BaseModel):
     job_id: str
 
 
+class JobDisplayedRequest(BaseModel):
+    """Client signals that it has rendered the final text. Stored as the
+    last hop in the end-to-end timing trail so an operator can compute
+    server→browser delta. ``displayed_at_ms`` is client wall-clock; the
+    server stores it as-is (seconds), so cross-clock comparisons must
+    only use it relative to other client-clock times."""
+    job_id: str
+    displayed_at_ms: float
+
+
 class JobRecord(BaseModel):
     job_id: str
     prompt: str

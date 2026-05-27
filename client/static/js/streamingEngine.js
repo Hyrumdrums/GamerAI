@@ -629,6 +629,15 @@ export async function streamIntoBubble(jobId, wrap, statusEl, startMs, messageId
           + (res.prompt_tokens || 0)
           + (res.completion_tokens || 0),
         );
+        // Close the end-to-end timing trail on the jobs row. Fire-and-
+        // forget; a network failure here just leaves the column NULL,
+        // which is the same as the pre-instrumentation behavior.
+        fetch('/api/displayed/' + jobId, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({displayed_at_ms: Date.now()}),
+          keepalive: true,
+        }).catch(() => {});
         return finalRes;
       }
     }

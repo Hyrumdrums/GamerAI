@@ -491,6 +491,21 @@ class DB:
                 self._conn.execute(ddl)
             except sqlite3.OperationalError:
                 pass
+        # End-to-end latency trail. submitted_at / started_at /
+        # completed_at already covered queue + worker time;
+        # first_partial_at marks when the first streaming partial landed
+        # (separates "queue + prompt eval" from "actual generation"),
+        # and client_displayed_at is when the browser reported it had
+        # rendered the final text. The browser value is client wall-clock
+        # so it's only comparable against other browser-clock points.
+        for ddl in (
+            "ALTER TABLE jobs ADD COLUMN first_partial_at REAL",
+            "ALTER TABLE jobs ADD COLUMN client_displayed_at REAL",
+        ):
+            try:
+                self._conn.execute(ddl)
+            except sqlite3.OperationalError:
+                pass
 
     # ---------- jobs ----------
     def insert_job(
@@ -534,6 +549,28 @@ class DB:
                 "UPDATE jobs SET status='running', worker_id=?, started_at=?, "
                 "attempts = attempts + 1 WHERE job_id=?",
                 (worker_id, started_at, job_id),
+            )
+
+    def mark_job_first_partial(self, job_id: str, when: float) -> None:
+        """Stamp the first-streaming-partial timestamp. WHERE clause
+        guards on NULL so subsequent partials (one every few hundred ms
+        during streaming) don't overwrite the first-token moment."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE jobs SET first_partial_at=? "
+                "WHERE job_id=? AND first_partial_at IS NULL",
+                (when, job_id),
+            )
+
+    def mark_job_displayed(self, job_id: str, when: float) -> None:
+        """Stamp the client-rendered-the-final-text timestamp.
+        Idempotent on NULL so a duplicate POST (offline-queue replay,
+        accidental double-fire) doesn't move the first-display moment."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE jobs SET client_displayed_at=? "
+                "WHERE job_id=? AND client_displayed_at IS NULL",
+                (when, job_id),
             )
 
     def mark_job_complete(

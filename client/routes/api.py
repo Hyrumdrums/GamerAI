@@ -53,6 +53,22 @@ async def proxy_cancel(job_id: str, request: Request):
     )
 
 
+@router.post("/displayed/{job_id}")
+async def proxy_displayed(job_id: str, payload: dict, request: Request):
+    """Fire-and-forget client-rendered ping. Closes the end-to-end
+    timing trail on the jobs row; debug-only data so a network failure
+    here is harmless."""
+    return await api_client.proxy_json(
+        bearer=require_session_bearer(request),
+        method="POST", path="/jobs/displayed",
+        json={
+            "job_id": job_id,
+            "displayed_at_ms": float(payload.get("displayed_at_ms") or 0),
+        },
+        timeout=5,
+    )
+
+
 @router.get("/images/{name}")
 async def proxy_image(name: str, request: Request):
     """Forward a generated PNG with the session's bearer. The browser
