@@ -47,7 +47,7 @@ IS_WINDOWS = platform.system() == "Windows"
 # the moment it starts. The CI-generated version.txt (short-sha +
 # build timestamp) is still what the self-updater diffs against;
 # AGENT_VERSION is just the human-facing label.
-AGENT_VERSION = "1.2.3"
+AGENT_VERSION = "1.2.4"
 
 # ---------------------------------------------------------------------------
 # Idle detection
@@ -76,6 +76,72 @@ else:
 
 def cpu_percent(sample_seconds: float) -> float:
     return psutil.cpu_percent(interval=sample_seconds)
+
+
+# CREATE_NO_WINDOW so the per-poll nvidia-smi probe doesn't flash a
+# console window on a tray-mode (hidden-console) agent. 0 on non-Windows.
+_NO_WINDOW_FLAGS = subprocess.CREATE_NO_WINDOW if IS_WINDOWS else 0  # type: ignore[attr-defined]
+
+
+def gpu_busy_percent(timeout: float = 2.0) -> Optional[float]:
+    """Max GPU utilization across NVIDIA GPUs as a percent, via
+    nvidia-smi. Returns None when nvidia-smi is absent or errors
+    (AMD / integrated / dev box) — callers treat None as "unknown,
+    don't block" and lean on the game-process gate instead.
+
+    Utilization (not free VRAM) is the signal on purpose: a game pegs
+    the GPU to ~100%, while our own Ollama model sitting resident
+    between jobs (keep-alive) reports ~0% util even though it still
+    holds VRAM. Gating on free VRAM would false-positive on our own
+    warm model and break the back-to-back chat streak; gating on
+    utilization does not."""
+    try:
+        out = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            creationflags=_NO_WINDOW_FLAGS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    vals: list[float] = []
+    for line in out.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            vals.append(float(line))
+        except ValueError:
+            continue
+    return max(vals) if vals else None
+
+
+def active_game_process(process_names: list[str]) -> Optional[str]:
+    """Name of the first running process matching ``process_names``
+    (case-insensitive), else None. Used to detect an active game / VR
+    session that GetLastInputInfo can't see — VR controllers never
+    register as keyboard/mouse input, so a player standing still reads
+    as idle to the input gate. Matching on the SteamVR/Oculus runtime
+    processes (which run for the whole session) is the reliable
+    cross-vendor signal."""
+    if not process_names:
+        return None
+    wanted = {n.lower() for n in process_names}
+    try:
+        for proc in psutil.process_iter(["name"]):
+            name = (proc.info.get("name") or "").lower()
+            if name in wanted:
+                return name
+    except (psutil.Error, OSError):
+        return None
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1305,14 +1371,39 @@ DEFAULTS = {
     "polling_interval_seconds": 5,
     "earnings_print_minutes": 10,
     "idle": {
-        "min_input_idle_seconds": 60,
+        # 300s, not 60s: GetLastInputInfo only sees keyboard/mouse, so
+        # VR controller activity reads as "idle" — a long window keeps
+        # the agent from claiming a job mid-session on a gaming rig.
+        # Note this gate is bypassed entirely when stayalive is on.
+        "min_input_idle_seconds": 300,
         "max_cpu_percent": 30,
+        # Skip claiming a GPU job when NVIDIA utilization is at/above
+        # this percent — a running game pegs the GPU, so loading a model
+        # onto it would OOM the game (the VR-session crash that motivated
+        # this). Best-effort: no-op when nvidia-smi is absent (AMD /
+        # integrated / dev). Set <= 0 to disable. Does not gate the
+        # CPU-only TTS loop.
+        "max_gpu_percent": 25,
         "cpu_sample_seconds": 2,
         # When true, if the user becomes active between job-claim and
         # inference-start the agent calls /jobs/abandon and forfeits
         # any pending earnings. Off by default: the existing behavior
         # is to drain (finish the in-flight job, *then* go offline).
         "override_drain": False,
+        # Process names whose presence means "a game/VR session is
+        # live" — checked even under stayalive, since VR controller
+        # input is invisible to GetLastInputInfo so a standing-still
+        # player reads as idle. Defaults to the SteamVR / Oculus / WMR
+        # runtime processes (they run the whole session); operators can
+        # add specific flatscreen game exes. Empty list disables.
+        "game_processes": [
+            "vrserver.exe",
+            "vrcompositor.exe",
+            "vrmonitor.exe",
+            "vrdashboard.exe",
+            "OVRServer_x64.exe",
+            "WMRHost.exe",
+        ],
     },
     "power": {
         # When true and running in --tray mode, ask Windows not to
@@ -1388,6 +1479,8 @@ class Config:
     max_cpu_percent: float
     cpu_sample_seconds: float
     override_drain: bool
+    max_gpu_percent: float
+    game_processes: list[str]
     keep_awake_while_online: bool
     update_enabled: bool
     update_check_interval_hours: float
@@ -1456,6 +1549,10 @@ class Config:
             max_cpu_percent=float(idle["max_cpu_percent"]),
             cpu_sample_seconds=float(idle["cpu_sample_seconds"]),
             override_drain=bool(idle.get("override_drain", False)),
+            max_gpu_percent=float(idle.get("max_gpu_percent", 25)),
+            game_processes=list(
+                idle.get("game_processes", DEFAULTS["idle"]["game_processes"])
+            ),
             keep_awake_while_online=bool(
                 power.get("keep_awake_while_online", True)
             ),
@@ -3800,13 +3897,31 @@ def _mock_audio_b64() -> str:
 # ---------------------------------------------------------------------------
 # Idle gate
 # ---------------------------------------------------------------------------
-def is_system_idle(cfg: Config) -> tuple[bool, str]:
+def is_system_idle(cfg: Config, *, check_gpu: bool = True) -> tuple[bool, str]:
+    """Decide whether the machine is free to claim a job.
+
+    ``check_gpu`` gates the NVIDIA utilization check. The GPU loop
+    passes True (don't load a model onto a GPU a game is using); the
+    CPU-only TTS loop passes False, since the dual-loop design runs TTS
+    on the CPU *in parallel* with a GPU chat job and must not be blocked
+    by GPU activity.
+
+    The game-process gate runs unconditionally — even under stayalive —
+    because a running game is exactly the case stayalive must not be
+    allowed to override (that footgun OOM'd a live VR session)."""
     idle_for = input_idle_seconds()
     if not cfg.stayalive and idle_for < cfg.min_input_idle_seconds:
         return False, f"user active ({idle_for:.0f}s since last input)"
+    game = active_game_process(cfg.game_processes)
+    if game:
+        return False, f"game running ({game})"
     cpu = cpu_percent(cfg.cpu_sample_seconds)
     if cpu >= cfg.max_cpu_percent:
         return False, f"cpu busy ({cpu:.1f}%)"
+    if check_gpu and cfg.max_gpu_percent > 0:
+        gpu = gpu_busy_percent()
+        if gpu is not None and gpu >= cfg.max_gpu_percent:
+            return False, f"gpu busy ({gpu:.0f}%)"
     suffix = " stayalive" if cfg.stayalive else ""
     return True, f"idle ({idle_for:.0f}s, cpu {cpu:.1f}%{suffix})"
 
@@ -4500,7 +4615,9 @@ def tts_loop(
     TTS jobs while they're trying to game."""
     log.info("tts loop started (cpu-only, voice-phase1 dual-loop)")
     while not stop_event.is_set():
-        idle, _reason = is_system_idle(cfg)
+        # check_gpu=False: TTS is CPU-only and runs in parallel with a
+        # GPU chat job, so a busy GPU must not gate it.
+        idle, _reason = is_system_idle(cfg, check_gpu=False)
         if not idle:
             # GPU loop's main_loop handles the user-visible offline
             # message + WORKER_STATUS update — we just back off here.
@@ -4532,7 +4649,7 @@ def process_tts_one(
     log.info("tts job %s started (cpu loop)", job_id)
 
     if cfg.override_drain:
-        idle_now, reason = is_system_idle(cfg)
+        idle_now, reason = is_system_idle(cfg, check_gpu=False)
         if not idle_now:
             log.info(
                 "override-drain: %s — abandoning tts job %s "

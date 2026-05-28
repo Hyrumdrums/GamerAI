@@ -152,6 +152,8 @@ class BootstrapInferenceShortCircuitTests(unittest.TestCase):
             max_cpu_percent=30.0,
             cpu_sample_seconds=2.0,
             override_drain=False,
+            max_gpu_percent=25.0,
+            game_processes=[],
             keep_awake_while_online=True,
             update_enabled=True,
             update_check_interval_hours=6.0,
@@ -577,6 +579,137 @@ class SearchBackendRotationTests(unittest.TestCase):
         self.assertEqual(second[0]["href"], "https://x.com")
         # Only the first call reached the rotation.
         self.assertEqual(len(calls), 1)
+
+
+class IdleGateTests(unittest.TestCase):
+    """The GPU + game-process gates added in v1.2.4 (phase 1 of the
+    'don't OOM a live game' work). On Linux input_idle_seconds() returns
+    a huge number, so the input gate is always satisfied here and we can
+    isolate the new gates by mocking the two probe helpers."""
+
+    def _cfg(self, **overrides):
+        defaults = dict(
+            coordinator_url="https://example.test",
+            polling_interval=5.0,
+            earnings_print_seconds=600.0,
+            min_input_idle_seconds=300.0,
+            max_cpu_percent=30.0,
+            cpu_sample_seconds=0.0,
+            override_drain=False,
+            max_gpu_percent=25.0,
+            game_processes=["vrserver.exe"],
+            keep_awake_while_online=True,
+            update_enabled=True,
+            update_check_interval_hours=6.0,
+            bootstrap_enabled=True,
+            bootstrap_model="llama3.2:3b",
+            bootstrap_ollama_url="http://localhost:11434",
+            bootstrap_mirror_base_url=None,
+            bootstrap_image_enabled=False,
+            bootstrap_image_model="sd1.5",
+            bootstrap_tts_enabled=False,
+            bootstrap_tts_model="piper:en_us-libritts-high",
+            model=None,
+            worker_id=None,
+            api_token=None,
+        )
+        defaults.update(overrides)
+        return agent.Config(**defaults)
+
+    def test_game_process_blocks(self):
+        cfg = self._cfg()
+        with mock.patch.object(agent, "active_game_process", return_value="vrserver.exe"), \
+             mock.patch.object(agent, "cpu_percent", return_value=1.0), \
+             mock.patch.object(agent, "gpu_busy_percent", return_value=0.0):
+            idle, reason = agent.is_system_idle(cfg)
+        self.assertFalse(idle)
+        self.assertIn("game running", reason)
+
+    def test_game_process_blocks_even_under_stayalive(self):
+        # The whole point: stayalive must not override a live game.
+        cfg = self._cfg(stayalive=True)
+        with mock.patch.object(agent, "active_game_process", return_value="vrserver.exe"), \
+             mock.patch.object(agent, "cpu_percent", return_value=1.0), \
+             mock.patch.object(agent, "gpu_busy_percent", return_value=0.0):
+            idle, reason = agent.is_system_idle(cfg)
+        self.assertFalse(idle)
+        self.assertIn("game running", reason)
+
+    def test_gpu_busy_blocks_gpu_loop(self):
+        cfg = self._cfg()
+        with mock.patch.object(agent, "active_game_process", return_value=None), \
+             mock.patch.object(agent, "cpu_percent", return_value=1.0), \
+             mock.patch.object(agent, "gpu_busy_percent", return_value=97.0):
+            idle, reason = agent.is_system_idle(cfg, check_gpu=True)
+        self.assertFalse(idle)
+        self.assertIn("gpu busy", reason)
+
+    def test_gpu_busy_ignored_for_tts_loop(self):
+        # check_gpu=False is what tts_loop passes — a busy GPU (chat job
+        # in flight on the GPU loop) must not stop the CPU TTS loop.
+        cfg = self._cfg()
+        with mock.patch.object(agent, "active_game_process", return_value=None), \
+             mock.patch.object(agent, "cpu_percent", return_value=1.0), \
+             mock.patch.object(agent, "gpu_busy_percent", return_value=97.0):
+            idle, _reason = agent.is_system_idle(cfg, check_gpu=False)
+        self.assertTrue(idle)
+
+    def test_gpu_unknown_does_not_block(self):
+        # nvidia-smi absent (AMD / dev box) → gpu_busy_percent None →
+        # we must not block; the game-process gate is the fallback.
+        cfg = self._cfg(game_processes=[])
+        with mock.patch.object(agent, "cpu_percent", return_value=1.0), \
+             mock.patch.object(agent, "gpu_busy_percent", return_value=None):
+            idle, _reason = agent.is_system_idle(cfg)
+        self.assertTrue(idle)
+
+    def test_gpu_check_disabled_when_threshold_non_positive(self):
+        cfg = self._cfg(max_gpu_percent=0.0, game_processes=[])
+        # gpu_busy_percent must not even be consulted when disabled.
+        with mock.patch.object(agent, "cpu_percent", return_value=1.0), \
+             mock.patch.object(agent, "gpu_busy_percent", side_effect=AssertionError("should not be called")):
+            idle, _reason = agent.is_system_idle(cfg)
+        self.assertTrue(idle)
+
+
+class GpuProbeTests(unittest.TestCase):
+    def test_parses_max_utilization(self):
+        completed = mock.Mock(returncode=0, stdout="3\n91\n")
+        with mock.patch.object(agent.subprocess, "run", return_value=completed):
+            self.assertEqual(agent.gpu_busy_percent(), 91.0)
+
+    def test_missing_nvidia_smi_returns_none(self):
+        with mock.patch.object(agent.subprocess, "run", side_effect=FileNotFoundError):
+            self.assertIsNone(agent.gpu_busy_percent())
+
+    def test_nonzero_returncode_returns_none(self):
+        completed = mock.Mock(returncode=9, stdout="")
+        with mock.patch.object(agent.subprocess, "run", return_value=completed):
+            self.assertIsNone(agent.gpu_busy_percent())
+
+
+class GameProcessProbeTests(unittest.TestCase):
+    def _fake_iter(self, names):
+        for n in names:
+            yield mock.Mock(info={"name": n})
+
+    def test_matches_case_insensitively(self):
+        with mock.patch.object(
+            agent.psutil, "process_iter", return_value=self._fake_iter(["explorer.exe", "VRServer.exe"]),
+        ):
+            self.assertEqual(
+                agent.active_game_process(["vrserver.exe"]), "vrserver.exe",
+            )
+
+    def test_no_match_returns_none(self):
+        with mock.patch.object(
+            agent.psutil, "process_iter", return_value=self._fake_iter(["explorer.exe"]),
+        ):
+            self.assertIsNone(agent.active_game_process(["vrserver.exe"]))
+
+    def test_empty_list_short_circuits(self):
+        with mock.patch.object(agent.psutil, "process_iter", side_effect=AssertionError("should not scan")):
+            self.assertIsNone(agent.active_game_process([]))
 
 
 if __name__ == "__main__":
