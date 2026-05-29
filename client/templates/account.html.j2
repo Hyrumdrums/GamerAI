@@ -9,6 +9,7 @@
   <div class="brand">GamerAI · account</div>
   <div class="topbar-actions">
     <a href="/" class="hide-mobile">← chat</a>
+    <a href="/machines" class="hide-mobile">machines</a>
     {% if me.role == 'admin' %}
     <a href="/dashboard" class="hide-mobile">admin</a>
     {% endif %}
@@ -373,99 +374,11 @@
   </section>
 
   <section class="card">
-    <h2>Paired machines</h2>
-    {% if machines %}
-    <p class="muted">PCs running a GamerAI agent under this account.
-      Unpair revokes the agent's credential server-side immediately —
-      the next heartbeat from that machine will 401.</p>
-    <table class="friends-table">
-      <thead>
-        <tr><th>Label</th><th>Paired</th><th>Last used</th><th></th></tr>
-      </thead>
-      <tbody>
-        {% for m in machines %}
-        <tr>
-          <td>{{ m.label }}</td>
-          <td>
-            {% if m.created_at %}
-            <span title="{{ m.created_at }}">
-              {{ ((m.created_at | int) | string)[:10] }}
-            </span>
-            {% else %}—{% endif %}
-          </td>
-          <td>
-            {% if m.last_used_at %}
-            <span title="{{ m.last_used_at }}">recent</span>
-            {% else %}
-            never
-            {% endif %}
-          </td>
-          <td>
-            <form method="POST" action="/account/machines/{{ m.id }}/unpair" class="inline">
-              <button type="submit" class="danger">unpair</button>
-            </form>
-          </td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-    {% elif not owned_workers %}
-    <p class="muted">
-      No paired PCs yet.
-      <a href="/contribute">Run an agent on a Windows PC</a> to
-      contribute to the network and lift your tier.
-    </p>
-    {% endif %}
-
-    {% if owned_workers %}
-    <h3>Registered workers</h3>
-    <p class="muted">What your machines advertise to the network.
-      Chat-only workers count as <strong>partial contributors</strong> —
-      install the image model to upgrade. Use <em>forget</em> to clear
-      a stale registration after a PC rebuild.</p>
-    <table class="friends-table">
-      <thead>
-        <tr>
-          <th>Worker</th>
-          <th>Status</th>
-          <th>Tools</th>
-          <th></th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for w in owned_workers %}
-        <tr>
-          <td>{{ w.worker_id }}</td>
-          <td>{{ w.status }}</td>
-          <td>
-            {% if w.is_partial %}
-            <span class="badge badge-partial" title="image generation unavailable">
-              partial — no image
-            </span>
-            {% else %}
-            {{ w.tools | join(', ') }}
-            {% endif %}
-          </td>
-          <td>
-            <form method="POST"
-                  action="/account/workers/{{ w.worker_id }}/forget"
-                  class="inline"
-                  onsubmit="return confirm('Forget {{ w.worker_id }}? Lifetime earnings stay, but the row disappears from this page.');">
-              <button type="submit" class="danger">forget</button>
-            </form>
-          </td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-    {% if hidden_stale_count and hidden_stale_count > 0 %}
-    <p class="muted small">
-      {{ hidden_stale_count }} more worker{% if hidden_stale_count != 1 %}s{% endif %}
-      offline for 30+ days {% if hidden_stale_count != 1 %}are{% else %}is{% endif %}
-      hidden. Earnings history is preserved.
-    </p>
-    {% endif %}
-    {% endif %}
+    <h2>Machines</h2>
+    <p class="muted">Your paired PCs now live on their own page, where you
+      can pause contributing, set a daily uptime window so a machine only
+      works while you're not gaming, or remove a machine.</p>
+    <p><a class="btn" href="/machines">Manage machines →</a></p>
   </section>
 
   <section class="card cta">

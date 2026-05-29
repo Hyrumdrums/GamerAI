@@ -42,19 +42,14 @@ async def account_page(request: Request, flash: Optional[str] = None):
     )
     if status != 200:
         friends = {"open_invites": [], "accepted": []}
+    # The machine list + schedule controls live on /machines now; the
+    # account page only needs the partial-contributor count for the
+    # activity-card nudge ("N of your machines are chat-only").
     machines_status, machines_body = await api_client.fetch_safe(
         bearer=bearer, path="/me/machines",
     )
-    machines = machines_body.get("machines", []) if machines_status == 200 else []
-    owned_workers = (
-        machines_body.get("owned_workers", []) if machines_status == 200 else []
-    )
     partial_count = (
         machines_body.get("partial_contributor_count", 0)
-        if machines_status == 200 else 0
-    )
-    hidden_stale_count = (
-        machines_body.get("hidden_stale_count", 0)
         if machines_status == 200 else 0
     )
     # Tier-engine status: 7d uptime, current/next-tier requirements,
@@ -84,10 +79,7 @@ async def account_page(request: Request, flash: Optional[str] = None):
         {
             "me": me,
             "friends": friends,
-            "machines": machines,
-            "owned_workers": owned_workers,
             "partial_contributor_count": partial_count,
-            "hidden_stale_count": hidden_stale_count,
             "contrib_status": contrib_status,
             "tier_quota_tokens": tier_quota.get("tokens"),
             "tier_quota_images": tier_quota.get("images"),

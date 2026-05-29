@@ -99,6 +99,7 @@ class WebUISmokeTests(unittest.TestCase):
             "DELETE FROM earnings; "
             "DELETE FROM member_usage; "
             "DELETE FROM invites; "
+            "DELETE FROM member_tokens; "
             "DELETE FROM members WHERE role <> 'admin';"
         )
         # The invite-accept flow now sets a fresh session cookie when
@@ -282,12 +283,12 @@ class WebUISmokeTests(unittest.TestCase):
         self.assertIn('action="/account/invites"', body)
         # No host section — admin has no parent.
         self.assertNotIn("Your host", body)
-        # Paired-machines section renders with empty state + a link
-        # to /contribute so a non-contributor admin has a path to
-        # become one.
-        self.assertIn("Paired machines", body)
+        # Machine management moved to its own page; the account page
+        # now links there instead of rendering the list inline.
+        self.assertIn("Machines", body)
+        self.assertIn('href="/machines"', body)
+        # The contribute CTA is still present for a non-contributor.
         self.assertIn('href="/contribute"', body)
-        self.assertIn("No paired PCs yet", body)
 
     def test_account_page_renders_for_invitee_with_host_section(self):
         _, code = self._make_contributor_and_invite()
@@ -1013,18 +1014,16 @@ class WebUISmokeTests(unittest.TestCase):
         self.assertIn('id="daily_quota_images_tip"', body)
 
     def test_forget_worker_round_trips(self):
-        """The stale-worker fix: a host clicking "forget" on a
-        registered worker row sends POST /account/workers/{id}/forget,
-        which proxies to the coordinator and removes the row. Mirrors
-        the unpair pattern."""
+        """The forget-worker endpoint proxies to the coordinator and
+        removes a stale worker row. The registered-workers table moved
+        off the account page with the Machines-page slice, but the
+        endpoint itself remains a valid account-management operation."""
         bob, member_id = self._signed_in_member("bobforget")
         import time as _time
         self.db.claim_worker_ownership(
             "w_stale", member_id, "idle", _time.time(),
         )
-        # Page renders with the worker present.
-        before = bob.get("/account").text
-        self.assertIn("w_stale", before)
+        self.assertEqual(self.db.worker_owner("w_stale"), member_id)
         # POST forget.
         resp = bob.post(
             "/account/workers/w_stale/forget", follow_redirects=False,
@@ -1033,10 +1032,8 @@ class WebUISmokeTests(unittest.TestCase):
         # Flash is URL-encoded into the Location header.
         self.assertIn("Worker", resp.headers["location"])
         self.assertIn("forgotten", resp.headers["location"])
-        # Row is gone from the DB and the next page render.
+        # Row is gone from the DB.
         self.assertIsNone(self.db.worker_owner("w_stale"))
-        after = bob.get("/account").text
-        self.assertNotIn("w_stale", after)
 
     def test_forget_worker_owned_by_someone_else_flashes_error(self):
         """Trying to forget a worker you don't own surfaces the
@@ -1062,6 +1059,77 @@ class WebUISmokeTests(unittest.TestCase):
         self.assertIn("worker", resp.headers["location"].lower())
         # And the row survives.
         self.assertEqual(self.db.worker_owner("w_other"), other_id)
+
+
+    # ------------------------------------------------------------------
+    # machines page (uptime schedule)
+    # ------------------------------------------------------------------
+    def test_machines_page_empty_state(self):
+        bob, _ = self._signed_in_member("bobnomach")
+        page = bob.get("/machines")
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("No paired PCs yet", page.text)
+
+    def test_machines_page_renders_and_schedule_patch_round_trips(self):
+        bob, member_id = self._signed_in_member("bobmachines")
+        # Pair a machine: a member_token row + a worker registered with
+        # that bearer (which stamps the worker_id link coordinator-side).
+        import time as _time
+        raw = member_auth.generate_token()
+        token_hash = member_auth.hash_token(raw)
+        self.db.add_member_token(token_hash, member_id, "agent", _time.time())
+        reg = self.coord.post(
+            "/register",
+            json={"worker_id": "win-DESKTOP-XYZ-abcd1234"},
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        self.assertEqual(reg.status_code, 200, reg.text)
+
+        # The page renders one merged machine card with the derived
+        # hostname + the schedule controls.
+        page = bob.get("/machines")
+        self.assertEqual(page.status_code, 200, page.text)
+        body = page.text
+        self.assertIn("DESKTOP-XYZ", body)
+        self.assertIn("Contributing", body)
+        self.assertIn('data-role="schedule"', body)
+        self.assertIn("Timezone", body)
+
+        mid = token_hash[:12]
+        # Pause → coordinator reports not-allowed, and it persists.
+        resp = bob.patch(
+            f"/machines/{mid}/schedule",
+            json={"paused": True, "enabled": False},
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertFalse(resp.json()["allowed_now"])
+        self.assertEqual(
+            self.db.get_machine_schedule_by_token(token_hash)["paused"], 1,
+        )
+
+        # A daily window round-trips through the proxy.
+        resp2 = bob.patch(
+            f"/machines/{mid}/schedule",
+            json={"paused": False, "enabled": True,
+                  "start_min": 60, "end_min": 540, "tz": "America/Denver"},
+        )
+        self.assertEqual(resp2.status_code, 200, resp2.text)
+        sched = resp2.json()["schedule"]
+        self.assertTrue(sched["enabled"])
+        self.assertEqual(sched["tz"], "America/Denver")
+
+    def test_machines_schedule_patch_bad_tz_surfaces_422(self):
+        bob, member_id = self._signed_in_member("bobbadtz")
+        import time as _time
+        raw = member_auth.generate_token()
+        token_hash = member_auth.hash_token(raw)
+        self.db.add_member_token(token_hash, member_id, "agent", _time.time())
+        resp = bob.patch(
+            f"/machines/{token_hash[:12]}/schedule",
+            json={"enabled": True, "start_min": 60, "end_min": 540,
+                  "tz": "Mars/Olympus"},
+        )
+        self.assertEqual(resp.status_code, 422)
 
 
 if __name__ == "__main__":

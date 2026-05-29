@@ -1,0 +1,111 @@
+/* Machines page — builds on account.css (card, badge, muted, danger,
+   flash). Only the machine-specific layout lives here. */
+
+.machine-card {
+  display: flex;
+  flex-direction: column;
+  gap: .75rem;
+}
+
+.machine-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: .75rem;
+  flex-wrap: wrap;
+}
+
+.machine-name {
+  font-size: 1.1rem;
+  font-weight: 600;
+}
+
+.machine-meta {
+  word-break: break-all;
+}
+
+/* Status pill — semantic colours mirror account.css badges. */
+.status-pill {
+  display: inline-block;
+  padding: .15rem .6rem;
+  border-radius: 999px;
+  font-size: .8rem;
+  font-weight: 600;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+.status-online,
+.status-idle,
+.status-busy { background: #e6f4ea; color: #1e6a37; border-color: #a9d9b9; }
+.status-sleeping { background: #e8f4ff; color: #1c4a78; border-color: #a7c8ec; }
+.status-paused { background: #fff7e6; color: #6e4f12; border-color: #f0d496; }
+.status-offline { background: #f1f1f1; color: #777; border-color: #ddd; }
+.status-pending { background: #f3f0ff; color: #4b3b8a; border-color: #cfc4f0; }
+
+.schedule-form {
+  display: flex;
+  flex-direction: column;
+  gap: .6rem;
+  border-top: 1px solid var(--border, #e0e0e0);
+  padding-top: .75rem;
+}
+
+.toggle-row {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  cursor: pointer;
+}
+.toggle-row input { width: 1.05rem; height: 1.05rem; }
+
+.window-fields {
+  padding: .5rem .75rem;
+  background: var(--surface, #f7f7f8);
+  border: 1px solid var(--border, #e0e0e0);
+  border-radius: var(--radius, 8px);
+}
+
+.window-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .75rem 1.25rem;
+  align-items: flex-end;
+}
+.window-row label {
+  display: flex;
+  flex-direction: column;
+  gap: .2rem;
+  font-size: .85rem;
+  color: var(--muted, #666);
+}
+.window-row input,
+.window-row select {
+  padding: .35rem .4rem;
+  border: 1px solid var(--border, #ccc);
+  border-radius: 6px;
+  font-size: .95rem;
+}
+.window-hint { margin: .5rem 0 0; }
+
+.machine-actions {
+  display: flex;
+  align-items: center;
+  gap: .75rem;
+}
+
+.save-msg { font-size: .85rem; }
+.save-msg.ok { color: #1e6a37; }
+.save-msg.err { color: #8a1f1f; }
+
+/* "Remove this machine" reads as a quiet danger link, not a big button —
+   it's a rare, destructive action that shouldn't compete with Save. */
+button.linklike {
+  background: transparent;
+  border: none;
+  padding: 0;
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+button.danger.linklike { color: #8a1f1f; }
+.remove-form { margin-top: -.15rem; }

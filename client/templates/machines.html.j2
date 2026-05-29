@@ -1,0 +1,133 @@
+{% extends "base.html.j2" %}
+{% block title %}Machines — GamerAI{% endblock %}
+{% block extra_css %}
+<link rel="stylesheet" href="/static/css/account.css">
+<link rel="stylesheet" href="/static/css/machines.css">
+{% endblock %}
+
+{% block topbar %}
+<div class="topbar">
+  <div class="brand">GamerAI · machines</div>
+  <div class="topbar-actions">
+    <a href="/" class="hide-mobile">← chat</a>
+    <a href="/account" class="hide-mobile">account</a>
+    <a href="/logout">sign out</a>
+  </div>
+</div>
+{% endblock %}
+
+{% block content %}
+<div class="page">
+  {% if flash %}
+  <div class="flash">{{ flash }}</div>
+  {% endif %}
+
+  <section class="card">
+    <h1>Machines</h1>
+    <p class="muted">
+      Every PC paired to this account. Pause a machine to stop it taking
+      work, or set a daily window so it only contributes during hours you
+      choose (e.g. overnight). Outside its window a machine claims no
+      jobs — your games keep the whole GPU.
+    </p>
+  </section>
+
+  {% if not machines %}
+  <section class="card">
+    <p class="muted">
+      No paired PCs yet.
+      <a href="/contribute">Run a GamerAI agent on a Windows PC</a> to
+      contribute to the network and lift your tier.
+    </p>
+  </section>
+  {% endif %}
+
+  {% for m in machines %}
+  <section class="card machine-card" data-machine-id="{{ m.id }}">
+    <div class="machine-head">
+      <div class="machine-name">
+        {{ m.name }}
+        {% if m.is_partial %}
+        <span class="badge badge-partial" title="image generation unavailable">
+          chat-only
+        </span>
+        {% endif %}
+      </div>
+      <span class="status-pill status-{{ m.status }}" data-role="status-pill">
+        {% if m.status == 'sleeping' %}
+          Sleeping{% if m.sleeping_until %} · until {{ m.sleeping_until }}{% endif %}
+        {% elif m.status == 'pending' %}
+          Awaiting first connection
+        {% else %}
+          {{ m.status }}
+        {% endif %}
+      </span>
+    </div>
+
+    <div class="machine-meta muted small">
+      {% set parts = [] %}
+      {% if m.worker_id %}{% set _ = parts.append(m.worker_id) %}{% endif %}
+      {% if m.tools %}{% set _ = parts.append(m.tools | join(', ')) %}{% endif %}
+      {% if m.created_at %}{% set _ = parts.append('paired ' ~ (m.created_at | epoch_date)) %}{% endif %}
+      {{ parts | join(' · ') }}
+    </div>
+
+    <form class="schedule-form" data-role="schedule"
+          data-enabled="{{ '1' if m.schedule.enabled else '0' }}"
+          data-paused="{{ '1' if m.schedule.paused else '0' }}"
+          data-start="{% if m.schedule.start_min is not none %}{{ m.schedule.start_min }}{% endif %}"
+          data-end="{% if m.schedule.end_min is not none %}{{ m.schedule.end_min }}{% endif %}"
+          data-tz="{{ m.schedule.tz or '' }}">
+      <label class="toggle-row">
+        <input type="checkbox" data-role="contributing"
+               {% if not m.schedule.paused %}checked{% endif %}>
+        <span><strong>Contributing</strong> — accept jobs when idle</span>
+      </label>
+
+      <label class="toggle-row">
+        <input type="checkbox" data-role="window-enabled"
+               {% if m.schedule.enabled %}checked{% endif %}>
+        <span>Only contribute during a daily window</span>
+      </label>
+
+      <div class="window-fields" data-role="window-fields" hidden>
+        <div class="window-row">
+          <label>From
+            <input type="time" data-role="start"
+                   value="{% if m.schedule.start_min is not none %}{{ '%02d:%02d'|format(m.schedule.start_min // 60, m.schedule.start_min % 60) }}{% else %}01:00{% endif %}">
+          </label>
+          <label>To
+            <input type="time" data-role="end"
+                   value="{% if m.schedule.end_min is not none %}{{ '%02d:%02d'|format(m.schedule.end_min // 60, m.schedule.end_min % 60) }}{% else %}09:00{% endif %}">
+          </label>
+          <label>Timezone
+            <select data-role="tz">
+              {% for z in timezones %}
+              <option value="{{ z }}"{% if m.schedule.tz == z %} selected{% endif %}>{{ z }}</option>
+              {% endfor %}
+            </select>
+          </label>
+        </div>
+        <p class="muted small window-hint">
+          Overnight is fine — e.g. 22:00 to 06:00 wraps past midnight.
+        </p>
+      </div>
+
+      <div class="machine-actions">
+        <button type="button" data-role="save">Save</button>
+        <span class="save-msg" data-role="save-msg" aria-live="polite"></span>
+      </div>
+    </form>
+
+    <form method="POST" action="/machines/{{ m.id }}/unpair" class="inline remove-form"
+          onsubmit="return confirm('Remove {{ m.name }}? Its agent credential is revoked immediately — the next heartbeat from that PC will fail. Reinstalling means pairing again.');">
+      <button type="submit" class="danger linklike">Remove this machine</button>
+    </form>
+  </section>
+  {% endfor %}
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script src="/static/js/machines.js"></script>
+{% endblock %}
