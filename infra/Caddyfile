@@ -61,6 +61,11 @@
     # no /account or /agent/pair routes).
     @web_ui_account path /account /account/*
     @web_ui_agent_pair path /agent/pair /agent/pair/*
+    # Machines page + its schedule PATCH / unpair proxies all live on
+    # the client container. Without this they fall through to the
+    # coordinator default and 401 (the coord owns /me/machines, but the
+    # browser-facing /machines surface is the client's).
+    @web_ui_machines path /machines /machines/*
     # Public onboarding pitch + Windows install TL;DR. Reachable
     # while signed in (topbar CTA) and anonymously.
     @web_ui_contribute path /contribute
@@ -100,6 +105,9 @@
         reverse_proxy client:8080
     }
     handle @web_ui_agent_pair {
+        reverse_proxy client:8080
+    }
+    handle @web_ui_machines {
         reverse_proxy client:8080
     }
     handle @web_ui_contribute {
