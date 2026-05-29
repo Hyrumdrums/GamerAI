@@ -712,5 +712,52 @@ class GameProcessProbeTests(unittest.TestCase):
             self.assertIsNone(agent.active_game_process([]))
 
 
+class ScheduleCacheTests(unittest.TestCase):
+    """Slice 3: the agent caches its uptime schedule from each /heartbeat
+    response, self-gates the main loop, and slows its beat in downtime."""
+
+    def _coord(self):
+        return agent.Coordinator(
+            "http://localhost:8000", "win-test-0001", mock.MagicMock(),
+        )
+
+    def test_defaults_allowed_and_fast_cadence(self):
+        c = self._coord()
+        self.assertEqual(c.schedule_state(), (True, None))
+        self.assertEqual(c._heartbeat_interval(), agent.HEARTBEAT_INTERVAL_SECONDS)
+
+    def test_downtime_response_gates_and_slows_cadence(self):
+        c = self._coord()
+        c._apply_schedule_response({
+            "allowed_now": False,
+            "sleeping_until": "06:00",
+            "downtime_poll_seconds": 300,
+        })
+        self.assertEqual(c.schedule_state(), (False, "06:00"))
+        self.assertEqual(c._heartbeat_interval(), 300.0)
+
+    def test_allowed_response_restores_fast_cadence(self):
+        c = self._coord()
+        c._apply_schedule_response({"allowed_now": False, "downtime_poll_seconds": 120})
+        self.assertFalse(c.schedule_state()[0])
+        c._apply_schedule_response({"allowed_now": True})
+        self.assertTrue(c.schedule_state()[0])
+        self.assertEqual(c._heartbeat_interval(), agent.HEARTBEAT_INTERVAL_SECONDS)
+
+    def test_missed_beat_leaves_state_unchanged(self):
+        # A None response (transient coordinator failure) must not flip
+        # the gate — we keep the last known state.
+        c = self._coord()
+        c._apply_schedule_response({"allowed_now": False, "downtime_poll_seconds": 300})
+        c._apply_schedule_response(None)
+        self.assertFalse(c.schedule_state()[0])
+        self.assertEqual(c._heartbeat_interval(), 300.0)
+
+    def test_downtime_default_when_response_omits_interval(self):
+        c = self._coord()
+        c._apply_schedule_response({"allowed_now": False})
+        self.assertEqual(c._heartbeat_interval(), agent.DOWNTIME_POLL_DEFAULT_SECONDS)
+
+
 if __name__ == "__main__":
     unittest.main()

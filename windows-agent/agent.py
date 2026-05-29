@@ -47,7 +47,7 @@ IS_WINDOWS = platform.system() == "Windows"
 # the moment it starts. The CI-generated version.txt (short-sha +
 # build timestamp) is still what the self-updater diffs against;
 # AGENT_VERSION is just the human-facing label.
-AGENT_VERSION = "1.2.4"
+AGENT_VERSION = "1.2.5"
 
 # ---------------------------------------------------------------------------
 # Idle detection
@@ -1900,6 +1900,14 @@ def stop_log_listener() -> None:
 # cadence one-for-one.
 HEARTBEAT_INTERVAL_SECONDS = 5.0
 
+# Fallback heartbeat cadence while a machine is outside its uptime window
+# (or paused), used until the coordinator's /heartbeat response supplies
+# its own ``downtime_poll_seconds``. Slow because a sleeping machine has
+# nothing to report except "still here, what's my schedule now?" — the
+# beat doubles as the schedule-change poll, so a window edit in the web
+# UI is picked up within this interval.
+DOWNTIME_POLL_DEFAULT_SECONDS = 300.0
+
 # How long the main loop blocks inside /jobs/next per tick. The
 # background heartbeat thread keeps the worker visible to the
 # coordinator throughout this window, so we're not constrained by
@@ -1938,6 +1946,16 @@ class Coordinator:
         self._current_job_id: Optional[str] = None
         self._hb_stop = threading.Event()
         self._hb_thread: Optional[threading.Thread] = None
+        # ----- uptime-schedule state (refreshed from /heartbeat) -----
+        # The coordinator is the authoritative gate (it won't dispatch a
+        # job to a machine outside its window), but the agent self-gates
+        # too so it stops polling and drops to a slow heartbeat during
+        # downtime. Defaults to "allowed" so a coordinator that doesn't
+        # return schedule info, or a transient heartbeat failure, never
+        # strands the agent offline.
+        self._allowed_now = True
+        self._sleeping_until: Optional[str] = None
+        self._downtime_poll_seconds = float(DOWNTIME_POLL_DEFAULT_SECONDS)
 
     # ---------- low-level HTTP ----------
     def _post(self, path: str, body: dict, timeout: float = 10.0) -> Optional[dict]:
@@ -2016,11 +2034,41 @@ class Coordinator:
         with self._hb_lock:
             self._current_job_id = None
 
+    def _apply_schedule_response(self, resp: Optional[dict]) -> None:
+        """Update the cached uptime-schedule state from a /heartbeat
+        response. A None/empty response (transient failure, or a
+        coordinator that predates this field) leaves the last known
+        state untouched — we never flip the gate on a missed beat."""
+        if not resp:
+            return
+        with self._hb_lock:
+            self._allowed_now = bool(resp.get("allowed_now", self._allowed_now))
+            self._sleeping_until = resp.get("sleeping_until")
+            downtime = resp.get("downtime_poll_seconds")
+            if isinstance(downtime, (int, float)) and downtime > 0:
+                self._downtime_poll_seconds = float(downtime)
+
+    def _heartbeat_interval(self) -> float:
+        """Seconds to wait before the next beat: the slow downtime
+        cadence while gated off, the normal cadence while working."""
+        with self._hb_lock:
+            return (
+                HEARTBEAT_INTERVAL_SECONDS if self._allowed_now
+                else self._downtime_poll_seconds
+            )
+
+    def schedule_state(self) -> tuple[bool, Optional[str]]:
+        """(allowed_now, sleeping_until) snapshot for the main loop."""
+        with self._hb_lock:
+            return self._allowed_now, self._sleeping_until
+
     def _heartbeat_loop(self) -> None:
-        """POST /heartbeat every HEARTBEAT_INTERVAL_SECONDS with the
-        current status + job_id snapshot. Never raises — the coordinator
-        being temporarily unreachable is a logged warning inside
-        ``_post`` and the next tick retries cleanly."""
+        """POST /heartbeat with the current status + job_id snapshot, then
+        wait — fast while working, slow while the machine is outside its
+        uptime window (the response carries allowed_now + the downtime
+        cadence). Never raises — the coordinator being temporarily
+        unreachable is a logged warning inside ``_post`` and the next
+        tick retries cleanly."""
         # First beat goes out immediately so a re-register followed by
         # a long inference doesn't leave the coordinator without a
         # post-register heartbeat.
@@ -2028,7 +2076,7 @@ class Coordinator:
             with self._hb_lock:
                 status = self._current_status
                 job_id = self._current_job_id
-            self._post(
+            resp = self._post(
                 "/heartbeat",
                 {
                     "worker_id": self.worker_id,
@@ -2037,7 +2085,8 @@ class Coordinator:
                 },
                 timeout=5,
             )
-            self._hb_stop.wait(HEARTBEAT_INTERVAL_SECONDS)
+            self._apply_schedule_response(resp)
+            self._hb_stop.wait(self._heartbeat_interval())
 
     def start_heartbeat(self) -> None:
         if self._hb_thread is not None and self._hb_thread.is_alive():
@@ -4135,6 +4184,21 @@ def main_loop(
         if now - last_earnings_print > cfg.earnings_print_seconds:
             print_earnings(state, log)
             last_earnings_print = now
+
+        # Uptime-schedule gate. The coordinator is authoritative (it
+        # won't dispatch outside the window), but self-gating here means
+        # we don't poll /jobs/next or even sample CPU/GPU while sleeping.
+        # The heartbeat thread keeps beating (slowly) and refreshes this
+        # flag, so a window edit in the web UI flips us back on within
+        # the downtime poll interval.
+        allowed, sleeping_until = coord.schedule_state()
+        if not allowed:
+            just_drained_job_id = None
+            coord.set_offline()
+            until = f" until {sleeping_until}" if sleeping_until else ""
+            emit_status("offline", f"scheduled off{until}")
+            time.sleep(cfg.polling_interval)
+            continue
 
         idle, reason = is_system_idle(cfg)
         if not idle:

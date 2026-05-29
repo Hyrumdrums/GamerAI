@@ -2489,9 +2489,16 @@ def _schedule_payload(token_hash: Optional[str]) -> dict:
         end_min=end_min,
         tz_name=tz,
     )
+    sleeping_until = (
+        None if allowed or paused
+        else machine_schedule.next_open_local(
+            start_min=start_min, end_min=end_min, tz_name=tz,
+        )
+    )
     return {
         "allowed_now": allowed,
         "downtime_poll_seconds": DOWNTIME_HEARTBEAT_SECONDS,
+        "sleeping_until": sleeping_until,
         "schedule": {
             "paused": paused,
             "enabled": sched_enabled,
