@@ -1,17 +1,13 @@
-{% extends "base.html.j2" %}
+{% extends "base_app.html.j2" %}
 {% block title %}Pair this PC — GamerAI{% endblock %}
 {% block extra_css %}
 <link rel="stylesheet" href="/static/css/account.css">
 {% endblock %}
 
-{% block topbar %}
-<div class="topbar">
-  <div class="brand">GamerAI · pair</div>
-  <div class="topbar-actions">
+{% block brand_suffix %} · pair{% endblock %}
+{% block topbar_actions %}
     <a href="/account" class="hide-mobile">← account</a>
     <a href="/logout">sign out</a>
-  </div>
-</div>
 {% endblock %}
 
 {% block content %}

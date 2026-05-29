@@ -1,17 +1,13 @@
-{% extends "base.html.j2" %}
+{% extends "base_app.html.j2" %}
 {% block title %}GamerAI Admin Dashboard{% endblock %}
 {% block extra_css %}
 <link rel="stylesheet" href="/static/css/dashboard.css">
 {% endblock %}
 
-{% block topbar %}
-<div class="topbar">
-  <div class="brand">GamerAI · admin</div>
-  <div class="topbar-actions">
+{% block brand_suffix %} · admin{% endblock %}
+{% block topbar_actions %}
     <button onclick="location.reload()" class="btn-quiet" style="width:auto">Refresh</button>
     <a href="/">← chat</a>
-  </div>
-</div>
 {% endblock %}
 
 {% block content %}

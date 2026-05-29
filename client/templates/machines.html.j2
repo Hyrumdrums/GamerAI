@@ -1,19 +1,15 @@
-{% extends "base.html.j2" %}
+{% extends "base_app.html.j2" %}
 {% block title %}Machines — GamerAI{% endblock %}
 {% block extra_css %}
 <link rel="stylesheet" href="/static/css/account.css">
 <link rel="stylesheet" href="/static/css/machines.css">
 {% endblock %}
 
-{% block topbar %}
-<div class="topbar">
-  <div class="brand">GamerAI · machines</div>
-  <div class="topbar-actions">
+{% block brand_suffix %} · machines{% endblock %}
+{% block topbar_actions %}
     <a href="/" class="hide-mobile">← chat</a>
     <a href="/account" class="hide-mobile">account</a>
     <a href="/logout">sign out</a>
-  </div>
-</div>
 {% endblock %}
 
 {% block content %}

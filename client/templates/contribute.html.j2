@@ -1,13 +1,10 @@
-{% extends "base.html.j2" %}
+{% extends "base_app.html.j2" %}
 {% block title %}Contribute & invite friends — GamerAI{% endblock %}
 {% block extra_css %}
 <link rel="stylesheet" href="/static/css/contribute.css">
 {% endblock %}
 
-{% block topbar %}
-<div class="topbar">
-  <div class="brand">GamerAI</div>
-  <div class="topbar-actions">
+{% block topbar_actions %}
     {% if me %}
     <a href="/" class="hide-mobile">← chat</a>
     <a href="/account">{{ me.username or me.email or 'account' }}</a>
@@ -15,8 +12,6 @@
     {% else %}
     <a href="/login">sign in</a>
     {% endif %}
-  </div>
-</div>
 {% endblock %}
 
 {% block content %}

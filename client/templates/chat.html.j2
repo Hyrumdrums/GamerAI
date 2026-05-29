@@ -1,11 +1,10 @@
-{% extends "base.html.j2" %}
+{% extends "base_app.html.j2" %}
 {% block title %}GamerAI{% endblock %}
 {% block extra_css %}
 <link rel="stylesheet" href="/static/css/chat.css">
 {% endblock %}
 
-{% block topbar %}
-<div class="topbar">
+{% block topbar_left %}
   <div style="display:flex;align-items:center;gap:.6rem">
     <button class="hamburger" id="hamburger" type="button" aria-label="Toggle conversations">☰</button>
     <div class="brand-stack">
@@ -17,13 +16,12 @@
       <span class="hide-desktop">Invite friends</span>
     </a>
   </div>
-  <div class="topbar-actions">
+{% endblock %}
+{% block topbar_actions %}
     <a id="who" href="/account">signing in…</a>
     <a href="/tos" target="_blank" class="hide-mobile">terms</a>
     <a id="adminlink" href="/dashboard" class="hide-mobile" hidden>admin</a>
     <a href="/logout">sign out</a>
-  </div>
-</div>
 {% endblock %}
 
 {% block content %}

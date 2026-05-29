@@ -1,0 +1,17 @@
+{% extends "base.html.j2" %}
+
+{# Shared site header. The .topbar shell + .topbar-actions wrapper is
+   identical on every signed-in page; only the brand label and the action
+   links differ. Pages set `brand_suffix` (e.g. " · account") and fill
+   `topbar_actions`. A page with a non-standard left cluster (the chat
+   shell) overrides `topbar_left` wholesale. #}
+{% block topbar %}
+<div class="topbar">
+  {% block topbar_left %}
+  <div class="brand">GamerAI{% block brand_suffix %}{% endblock %}</div>
+  {% endblock %}
+  <div class="topbar-actions">
+    {% block topbar_actions %}{% endblock %}
+  </div>
+</div>
+{% endblock %}
