@@ -3,9 +3,11 @@
 Mirrors the structure of test_member_auth_e2e: auth ON, fakeredis,
 TestClient against the coordinator app. Exercises:
 
-- POST /agents/pair/start emits a code + url
+- POST /agents/pair/start emits a secret pair_code + a display user_code
+  + a verification URL that contains NO secret (anti-phishing)
 - GET /agents/pair/{code} returns state without revealing the token
-- POST /agents/pair/{code}/confirm requires auth and approves
+- POST /agents/pair/confirm approves by the typed user_code (requires
+  auth), and rejects the secret pair_code as a credential
 - POST /agents/pair/poll picks up the token exactly once
 - The issued token authenticates as the confirming member
 - Confirming does NOT rotate the member's primary token (web session
@@ -69,6 +71,18 @@ class AgentPairingTests(unittest.TestCase):
     def _admin_headers(self) -> dict:
         return {"Authorization": f"Bearer {ADMIN_TOKEN}"}
 
+    def _start(self) -> tuple[str, str]:
+        """Start a pairing; return (pair_code, user_code)."""
+        body = self.client.post("/agents/pair/start").json()
+        return body["pair_code"], body["user_code"]
+
+    def _confirm(self, user_code: str, headers: dict | None = None):
+        return self.client.post(
+            "/agents/pair/confirm",
+            json={"user_code": user_code},
+            headers=headers if headers is not None else self._admin_headers(),
+        )
+
     # ------------------------------------------------------------------
     # /agents/pair/start
     # ------------------------------------------------------------------
@@ -78,10 +92,25 @@ class AgentPairingTests(unittest.TestCase):
         self.assertEqual(r.status_code, 200, r.text)
         body = r.json()
         self.assertTrue(body["pair_code"].startswith("pair_"))
-        self.assertIn("pair_url", body)
-        self.assertTrue(
-            body["pair_url"].startswith("https://example.invalid/agent/pair?code=")
+        self.assertIn("user_code", body)
+        # The verification URL must carry NO secret — that's the
+        # anti-phishing property. The agent shows user_code out-of-band.
+        self.assertEqual(
+            body["verification_url"], "https://example.invalid/agent/pair",
         )
+        self.assertNotIn("?", body["verification_url"])
+        self.assertNotIn(body["pair_code"], body["verification_url"])
+
+    def test_confirm_by_user_code_not_secret_pair_code(self):
+        """The secret pair_code must NOT be accepted as the confirm
+        credential — only the user_code the agent displays."""
+        pair_code, user_code = self._start()
+        # Passing the secret pair_code as the user_code is rejected.
+        bad = self._confirm(pair_code)
+        self.assertEqual(bad.status_code, 400, bad.text)
+        # The real user_code works.
+        ok = self._confirm(user_code)
+        self.assertEqual(ok.status_code, 200, ok.text)
 
     # ------------------------------------------------------------------
     # /agents/pair/{code}
@@ -101,10 +130,8 @@ class AgentPairingTests(unittest.TestCase):
 
     def test_info_does_not_reveal_token_even_when_approved(self):
         # Approve a code, then re-read its info.
-        code = self.client.post("/agents/pair/start").json()["pair_code"]
-        self.client.post(
-            f"/agents/pair/{code}/confirm", headers=self._admin_headers()
-        )
+        code, user_code = self._start()
+        self._confirm(user_code)
         r = self.client.get(f"/agents/pair/{code}", headers=self._admin_headers())
         self.assertEqual(r.status_code, 200)
         body = r.json()
@@ -113,37 +140,33 @@ class AgentPairingTests(unittest.TestCase):
         self.assertNotIn("token", body)
 
     # ------------------------------------------------------------------
-    # /agents/pair/{code}/confirm
+    # /agents/pair/confirm
     # ------------------------------------------------------------------
     def test_confirm_requires_auth(self):
-        code = self.client.post("/agents/pair/start").json()["pair_code"]
-        r = self.client.post(f"/agents/pair/{code}/confirm")
+        _, user_code = self._start()
+        r = self._confirm(user_code, headers={})
         self.assertEqual(r.status_code, 401)
 
     def test_confirm_succeeds_for_authenticated_member(self):
-        code = self.client.post("/agents/pair/start").json()["pair_code"]
-        r = self.client.post(
-            f"/agents/pair/{code}/confirm", headers=self._admin_headers(),
-        )
+        _, user_code = self._start()
+        r = self._confirm(user_code)
         self.assertEqual(r.status_code, 200, r.text)
 
     def test_confirm_410_after_second_confirm_attempt(self):
-        code = self.client.post("/agents/pair/start").json()["pair_code"]
-        first = self.client.post(
-            f"/agents/pair/{code}/confirm", headers=self._admin_headers(),
-        )
+        _, user_code = self._start()
+        first = self._confirm(user_code)
         self.assertEqual(first.status_code, 200)
-        second = self.client.post(
-            f"/agents/pair/{code}/confirm", headers=self._admin_headers(),
-        )
+        second = self._confirm(user_code)
         self.assertEqual(second.status_code, 410)
 
     def test_confirm_404_for_unknown_code(self):
-        r = self.client.post(
-            "/agents/pair/pair_unknownsuffix12/confirm",
-            headers=self._admin_headers(),
-        )
+        # Well-formed (8 in-alphabet chars) but never issued.
+        r = self._confirm("ZZZZZZZZ")
         self.assertEqual(r.status_code, 404)
+
+    def test_confirm_400_for_malformed_code(self):
+        r = self._confirm("nope")
+        self.assertEqual(r.status_code, 400)
 
     # ------------------------------------------------------------------
     # /agents/pair/poll
@@ -157,10 +180,8 @@ class AgentPairingTests(unittest.TestCase):
         self.assertEqual(r.json()["state"], "pending")
 
     def test_poll_returns_token_after_confirm(self):
-        code = self.client.post("/agents/pair/start").json()["pair_code"]
-        self.client.post(
-            f"/agents/pair/{code}/confirm", headers=self._admin_headers(),
-        )
+        code, user_code = self._start()
+        self._confirm(user_code)
         r = self.client.post(
             "/agents/pair/poll", json={"pair_code": code},
         )
@@ -171,10 +192,8 @@ class AgentPairingTests(unittest.TestCase):
         self.assertEqual(body["member_id"], "mem_admin_seed")
 
     def test_poll_is_one_shot(self):
-        code = self.client.post("/agents/pair/start").json()["pair_code"]
-        self.client.post(
-            f"/agents/pair/{code}/confirm", headers=self._admin_headers(),
-        )
+        code, user_code = self._start()
+        self._confirm(user_code)
         first = self.client.post("/agents/pair/poll", json={"pair_code": code})
         self.assertEqual(first.status_code, 200)
         second = self.client.post("/agents/pair/poll", json={"pair_code": code})
@@ -190,10 +209,8 @@ class AgentPairingTests(unittest.TestCase):
     # end-to-end: paired token authenticates as the right member
     # ------------------------------------------------------------------
     def test_paired_token_authenticates_as_confirming_member(self):
-        code = self.client.post("/agents/pair/start").json()["pair_code"]
-        self.client.post(
-            f"/agents/pair/{code}/confirm", headers=self._admin_headers(),
-        )
+        code, user_code = self._start()
+        self._confirm(user_code)
         token = self.client.post(
             "/agents/pair/poll", json={"pair_code": code},
         ).json()["token"]
@@ -207,10 +224,8 @@ class AgentPairingTests(unittest.TestCase):
         """A web user signed in on another device must keep working
         after they pair an agent — we add to member_tokens rather than
         rotating members.token_hash."""
-        code = self.client.post("/agents/pair/start").json()["pair_code"]
-        self.client.post(
-            f"/agents/pair/{code}/confirm", headers=self._admin_headers(),
-        )
+        code, user_code = self._start()
+        self._confirm(user_code)
         # Pick up the agent token (consumes the pair record).
         self.client.post("/agents/pair/poll", json={"pair_code": code})
         # Original ADMIN_TOKEN still works.
@@ -222,10 +237,8 @@ class AgentPairingTests(unittest.TestCase):
     # /agents/pair/unpair
     # ------------------------------------------------------------------
     def _pair_and_get_token(self) -> str:
-        code = self.client.post("/agents/pair/start").json()["pair_code"]
-        self.client.post(
-            f"/agents/pair/{code}/confirm", headers=self._admin_headers(),
-        )
+        code, user_code = self._start()
+        self._confirm(user_code)
         return self.client.post(
             "/agents/pair/poll", json={"pair_code": code},
         ).json()["token"]

@@ -5174,13 +5174,14 @@ def run_pair_flow(
 ) -> Optional[str]:
     """Browser-handoff pairing.
 
-    1. POST /agents/pair/start → ``{pair_code, pair_url}``
-    2. Open the user's default browser to ``pair_url``. (Skip when
-       running headless — caller passes ``open_browser=False`` and the
-       contributor pastes the URL manually.)
-    3. Poll ``POST /agents/pair/poll`` every ``poll_interval_seconds``
-       until the user clicks Pair, then persist the returned bearer in
-       ``state.json``.
+    1. POST /agents/pair/start → ``{pair_code, user_code, verification_url}``
+    2. Show ``user_code`` on screen and open the user's default browser
+       to ``verification_url`` (which contains NO secret). The user
+       types the code we display to approve — that out-of-band step is
+       what stops someone from phishing the pairing with a link.
+    3. Poll ``POST /agents/pair/poll`` with the secret ``pair_code``
+       every ``poll_interval_seconds`` until the user approves, then
+       persist the returned bearer in ``state.json``.
 
     Returns the new token on success, None on failure / timeout /
     user-abort. Prints status to stdout so a contributor running this
@@ -5197,7 +5198,12 @@ def run_pair_flow(
         return None
     info = r.json()
     code = info.get("pair_code")
-    url = info.get("pair_url")
+    url = info.get("verification_url") or info.get("pair_url")
+    # user_code is the human-typeable code the browser asks for. Older
+    # coordinators didn't emit it; fall back to the secret code only so
+    # the flow still completes against a stale server (the secret is
+    # never put in the URL either way).
+    user_code = info.get("user_code") or code
     if not code or not url:
         sys.stderr.write(
             f"pair: coordinator returned unexpected payload: {info!r}\n"
@@ -5208,9 +5214,14 @@ def run_pair_flow(
         "\n"
         "Pairing this PC with your GamerAI account\n"
         "-----------------------------------------\n"
-        f"Sign in (or stay signed in) on your browser and approve at:\n"
-        f"  {url}\n"
-        f"Pairing code (5-minute TTL): {code}\n"
+        "1. Sign in (or stay signed in) on your browser at:\n"
+        f"     {url}\n"
+        "2. Enter this code to approve (valid 5 minutes):\n"
+        "\n"
+        f"     {user_code}\n"
+        "\n"
+        "Only type this code into the GamerAI page above. We will never\n"
+        "ask for it anywhere else.\n"
         "Waiting for your approval"
     )
     sys.stdout.flush()

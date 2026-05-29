@@ -300,13 +300,28 @@ class PasswordChangeRequest(BaseModel):
 class AgentPairPollRequest(BaseModel):
     """Agent's polling body during browser-handoff pairing.
 
-    Carries only the short pairing code; the request is unauthenticated
+    Carries only the secret polling code; the request is unauthenticated
     because the agent does not yet have a token (that's the whole point
-    of pairing). The code itself is the credential — leaking it lets a
-    bystander steal the token once the user clicks Confirm in the
-    browser, so we keep the TTL short (default 5 minutes).
+    of pairing). This code is held only by the agent — it is never put
+    in the browser URL, so it can't be phished. The TTL is short
+    (default 5 minutes).
     """
     pair_code: str
+
+
+class AgentPairConfirmRequest(BaseModel):
+    """Browser confirm body during pairing.
+
+    Carries the short, human-readable ``user_code`` the agent displays
+    on screen — NOT the secret polling code. The user reads it off the
+    agent window and types it here, which is what defeats device-code
+    phishing: an attacker who starts a pairing can mail a victim the
+    /agent/pair link, but the victim will only ever type the code shown
+    by their OWN agent, not the attacker's. The request is
+    authenticated; the confirming session is the account the agent gets
+    bound to.
+    """
+    user_code: str
 
 
 class MachineScheduleUpdate(BaseModel):

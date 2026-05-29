@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import threading
 import time
 import uuid
@@ -69,6 +70,7 @@ from coordinator.tiers import (
     meets_requirements as _tier_meets,
 )
 from shared.models import (
+    AgentPairConfirmRequest,
     AgentPairPollRequest,
     ConversationCreateRequest,
     FriendQuotaUpdateRequest,
@@ -5064,32 +5066,83 @@ def metrics(request: Request):
 # at /confirm time, so a re-played /poll after pickup is a 404 — the
 # token has already been delivered exactly once.
 PAIR_KEY_PREFIX = "agents:pair:"
+# Index: normalized user_code -> secret pair_code. Lets the browser
+# resolve the code the user typed (read off the agent screen) back to
+# the pending pair record WITHOUT ever handling the agent's secret
+# polling code. Same TTL as the pair record.
+PAIR_USERCODE_PREFIX = "agents:pair:uc:"
 PAIR_TTL_SECONDS = 300
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+
+# User-code alphabet: uppercase + digits with the visually ambiguous
+# characters removed (no 0/O, 1/I/L) so a contributor reading the code
+# off their agent window and typing it into the browser doesn't fat-
+# finger it. 8 chars over 32 symbols = 40 bits — far beyond brute force
+# within the 5-minute TTL, and re-confirming an already-approved code
+# is a no-op (410) anyway, so guessing buys an attacker nothing.
+_USER_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+_USER_CODE_LEN = 8
 
 
 def _pair_key(code: str) -> str:
     return f"{PAIR_KEY_PREFIX}{code}"
 
 
+def _normalize_user_code(raw: Optional[str]) -> str:
+    """Strip formatting (dashes/spaces) and uppercase so 'wdjb-mjht'
+    and 'WDJB MJHT' both resolve to the stored 'WDJBMJHT'."""
+    return "".join(ch for ch in (raw or "").upper() if ch in _USER_CODE_ALPHABET)
+
+
+def _pair_usercode_key(user_code: str) -> str:
+    return f"{PAIR_USERCODE_PREFIX}{_normalize_user_code(user_code)}"
+
+
+def _generate_user_code() -> str:
+    return "".join(secrets.choice(_USER_CODE_ALPHABET) for _ in range(_USER_CODE_LEN))
+
+
+def _format_user_code(code: str) -> str:
+    """Group into XXXX-XXXX for legibility on the agent console."""
+    half = _USER_CODE_LEN // 2
+    return f"{code[:half]}-{code[half:]}"
+
+
 @app.post("/agents/pair/start")
 def agent_pair_start(request: Request):
     """Agent starts the pairing flow. Public — the agent has no token
-    yet. Returns the pairing code + a URL the agent should pop open in
-    the user's default browser. The browser-side flow happens at
-    ``GET /agent/pair?code=<>`` on the web UI, which proxies to
-    ``/agents/pair/{code}/confirm`` here on click."""
+    yet. Returns the secret ``pair_code`` (the agent polls with it), a
+    short ``user_code`` the agent displays on screen, and a verification
+    URL with NO secret in it. The browser-side flow happens at
+    ``GET /agent/pair`` on the web UI: the signed-in user types the
+    ``user_code`` and POSTs it to ``/agents/pair/confirm`` here. Putting
+    the secret in the URL instead (the prior design) let an attacker who
+    called /start mail a victim a one-click link and harvest a token in
+    the victim's name — the typed out-of-band code closes that."""
     code = "pair_" + uuid.uuid4().hex[:16]
+    user_code = _generate_user_code()
     expires_at = time.time() + PAIR_TTL_SECONDS
     r.set(
         _pair_key(code),
-        json.dumps({"state": "pending", "expires_at": expires_at}),
+        json.dumps(
+            {"state": "pending", "expires_at": expires_at, "user_code": user_code}
+        ),
         ex=PAIR_TTL_SECONDS,
     )
+    r.set(_pair_usercode_key(user_code), code, ex=PAIR_TTL_SECONDS)
     base = PUBLIC_BASE_URL or str(request.base_url).rstrip("/")
+    # The verification URL carries NO secret. Embedding the code (an
+    # RFC 8628 "verification_uri_complete") would let an attacker who
+    # ran /start mail a victim a pre-filled link and harvest a token in
+    # the victim's name on click. Instead the agent shows `user_code`
+    # and the user types it on the (clean) page — they'll only ever
+    # type the code their own agent displays.
     return {
         "pair_code": code,
-        "pair_url": f"{base}/agent/pair?code={code}",
+        "user_code": _format_user_code(user_code),
+        "verification_url": f"{base}/agent/pair",
+        # Back-compat alias for older agents that read `pair_url`.
+        "pair_url": f"{base}/agent/pair",
         "expires_at": expires_at,
         "ttl_seconds": PAIR_TTL_SECONDS,
     }
@@ -5116,17 +5169,20 @@ def agent_pair_info(code: str):
     }
 
 
-@app.post("/agents/pair/{code}/confirm")
-def agent_pair_confirm(code: str, request: Request):
-    """Web UI calls this when the signed-in user clicks "Pair this PC".
-    Mints a fresh ``gai_…`` bearer, stores its hash in ``member_tokens``
-    tied to the caller's member_id (so future agent requests
-    authenticate as that member), and stashes the raw token in Redis
-    behind the pair code for the agent to retrieve via /poll.
+@app.post("/agents/pair/confirm")
+def agent_pair_confirm(req: AgentPairConfirmRequest, request: Request):
+    """Web UI calls this when the signed-in user types the code shown by
+    their agent and clicks "Pair this PC". Resolves the typed
+    ``user_code`` to the pending pair record, mints a fresh ``gai_…``
+    bearer, stores its hash in ``member_tokens`` tied to the caller's
+    member_id (so future agent requests authenticate as that member),
+    and stashes the raw token in Redis behind the secret pair code for
+    the agent to retrieve via /poll.
 
-    Auth required — the calling browser has to be signed in. The
-    coordinator middleware already enforces this for any path that
-    isn't on the public allowlist."""
+    The browser never sees the secret pair code — it only knows the
+    user_code, which is worthless without physical sight of the agent
+    screen. Auth required: the confirming session is the account the
+    agent gets bound to."""
     member = getattr(request.state, "member", None)
     if member is None:
         if AUTH_ENABLED:
@@ -5137,15 +5193,28 @@ def agent_pair_confirm(code: str, request: Request):
             detail="pairing requires auth; set API_TOKEN to enable",
         )
 
+    normalized = _normalize_user_code(req.user_code)
+    if len(normalized) != _USER_CODE_LEN:
+        raise HTTPException(
+            status_code=400,
+            detail="enter the code shown in your GamerAI agent window",
+        )
+    code = r.get(_pair_usercode_key(normalized))
+    if code is None:
+        raise HTTPException(
+            status_code=404, detail="pairing code not found or expired"
+        )
     raw = r.get(_pair_key(code))
     if raw is None:
-        raise HTTPException(status_code=404, detail="pair code not found or expired")
+        raise HTTPException(
+            status_code=404, detail="pairing code not found or expired"
+        )
     try:
         record = json.loads(raw)
     except json.JSONDecodeError:
         raise HTTPException(status_code=404, detail="pair code corrupt")
     if record.get("state") != "pending":
-        raise HTTPException(status_code=410, detail="pair code already used")
+        raise HTTPException(status_code=410, detail="pairing code already used")
 
     raw_token = member_auth.generate_token()
     token_hash = member_auth.hash_token(raw_token)

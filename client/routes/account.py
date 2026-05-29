@@ -364,64 +364,52 @@ async def contribute_page(request: Request):
 
 
 @router.get("/agent/pair", response_class=HTMLResponse)
-async def agent_pair_landing(request: Request, code: str = ""):
-    """Browser-side of the agent-pairing handoff. The Windows agent
-    opens the user's default browser to this URL. We require an
-    authenticated session — if they aren't signed in we bounce to
-    /login with this URL as the ``next`` param so they come right back
-    after sign-in."""
+async def agent_pair_landing(request: Request):
+    """Browser-side of the agent-pairing handoff. The Windows agent opens
+    the user's default browser to this URL (no secret in it) and prints a
+    short code on its own screen. The user types that code here to
+    approve. We require an authenticated session — if they aren't signed
+    in we bounce to /login and bring them right back."""
     bearer = session_bearer(request)
     me = await identify(bearer) if bearer else None
     if me is None:
-        return login_redirect(f"/agent/pair?code={code}")
-    if not code.startswith("pair_"):
-        return templates.TemplateResponse(
-            request,
-            "agent_pair.html.j2",
-            {"state": "invalid", "me": me, "code": code},
-            status_code=400,
-        )
-    async with coordinator_client._client(bearer=bearer) as c:
-        r = await c.get(f"/agents/pair/{code}", timeout=5)
-    if r.status_code == 404:
-        return templates.TemplateResponse(
-            request,
-            "agent_pair.html.j2",
-            {"state": "expired", "me": me, "code": code},
-            status_code=404,
-        )
-    info = r.json() if r.status_code == 200 else {}
+        return login_redirect("/agent/pair")
     return templates.TemplateResponse(
-        request,
-        "agent_pair.html.j2",
-        {"state": info.get("state", "unknown"), "me": me, "code": code,
-         "expires_at": info.get("expires_at")},
+        request, "agent_pair.html.j2", {"state": "enter", "me": me},
     )
 
 
 @router.post("/agent/pair")
-async def agent_pair_confirm(request: Request, code: str = Form(...)):
+async def agent_pair_confirm(request: Request, user_code: str = Form("")):
     bearer = session_bearer(request)
     me = await identify(bearer) if bearer else None
     if me is None:
-        return login_redirect(f"/agent/pair?code={code}")
+        return login_redirect("/agent/pair")
     async with coordinator_client._client(bearer=bearer) as c:
-        r = await c.post(f"/agents/pair/{code}/confirm", timeout=5)
+        r = await c.post(
+            "/agents/pair/confirm", json={"user_code": user_code}, timeout=5,
+        )
     if r.status_code == 200:
         return templates.TemplateResponse(
-            request,
-            "agent_pair.html.j2",
-            {"state": "confirmed", "me": me, "code": code},
+            request, "agent_pair.html.j2", {"state": "confirmed", "me": me},
         )
     detail = "couldn't confirm"
     try:
         detail = r.json().get("detail", detail)
     except ValueError:
         pass
-    status = "expired" if r.status_code in (404, 410) else "error"
+    # 404/410 → the code is gone (expired or already used): dead end.
+    # Anything else (e.g. 400 mistyped) → re-show the form to retry.
+    if r.status_code in (404, 410):
+        return templates.TemplateResponse(
+            request,
+            "agent_pair.html.j2",
+            {"state": "expired", "me": me, "error_detail": detail},
+            status_code=r.status_code,
+        )
     return templates.TemplateResponse(
         request,
         "agent_pair.html.j2",
-        {"state": status, "me": me, "code": code, "error_detail": detail},
-        status_code=r.status_code,
+        {"state": "enter", "me": me, "error_detail": detail,
+         "user_code": user_code},
     )

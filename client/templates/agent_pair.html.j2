@@ -13,20 +13,28 @@
 {% block content %}
 <div class="page">
   <section class="card">
-    {% if state == 'pending' %}
+    {% if state == 'enter' %}
     <h1>Pair this PC with your account</h1>
     <p>
-      A GamerAI agent on a Windows PC is asking to sign in as
-      <strong>{{ me.username or me.email or me.member_id }}</strong>.
-      Approving will let it serve jobs and contribute uptime under your
-      account.
+      A GamerAI agent wants to sign in as
+      <strong>{{ me.username or me.email or me.member_id }}</strong> so it
+      can serve jobs and contribute uptime under your account.
     </p>
     <p class="muted">
-      Only approve if you started the pairing yourself. The code is
-      short-lived (5 minutes) and can be used by exactly one agent.
+      Type the code shown in your agent's window to approve. The code
+      appears <em>only</em> on the PC running the agent — never enter a
+      code someone sent you in a link or message, even if it points here.
+      It's valid for 5 minutes and pairs exactly one agent.
     </p>
+    {% if error_detail %}
+    <p class="error">{{ error_detail }}</p>
+    {% endif %}
     <form method="POST" action="/agent/pair">
-      <input type="hidden" name="code" value="{{ code }}">
+      <input type="text" name="user_code" inputmode="text"
+             placeholder="XXXX-XXXX" autocomplete="off"
+             autocapitalize="characters" spellcheck="false"
+             aria-label="Pairing code from your agent window"
+             value="{{ user_code or '' }}" required>
       <button type="submit">Pair this PC</button>
     </form>
 
@@ -39,30 +47,16 @@
       the network as soon as the machine is idle.
     </p>
 
-    {% elif state == 'approved' %}
-    <h1>This code has already been approved</h1>
-    <p>
-      Looks like you already clicked Pair on this code. The agent
-      should already have its credentials. If it didn't pick them up,
-      restart the agent and run <code>agent pair</code> again to get a
-      fresh code.
-    </p>
-
     {% elif state == 'expired' %}
-    <h1>This pairing code has expired</h1>
+    <h1>That code didn't work</h1>
     <p>
-      Pairing codes are valid for 5 minutes. On the PC running the
-      agent, run <code>agent pair</code> again to get a fresh one.
+      It may have expired (codes last 5 minutes) or already been used.
+      On the PC running the agent, run <code>agent pair</code> again to
+      get a fresh code, then enter it here.
     </p>
     {% if error_detail %}
     <p class="muted">Server detail: {{ error_detail }}</p>
     {% endif %}
-
-    {% elif state == 'invalid' %}
-    <h1>This pairing link looks malformed</h1>
-    <p>
-      Double-check the URL the agent printed in its console.
-    </p>
 
     {% else %}
     <h1>Something went wrong</h1>

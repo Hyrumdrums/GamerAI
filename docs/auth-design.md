@@ -27,12 +27,20 @@ way and what is *not* implemented yet," you are in the right file.
   only in v1), and a placeholder "This PC" section for paired
   agents.
 - **Agent pairing (browser handoff).** The Windows agent runs
-  `agent --pair`, which calls `POST /agents/pair/start`, opens the
-  default browser to `/agent/pair?code=…`, and polls until the
-  signed-in user clicks Confirm. The user's account picks up a new
+  `agent --pair`, which calls `POST /agents/pair/start`. The
+  coordinator returns a secret `pair_code` (the agent polls with it),
+  a short human-typeable `user_code`, and a verification URL with **no
+  secret in it**. The agent prints the `user_code` on screen and opens
+  the default browser to `/agent/pair`; the signed-in user types the
+  `user_code` to approve (`POST /agents/pair/confirm`). The
+  out-of-band code is the anti-phishing control: a code in the URL
+  (the original design) let anyone who called `/start` mail a victim a
+  one-click approval link and capture a token in the victim's name.
+  The agent polls `/agents/pair/poll` with the secret `pair_code` and
+  picks the token up exactly once. The user's account gains a new
   per-agent row in the `member_tokens` table — pairing does *not*
-  rotate the primary web bearer, so web sessions on other devices
-  keep working.
+  rotate the primary web bearer, so web sessions on other devices keep
+  working.
 - **Multi-token support.** A new `member_tokens` table holds
   per-agent / per-CLI bearers. `lookup_member_by_token` checks this
   table first, then falls back to `members.token_hash` (the single
@@ -275,18 +283,19 @@ web stamps session cookie + 303 to next_path
 
 ```
 agent  --[POST /agents/pair/start]-->  coordinator
-                                       store {state:pending, ttl=300} in Redis
-                                       return {pair_code, pair_url}
+                                       store {state:pending, user_code, ttl=300} in Redis
+                                       index user_code -> pair_code in Redis
+                                       return {pair_code, user_code, verification_url}
+                                       (verification_url has NO secret)
 
-agent prints + webbrowser.open(pair_url)
+agent prints user_code + webbrowser.open(verification_url)
 
-user  /agent/pair?code=...           web: require session
-       --[GET /agents/pair/<code>]--> coordinator: returns state
+user  /agent/pair                    web: require session, show code-entry form
 
-user clicks Pair this PC
-       --[POST /agent/pair]-->        web --[POST /agents/pair/<code>/confirm]-->
-                                                              coordinator: mint gai_,
-                                                              insert into member_tokens,
+user types the user_code shown by the agent and submits
+       --[POST /agent/pair {user_code}]--> web --[POST /agents/pair/confirm {user_code}]-->
+                                                              coordinator: resolve user_code->pair_code,
+                                                              mint gai_, insert into member_tokens,
                                                               store raw in Redis {state:approved}
 
 agent polls:  POST /agents/pair/poll {pair_code}
