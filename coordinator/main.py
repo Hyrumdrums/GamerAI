@@ -1353,11 +1353,22 @@ async def _auth_middleware(request: Request, call_next):
 
 # ---------- rate limit (no-op when RATE_LIMIT_PER_MIN <= 0) ----------
 def _client_ip(request: Request) -> str:
-    """Trust the first X-Forwarded-For when present (Caddy adds it),
-    otherwise fall back to the direct peer address."""
+    """Best-effort real client IP for rate-limit keying.
+
+    Only Caddy talks to the coordinator in prod (the container port is
+    bound to localhost — see infra/docker-compose.prod.yml), and Caddy
+    *appends* the observed peer to any inbound X-Forwarded-For. So the
+    RIGHTMOST entry is the address Caddy actually saw; the leftmost is
+    attacker-controlled. Trusting the leftmost let a client forge its
+    own rate-limit bucket (send "X-Forwarded-For: 1.2.3.4", rotate it
+    per request, bypass the limiter entirely). Take the rightmost hop
+    instead, and fall back to the direct peer when there's no forwarded
+    header (direct access / local dev)."""
     fwd = request.headers.get("x-forwarded-for")
     if fwd:
-        return fwd.split(",", 1)[0].strip() or "unknown"
+        parts = [p.strip() for p in fwd.split(",") if p.strip()]
+        if parts:
+            return parts[-1]
     return getattr(request.client, "host", "unknown")
 
 
@@ -2333,7 +2344,25 @@ def _rebuild_messages_for_requeue(row) -> Optional[list[dict]]:
 
 
 @app.get("/result/{job_id}")
-def result(job_id: str):
+def result(job_id: str, request: Request):
+    # Ownership gate: a member may only poll their own jobs; admin can
+    # read any (moderation). Mirrors /jobs/cancel + /jobs/displayed.
+    # No-op when AUTH is disabled (dev/test). job_id is a uuid4 so this
+    # is defense-in-depth, but the control must not rely on entropy.
+    if AUTH_ENABLED:
+        member = getattr(request.state, "member", None)
+        if member is None:
+            raise HTTPException(status_code=401, detail="unauthorized")
+        if member.role != "admin":
+            owner_row = db.get_job(job_id)
+            submitted_by = (
+                owner_row["submitted_by_member_id"]
+                if owner_row is not None
+                and "submitted_by_member_id" in owner_row.keys()
+                else None
+            )
+            if submitted_by is None or submitted_by != member.member_id:
+                raise HTTPException(status_code=404, detail="job not found")
     raw = r.hget(JOB_RESULTS, job_id)
     if raw:
         data = json.loads(raw)
@@ -3611,8 +3640,27 @@ def _load_capabilities(worker_id: str) -> dict | None:
         return None
 
 
+def _require_admin(request: Request) -> None:
+    """Reject non-admins. No-op when AUTH is disabled (dev/test).
+
+    These operational endpoints (workers/earnings/metrics) expose
+    cross-member data. The web BFF already gates them admin-only, but
+    the coordinator is directly reachable through the Caddy catch-all
+    (infra/Caddyfile), so the role check has to live here too — any
+    valid member token would otherwise read the whole network's
+    earnings + worker inventory."""
+    if not AUTH_ENABLED:
+        return
+    member = getattr(request.state, "member", None)
+    if member is None:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    if member.role != "admin":
+        raise HTTPException(status_code=403, detail="admin only")
+
+
 @app.get("/workers")
-def workers():
+def workers(request: Request):
+    _require_admin(request)
     rows = db.list_workers()
     earnings_by_worker = {row["worker_id"]: row for row in db.list_earnings()}
     now = time.time()
@@ -4963,7 +5011,8 @@ def models():
 
 
 @app.get("/earnings")
-def earnings():
+def earnings(request: Request):
+    _require_admin(request)
     rows = db.list_earnings()
     workers_list = [
         {
@@ -4981,7 +5030,8 @@ def earnings():
 
 
 @app.get("/earnings/{worker_id}")
-def earnings_for(worker_id: str):
+def earnings_for(worker_id: str, request: Request):
+    _require_admin(request)
     row = db.earnings_for(worker_id)
     if row is None:
         return {"worker_id": worker_id, "total_tokens": 0, "total_usd": 0.0}
@@ -4993,7 +5043,8 @@ def earnings_for(worker_id: str):
 
 
 @app.get("/metrics")
-def metrics():
+def metrics(request: Request):
+    _require_admin(request)
     m = db.metrics()
     m["queue_depth"] = r.llen(JOB_QUEUE)
     m["processing"] = r.hlen(JOB_PROCESSING)

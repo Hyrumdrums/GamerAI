@@ -25,7 +25,18 @@ router = APIRouter()
 
 
 def _safe_next(next_value: str | None) -> str:
-    return next_value if next_value and next_value.startswith("/") else "/"
+    # Only same-origin absolute paths. Reject protocol-relative
+    # ("//evil.com") and backslash ("/\\evil.com") forms — browsers
+    # treat both as off-site, so accepting them turns the post-login
+    # redirect into an open redirect (phishing aid).
+    if (
+        next_value
+        and next_value.startswith("/")
+        and not next_value.startswith("//")
+        and not next_value.startswith("/\\")
+    ):
+        return next_value
+    return "/"
 
 
 def _render_login(
@@ -52,10 +63,11 @@ def _render_login(
 async def login_page(request: Request, next: str = "/"):
     # If already logged in, bounce to the destination.
     bearer = session_bearer(request)
+    safe_next = _safe_next(next)
     if bearer and await identify(bearer):
-        return RedirectResponse(next or "/", status_code=303)
+        return RedirectResponse(safe_next, status_code=303)
     return _render_login(
-        request, next_path=next or "/", error=None,
+        request, next_path=safe_next, error=None,
     )
 
 

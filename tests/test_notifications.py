@@ -161,6 +161,39 @@ class NotificationsTests(unittest.TestCase):
         )
         self.assertEqual(resp.status_code, 400)
 
+    def test_subscribe_rejects_ssrf_endpoints(self):
+        """The push endpoint is later POSTed to server-side by pywebpush,
+        so an internal/non-https target would be SSRF. Reject them at
+        subscribe time."""
+        bad = [
+            "http://push.example.com/abc",        # not https
+            "https://localhost/abc",              # loopback hostname
+            "https://coordinator/abc",            # single-label internal
+            "https://127.0.0.1/abc",              # loopback IP
+            "https://169.254.169.254/latest",     # cloud metadata
+            "https://10.0.0.5/abc",               # private IP
+            "https://[::1]/abc",                  # IPv6 loopback
+        ]
+        for endpoint in bad:
+            resp = self.client.post(
+                "/notifications/subscribe",
+                json={"endpoint": endpoint,
+                      "keys": {"p256dh": "p", "auth": "a"}},
+                headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+            )
+            self.assertEqual(
+                resp.status_code, 400, f"{endpoint!r} should be rejected",
+            )
+
+    def test_subscribe_accepts_real_push_endpoint(self):
+        resp = self.client.post(
+            "/notifications/subscribe",
+            json={"endpoint": "https://fcm.googleapis.com/fcm/send/abc123",
+                  "keys": {"p256dh": "p", "auth": "a"}},
+            headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+
     def test_unsubscribe_removes_row(self):
         self._subscribe(ADMIN_TOKEN)
         resp = self.client.request(
@@ -599,8 +632,8 @@ class NotificationsTests(unittest.TestCase):
         self.assertEqual(rows, [])
 
     def test_send_succeeds_when_webpush_returns_normally(self):
-        self._subscribe(ADMIN_TOKEN, endpoint="https://e1")
-        self._subscribe(ADMIN_TOKEN, endpoint="https://e2")
+        self._subscribe(ADMIN_TOKEN, endpoint="https://push.example.com/e1")
+        self._subscribe(ADMIN_TOKEN, endpoint="https://push.example.com/e2")
         sent = []
 
         def fake_webpush(**kwargs):
@@ -622,7 +655,10 @@ class NotificationsTests(unittest.TestCase):
                 {"url": "/conv/abc"},
             )
         self.assertEqual(pushed, 2)
-        self.assertEqual(sorted(sent), ["https://e1", "https://e2"])
+        self.assertEqual(
+            sorted(sent),
+            ["https://push.example.com/e1", "https://push.example.com/e2"],
+        )
         rows = self.db.list_notifications(self.admin_member_id, 10, 0)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["pushed"], 1)  # bool stored as 1

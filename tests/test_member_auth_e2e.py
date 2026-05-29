@@ -317,6 +317,56 @@ class MemberAuthE2ETests(unittest.TestCase):
         code = self._create_invite(contributor_token)
         self.assertTrue(code.startswith("inv_"))
 
+    def test_operational_endpoints_are_admin_only(self):
+        """/workers, /earnings, /metrics expose cross-member data and are
+        reachable directly via the Caddy catch-all, so the coordinator —
+        not just the web BFF — must reject non-admin members."""
+        _, contributor_token = self._make_contributor()
+        ct_headers = {"Authorization": f"Bearer {contributor_token}"}
+        for path in (
+            "/workers", "/earnings", "/metrics", "/earnings/some-worker",
+        ):
+            resp = self.client.get(path, headers=ct_headers)
+            self.assertEqual(resp.status_code, 403, f"{path}: {resp.text}")
+        for path in ("/workers", "/earnings", "/metrics"):
+            self.assertEqual(
+                self.client.get(path, headers=self._admin_headers())
+                .status_code,
+                200, path,
+            )
+
+    def test_result_is_owner_scoped(self):
+        """A member must not read another member's job result by job_id
+        (broken-access-control / IDOR). Owner + admin may."""
+        _, alice = self._make_contributor()
+        a_headers = {"Authorization": f"Bearer {alice}"}
+        conv = self.client.post(
+            "/conversations", json={}, headers=a_headers,
+        ).json()
+        job_id = self.client.post(
+            "/generate",
+            json={"prompt": "secret prompt",
+                  "conversation_id": conv["conversation_id"]},
+            headers=a_headers,
+        ).json()["job_id"]
+        _, bob = self._make_contributor()
+        intruder = self.client.get(
+            f"/result/{job_id}",
+            headers={"Authorization": f"Bearer {bob}"},
+        )
+        self.assertEqual(intruder.status_code, 404, intruder.text)
+        self.assertEqual(
+            self.client.get(f"/result/{job_id}", headers=a_headers)
+            .status_code,
+            200,
+        )
+        self.assertEqual(
+            self.client.get(
+                f"/result/{job_id}", headers=self._admin_headers(),
+            ).status_code,
+            200,
+        )
+
     def test_invitee_role_cannot_create_invite(self):
         # An invitee tries to create an invite — should be forbidden.
         _, contributor_token = self._make_contributor()

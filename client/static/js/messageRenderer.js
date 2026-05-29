@@ -124,12 +124,17 @@ export function renderSources(wrap, sources) {
   for (const s of sources) {
     const li = document.createElement('li');
     li.value = s.n || 0;
-    if (s.url) {
+    // Only link out to http(s). Sources come from a worker (an
+    // untrusted contributor machine), so a "javascript:" or "data:"
+    // url would be DOM-XSS-on-click — render it as inert text instead.
+    const safeUrl = (typeof s.url === 'string' && /^https?:\/\//i.test(s.url))
+      ? s.url : null;
+    if (safeUrl) {
       const a = document.createElement('a');
-      a.href = s.url;
+      a.href = safeUrl;
       a.target = '_blank';
       a.rel = 'noopener noreferrer';
-      a.textContent = s.title || s.domain || s.url;
+      a.textContent = s.title || s.domain || safeUrl;
       li.appendChild(a);
       if (s.domain && s.title && s.domain !== s.title) {
         const dom = document.createElement('span');
@@ -137,7 +142,7 @@ export function renderSources(wrap, sources) {
         li.appendChild(dom);
       }
     } else {
-      li.textContent = s.title || '(unknown)';
+      li.textContent = s.title || s.domain || '(unknown)';
     }
     ol.appendChild(li);
   }

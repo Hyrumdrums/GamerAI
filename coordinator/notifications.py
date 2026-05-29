@@ -37,12 +37,14 @@ once: ``app.include_router(notifications.build_router(db))``.
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
 import secrets
 import time
 from typing import Optional
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
@@ -96,6 +98,45 @@ VAPID_SUBJECT = (
 )
 
 NOTIFICATION_ID_PREFIX = "notif_"
+
+
+def is_safe_push_endpoint(endpoint: str) -> bool:
+    """Reject push endpoints that could be used for SSRF.
+
+    The browser hands us a push-service URL at subscribe time and the
+    coordinator later POSTs to it via pywebpush — server-side, from
+    inside the Docker network. Without validation a member could
+    register ``http://coordinator:8000/...`` or
+    ``https://169.254.169.254/...`` and turn their own image-done
+    notification into a request against internal services / cloud
+    metadata. Real push endpoints are always https FQDNs at the big
+    providers, so require https, reject IP-literal hosts in
+    private/loopback/link-local/reserved ranges, and reject single-label
+    hosts (``localhost``, ``redis``, ``coordinator``). This is a blunt
+    instrument — DNS rebinding at send time isn't covered — but it kills
+    the practical internal-reach vector at zero cost to legitimate
+    subscriptions."""
+    try:
+        u = urlparse(endpoint)
+    except (ValueError, TypeError):
+        return False
+    if u.scheme != "https" or not u.hostname:
+        return False
+    host = u.hostname
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        # Hostname (not an IP literal). Reject obviously-internal
+        # single-label names; require a dotted FQDN.
+        return host.lower() != "localhost" and "." in host
+    return not (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    )
 
 
 def _new_notification_id() -> str:
@@ -276,6 +317,11 @@ def build_router(db) -> APIRouter:
         if not req.endpoint:
             raise HTTPException(
                 status_code=400, detail="endpoint is required",
+            )
+        if not is_safe_push_endpoint(req.endpoint):
+            raise HTTPException(
+                status_code=400,
+                detail="endpoint must be an https push-service URL",
             )
         ua = request.headers.get("user-agent")
         sub_id = db.upsert_push_subscription(
