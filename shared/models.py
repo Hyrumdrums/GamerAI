@@ -309,6 +309,19 @@ class AgentPairPollRequest(BaseModel):
     pair_code: str
 
 
+class MachineScheduleUpdate(BaseModel):
+    """Per-machine uptime schedule from the Machines page. ``paused`` is
+    a hard manual stop. When ``enabled`` is true, the machine only works
+    inside [start_min, end_min) (minutes from local midnight in ``tz``);
+    start>end wraps overnight, start==end means all day. start/end/tz are
+    required only when enabled — the endpoint validates that."""
+    paused: bool = False
+    enabled: bool = False
+    start_min: Optional[int] = None
+    end_min: Optional[int] = None
+    tz: Optional[str] = None
+
+
 class JobCancelRequest(BaseModel):
     """Member-initiated cancel. The caller's session identifies the
     submitter; the coordinator verifies ownership of the job before

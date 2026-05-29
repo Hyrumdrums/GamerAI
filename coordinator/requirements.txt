@@ -18,3 +18,8 @@ nudenet==3.4.2
 # env vars are missing the push send becomes a no-op, so dev/test
 # without VAPID still passes.
 pywebpush==2.0.0
+# IANA timezone database for zoneinfo. Slim Docker base images omit
+# /usr/share/zoneinfo, so ZoneInfo("America/Denver") raises
+# ZoneInfoNotFoundError without this. Used by coordinator.schedule for
+# the per-machine uptime window math.
+tzdata==2025.2

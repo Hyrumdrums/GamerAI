@@ -18,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 
 from coordinator import canaries as canary_lib
 from coordinator import member_auth, model_registry, notifications
+from coordinator import schedule as machine_schedule
 from coordinator.canaries import CanaryInjector
 from coordinator.db import DB
 from coordinator.idempotency import IdempotencyStore
@@ -83,6 +84,7 @@ from shared.models import (
     JobNextRequest,
     JobPartialRequest,
     LoginRequest,
+    MachineScheduleUpdate,
     PasswordChangeRequest,
     WorkerIdent,
 )
@@ -1421,6 +1423,22 @@ def _worker_status(worker_id: str, now: float) -> str:
     return r.hget(WORKER_STATUS, worker_id) or "idle"
 
 
+_WORKER_ID_RE = re.compile(r"^win-(.+)-[0-9a-f]{8}$")
+
+
+def _machine_display_name(label: Optional[str], worker_id: Optional[str]) -> str:
+    """Friendly machine name for the UI. Prefer a custom label; else the
+    hostname embedded in worker_id (win-<hostname>-<rand>); else the
+    generic pairing label."""
+    if label and label.strip() and label.strip().lower() != "agent":
+        return label.strip()
+    if worker_id:
+        m = _WORKER_ID_RE.match(worker_id)
+        if m:
+            return m.group(1)
+    return label or "agent"
+
+
 _NO_WORKERS_MESSAGE = (
     "No community members are available right now. Please try again in a few minutes."
 )
@@ -2433,6 +2451,57 @@ def serve_image(name: str, request: Request):
 
 
 # ---------- worker lifecycle ----------
+def _caller_token_hash(request: Request) -> Optional[str]:
+    """SHA256 of the caller's bearer, or None when there's no bearer
+    (AUTH off in dev, or the in-VPS worker). Used to find the machine's
+    pairing record for the worker_id link + schedule lookup."""
+    raw = member_auth.parse_bearer(request.headers.get("authorization"))
+    return member_auth.hash_token(raw) if raw else None
+
+
+# How long an agent should wait between heartbeats while it's outside
+# its uptime window (or paused). Returned in the /heartbeat response so
+# a sleeping agent slows its polling yet still notices a schedule change
+# within this window. Steady-state (working) cadence stays agent-side.
+DOWNTIME_HEARTBEAT_SECONDS = 300
+
+
+def _schedule_payload(token_hash: Optional[str]) -> dict:
+    """Schedule + computed allowed_now for the machine identified by
+    ``token_hash``. An unpaired/tokenless caller (server worker) has no
+    schedule and is always allowed."""
+    row = (
+        db.get_machine_schedule_by_token(token_hash)
+        if token_hash is not None
+        else None
+    )
+    if row is None:
+        return {"allowed_now": True, "schedule": None, "downtime_poll_seconds": DOWNTIME_HEARTBEAT_SECONDS}
+    paused = bool(row["paused"])
+    sched_enabled = bool(row["sched_enabled"])
+    start_min = row["sched_start_min"]
+    end_min = row["sched_end_min"]
+    tz = row["sched_tz"]
+    allowed = machine_schedule.allowed_now(
+        paused=paused,
+        sched_enabled=sched_enabled,
+        start_min=start_min,
+        end_min=end_min,
+        tz_name=tz,
+    )
+    return {
+        "allowed_now": allowed,
+        "downtime_poll_seconds": DOWNTIME_HEARTBEAT_SECONDS,
+        "schedule": {
+            "paused": paused,
+            "enabled": sched_enabled,
+            "start_min": start_min,
+            "end_min": end_min,
+            "tz": tz,
+        },
+    }
+
+
 def _require_worker_owner(request: Request, worker_id: str) -> None:
     """Reject when the authenticated member doesn't own the worker_id.
     Admin bypasses for operational override (incident response). When
@@ -2482,6 +2551,12 @@ def register(req: WorkerIdent, request: Request):
             detail="worker_id is owned by a different member",
         )
 
+    # Link the runtime worker_id to the machine's pairing record so the
+    # Machines page + schedule gate can join the two.
+    token_hash = _caller_token_hash(request)
+    if token_hash is not None:
+        db.link_token_to_worker(token_hash, req.worker_id)
+
     r.sadd(WORKER_REGISTRY, req.worker_id)
     _write_heartbeat(req.worker_id, now, None)
     r.hset(WORKER_STATUS, req.worker_id, "idle")
@@ -2517,7 +2592,13 @@ def heartbeat(req: HeartbeatRequest, request: Request):
     _write_heartbeat(req.worker_id, now, req.job_id)
     r.hset(WORKER_STATUS, req.worker_id, req.status)
     db.upsert_worker(req.worker_id, req.status, now)
-    return {"ok": True}
+    # Backfill the link for agents that paired before this slice (their
+    # /register predates link stamping), then hand back the current
+    # schedule so the agent can self-gate + slow its beat in downtime.
+    token_hash = _caller_token_hash(request)
+    if token_hash is not None:
+        db.link_token_to_worker(token_hash, req.worker_id)
+    return {"ok": True, **_schedule_payload(token_hash)}
 
 
 def _verify_claim_or_410(
@@ -2619,6 +2700,14 @@ def next_job(req: JobNextRequest, request: Request):
     in-VPS worker.py) pass ``tool=X`` and ``wait=0`` and get the
     classic immediate-LPOP behavior unchanged."""
     _require_worker_owner(request, req.worker_id)
+    # Uptime-schedule gate. A paused machine, or one outside its allowed
+    # window, gets no work — returned as the normal no-job shape so the
+    # agent's long-poll loop stays quiet (same as an empty queue).
+    # Tokenless callers (in-VPS server worker) have no schedule and pass
+    # through. This is the authoritative gate; the agent also self-gates
+    # for efficiency, but never claims here regardless.
+    if not _schedule_payload(_caller_token_hash(request))["allowed_now"]:
+        return {"job": None}
     # Resolve the queue list. tools (list) wins when provided so a
     # v1.1.25+ agent's long-poll request takes precedence over its
     # legacy single-tool field; otherwise fall back to ``tool``.
@@ -3645,21 +3734,70 @@ def my_machines(request: Request):
         if not AUTH_ENABLED:
             return {"machines": [], "owned_workers": []}
         raise HTTPException(status_code=401, detail="unauthorized")
-    rows = db.list_member_tokens(member.member_id)
+    now = time.time()
+    # Unified machine list: one row per paired machine (member_tokens),
+    # joined to its runtime worker row, enriched with the uptime
+    # schedule + a computed status the Machines page renders directly.
     machines = []
-    for row in rows:
-        full_hash = row["token_hash"]
+    for row in db.list_machines_for_member(member.member_id):
+        wid = row["worker_id"]
+        paused = bool(row["paused"])
+        sched_enabled = bool(row["sched_enabled"])
+        start_min = row["sched_start_min"]
+        end_min = row["sched_end_min"]
+        tz = row["sched_tz"]
+        allowed = machine_schedule.allowed_now(
+            paused=paused, sched_enabled=sched_enabled,
+            start_min=start_min, end_min=end_min, tz_name=tz,
+        )
+        sleeping_until = (
+            None if allowed
+            else machine_schedule.next_open_local(
+                start_min=start_min, end_min=end_min, tz_name=tz,
+            )
+        )
+        if wid is None:
+            # Paired but the agent hasn't called /register yet.
+            status, last_seen, tools, is_partial = "pending", None, [], False
+        else:
+            raw_tools = row["worker_tools_json"]
+            try:
+                tools = json.loads(raw_tools) if raw_tools else ["chat"]
+            except (TypeError, json.JSONDecodeError):
+                tools = ["chat"]
+            is_partial = "image" not in tools
+            last_seen = float(row["worker_last_seen"] or 0) or None
+            # Schedule state overlays the live worker status: a sleeping
+            # or paused machine is intentionally not working, which reads
+            # very differently from "offline" (crashed / powered off).
+            if paused:
+                status = "paused"
+            elif not allowed:
+                status = "sleeping"
+            else:
+                status = _worker_status(wid, now)
         machines.append({
-            # 12-char prefix is enough to disambiguate even tens of
-            # thousands of rows; the full hash isn't a credential
-            # but there's no reason to surface it.
-            "id": full_hash[:12],
+            "id": row["token_hash"][:12],
+            "name": _machine_display_name(row["label"], wid),
             "label": row["label"] or "agent",
+            "worker_id": wid,
             "created_at": row["created_at"],
             "last_used_at": row["last_used_at"],
+            "last_seen": last_seen,
+            "status": status,
+            "tools": tools,
+            "is_partial": is_partial,
+            "allowed_now": allowed,
+            "sleeping_until": sleeping_until,
+            "schedule": {
+                "enabled": sched_enabled,
+                "paused": paused,
+                "start_min": start_min,
+                "end_min": end_min,
+                "tz": tz,
+            },
         })
     worker_rows = db.list_workers_for_member(member.member_id)
-    now = time.time()
     stale_cutoff = now - STALE_WORKER_HIDE_DAYS * 86400.0
     owned_workers = []
     hidden_stale_count = 0
@@ -3692,6 +3830,55 @@ def my_machines(request: Request):
         "hidden_stale_count": hidden_stale_count,
         "partial_contributor_count": partial_count,
     }
+
+
+@app.patch("/me/machines/{machine_id}/schedule")
+def update_machine_schedule(
+    machine_id: str, req: MachineScheduleUpdate, request: Request,
+):
+    """Set a machine's uptime schedule. ``machine_id`` is the 12-char
+    handle from /me/machines; resolved to the full token_hash scoped to
+    the caller so one member can't reschedule another's machine."""
+    member = getattr(request.state, "member", None)
+    if member is None:
+        if not AUTH_ENABLED:
+            return {"ok": True}
+        raise HTTPException(status_code=401, detail="unauthorized")
+    token_hash = db.resolve_machine_token_hash(member.member_id, machine_id)
+    if token_hash is None:
+        raise HTTPException(status_code=404, detail="machine not found")
+    if req.enabled:
+        if req.start_min is None or req.end_min is None:
+            raise HTTPException(
+                status_code=422,
+                detail="start_min and end_min are required when enabled",
+            )
+        if not (0 <= req.start_min < 1440 and 0 <= req.end_min < 1440):
+            raise HTTPException(
+                status_code=422,
+                detail="start_min/end_min must be minutes-from-midnight in [0,1440)",
+            )
+        if not req.tz or not machine_schedule.valid_tz(req.tz):
+            raise HTTPException(
+                status_code=422, detail=f"unknown or missing timezone: {req.tz!r}",
+            )
+    ok = db.set_machine_schedule(
+        member.member_id, token_hash,
+        paused=req.paused, sched_enabled=req.enabled,
+        start_min=req.start_min, end_min=req.end_min, tz=req.tz,
+    )
+    if not ok:
+        raise HTTPException(status_code=404, detail="machine not found")
+    log.info(
+        "machine schedule updated",
+        extra={
+            "event": "machine_schedule_updated",
+            "by_member_id": member.member_id,
+            "paused": req.paused,
+            "enabled": req.enabled,
+        },
+    )
+    return {"ok": True, **_schedule_payload(token_hash)}
 
 
 @app.post("/me/workers/{worker_id}/forget")

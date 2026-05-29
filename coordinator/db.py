@@ -477,6 +477,33 @@ class DB:
             "CREATE INDEX IF NOT EXISTS idx_member_tokens_member "
             "ON member_tokens(member_id);"
         )
+        # Uptime-schedule slice. ``member_tokens`` is the durable
+        # per-machine record (created at pairing); the schedule lives
+        # here, not on ``workers``, because worker_id is regenerated on
+        # agent reinstall (win-<host>-<random>) while the paired token
+        # persists. ``worker_id`` links this record to its runtime
+        # registration in ``workers`` — stamped at /register and
+        # backfilled at /heartbeat, so already-paired agents pick it up
+        # without re-pairing. Schedule window is minutes-from-midnight
+        # in ``sched_tz`` (IANA); start>end means an overnight wrap
+        # (e.g. 1320..360 = 22:00-06:00). paused is a hard manual stop
+        # independent of the time window.
+        for ddl in (
+            "ALTER TABLE member_tokens ADD COLUMN worker_id TEXT",
+            "ALTER TABLE member_tokens ADD COLUMN paused INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE member_tokens ADD COLUMN sched_enabled INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE member_tokens ADD COLUMN sched_start_min INTEGER",
+            "ALTER TABLE member_tokens ADD COLUMN sched_end_min INTEGER",
+            "ALTER TABLE member_tokens ADD COLUMN sched_tz TEXT",
+        ):
+            try:
+                self._conn.execute(ddl)
+            except sqlite3.OperationalError:
+                pass
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_member_tokens_worker "
+            "ON member_tokens(worker_id)"
+        )
         # History summarization (Phase 3 of the long-context fix).
         # ``summary_text`` is a short natural-language recap of every
         # turn up through ``summary_through_seq``. _build_chat_messages
@@ -958,6 +985,99 @@ class DB:
             cur = self._conn.execute(
                 "DELETE FROM member_tokens WHERE member_id=? AND token_hash=?",
                 (member_id, token_hash),
+            )
+            return cur.rowcount > 0
+
+    # ---------- machines (member_tokens as the durable machine record) ----------
+    def link_token_to_worker(self, token_hash: str, worker_id: str) -> None:
+        """Stamp the runtime ``worker_id`` onto the machine's pairing
+        record. Called at /register and /heartbeat; the WHERE guard makes
+        the per-heartbeat call a no-op write once the link is set (or
+        re-points it if the agent regenerated its worker_id)."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE member_tokens SET worker_id=? "
+                "WHERE token_hash=? AND (worker_id IS NULL OR worker_id <> ?)",
+                (worker_id, token_hash, worker_id),
+            )
+
+    def get_machine_schedule_by_token(self, token_hash: str) -> Optional[sqlite3.Row]:
+        """Schedule fields for the machine identified by its pairing
+        token. None when the token isn't a paired machine (e.g. the
+        in-VPS server worker, or a web-session token) — callers treat
+        None as "no schedule → always allowed"."""
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT paused, sched_enabled, sched_start_min, sched_end_min, "
+                "sched_tz FROM member_tokens WHERE token_hash=?",
+                (token_hash,),
+            )
+            return cur.fetchone()
+
+    def list_machines_for_member(self, member_id: str) -> list[sqlite3.Row]:
+        """One row per paired machine, joined to its runtime registration
+        in ``workers`` (LEFT JOIN — a freshly-paired machine has no worker
+        row until the agent calls /register). This is the single source
+        for the Machines page."""
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT t.token_hash, t.label, t.created_at, t.last_used_at, "
+                "t.worker_id, t.paused, t.sched_enabled, t.sched_start_min, "
+                "t.sched_end_min, t.sched_tz, "
+                "w.status AS worker_status, w.last_seen AS worker_last_seen, "
+                "w.tools_json AS worker_tools_json, w.registered_at AS worker_registered_at "
+                "FROM member_tokens t "
+                "LEFT JOIN workers w ON w.worker_id = t.worker_id "
+                "WHERE t.member_id=? ORDER BY t.created_at DESC",
+                (member_id,),
+            )
+            return cur.fetchall()
+
+    def resolve_machine_token_hash(
+        self, member_id: str, id_prefix: str,
+    ) -> Optional[str]:
+        """Map the 12-char machine ``id`` the UI carries back to a full
+        token_hash, scoped to the caller. Returns None if no match or an
+        ambiguous prefix (collision is statistically impossible at 12 hex
+        chars, but we refuse rather than guess)."""
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT token_hash FROM member_tokens "
+                "WHERE member_id=? AND token_hash LIKE ?",
+                (member_id, id_prefix.replace("%", "") + "%"),
+            )
+            rows = cur.fetchall()
+        if len(rows) != 1:
+            return None
+        return rows[0]["token_hash"]
+
+    def set_machine_schedule(
+        self,
+        member_id: str,
+        token_hash: str,
+        *,
+        paused: bool,
+        sched_enabled: bool,
+        start_min: Optional[int],
+        end_min: Optional[int],
+        tz: Optional[str],
+    ) -> bool:
+        """Persist a machine's schedule, scoped to its owner. Returns
+        False when the (member, token) pair doesn't exist."""
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE member_tokens SET paused=?, sched_enabled=?, "
+                "sched_start_min=?, sched_end_min=?, sched_tz=? "
+                "WHERE member_id=? AND token_hash=?",
+                (
+                    1 if paused else 0,
+                    1 if sched_enabled else 0,
+                    start_min,
+                    end_min,
+                    tz,
+                    member_id,
+                    token_hash,
+                ),
             )
             return cur.rowcount > 0
 
