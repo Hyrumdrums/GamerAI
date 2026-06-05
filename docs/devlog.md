@@ -20,9 +20,10 @@ Full security review of the project, then fixes in three commits.
   uuid4 so it was hard to enumerate, but the control was missing.
 - Rate limiter keyed on the *leftmost* X-Forwarded-For — client-spoofable
   (send a fake XFF, rotate per request, bypass). Now uses the rightmost
-  (Caddy-appended) hop. Also note: limiter is still disabled by default
-  (`RATE_LIMIT_PER_MIN=0`) and there's no per-account login lockout — both
-  still open.
+  (Caddy-appended) hop. The coarse global limiter stays opt-in
+  (`RATE_LIMIT_PER_MIN=0`) on purpose: the chat client polls `/result`
+  every ~200ms (~300 req/min per active stream), so enabling it below
+  that would 429 normal streaming — sizing guidance is in config.py.
 - Push-subscribe stored an arbitrary `endpoint` later POSTed to
   server-side by pywebpush → SSRF against the Docker network / cloud
   metadata. Added `is_safe_push_endpoint` (https + reject loopback/
@@ -62,8 +63,21 @@ fleet. Added Ed25519 payload signing:
   breaks before then. Authenticode (SmartScreen/AV) is a separate future
   step.
 
-497 tests green (+13 for the signature path). Nothing pushed/deployed in
-the review session itself.
+**Commit 4 — login brute-force throttle (M3).** `/login` had no
+attempt limiting. Added a per-username failure counter in Redis
+(`LOGIN_FAIL_MAX` default 15 / `LOGIN_FAIL_WINDOW_SECONDS` default 900):
+after the cap, `/login` 429s with Retry-After until the window elapses;
+a success clears it. Keyed on the (lowercased) username rather than IP
+because the primary login path is the web BFF — the coordinator sees the
+client *container's* IP there, not the browser's, so an IP key would
+lump every web user into one bucket. The 429 fires identically for real
+and unknown usernames (no enumeration leak). Tradeoff: a victim's logins
+can be soft-locked for the window by spamming bad passwords — bounded and
+acceptable for an invite-only userbase.
+
+501 tests green (+13 signature, +4 login throttle). Coordinator + client
+deployed and smoke-checked; nothing about the agent fleet changed at
+runtime (signing stays off until keys are provisioned).
 
 ---
 

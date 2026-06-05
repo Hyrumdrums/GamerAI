@@ -81,7 +81,23 @@ IMAGE_UNIT_COST_BASE = _float("IMAGE_UNIT_COST_BASE", 1.0)
 
 # --- abuse / retry safety (all opt-in; 0 / unset disables) ---
 IDEMPOTENCY_TTL_SECONDS = _int("IDEMPOTENCY_TTL_SECONDS", 86400)  # 24h
+# Coarse per-IP limiter across ALL non-public coordinator paths. Left
+# OFF by default: the chat client polls /result every ~200ms while a
+# stream is in flight (~300 req/min for a single conversation), so any
+# value below that ceiling would 429 normal streaming. If you enable it
+# for flood protection, size it well above the polling rate (e.g. 1200).
 RATE_LIMIT_PER_MIN = _int("RATE_LIMIT_PER_MIN", 0)
+
+# --- login brute-force throttle (per client IP; ON by default) ---
+# Separate from RATE_LIMIT_PER_MIN because it targets only POST /login
+# and so can't interfere with the streaming poll path. After
+# LOGIN_FAIL_MAX failed attempts from one IP within the rolling window,
+# /login returns 429 until the window elapses; a successful login clears
+# the counter. Keyed on IP (not username) so an attacker can't lock a
+# victim out of their own account by spamming bad passwords. Set
+# LOGIN_FAIL_MAX=0 to disable.
+LOGIN_FAIL_MAX = _int("LOGIN_FAIL_MAX", 15)
+LOGIN_FAIL_WINDOW_SECONDS = _int("LOGIN_FAIL_WINDOW_SECONDS", 900)  # 15 min
 
 # --- model registry (off by default = legacy "any model name accepted") ---
 STRICT_MODELS = _bool("STRICT_MODELS", False)

@@ -10,6 +10,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 # 1. Env BEFORE imports — auth on, fresh DB, no rate limit.
 _TMPDIR = tempfile.mkdtemp(prefix="gamerai-test-pwauth-")
@@ -436,6 +437,101 @@ class PasswordAuthTests(unittest.TestCase):
             headers={"Authorization": f"Bearer {contributor_token}"},
         )
         self.assertEqual(r.status_code, 200)
+
+
+class LoginThrottleTests(unittest.TestCase):
+    """Per-username brute-force throttle on POST /login (M3)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.client = TestClient(coordinator_main.app)
+        cls.db = coordinator_main.db
+        coordinator_main.ensure_admin_seed()
+
+    def setUp(self):
+        _FAKE.flushall()
+        self.db._conn.executescript(
+            "DELETE FROM jobs; DELETE FROM workers; DELETE FROM earnings; "
+            "DELETE FROM member_usage; DELETE FROM invites; DELETE FROM members;"
+        )
+        coordinator_main.ensure_admin_seed()
+
+    def _set_creds(self, username: str, password: str) -> None:
+        coordinator_admin.main([
+            "set-credentials", "--token", ADMIN_TOKEN,
+            "--username", username, "--password", password,
+        ])
+
+    def test_locks_after_max_failures_even_with_correct_password(self):
+        self._set_creds("throttleme", "correct-horse-battery")
+        with mock.patch.object(coordinator_main, "LOGIN_FAIL_MAX", 3):
+            for _ in range(3):
+                r = self.client.post(
+                    "/login",
+                    json={"username": "throttleme", "password": "WRONG"},
+                )
+                self.assertEqual(r.status_code, 401)
+            # The right password is now rejected with 429, not logged in.
+            blocked = self.client.post(
+                "/login",
+                json={"username": "throttleme",
+                      "password": "correct-horse-battery"},
+            )
+            self.assertEqual(blocked.status_code, 429)
+            self.assertIn("retry-after", {k.lower() for k in blocked.headers})
+
+    def test_successful_login_resets_the_counter(self):
+        self._set_creds("resetme", "correct-horse-battery")
+        with mock.patch.object(coordinator_main, "LOGIN_FAIL_MAX", 3):
+            for _ in range(2):  # under the cap
+                self.client.post(
+                    "/login",
+                    json={"username": "resetme", "password": "WRONG"},
+                )
+            ok = self.client.post(
+                "/login",
+                json={"username": "resetme", "password": "correct-horse-battery"},
+            )
+            self.assertEqual(ok.status_code, 200)
+            # Counter cleared: two more failures must not trip the lock.
+            for _ in range(2):
+                r = self.client.post(
+                    "/login",
+                    json={"username": "resetme", "password": "WRONG"},
+                )
+                self.assertEqual(r.status_code, 401)
+
+    def test_throttle_is_case_insensitive(self):
+        # Varying case must not mint a fresh counter (the username lookup
+        # is case-insensitive, so the throttle key is lowercased too).
+        self._set_creds("MixedThrottle", "correct-horse-battery")
+        with mock.patch.object(coordinator_main, "LOGIN_FAIL_MAX", 2):
+            self.client.post(
+                "/login", json={"username": "mixedthrottle", "password": "x"},
+            )
+            self.client.post(
+                "/login", json={"username": "MIXEDTHROTTLE", "password": "x"},
+            )
+            blocked = self.client.post(
+                "/login",
+                json={"username": "MixedThrottle",
+                      "password": "correct-horse-battery"},
+            )
+            self.assertEqual(blocked.status_code, 429)
+
+    def test_unknown_username_also_throttles(self):
+        # 429 fires for a nonexistent account too, so throttle behavior
+        # doesn't reveal which usernames exist.
+        with mock.patch.object(coordinator_main, "LOGIN_FAIL_MAX", 2):
+            for _ in range(2):
+                r = self.client.post(
+                    "/login", json={"username": "ghost-user", "password": "x"},
+                )
+                self.assertEqual(r.status_code, 401)
+            blocked = self.client.post(
+                "/login", json={"username": "ghost-user", "password": "x"},
+            )
+            self.assertEqual(blocked.status_code, 429)
 
 
 if __name__ == "__main__":

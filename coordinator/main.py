@@ -49,6 +49,8 @@ from shared.config import (
     JOB_QUEUE,
     JOB_RESULTS,
     JOB_TIMEOUT_SECONDS,
+    LOGIN_FAIL_MAX,
+    LOGIN_FAIL_WINDOW_SECONDS,
     RATE_LIMIT_PER_MIN,
     RATE_PER_TOKEN,
     REQUIRE_LIVE_WORKER,
@@ -4204,6 +4206,14 @@ def revoke_friend(friend_member_id: str, request: Request):
     return {"ok": True, "was_already_revoked": not revoked}
 
 
+def _login_fail_key(username_norm: str) -> str:
+    # Lowercased to match the case-insensitive username lookup
+    # (db.get_member_by_username uses LOWER(username)) — otherwise an
+    # attacker could vary case to mint a fresh counter and bypass the
+    # throttle.
+    return f"login_fail:{username_norm}"
+
+
 @app.post("/login")
 def login(req: LoginRequest):
     """Public username + password sign-in. On success, rotates the
@@ -4212,19 +4222,63 @@ def login(req: LoginRequest):
     to store as their session credential.
 
     Always returns the same 401 detail for unknown-username and
-    bad-password so an attacker can't enumerate accounts."""
+    bad-password so an attacker can't enumerate accounts.
+
+    Brute-force throttle: after LOGIN_FAIL_MAX failed attempts against
+    one username within LOGIN_FAIL_WINDOW_SECONDS, returns 429 until the
+    window elapses. Keyed on username (not IP) because the primary login
+    path is the web BFF — the coordinator sees the client *container's*
+    IP there, not the browser's, so an IP key would lump every web user
+    into one bucket. The 429 fires identically for real and unknown
+    usernames, so it doesn't leak which accounts exist. A successful
+    login clears the counter. Tradeoff: an attacker can soft-lock a
+    victim's logins for the window by spamming bad passwords — bounded
+    and acceptable for an invite-only userbase; the alternative (no
+    throttle) is worse."""
     INVALID = HTTPException(status_code=401, detail="invalid credentials")
     username = (req.username or "").strip()
     password = req.password or ""
+    username_norm = username.lower()
+    fail_key = _login_fail_key(username_norm) if username_norm else None
+
+    if LOGIN_FAIL_MAX > 0 and fail_key is not None:
+        current = r.get(fail_key)
+        if current is not None and int(current) >= LOGIN_FAIL_MAX:
+            ttl = r.ttl(fail_key)
+            retry_after = (
+                int(ttl) if ttl and ttl > 0 else LOGIN_FAIL_WINDOW_SECONDS
+            )
+            raise HTTPException(
+                status_code=429,
+                detail="too many failed login attempts; try again later",
+                headers={"Retry-After": str(max(1, retry_after))},
+            )
+
+    def _record_failure() -> None:
+        if LOGIN_FAIL_MAX <= 0 or fail_key is None:
+            return
+        n = int(r.incr(fail_key))
+        if n == 1:
+            # First failure in a fresh window — arm the TTL so the
+            # counter self-clears even if the attacker walks away.
+            r.expire(fail_key, LOGIN_FAIL_WINDOW_SECONDS)
+
+    # Malformed (missing field) — nothing to protect, don't burn a
+    # counter slot under a meaningless key.
     if not username or not password:
         raise INVALID
     row = db.get_member_by_username(username)
     if row is None:
+        _record_failure()
         raise INVALID
     keys = row.keys()
     stored_hash = row["password_hash"] if "password_hash" in keys else None
     if not member_auth.verify_password(password, stored_hash):
+        _record_failure()
         raise INVALID
+    # Success — clear the failure counter for this username.
+    if LOGIN_FAIL_MAX > 0 and fail_key is not None:
+        r.delete(fail_key)
     raw_token = member_auth.generate_token()
     new_hash = member_auth.hash_token(raw_token)
     if not db.rotate_member_token(row["member_id"], new_hash):
