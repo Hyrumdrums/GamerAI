@@ -12,6 +12,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 # 1. Env BEFORE imports — auth on, fresh DB, no rate limit.
 _TMPDIR = tempfile.mkdtemp(prefix="gamerai-test-webui-")
@@ -348,6 +349,29 @@ class WebUISmokeTests(unittest.TestCase):
             follow_redirects=False,
         )
         self.assertEqual(login.status_code, 303)
+
+    def test_login_surfaces_throttle_429(self):
+        # The coordinator throttles brute-force /login; the web layer must
+        # surface that as a distinct "too many attempts" message rather
+        # than the generic "didn't match", so a locked-out user isn't told
+        # their password is wrong.
+        self.web.cookies.clear()  # anonymous
+        with mock.patch.object(coordinator_main, "LOGIN_FAIL_MAX", 2):
+            for _ in range(2):
+                r = self.web.post(
+                    "/login",
+                    data={"username": "ghostuser", "password": "x"},
+                    follow_redirects=False,
+                )
+                self.assertEqual(r.status_code, 401)
+            blocked = self.web.post(
+                "/login",
+                data={"username": "ghostuser", "password": "x"},
+                follow_redirects=False,
+            )
+            self.assertEqual(blocked.status_code, 429)
+            self.assertIn("Too many failed attempts", blocked.text)
+        self.web.cookies.set(client_web.SESSION_COOKIE, ADMIN_TOKEN)
 
     def test_agent_pair_page_redirects_anonymous_to_login(self):
         anon = TestClient(client_web.app, follow_redirects=False)

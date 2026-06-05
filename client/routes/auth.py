@@ -86,6 +86,22 @@ async def login_submit(
             json={"username": username.strip(), "password": password},
             timeout=5,
         )
+    if r.status_code == 429:
+        # Coordinator's brute-force throttle tripped. Surface it honestly
+        # instead of the generic "didn't match" — otherwise a locked-out
+        # user is told their password is wrong and keeps hammering.
+        retry_after = (r.headers.get("retry-after") or "").strip()
+        wait = ""
+        if retry_after.isdigit():
+            mins = max(1, int(retry_after) // 60)
+            wait = f" Try again in about {mins} minute{'s' if mins != 1 else ''}."
+        return _render_login(
+            request,
+            next_path=next_path,
+            username=username,
+            error="Too many failed attempts on this account." + wait,
+            status_code=429,
+        )
     if r.status_code != 200:
         return _render_login(
             request,
