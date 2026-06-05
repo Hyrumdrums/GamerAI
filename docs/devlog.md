@@ -5,6 +5,68 @@ entries on top. Skim for context before resuming work.
 
 ---
 
+## 2026-06-05 — Security pass: access-control, SSRF, IDOR, pairing phishing, signed updates
+
+Full security review of the project, then fixes in three commits.
+
+**Commit 1 — access-control / SSRF / IDOR / redirect gaps.**
+- `/workers`, `/earnings`, `/metrics` were reachable directly through
+  the Caddy catch-all and gated only by "any valid bearer" (the admin
+  check lived in the web BFF, which the coordinator sits behind, not
+  inside). Added `_require_admin` at the coordinator. Any member could
+  otherwise read the whole network's earnings + worker inventory.
+- `/result/{job_id}` had no ownership check (the sibling `/jobs/cancel`
+  and `/jobs/displayed` did). Now submitter/admin-scoped. job_id is a
+  uuid4 so it was hard to enumerate, but the control was missing.
+- Rate limiter keyed on the *leftmost* X-Forwarded-For — client-spoofable
+  (send a fake XFF, rotate per request, bypass). Now uses the rightmost
+  (Caddy-appended) hop. Also note: limiter is still disabled by default
+  (`RATE_LIMIT_PER_MIN=0`) and there's no per-account login lockout — both
+  still open.
+- Push-subscribe stored an arbitrary `endpoint` later POSTed to
+  server-side by pywebpush → SSRF against the Docker network / cloud
+  metadata. Added `is_safe_push_endpoint` (https + reject loopback/
+  private/link-local/single-label hosts).
+- Login `next` accepted `//evil.com` (open redirect) → now rejects
+  protocol-relative + backslash forms. Source links in chat rendered any
+  scheme → restricted to http(s) (a malicious worker could return a
+  `javascript:` source URL). PWA cache bumped 17→18.
+
+**Commit 2 — agent-pairing phishing → account takeover (the scary one).**
+The pairing verification URL embedded the secret code
+(`/agent/pair?code=…`). Anyone could call the public `/agents/pair/start`,
+get a code, and mail a signed-in victim the link; one click on "Pair this
+PC" minted a bearer bound to the *victim* and handed it to the attacker's
+poll. Switched to an RFC 8628-style out-of-band code: `/start` now also
+returns a short human `user_code` and a verification URL with **no
+secret**; the agent shows `user_code` on its own screen; the browser asks
+the user to type it (`POST /agents/pair/confirm`). The old
+`/agents/pair/{code}/confirm` path is gone. A phishing link can't
+pre-authorize because the victim only types the code their own agent
+displays.
+
+**Commit 3 — signed self-updates (H2).** The agent auto-updates with no
+prompt; the only check was a same-origin SHA-256 sidecar (integrity, not
+authenticity), skipped entirely if the sidecar was missing. So owning
+`/var/www/downloads` (or the CI upload key) = silent RCE to the whole
+fleet. Added Ed25519 payload signing:
+- `UPDATE_PUBLIC_KEY` embedded in `agent.py` (empty by default). When
+  set, the updater fail-closed-verifies `agent.exe.sig` before swapping —
+  missing sig, bad sig, or absent crypto lib all abort.
+- CI signs with `AGENT_SIGNING_KEY` (a secret, never on the VPS) and
+  **refuses to build** if the key is embedded but the secret is missing
+  (can't ship an enforcing agent with no signatures). `tools/
+  gen_agent_signing_key.py` + `tools/sign_agent.py` are the operator/CI
+  halves. Runbook in OPERATOR.md §6.8.
+- Still off until the operator provisions keys — left empty so nothing
+  breaks before then. Authenticode (SmartScreen/AV) is a separate future
+  step.
+
+497 tests green (+13 for the signature path). Nothing pushed/deployed in
+the review session itself.
+
+---
+
 ## 2026-05-26 — Prod chat regression: image-only contributor + missing Ollama mirror
 
 Two-cause incident traced in a single session. User reported a

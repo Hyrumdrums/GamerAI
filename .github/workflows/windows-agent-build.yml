@@ -82,6 +82,39 @@ jobs:
           }
           Get-Item dist\agent.exe | Select-Object Name, Length
 
+      - name: Sign agent.exe (Ed25519)
+        # Authenticity for self-updates: agents with UPDATE_PUBLIC_KEY
+        # embedded fail-closed-verify agent.exe.sig before swapping, so a
+        # compromised download host can't push code to the fleet. The
+        # signing seed lives ONLY in this secret, never on the VPS.
+        working-directory: windows-agent
+        env:
+          AGENT_SIGNING_KEY: ${{ secrets.AGENT_SIGNING_KEY }}
+        run: |
+          # Read the public key the shipping agent will enforce against.
+          $line = Select-String -Path agent.py `
+            -Pattern '^UPDATE_PUBLIC_KEY\s*=\s*"([^"]*)"'
+          $pubkey = if ($line) { $line.Matches[0].Groups[1].Value } else { "" }
+          $haveSecret = -not [string]::IsNullOrWhiteSpace($env:AGENT_SIGNING_KEY)
+          # Interlock: refuse to ship a build that ENFORCES signatures
+          # without also publishing one — otherwise every agent that
+          # updates to it would then fail-closed and never update again.
+          if ($pubkey -ne "" -and -not $haveSecret) {
+            Write-Error ("agent.py sets UPDATE_PUBLIC_KEY but the " +
+              "AGENT_SIGNING_KEY secret is missing. Agents on this build " +
+              "would refuse all further updates. Add the secret (see " +
+              "docs/OPERATOR.md 'Agent update signing') or clear the key.")
+            exit 1
+          }
+          if ($haveSecret) {
+            python ..\tools\sign_agent.py dist\agent.exe
+            if ($LASTEXITCODE -ne 0) { Write-Error "signing failed"; exit 1 }
+            Write-Host "Signed dist\agent.exe -> dist\agent.exe.sig"
+          } else {
+            Write-Host ("No AGENT_SIGNING_KEY and no embedded public key " +
+              "- skipping signing (legacy SHA-only updates).")
+          }
+
       - name: Install Inno Setup
         # Inno Setup ships ISCC.exe (the compiler). Chocolatey ships
         # innosetup as a pinned package on the windows-latest runner.
@@ -130,6 +163,12 @@ jobs:
           $hash = (Get-FileHash dist\agent.exe -Algorithm SHA256).Hash.ToLower()
           "$hash  agent.exe" | Out-File -FilePath upload\agent.exe.sha256 -Encoding ascii -NoNewline
           Write-Host "Published SHA256: $hash"
+          # Ed25519 signature sidecar (only present when signing is
+          # configured). Authenticity, vs the sha256's integrity-only.
+          if (Test-Path dist\agent.exe.sig) {
+            Copy-Item dist\agent.exe.sig upload\agent.exe.sig
+            Write-Host "Staged agent.exe.sig"
+          }
           # A small index helps Caddy's browse view be self-explanatory.
           $sha = "${{ github.sha }}".Substring(0, 7)
           $now = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm 'UTC'")
@@ -157,21 +196,28 @@ jobs:
           VPS_HOST: ${{ secrets.VPS_HOST }}
         run: |
           # sftp batch file — uploads into the chroot's /uploads dir
-          # Upload the sha256 sidecar BEFORE agent.exe + version.txt so
-          # an agent that races the publish window never sees a
-          # version.txt mismatch driving it to download an agent.exe
-          # whose .sha256 hasn't landed yet. Once .sha256 is on disk,
-          # we publish agent.exe; once that's on disk, we bump
-          # version.txt (the trigger for clients). Strict ordering.
-          @"
-          cd uploads
-          put upload/agent.exe.sha256 agent.exe.sha256
-          put upload/agent.exe agent.exe
-          put upload/GamerAI-Agent-Setup.exe GamerAI-Agent-Setup.exe
-          put upload/version.txt version.txt
-          put upload/BUILD.txt BUILD.txt
-          bye
-          "@ | Out-File -FilePath sftp.batch -Encoding ascii
+          # Upload the sha256 + .sig sidecars BEFORE agent.exe + version.txt
+          # so an agent that races the publish window never sees a
+          # version.txt mismatch driving it to download an agent.exe whose
+          # sidecars haven't landed yet. Once the sidecars are on disk we
+          # publish agent.exe; once that's on disk we bump version.txt
+          # (the trigger for clients). Strict ordering. The .sig line is
+          # included only when signing produced one.
+          $lines = @(
+            "cd uploads",
+            "put upload/agent.exe.sha256 agent.exe.sha256"
+          )
+          if (Test-Path upload/agent.exe.sig) {
+            $lines += "put upload/agent.exe.sig agent.exe.sig"
+          }
+          $lines += @(
+            "put upload/agent.exe agent.exe",
+            "put upload/GamerAI-Agent-Setup.exe GamerAI-Agent-Setup.exe",
+            "put upload/version.txt version.txt",
+            "put upload/BUILD.txt BUILD.txt",
+            "bye"
+          )
+          ($lines -join "`n") | Out-File -FilePath sftp.batch -Encoding ascii
 
           sftp -i $HOME\.ssh\id_ci `
                -o UserKnownHostsFile=$HOME\.ssh\known_hosts `

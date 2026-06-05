@@ -47,7 +47,26 @@ IS_WINDOWS = platform.system() == "Windows"
 # the moment it starts. The CI-generated version.txt (short-sha +
 # build timestamp) is still what the self-updater diffs against;
 # AGENT_VERSION is just the human-facing label.
-AGENT_VERSION = "1.2.5"
+AGENT_VERSION = "1.2.6"
+
+# Base64-encoded Ed25519 PUBLIC key used to verify self-update payloads.
+# When this is non-empty, the self-updater REQUIRES a valid signature on
+# the downloaded agent.exe (fail-closed: no signature, a bad signature,
+# or a missing crypto lib all abort the update) — this is what stops a
+# compromised download server from pushing arbitrary code to the fleet.
+# The matching private seed is held only as the CI secret
+# AGENT_SIGNING_KEY and never touches the VPS, so owning the download
+# host is no longer enough to forge an update.
+#
+# Left empty by default so an un-provisioned deploy keeps updating via
+# the SHA-256 sidecar (integrity, not authenticity). To turn signing on:
+#   1. python tools/gen_agent_signing_key.py
+#   2. paste the printed public key here
+#   3. add the printed private seed as the repo secret AGENT_SIGNING_KEY
+#   4. commit — CI then publishes agent.exe.sig and refuses to build if
+#      this key is set but the secret is missing.
+# See docs/OPERATOR.md "Agent update signing".
+UPDATE_PUBLIC_KEY = ""
 
 # ---------------------------------------------------------------------------
 # Idle detection
@@ -1106,6 +1125,89 @@ def _write_update_batch(
     return bat
 
 
+def _verify_ed25519(public_key_b64: str, message: bytes, signature_b64: str) -> bool:
+    """Return True iff *signature_b64* is a valid Ed25519 signature over
+    *message* under *public_key_b64*. Fail-closed: any malformed input,
+    missing crypto library, or verification failure returns False rather
+    than raising, so a caller can treat False as "do not trust this
+    payload." Pure function (no I/O) so it's unit-testable without the
+    network or the filesystem."""
+    try:
+        from cryptography.exceptions import InvalidSignature
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+            Ed25519PublicKey,
+        )
+    except Exception:
+        # cryptography not bundled — caller decides whether that's fatal
+        # (it is, when a key is configured: we can't verify, so refuse).
+        return False
+    try:
+        pub = Ed25519PublicKey.from_public_bytes(base64.b64decode(public_key_b64))
+        pub.verify(base64.b64decode(signature_b64), message)
+        return True
+    except (InvalidSignature, ValueError, TypeError, Exception):
+        return False
+
+
+def _verify_update_authenticity(
+    staged: Path, base_url: str, log: logging.Logger
+) -> bool:
+    """Authenticity gate for a freshly-downloaded agent.exe.
+
+    When ``UPDATE_PUBLIC_KEY`` is configured this is MANDATORY and
+    fail-closed: fetch ``agent.exe.sig`` (base64 Ed25519 signature over
+    the raw exe bytes) and verify it against the embedded public key.
+    Any failure — sidecar unreachable, malformed, wrong/forged signature,
+    or crypto lib absent — returns False and the caller must abort the
+    swap. This is the control that makes owning the download server
+    insufficient to push code to the fleet.
+
+    When ``UPDATE_PUBLIC_KEY`` is empty (signing not yet provisioned)
+    this returns True after logging a warning, leaving the SHA-256
+    sidecar as the only (integrity-but-not-authenticity) check — the
+    pre-signing behavior."""
+    if not UPDATE_PUBLIC_KEY:
+        log.warning(
+            "self-update: update signing is NOT configured "
+            "(UPDATE_PUBLIC_KEY empty) — proceeding on SHA-256 integrity "
+            "only. A compromised download host could serve malicious "
+            "code. See docs/OPERATOR.md 'Agent update signing'.",
+        )
+        return True
+    sig_url = f"{base_url.rstrip('/')}/download/agent.exe.sig"
+    try:
+        with httpx.Client(timeout=10.0) as c:
+            resp = c.get(sig_url)
+    except Exception as e:
+        log.warning(
+            "self-update: signature required but sidecar fetch failed "
+            "(%s); aborting", e,
+        )
+        return False
+    if resp.status_code != 200 or not (resp.text or "").strip():
+        log.warning(
+            "self-update: signature required but %s returned HTTP %d / "
+            "empty; aborting", sig_url, resp.status_code,
+        )
+        return False
+    signature_b64 = resp.text.strip()
+    try:
+        with open(staged, "rb") as f:
+            payload = f.read()
+    except OSError as e:
+        log.warning("self-update: could not read staged file to verify: %s", e)
+        return False
+    if not _verify_ed25519(UPDATE_PUBLIC_KEY, payload, signature_b64):
+        log.warning(
+            "self-update: signature verification FAILED — staged binary "
+            "is not signed by the trusted key; aborting (possible tampered "
+            "or spoofed download host)",
+        )
+        return False
+    log.info("self-update: Ed25519 signature verified")
+    return True
+
+
 def _apply_update(
     base_url: str,
     exe: Path,
@@ -1217,6 +1319,17 @@ def _apply_update(
             staged.unlink(missing_ok=True)
             return False
         log.info("self-update: sha256 verified (%s)", actual_hash[:16])
+
+    # Authenticity gate (Ed25519). When a public key is embedded this is
+    # mandatory + fail-closed; otherwise it warns and falls through to
+    # SHA-only. Runs after the SHA check so a truncated download is
+    # rejected cheaply before we bother fetching the signature.
+    if not _verify_update_authenticity(staged, base_url, log):
+        try:
+            staged.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
 
     try:
         bat = _write_update_batch(exe, staged, relaunch_args=relaunch_args)

@@ -20,3 +20,8 @@ trafilatura==2.0.0
 # Tiny in-process TTL cache for duplicate search queries on the same
 # worker. Pure-Python, ~30KB, bundles cleanly into pyinstaller.
 cachetools==5.5.2
+# Ed25519 verification for signed self-updates (see UPDATE_PUBLIC_KEY in
+# agent.py). Ships prebuilt cp311 Windows wheels so the pyinstaller
+# build needs no Rust toolchain. The same lib is used CI-side to sign
+# the published agent.exe.
+cryptography==43.0.1

@@ -544,6 +544,66 @@ before each of those.
 
 ---
 
+## 6.8 Agent update signing
+
+The Windows agent auto-updates itself (checks `/download/version.txt`
+every ~6h, downloads `/download/agent.exe`, swaps, relaunches — no user
+prompt). Without signing, anyone who can write to the download host (or
+the CI upload key) could push arbitrary code to every contributor PC.
+The agent verifies an **Ed25519 signature** of `agent.exe` before
+swapping, with the private key held only as a CI secret — so owning the
+VPS is not enough to forge an update.
+
+**State of play.** Signing is *armed* in code but *off* until you
+provision keys: `UPDATE_PUBLIC_KEY` in `windows-agent/agent.py` is empty,
+so agents fall back to the SHA-256 sidecar (integrity, not authenticity)
+and log a warning each update. Turn it on once:
+
+```bash
+# 1. Generate the keypair locally (NEVER on the VPS).
+python tools/gen_agent_signing_key.py
+
+# 2. Paste the printed PUBLIC key into windows-agent/agent.py:
+#       UPDATE_PUBLIC_KEY = "<base64 public key>"
+
+# 3. Add the printed PRIVATE seed as a GitHub Actions repo secret:
+#       Settings → Secrets and variables → Actions → New repository secret
+#       Name:  AGENT_SIGNING_KEY
+#       Value: <base64 private seed>
+#    Also stash it in your password manager. Do NOT commit it; do NOT
+#    copy it to the VPS.
+
+# 4. Commit the agent.py change and push. CI signs agent.exe, publishes
+#    agent.exe.sig, and bumps version.txt.
+```
+
+**Ordering matters / the interlock.** The build workflow *refuses to
+build* if `UPDATE_PUBLIC_KEY` is set but the `AGENT_SIGNING_KEY` secret
+is missing — otherwise it would ship an agent that fail-closed-refuses
+every future update. So add the secret (step 3) **before or with** the
+commit that embeds the key (step 2). If you want a staged rollout, you
+can add the secret first and ship signatures while `UPDATE_PUBLIC_KEY`
+is still empty (CI signs whenever the secret is present); flip
+enforcement on in a later commit by filling in the key.
+
+**Transition.** Agents on the current (unsigned) build update to the
+first signed build over the normal SHA path. From that build on, they
+enforce the signature. The first signed build must carry a valid
+`agent.exe.sig` — guaranteed by CI once the secret is set.
+
+**Rotation.** Generate a new pair, embed the new public key, update the
+secret, and ship. Agents pick up the new key as part of that (SHA-or-old-
+key-verified) update, then enforce the new key thereafter. Losing the
+private seed means you can't publish further signed updates — recover by
+rotating.
+
+**Not covered (future).** This is publisher-key signing, not OS-level
+Authenticode — SmartScreen/AV still see an unsigned PE. Authenticode is
+the next step and needs a paid code-signing cert; it's complementary,
+not a replacement, for the update-payload signature above.
+
+---
+
 ## 7. Things deferred (intentionally not in this doc / repo yet)
 
 - **"+ Invite a friend" button on `/dashboard`.** Form: email, daily-quota
