@@ -604,6 +604,66 @@ not a replacement, for the update-payload signature above.
 
 ---
 
+## 6.9 Redis auth + localhost binding
+
+Two defense-in-depth changes (L6):
+
+**1. Localhost-only port bindings (always on, nothing to do).** `redis`,
+`coordinator`, and `client` publish their host ports as `127.0.0.1:…`
+in both the base compose and the prod overlay. Docker punches published
+ports straight through `ufw`, so a `0.0.0.0` bind would expose them to
+the internet on any host running the base file directly. Container-to-
+container traffic uses the Docker network (service names), not the
+published port, and public users reach the app through Caddy on 443 —
+so this restricts *host* access only and changes nothing operationally.
+
+**2. Optional Redis password (`REDIS_PASSWORD`).** Redis is already
+localhost-bound, so this guards a narrower case: another container on the
+same host (or a compromised one) pivoting to the queue. It is **off by
+default** — empty `REDIS_PASSWORD` means `--requirepass ""`, i.e. no auth,
+identical to the old behavior. The redis container's `--requirepass` and
+the Python clients (`shared.config.redis_kwargs`) read the **same**
+`REDIS_PASSWORD` env var, so they can't drift as long as they're brought
+up from the same `.env.prod`.
+
+- **Fresh installs:** `bootstrap.sh` generates a random `REDIS_PASSWORD`
+  into `.env.prod` automatically. Nothing to do — it's enforced on first
+  boot.
+
+- **Enabling on an EXISTING deploy** (the one that's already running
+  passwordless):
+  ```bash
+  # On the VPS, add a generated password to the env file:
+  echo "REDIS_PASSWORD=$(openssl rand -hex 24)" >> /opt/gamerai/.env.prod
+  # Redeploy. One `compose up -d` recreates redis (now requiring the
+  # password) AND coordinator+worker (now sending it) together, so they
+  # come back consistent — no manual ordering, no window where one half
+  # has the password and the other doesn't.
+  sudo /opt/gamerai/infra/deploy.sh
+  ```
+  Redis here holds only ephemeral state (job queue, results, partials,
+  pairing codes, rate-limit counters) — a recreate drops in-flight jobs
+  exactly like any other redeploy; there is no durable data to lose.
+
+- **Verify:**
+  ```bash
+  source /opt/gamerai/.env.prod
+  docker exec gamerai-redis redis-cli -a "$REDIS_PASSWORD" ping   # -> PONG
+  curl -s https://$DOMAIN/health                                  # -> {"status":"ok"}
+  ```
+
+- **Rollback:** delete the `REDIS_PASSWORD=` line from `.env.prod` and
+  re-run `deploy.sh`. Server and clients drop auth together.
+
+**The one way to get stuck in the mud:** hand-editing a single
+container's env so the password differs between the redis server and the
+clients. Symptom: coordinator/worker logs spewing `NOAUTH` /
+`WRONGPASS`, and `/health` failing on the Redis ping. Fix: never set it
+per-container — keep `REDIS_PASSWORD` only in `.env.prod` and re-run
+`deploy.sh` so every container reads the same value.
+
+---
+
 ## 7. Things deferred (intentionally not in this doc / repo yet)
 
 - **"+ Invite a friend" button on `/dashboard`.** Form: email, daily-quota

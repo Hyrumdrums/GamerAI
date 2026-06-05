@@ -79,6 +79,22 @@ acceptable for an invite-only userbase.
 deployed and smoke-checked; nothing about the agent fleet changed at
 runtime (signing stays off until keys are provisioned).
 
+**Commit 6 — Redis auth + localhost binding (L6, defense-in-depth).**
+Base compose bound redis/coordinator/client to `0.0.0.0`; Docker
+bypasses `ufw`, so running the base file on a public host would expose
+passwordless Redis. Bound all three to `127.0.0.1` (container-to-
+container traffic uses the Docker network, public traffic goes through
+Caddy, so this is host-access-only — zero functional change). Added an
+**opt-in** Redis password: a single `REDIS_PASSWORD` drives both the
+server's `--requirepass` and the clients (`redis_kwargs`), so they can't
+drift; empty (the default) = no auth, so existing deploys and local dev
+are unaffected. `bootstrap.sh` generates one for fresh installs;
+OPERATOR.md §6.9 has the enable-on-existing-deploy runbook + the one
+mud-trap to avoid (per-container env drift → NOAUTH). Kept off-by-default
+deliberately to avoid breaking the live deploy on push. 506 tests green
+(+4 redis_kwargs). Web login 429-surfacing (commit 5, `3dfb271`)
+deployed and verified in prod alongside the M3 throttle.
+
 ---
 
 ## 2026-05-26 — Prod chat regression: image-only contributor + missing Ollama mirror

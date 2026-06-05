@@ -23,6 +23,14 @@ def _int(name: str, default: int) -> int:
 
 # --- redis ---
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
+# Optional Redis auth. Defense-in-depth: Redis is already bound to
+# localhost (see docker-compose), so this guards against a co-located /
+# compromised container pivoting to the queue. OFF by default (empty =
+# no auth) so local dev and existing deployments are unaffected. A
+# password embedded in REDIS_URL still wins; otherwise this env var is
+# used. The redis container's --requirepass reads the SAME variable, so
+# server and clients can never drift. See docs/OPERATOR.md "Redis auth".
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "").strip()
 
 
 def redis_kwargs() -> dict:
@@ -31,7 +39,9 @@ def redis_kwargs() -> dict:
         "host": u.hostname or "redis",
         "port": u.port or 6379,
         "db": int((u.path or "/0").lstrip("/") or 0),
-        "password": u.password,
+        # URL-embedded password takes precedence; fall back to the
+        # standalone env var; None when neither is set (no auth).
+        "password": u.password or REDIS_PASSWORD or None,
     }
 
 

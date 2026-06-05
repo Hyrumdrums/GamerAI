@@ -2,10 +2,26 @@ services:
   redis:
     image: redis:7-alpine
     container_name: gamerai-redis
+    # Bind to localhost only. Docker publishes ports by punching through
+    # the host firewall (ufw won't save you), so a 0.0.0.0 bind would
+    # expose the queue to the internet on any host that runs this base
+    # file directly. Container-to-container traffic uses the Docker
+    # network (service name "redis"), NOT this published port, so this
+    # restricts host access only. The prod overlay also pins 127.0.0.1.
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
+    # Optional auth: --requirepass reads REDIS_PASSWORD; empty disables
+    # auth (the default), so this is a no-op until an operator sets it.
+    # sh -c + $$ so the container shell expands the var (server and the
+    # python clients read the SAME var via shared.config.redis_kwargs,
+    # so they can't drift). `exec` keeps redis as PID 1 for signals.
+    command: ["sh", "-c", "exec redis-server --requirepass \"$$REDIS_PASSWORD\""]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      # Authenticate only when a password is set, so the probe works in
+      # both modes without emitting redis-cli's insecure-'-a' warning.
+      test: ["CMD-SHELL", "if [ -n \"$$REDIS_PASSWORD\" ]; then redis-cli -a \"$$REDIS_PASSWORD\" ping; else redis-cli ping; fi"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -39,6 +55,8 @@ services:
         condition: service_healthy
     environment:
       REDIS_URL: redis://redis:6379/0
+      # Matches the redis service's --requirepass. Empty = no auth.
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
       DB_PATH: /data/gamerai.db
       JOB_TIMEOUT_SECONDS: "120"
       WORKER_TIMEOUT_SECONDS: "15"
@@ -60,8 +78,12 @@ services:
       # coordinator image doesn't bake a secret in. VAPID_PRIVATE_KEY_PATH
       # in .env should point at /secrets/vapid_private.pem to match.
       - ./.secrets:/secrets:ro
+    # Localhost-only (see redis note). Public traffic reaches the
+    # coordinator through Caddy on 443, never this raw port; inter-
+    # container calls use the "coordinator" service name. Prod overrides
+    # to 127.0.0.1 too.
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
 
   worker:
     build:
@@ -74,6 +96,8 @@ services:
         condition: service_started
     environment:
       REDIS_URL: redis://redis:6379/0
+      # Matches the redis service's --requirepass. Empty = no auth.
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
       COORDINATOR_URL: http://coordinator:8000
       OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
       MODEL: ${MODEL:-llama3.2:1b}
@@ -99,5 +123,8 @@ services:
     environment:
       COORDINATOR_URL: http://coordinator:8000
       API_TOKEN: ${API_TOKEN:-}
+    # Localhost-only (see redis note). The web UI is served publicly via
+    # Caddy on 443; this raw port is for host/dev access only. Prod
+    # overrides to 127.0.0.1 too.
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
