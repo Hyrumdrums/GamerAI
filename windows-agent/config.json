@@ -30,6 +30,24 @@
     "ollama_url": "http://localhost:11434",
     "mirror_base_url": null
   },
+  "smart": {
+    "enabled": false,
+    "role": "head",
+    "model": "qwen2.5:14b",
+    "rpc_peers": [],
+    "rpc_listen_host": "0.0.0.0",
+    "rpc_listen_port": 50052,
+    "llama_release": "b9610",
+    "llama_zip_url": null,
+    "cudart_zip_url": null,
+    "gguf_url": null,
+    "context_length": 8192,
+    "tensor_split": null,
+    "llama_server_port": 8092,
+    "extra_args": [],
+    "endpoint": null,
+    "startup_timeout_seconds": 1200
+  },
   "model": null,
   "worker_id": null,
   "api_token": null

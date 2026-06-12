@@ -45,6 +45,13 @@ class GenerateRequest(BaseModel):
     # the conversation on completion. Requires ownership: the caller's
     # member_id must match the conversation's owner_member_id.
     conversation_id: Optional[str] = None
+    # Chat-only flag. When true (and no explicit model is pinned), the
+    # coordinator targets the smart-tier model (model_registry.
+    # DEFAULT_SMART_MODEL) and routes the job to the chat:smart queue,
+    # which only multi-machine pipeline heads poll. Noticeably slower
+    # than the standard 3B canonical, much more capable. Ignored for
+    # tool != "chat".
+    smart: bool = False
     # Chat-only flag. When true, the agent's chat handler pipelines
     # Piper TTS with LLM inference: as soon as the first sentence is
     # emitted, it spawns a CPU-side synth in parallel and ships the

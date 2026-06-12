@@ -1,0 +1,166 @@
+# Smart mode — pooling two machines' VRAM for a 14B-class chat model
+
+Smart mode lets two GamerAI machines on the same LAN serve a chat model
+neither GPU can hold alone. The reference deployment is the founder's
+pair: a 6 GB card and an 8 GB card, which together comfortably fit
+**Qwen2.5-14B-Instruct Q4_K_M** (~9 GB of weights + KV cache) — roughly
+4–5× the parameter count of the network's 3B canonical, and a whole
+capability class up in reasoning, instruction-following, and coding.
+
+It is slower than a flagship hosted model and that's fine — the value
+proposition is "a much smarter answer from hardware you already own,"
+not latency parity with ChatGPT. Expect single-digit tokens/sec
+depending on the LAN and the cards.
+
+## How it works
+
+```
+            chat (smart) job, via job_queue:chat:smart
+                              │
+                              ▼
+   ┌────────────────────── HEAD (8 GB) ──────────────────────┐
+   │ agent ──► llama-server  -m qwen2.5-14b.gguf             │
+   │           --rpc 192.168.1.42:50052   (OpenAI API on     │
+   │           holds ~layers 0..N locally  127.0.0.1:8092)   │
+   └────────────────────────────┬─────────────────────────────┘
+                                │ activations over LAN (RPC)
+   ┌────────────────────── BACKEND (6 GB) ────────────────────┐
+   │ agent ──► rpc-server -H 0.0.0.0 -p 50052                 │
+   │           holds the remaining layers in its VRAM         │
+   └───────────────────────────────────────────────────────────┘
+```
+
+- It uses **llama.cpp's RPC backend** ([docs](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc)):
+  the head's `llama-server` treats the backend's GPU as one more
+  device and splits the model's layers across both **in proportion to
+  free VRAM** (override with `tensor_split`). Activations — a few KB
+  per token, not weights — cross the LAN per layer boundary, which is
+  why this works fine on gigabit Ethernet and tolerably on good Wi-Fi.
+- Coordinator-side, smart jobs keep `tool="chat"` but ride a dedicated
+  `job_queue:chat:smart` queue that **only the head polls** (it
+  advertises the `chat:smart` capability). Streaming, partials,
+  conversations, and earnings all reuse the existing chat plumbing.
+- The web UI grows a **"Smart mode"** toggle in the composer (sticky
+  per conversation, like search). It sends `smart: true` on
+  `/generate`; the coordinator resolves that to the registry's
+  `DEFAULT_SMART_MODEL` and routes accordingly. If the pipeline is
+  offline the user gets a clear 503 message instead of a queued-forever
+  job.
+
+## Setting it up (two Windows machines, agents already paired)
+
+Pick the machine with **more VRAM as the head** — it holds the bigger
+layer share plus compute buffers, and it's the one running
+`llama-server`.
+
+### 1. Backend machine (the 6 GB box)
+
+Edit `%APPDATA%\GamerAI\config.json` (or the config next to the agent):
+
+```json
+"smart": {
+  "enabled": true,
+  "role": "backend"
+}
+```
+
+Restart the agent. First run downloads the pinned llama.cpp CUDA build
+(~500 MB, one-time per release) and launches `rpc-server` on port
+50052. Allow the inbound rule if Windows Firewall prompts — or add it
+manually:
+
+```
+netsh advfirewall firewall add rule name="GamerAI smart rpc" dir=in action=allow protocol=TCP localport=50052 remoteip=localsubnet
+```
+
+Note the machine's LAN IP (`ipconfig` → e.g. `192.168.1.42`). Giving
+it a DHCP reservation in your router avoids the IP drifting later.
+
+> **Security note:** llama.cpp's RPC protocol is unauthenticated by
+> design. `rpc_listen_host: 0.0.0.0` exposes it to your LAN only —
+> never port-forward it to the internet. The `remoteip=localsubnet`
+> firewall scope above is the belt-and-suspenders version.
+
+### 2. Head machine (the 8 GB box)
+
+```json
+"smart": {
+  "enabled": true,
+  "role": "head",
+  "rpc_peers": ["192.168.1.42:50052"]
+}
+```
+
+Restart the agent. First run downloads the same llama.cpp build plus
+the model GGUF (~9 GB — this is the long one), then launches
+`llama-server`, which streams the backend's layer share over the LAN
+on first load. **First startup can take several minutes**; the agent
+logs progress and only advertises `chat:smart` once the server's
+`/health` goes green. Subsequent loads are much faster (`rpc-server`
+runs with its local tensor cache on, so the shard is re-read from the
+backend's own disk).
+
+### 3. Try it
+
+Open the chat UI, tick **Smart mode**, ask something hard. The status
+line says "thinking (smart mode is slower)…" and the answer streams
+with the usual typewriter. The message is billed/credited in tokens
+exactly like standard chat.
+
+## What a smart-enabled agent stops doing
+
+The pipeline shard owns the GPU's VRAM, so a smart-enabled agent
+**does not** bootstrap Ollama or stable-diffusion, and advertises:
+
+- head: `chat:smart` (+ `tts` — Piper is CPU-only)
+- backend: nothing on the GPU (+ `tts` if bootstrapped)
+
+The usual idle gates still apply: the agent only claims jobs when the
+machine is idle, and the game-process / GPU-utilization checks keep it
+out of the way of a gaming session. (The sidecar processes do keep
+their VRAM resident while the agent runs — if you game on one of these
+machines regularly, expect to see less free VRAM while the agent is
+up. Killing the agent releases everything.)
+
+## Config reference (`smart` block)
+
+| key | default | meaning |
+|---|---|---|
+| `enabled` | `false` | master switch |
+| `role` | `"head"` | `"head"` (runs llama-server, claims jobs) or `"backend"` (runs rpc-server, lends GPU) |
+| `model` | `"qwen2.5:14b"` | must be a smart-tier model in the coordinator's registry |
+| `rpc_peers` | `[]` | head: backend `ip:port` list. Empty = single-machine (spills to CPU, slow) |
+| `rpc_listen_host` / `rpc_listen_port` | `0.0.0.0` / `50052` | backend bind address |
+| `llama_release` | pinned tag | llama.cpp release. **Head and backend must match** (RPC protocol compatibility); the install dir is keyed by it |
+| `llama_zip_url` / `cudart_zip_url` | `null` | override the GitHub release asset URLs (e.g. for a Vulkan build on AMD) |
+| `gguf_url` | `null` | override the model download (default: bartowski's Q4_K_M single-file GGUF) |
+| `context_length` | `8192` | pipeline-wide KV budget. Drop to 4096 if you OOM |
+| `tensor_split` | `null` | e.g. `"5,8"` — manual layer proportions, order `[peers..., local]` |
+| `llama_server_port` | `8092` | head's local OpenAI-compatible port (loopback only) |
+| `extra_args` | `[]` | appended raw to the sidecar command line |
+| `endpoint` | `null` | point at your own OpenAI-compatible server and skip managed launch entirely (also the non-Windows dev path) |
+| `startup_timeout_seconds` | `1200` | head health-check budget for the first slow load |
+
+## Troubleshooting
+
+- **Head never goes healthy** → check `%APPDATA%\GamerAI\logs\llama-head.log`.
+  Usual suspects: backend agent not running, wrong IP in `rpc_peers`,
+  firewall blocking 50052, mismatched `llama_release` between machines.
+- **OOM on load** → lower `context_length` to 4096, or bias more
+  layers to the bigger card with `tensor_split`.
+- **AMD / non-NVIDIA GPU** → the default zips are CUDA builds; point
+  `llama_zip_url` at the matching Vulkan or HIP asset of the same
+  release tag (no cudart needed for Vulkan — point `cudart_zip_url`
+  at the same zip or leave the file absent and set it explicitly).
+- **It's slow** → expected; check you're on Ethernet rather than Wi-Fi
+  first, then experiment with `tensor_split`. Wired gigabit between
+  the boxes is the single biggest lever.
+
+## Where this goes next
+
+This is the first concrete step of the Phase 4 plan in
+`research/big-models-feasibility.md`: pipeline-parallel inference
+across contributor machines. Today the pairing is static config on two
+machines owned by one contributor; coordinator-side pipeline-group
+scheduling (binding arbitrary contributors' machines into ephemeral
+pipelines, EXO/Petals-style) is the follow-on once this proves out.

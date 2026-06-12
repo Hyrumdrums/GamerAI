@@ -34,6 +34,11 @@ class Model:
     # does — an image model on a /generate call with tool="chat"
     # should be rejected by STRICT_MODELS=true.
     kind: str = "chat"
+    # "standard" (any single chat-capable worker can serve it) or
+    # "smart" (needs the dedicated smart pipeline — e.g. a multi-
+    # machine llama.cpp RPC split — so it routes to job_queue:chat:smart
+    # and only workers advertising the "chat:smart" tool pick it up).
+    tier: str = "standard"
 
     @property
     def is_moe(self) -> bool:
@@ -60,6 +65,16 @@ _CATALOG: dict[str, Model] = {
         Model("deepseek-v3",  "deepseek", 671.0, 37.0,  20.0, "MIT-style", "MoE; 8 of 256 experts active"),
         Model("qwen2.5:7b",   "qwen",     7.6,   7.6,   6.0,  "Apache-2.0"),
         Model("phi3:14b",     "phi",      14.0,  14.0,  10.0, "MIT"),
+        # Smart-mode chat model. min_vram_gb is the COMBINED pipeline
+        # requirement (Q4_K_M weights ≈ 9 GB + KV cache), not a single
+        # card's — it's served by a llama.cpp RPC pipeline that splits
+        # layers across two or more contributor GPUs (e.g. 6 GB + 8 GB).
+        # Slower than the 3B canonical but a whole capability class up;
+        # routed via job_queue:chat:smart to "chat:smart" workers only.
+        Model("qwen2.5:14b",  "qwen",     14.8,  14.8,  11.0, "Apache-2.0",
+              "smart-mode default; Q4_K_M GGUF split across a multi-"
+              "machine llama.cpp RPC pipeline",
+              tier="smart"),
         # Image-generation models. params_b is the unet+text-encoder
         # parameter count (estimate); min_vram_gb is the rough Q4 GGUF
         # requirement at the model's native resolution. DreamShaper XL
@@ -135,6 +150,12 @@ DEFAULT_IMAGE_MODEL = "dreamshaperXL-lightning"
 # and the coordinator's STRICT_MODELS gate accepts it.
 DEFAULT_TTS_MODEL = "piper:en_us-libritts-high"
 
+# Default smart-mode model — what /generate resolves `smart: true` to
+# when the caller didn't pin a model. The agent's smart bootstrap pulls
+# this model's GGUF, so the two stay in sync the same way the image /
+# TTS defaults do.
+DEFAULT_SMART_MODEL = "qwen2.5:14b"
+
 
 def is_image_model(name: str | None) -> bool:
     """True if *name* is registered as an image model. Unknown names
@@ -144,6 +165,27 @@ def is_image_model(name: str | None) -> bool:
         return False
     m = _CATALOG.get(name)
     return m is not None and m.kind == "image"
+
+
+def is_smart_model(name: str | None) -> bool:
+    """True if *name* is a chat model registered at the "smart" tier
+    (needs the multi-machine pipeline, not a single worker). Unknown
+    names return False so they keep riding the standard chat queue."""
+    if not name:
+        return False
+    m = _CATALOG.get(name)
+    return m is not None and m.kind == "chat" and m.tier == "smart"
+
+
+def route_for(tool: str, model: str | None) -> str:
+    """Routing key for ``shared.config.job_queue_for``. Identical to
+    *tool* except for chat jobs targeting a smart-tier model, which
+    route to the dedicated "chat:smart" queue so only smart-pipeline
+    head workers pick them up. Centralized here so /generate, the
+    reaper, abandon, and retry all requeue to the same place."""
+    if tool == "chat" and is_smart_model(model):
+        return "chat:smart"
+    return tool
 
 
 def is_tts_model(name: str | None) -> bool:

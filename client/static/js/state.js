@@ -57,6 +57,14 @@ export const msgCache = new Map();
 // (currentId === null) gets its own slot via the null key.
 export const searchModeByConv = new Map();
 
+// Per-conversation smart-mode state. Same stickiness contract as
+// search: a conversation that started on the 14B smart model wants
+// every follow-up on it too — silently dropping back to the 3B
+// mid-thread would be a confusing quality cliff. The checkbox state
+// is what carries smart across turns (each submit re-sends
+// smart:true); the coordinator treats every /generate independently.
+export const smartModeByConv = new Map();
+
 // readAloudCache is keyed by message_id and stores the WAV base64 once
 // fetched, so re-tapping the same speaker icon replays from memory
 // without billing voice_minutes again. In-memory only — a page refresh

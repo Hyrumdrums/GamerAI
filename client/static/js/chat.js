@@ -12,7 +12,7 @@ import { stopReadAloud } from './readAloud.js';
 import { messageEl } from './messageRenderer.js';
 import { streamIntoBubble } from './streamingEngine.js';
 import {
-  imageCheckbox, searchCheckbox,
+  imageCheckbox, searchCheckbox, smartCheckbox,
   selectedSearchMode, selectedImageSize,
   IMAGE_SIZE_PRESETS,
   refreshComposerUI,
@@ -429,6 +429,9 @@ document.getElementById('composer').onsubmit = async (e) => {
   let submitTool = 'chat';
   if (imageCheckbox.checked) submitTool = 'image';
   else if (searchCheckbox.checked) submitTool = 'search';
+  // Smart mode rides the chat tool — it's a routing flag, not a tool.
+  // Sticky per conversation like search (see smartModeByConv).
+  const submitSmart = submitTool === 'chat' && smartCheckbox.checked;
   const submitSearchMode = submitTool === 'search' ? selectedSearchMode() : null;
   // Snapshot before auto-clearing the image checkbox so the resolution
   // pick that the user saw on submit is what we actually send.
@@ -457,9 +460,11 @@ document.getElementById('composer').onsubmit = async (e) => {
   // Submit + stream.
   if (submitTool === 'image') statusEl.textContent = 'rendering…';
   else if (submitTool === 'search') statusEl.textContent = 'searching…';
+  else if (submitSmart) statusEl.textContent = 'thinking (smart mode is slower)…';
   else statusEl.textContent = 'submitting…';
   const start = Date.now();
   const body = {prompt, conversation_id: state.currentId};
+  if (submitSmart) body.smart = true;
   if (submitTool === 'image') {
     body.tool = 'image';
     // Always pin width/height so the worker doesn't fall through to

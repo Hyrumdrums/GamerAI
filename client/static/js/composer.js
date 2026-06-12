@@ -22,13 +22,15 @@
 // Search misfires are cheap (one DDG call + a normal chat turn), so
 // the worst case of leaving it on is much milder than the image case.
 
-import { state, searchModeByConv } from './state.js';
+import { state, searchModeByConv, smartModeByConv } from './state.js';
 import { stopReadAloud } from './readAloud.js';
 
 export const imageCheckbox = document.getElementById('tool-image-cb');
 export const searchCheckbox = document.getElementById('tool-search-cb');
+export const smartCheckbox = document.getElementById('tool-smart-cb');
 const imageWrap = document.getElementById('image-toggle-wrap');
 const searchWrap = document.getElementById('search-toggle-wrap');
+const smartWrap = document.getElementById('smart-toggle-wrap');
 const searchModeWrap = document.getElementById('search-mode-wrap');
 const imageSizeWrap = document.getElementById('image-size-wrap');
 const voiceToggleBtn = document.getElementById('voice-toggle');
@@ -84,8 +86,9 @@ export function selectedImageSize() {
 
 export function refreshComposerUI() {
   // Visibility: whichever checkbox is checked claims the row alone.
-  imageWrap.hidden = searchCheckbox.checked;
-  searchWrap.hidden = imageCheckbox.checked;
+  imageWrap.hidden = searchCheckbox.checked || smartCheckbox.checked;
+  searchWrap.hidden = imageCheckbox.checked || smartCheckbox.checked;
+  smartWrap.hidden = imageCheckbox.checked || searchCheckbox.checked;
   // Sub-toggles only show under their parent checkbox.
   searchModeWrap.hidden = !searchCheckbox.checked;
   imageSizeWrap.hidden = !imageCheckbox.checked;
@@ -95,6 +98,8 @@ export function refreshComposerUI() {
     ta.placeholder = 'Describe the image you want…';
   } else if (searchCheckbox.checked) {
     ta.placeholder = 'Search the web for…';
+  } else if (smartCheckbox.checked) {
+    ta.placeholder = 'Ask the smart model (slower, smarter)…';
   } else {
     ta.placeholder = 'Message GamerAI...';
   }
@@ -122,26 +127,50 @@ export function persistSearchMode() {
   searchModeByConv.set(state.currentId, searchCheckbox.checked);
 }
 
-// Restore the search checkbox for the conversation we're switching
-// to. Image is always restored to off (one-shot, never sticky).
-// Called from openConversation / new-chat / right after a brand-new
-// conversation is created on submit.
+// Same per-conversation stickiness for smart mode — a thread started
+// on the 14B model wants its follow-ups on it too.
+export function persistSmartMode() {
+  smartModeByConv.set(state.currentId, smartCheckbox.checked);
+}
+
+// Restore the search + smart checkboxes for the conversation we're
+// switching to. Image is always restored to off (one-shot, never
+// sticky). Called from openConversation / new-chat / right after a
+// brand-new conversation is created on submit.
 export function restoreModeFor(convId) {
   const want = !!searchModeByConv.get(convId);
   searchCheckbox.checked = want;
+  smartCheckbox.checked = !want && !!smartModeByConv.get(convId);
   imageCheckbox.checked = false;
   refreshComposerUI();
 }
 
 imageCheckbox.addEventListener('change', () => {
-  // Mutually exclusive — checking image clears search and vice versa.
-  if (imageCheckbox.checked) searchCheckbox.checked = false;
+  // Mutually exclusive — checking any one clears the other two.
+  if (imageCheckbox.checked) {
+    searchCheckbox.checked = false;
+    smartCheckbox.checked = false;
+  }
   persistSearchMode();
+  persistSmartMode();
   refreshComposerUI();
 });
 searchCheckbox.addEventListener('change', () => {
-  if (searchCheckbox.checked) imageCheckbox.checked = false;
+  if (searchCheckbox.checked) {
+    imageCheckbox.checked = false;
+    smartCheckbox.checked = false;
+  }
   persistSearchMode();
+  persistSmartMode();
+  refreshComposerUI();
+});
+smartCheckbox.addEventListener('change', () => {
+  if (smartCheckbox.checked) {
+    imageCheckbox.checked = false;
+    searchCheckbox.checked = false;
+  }
+  persistSearchMode();
+  persistSmartMode();
   refreshComposerUI();
 });
 refreshComposerUI();

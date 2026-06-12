@@ -31,7 +31,7 @@ import sys
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -47,7 +47,7 @@ IS_WINDOWS = platform.system() == "Windows"
 # the moment it starts. The CI-generated version.txt (short-sha +
 # build timestamp) is still what the self-updater diffs against;
 # AGENT_VERSION is just the human-facing label.
-AGENT_VERSION = "1.2.6"
+AGENT_VERSION = "1.3.0"
 
 # Base64-encoded Ed25519 PUBLIC key used to verify self-update payloads.
 # When this is non-empty, the self-updater REQUIRES a valid signature on
@@ -1577,6 +1577,56 @@ DEFAULTS = {
         "tts_enabled": True,
         "tts_model": "piper:en_us-libritts-high",
     },
+    # Smart mode (multi-machine pipeline). Two GamerAI machines on the
+    # same LAN pool their VRAM to serve a 14B-class model via
+    # llama.cpp's RPC backend — one machine is the "head" (runs
+    # llama-server, holds the GGUF, claims chat:smart jobs), the
+    # other is a "backend" (runs rpc-server, lends its GPU to the
+    # head, claims nothing itself). Opt-in and OFF by default: a
+    # smart-enabled agent stops advertising the standard chat/image
+    # tools because the pipeline shard owns its VRAM. See
+    # docs/smart-mode.md for the two-machine setup walkthrough.
+    "smart": {
+        "enabled": False,
+        "role": "head",  # "head" | "backend"
+        "model": "qwen2.5:14b",
+        # head only: rpc-server peers to join, e.g. ["192.168.1.42:50052"].
+        "rpc_peers": [],
+        # backend only: where rpc-server listens. 0.0.0.0 exposes it on
+        # the LAN — llama.cpp's RPC protocol is unauthenticated, so
+        # NEVER port-forward this. Home-LAN-only by design.
+        "rpc_listen_host": "0.0.0.0",
+        "rpc_listen_port": 50052,
+        # llama.cpp release pin. The RPC protocol is only guaranteed
+        # compatible between identical builds, so head and backend MUST
+        # run the same release — the bootstrap keys the install dir by
+        # this tag so a bump re-downloads on both machines.
+        "llama_release": "b9610",
+        # Override URLs (null = derive from llama_release / model).
+        "llama_zip_url": None,
+        "cudart_zip_url": None,
+        "gguf_url": None,
+        # head only: llama-server knobs. context_length is shared
+        # across the whole pipeline's KV cache; 8192 fits the 6+8 GB
+        # reference pair with the Q4_K_M 14B. tensor_split (e.g.
+        # "5,8") overrides the default free-VRAM-proportional layer
+        # split — order is [rpc_peers..., local GPU].
+        "context_length": 8192,
+        "tensor_split": None,
+        "llama_server_port": 8092,
+        # Escape hatch: extra raw args appended to the llama-server /
+        # rpc-server command line.
+        "extra_args": [],
+        # Set to an OpenAI-compatible base URL (e.g.
+        # "http://127.0.0.1:8092") to skip the managed download/launch
+        # entirely and serve smart jobs against a server you run
+        # yourself. Also the dev path on non-Windows.
+        "endpoint": None,
+        # head only: how long to wait for llama-server's /health to go
+        # green after launch. First load streams ~9 GB of weights to
+        # the backend over the LAN, so this is minutes, not seconds.
+        "startup_timeout_seconds": 1200,
+    },
     "model": None,
     "worker_id": None,
     "api_token": None,
@@ -1617,10 +1667,35 @@ class Config:
     # state.json (so it survives restarts and auto-updates), cleared
     # with --no-stayalive.
     stayalive: bool = False
+    # Smart-mode (multi-machine pipeline) knobs — see DEFAULTS["smart"]
+    # for the field-by-field documentation. Defaulted (rather than
+    # required like the bootstrap_* fields) because smart mode is the
+    # opt-in exception, and tests construct Config directly.
+    smart_enabled: bool = False
+    smart_role: str = "head"
+    smart_model: str = "qwen2.5:14b"
+    smart_rpc_peers: list[str] = field(default_factory=list)
+    smart_rpc_listen_host: str = "0.0.0.0"
+    smart_rpc_listen_port: int = 50052
+    smart_llama_release: str = "b9610"
+    smart_llama_zip_url: Optional[str] = None
+    smart_cudart_zip_url: Optional[str] = None
+    smart_gguf_url: Optional[str] = None
+    smart_context_length: int = 8192
+    smart_tensor_split: Optional[str] = None
+    smart_llama_server_port: int = 8092
+    smart_extra_args: list[str] = field(default_factory=list)
+    smart_endpoint: Optional[str] = None
+    smart_startup_timeout_seconds: float = 1200.0
 
     @classmethod
     def load(cls, path: Optional[Path]) -> "Config":
-        data = dict(DEFAULTS)
+        # Deep copy: _deep_merge mutates nested dicts in place, and a
+        # shallow dict(DEFAULTS) would let one load's user values leak
+        # into module-level DEFAULTS (visible to any later load in the
+        # same process — tests, and any future reload-on-the-fly).
+        import copy
+        data = copy.deepcopy(DEFAULTS)
         if path and path.exists():
             with open(path, "r", encoding="utf-8") as f:
                 user = json.load(f)
@@ -1651,6 +1726,9 @@ class Config:
         power = data.get("power", DEFAULTS["power"])
         update = data.get("update", DEFAULTS["update"])
         bootstrap = data.get("bootstrap", DEFAULTS["bootstrap"])
+        smart = data.get("smart", DEFAULTS["smart"])
+        if not isinstance(smart, dict):
+            smart = DEFAULTS["smart"]
         # env overrides config so a single API_TOKEN export works
         # for ad-hoc testing without touching config.json.
         token = (os.getenv("API_TOKEN") or data.get("api_token") or "").strip()
@@ -1697,6 +1775,39 @@ class Config:
             bootstrap_tts_enabled=bool(bootstrap.get("tts_enabled", False)),
             bootstrap_tts_model=str(
                 bootstrap.get("tts_model", "piper:en_us-libritts-high")
+            ),
+            smart_enabled=bool(smart.get("enabled", False)),
+            smart_role=str(smart.get("role", "head")).strip().lower(),
+            smart_model=str(smart.get("model", "qwen2.5:14b")),
+            smart_rpc_peers=[
+                str(p).strip() for p in (smart.get("rpc_peers") or []) if str(p).strip()
+            ],
+            smart_rpc_listen_host=str(smart.get("rpc_listen_host", "0.0.0.0")),
+            smart_rpc_listen_port=int(smart.get("rpc_listen_port", 50052)),
+            smart_llama_release=str(smart.get("llama_release", "b9610")),
+            smart_llama_zip_url=(
+                str(smart["llama_zip_url"]) if smart.get("llama_zip_url") else None
+            ),
+            smart_cudart_zip_url=(
+                str(smart["cudart_zip_url"]) if smart.get("cudart_zip_url") else None
+            ),
+            smart_gguf_url=(
+                str(smart["gguf_url"]) if smart.get("gguf_url") else None
+            ),
+            smart_context_length=int(smart.get("context_length", 8192)),
+            smart_tensor_split=(
+                str(smart["tensor_split"]) if smart.get("tensor_split") else None
+            ),
+            smart_llama_server_port=int(smart.get("llama_server_port", 8092)),
+            smart_extra_args=[
+                str(a) for a in (smart.get("extra_args") or [])
+            ],
+            smart_endpoint=(
+                str(smart["endpoint"]).rstrip("/")
+                if smart.get("endpoint") else None
+            ),
+            smart_startup_timeout_seconds=float(
+                smart.get("startup_timeout_seconds", 1200)
             ),
             model=data.get("model"),
             worker_id=data.get("worker_id"),
@@ -3301,6 +3412,525 @@ def bootstrap_inference(cfg: "Config", log: logging.Logger) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
+# Smart mode (multi-machine pipeline via llama.cpp RPC)
+# ---------------------------------------------------------------------------
+# Two LAN-linked contributor machines pool their VRAM to serve a
+# 14B-class model neither card can hold alone:
+#
+#   backend role: runs llama.cpp's rpc-server, which exposes this
+#       machine's GPU to the head over TCP. Holds a layer shard in
+#       VRAM; claims no jobs itself.
+#   head role: runs llama-server with --rpc <backend>, which splits
+#       the model's layers across the local GPU + every backend in
+#       proportion to free VRAM (override with tensor_split). Exposes
+#       an OpenAI-compatible API on localhost; the agent advertises
+#       the "chat:smart" tool and serves jobs against it.
+#
+# Both machines MUST run the same llama.cpp build — the RPC protocol
+# is only compatible between identical versions — which is why the
+# bootstrap pins a release tag and keys the install dir by it.
+#
+# Best-effort like the image/TTS bootstraps: any failure leaves the
+# agent running without the smart capability. See docs/smart-mode.md.
+
+# Single-file Q4_K_M GGUFs for the registered smart-tier models.
+# Overridable per-install via smart.gguf_url in config.json.
+_SMART_GGUF_URLS = {
+    "qwen2.5:14b": (
+        "https://huggingface.co/bartowski/Qwen2.5-14B-Instruct-GGUF/"
+        "resolve/main/Qwen2.5-14B-Instruct-Q4_K_M.gguf"
+    ),
+}
+
+# How often the watchdog checks that the sidecar process is alive,
+# and the backoff cap between relaunch attempts after a crash.
+SMART_WATCHDOG_INTERVAL_SECONDS = 5.0
+SMART_RESTART_BACKOFF_MAX_SECONDS = 300.0
+
+
+def llama_install_dir() -> Path:
+    """Root for everything smart mode puts on disk. Same state_dir()
+    convention as the sd/ and tts/ trees: one folder to delete."""
+    d = state_dir() / "llama"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def llama_bin_dir(release: str) -> Path:
+    """Per-release binary dir. Keyed by the release tag so bumping
+    smart.llama_release re-downloads cleanly on both machines and the
+    pipeline can never silently run mismatched RPC protocol versions."""
+    d = llama_install_dir() / release
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def llama_models_dir() -> Path:
+    d = llama_install_dir() / "models"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def smart_gguf_path(model: str) -> Path:
+    return llama_models_dir() / f"{_model_slug(model)}.gguf"
+
+
+def _smart_default_llama_zip_url(release: str) -> str:
+    # Official prebuilt Windows CUDA binaries. The 12.4 build has the
+    # widest driver compatibility across the consumer cards we target.
+    return (
+        "https://github.com/ggml-org/llama.cpp/releases/download/"
+        f"{release}/llama-{release}-bin-win-cuda-12.4-x64.zip"
+    )
+
+
+def _smart_default_cudart_zip_url(release: str) -> str:
+    # CUDA runtime DLL sidecar published alongside each release —
+    # needed when the machine doesn't have the CUDA toolkit installed
+    # (i.e. virtually every contributor box).
+    return (
+        "https://github.com/ggml-org/llama.cpp/releases/download/"
+        f"{release}/cudart-llama-bin-win-cuda-12.4-x64.zip"
+    )
+
+
+def _extract_zip_to(zip_path: Path, dest: Path, log: logging.Logger) -> bool:
+    """Flatten-extract *zip_path* into *dest*. Some llama.cpp release
+    zips nest everything under a build/bin/ prefix and some are flat;
+    flattening means callers can always expect <dest>/<exe> regardless.
+    Rejects unsafe member names (zip-slip) and skips directories."""
+    import zipfile
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                name = Path(info.filename).name
+                if not name or name.startswith(".."):
+                    continue
+                target = dest / name
+                with zf.open(info) as src, open(target, "wb") as out:
+                    while True:
+                        chunk = src.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+        return True
+    except Exception as e:
+        log.warning("smart: could not extract %s: %s", zip_path.name, e)
+        return False
+
+
+def _smart_ensure_binaries(cfg: "Config", log: logging.Logger) -> Optional[Path]:
+    """Download + extract the pinned llama.cpp release (binaries zip +
+    cudart sidecar) into the per-release dir. Idempotent: short-circuits
+    when the role's exe is already present. Returns the bin dir, or
+    None on failure."""
+    bin_dir = llama_bin_dir(cfg.smart_llama_release)
+    needed_exe = (
+        "rpc-server.exe" if cfg.smart_role == "backend" else "llama-server.exe"
+    )
+    if (bin_dir / needed_exe).exists():
+        return bin_dir
+    log.info(
+        "smart bootstrap: %s not present — downloading llama.cpp %s "
+        "(~500 MB of binaries + CUDA runtime; one-time per release)",
+        needed_exe, cfg.smart_llama_release,
+    )
+    downloads = [
+        (
+            cfg.smart_llama_zip_url
+            or _smart_default_llama_zip_url(cfg.smart_llama_release),
+            f"llama-{cfg.smart_llama_release}.zip",
+        ),
+        (
+            cfg.smart_cudart_zip_url
+            or _smart_default_cudart_zip_url(cfg.smart_llama_release),
+            f"cudart-{cfg.smart_llama_release}.zip",
+        ),
+    ]
+    for url, label in downloads:
+        zip_dest = llama_install_dir() / label
+        if not zip_dest.exists():
+            if not _download_to(url, zip_dest, log, label):
+                return None
+        if not _extract_zip_to(zip_dest, bin_dir, log):
+            return None
+        # Zip already extracted into place — drop it so a contributor
+        # box doesn't carry an extra ~500 MB per release bump.
+        try:
+            zip_dest.unlink()
+        except OSError:
+            pass
+    if not (bin_dir / needed_exe).exists():
+        log.warning(
+            "smart bootstrap: %s missing after extraction — the release "
+            "zip layout may have changed; check smart.llama_zip_url",
+            needed_exe,
+        )
+        return None
+    return bin_dir
+
+
+def _smart_ensure_gguf(cfg: "Config", log: logging.Logger) -> Optional[Path]:
+    """Head only: make sure the smart model's GGUF is on disk."""
+    dest = smart_gguf_path(cfg.smart_model)
+    if dest.exists():
+        return dest
+    url = cfg.smart_gguf_url or _SMART_GGUF_URLS.get(cfg.smart_model)
+    if not url:
+        log.warning(
+            "smart bootstrap: no GGUF url known for %s — set "
+            "smart.gguf_url in config.json", cfg.smart_model,
+        )
+        return None
+    log.info(
+        "smart bootstrap: downloading %s weights (~9 GB — this is a "
+        "one-time download and can take a while on home internet)",
+        cfg.smart_model,
+    )
+    if not _download_to(url, dest, log, dest.name):
+        return None
+    return dest
+
+
+class SmartRuntime:
+    """Owns the smart-mode sidecar process (llama-server on the head,
+    rpc-server on a backend) plus the watchdog that relaunches it if
+    it dies. ``ready()`` is what the job loop checks before polling
+    the chat:smart queue, so a crashed/mid-restart pipeline stops
+    claiming jobs it can't serve instead of erroring them.
+
+    When config supplies smart.endpoint the runtime is unmanaged: no
+    process, no watchdog — ready() just reflects the last health probe
+    of the external server."""
+
+    def __init__(self, cfg: "Config", log: logging.Logger, bin_dir: Optional[Path],
+                 gguf: Optional[Path]):
+        self.cfg = cfg
+        self.log = log
+        self.bin_dir = bin_dir
+        self.gguf = gguf
+        self.role = cfg.smart_role
+        self.managed = cfg.smart_endpoint is None
+        self.endpoint = (
+            cfg.smart_endpoint
+            or f"http://127.0.0.1:{cfg.smart_llama_server_port}"
+        )
+        self._proc: Optional[subprocess.Popen] = None
+        self._ready = threading.Event()
+        self._stop = threading.Event()
+        self._watchdog: Optional[threading.Thread] = None
+
+    # ---------- public ----------
+    def ready(self) -> bool:
+        return self._ready.is_set()
+
+    def start(self) -> bool:
+        """Launch (managed) or probe (unmanaged), then arm the watchdog.
+        Returns True when the pipeline came up ready."""
+        if not self.managed:
+            ok = self._wait_healthy(timeout=15.0)
+            if ok:
+                self._ready.set()
+                self.log.info(
+                    "smart: using external server at %s", self.endpoint,
+                )
+            else:
+                self.log.warning(
+                    "smart: external endpoint %s is not answering /health",
+                    self.endpoint,
+                )
+            return ok
+        if not self._launch():
+            return False
+        ok = self._post_launch_ready()
+        self._watchdog = threading.Thread(
+            target=self._watchdog_loop, name="gamerai-smart-watchdog",
+            daemon=True,
+        )
+        self._watchdog.start()
+        return ok
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._ready.clear()
+        proc = self._proc
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=10)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+    # ---------- internals ----------
+    def _command(self) -> list[str]:
+        cfg = self.cfg
+        assert self.bin_dir is not None
+        if self.role == "backend":
+            cmd = [
+                str(self.bin_dir / "rpc-server.exe"),
+                "-H", cfg.smart_rpc_listen_host,
+                "-p", str(cfg.smart_rpc_listen_port),
+                # Local tensor cache: after the first job, model shards
+                # are cached on this machine's disk so a pipeline
+                # restart doesn't re-stream ~5 GB over the LAN.
+                "-c",
+            ]
+        else:
+            assert self.gguf is not None
+            cmd = [
+                str(self.bin_dir / "llama-server.exe"),
+                "-m", str(self.gguf),
+                "--host", "127.0.0.1",
+                "--port", str(cfg.smart_llama_server_port),
+                # Offload everything; llama.cpp clamps to the real
+                # layer count and spreads across local GPU + RPC
+                # backends by free VRAM.
+                "-ngl", "999",
+                "-c", str(cfg.smart_context_length),
+            ]
+            if cfg.smart_rpc_peers:
+                cmd += ["--rpc", ",".join(cfg.smart_rpc_peers)]
+            if cfg.smart_tensor_split:
+                cmd += ["-ts", cfg.smart_tensor_split]
+        cmd += list(cfg.smart_extra_args)
+        return cmd
+
+    def _launch(self) -> bool:
+        cmd = self._command()
+        log_path = logs_dir() / f"llama-{self.role}.log"
+        self.log.info("smart: launching %s", " ".join(cmd))
+        try:
+            out = open(log_path, "ab")
+        except OSError:
+            out = subprocess.DEVNULL  # type: ignore[assignment]
+        try:
+            self._proc = subprocess.Popen(
+                cmd,
+                cwd=str(self.bin_dir),
+                stdout=out,
+                stderr=subprocess.STDOUT,
+                creationflags=_NO_WINDOW_FLAGS,
+            )
+            return True
+        except Exception as e:
+            self.log.warning("smart: could not launch %s: %s", cmd[0], e)
+            return False
+
+    def _post_launch_ready(self) -> bool:
+        """Role-specific readiness: the head must answer /health (model
+        fully loaded — first load streams the backend's shard over the
+        LAN, so this can take minutes); a backend just has to stay
+        alive past its first few seconds."""
+        if self.role == "backend":
+            time.sleep(3.0)
+            if self._proc is not None and self._proc.poll() is None:
+                self._ready.set()
+                self.log.info(
+                    "smart: rpc-server up on %s:%d — this GPU is now "
+                    "lendable to the pipeline head",
+                    self.cfg.smart_rpc_listen_host,
+                    self.cfg.smart_rpc_listen_port,
+                )
+                return True
+            self.log.warning(
+                "smart: rpc-server exited immediately — see %s",
+                logs_dir() / "llama-backend.log",
+            )
+            return False
+        ok = self._wait_healthy(self.cfg.smart_startup_timeout_seconds)
+        if ok:
+            self._ready.set()
+            self.log.info(
+                "smart: llama-server healthy at %s (model=%s, peers=%s)",
+                self.endpoint, self.cfg.smart_model,
+                ",".join(self.cfg.smart_rpc_peers) or "(local only)",
+            )
+        else:
+            self.log.warning(
+                "smart: llama-server did not become healthy within "
+                "%.0fs — see %s. Common causes: backend rpc-server not "
+                "running / wrong smart.rpc_peers address / firewall "
+                "blocking port %d on the backend machine.",
+                self.cfg.smart_startup_timeout_seconds,
+                logs_dir() / "llama-head.log",
+                self.cfg.smart_rpc_listen_port,
+            )
+        return ok
+
+    def _wait_healthy(self, timeout: float) -> bool:
+        """Poll GET /health until 200. llama-server returns 503 while
+        the model is still loading, 200 once it can serve."""
+        deadline = time.time() + timeout
+        url = f"{self.endpoint}/health"
+        while time.time() < deadline and not self._stop.is_set():
+            if self.managed and self._proc is not None and self._proc.poll() is not None:
+                return False  # process died — no point polling on
+            try:
+                with httpx.Client(timeout=5.0) as c:
+                    if c.get(url).status_code == 200:
+                        return True
+            except httpx.HTTPError:
+                pass
+            time.sleep(5.0)
+        return False
+
+    def _watchdog_loop(self) -> None:
+        backoff = SMART_WATCHDOG_INTERVAL_SECONDS
+        while not self._stop.is_set():
+            self._stop.wait(SMART_WATCHDOG_INTERVAL_SECONDS)
+            if self._stop.is_set():
+                return
+            proc = self._proc
+            if proc is None or proc.poll() is None:
+                backoff = SMART_WATCHDOG_INTERVAL_SECONDS
+                continue
+            self._ready.clear()
+            self.log.warning(
+                "smart: %s exited rc=%s — relaunching in %.0fs",
+                "rpc-server" if self.role == "backend" else "llama-server",
+                proc.returncode, backoff,
+            )
+            if self._stop.wait(backoff):
+                return
+            backoff = min(backoff * 2, SMART_RESTART_BACKOFF_MAX_SECONDS)
+            if self._launch():
+                self._post_launch_ready()
+
+
+def bootstrap_smart_runtime(
+    cfg: "Config", log: logging.Logger,
+) -> Optional["SmartRuntime"]:
+    """Bring up smart mode per config. Returns a started SmartRuntime,
+    or None when smart mode is disabled / failed to start (agent then
+    runs exactly as before — best-effort, same contract as the image
+    and TTS bootstraps)."""
+    if not cfg.smart_enabled:
+        return None
+    if cfg.smart_role not in ("head", "backend"):
+        log.warning(
+            "smart: unknown role %r (want 'head' or 'backend') — "
+            "smart mode disabled", cfg.smart_role,
+        )
+        return None
+    if cfg.smart_endpoint is not None:
+        # Unmanaged: operator runs their own llama-server. Works on
+        # any OS — this is also the dev path on Linux/Mac.
+        rt = SmartRuntime(cfg, log, bin_dir=None, gguf=None)
+        return rt if rt.start() else None
+    if not IS_WINDOWS:
+        log.info(
+            "smart: managed sidecar launch is Windows-only — set "
+            "smart.endpoint to use an externally-run llama-server "
+            "(dev mode)",
+        )
+        return None
+    bin_dir = _smart_ensure_binaries(cfg, log)
+    if bin_dir is None:
+        return None
+    gguf: Optional[Path] = None
+    if cfg.smart_role == "head":
+        gguf = _smart_ensure_gguf(cfg, log)
+        if gguf is None:
+            return None
+        if not cfg.smart_rpc_peers:
+            log.warning(
+                "smart: head has no rpc_peers configured — running the "
+                "%s pipeline on this machine alone (layers that don't "
+                "fit in VRAM spill to CPU; expect it to be slow). Add "
+                "the backend machine's ip:port to smart.rpc_peers.",
+                cfg.smart_model,
+            )
+    rt = SmartRuntime(cfg, log, bin_dir=bin_dir, gguf=gguf)
+    return rt if rt.start() else None
+
+
+def _parse_sse_data(line: str) -> Optional[str]:
+    """Extract the payload from one Server-Sent-Events line. Returns
+    None for blanks / comments / non-data fields, the raw data string
+    (possibly "[DONE]") otherwise. Split out of run_smart_inference so
+    the protocol parsing is unit-testable without a server."""
+    if not line:
+        return None
+    if line.startswith("data:"):
+        return line[len("data:"):].strip()
+    return None
+
+
+def run_smart_inference(
+    prompt: str,
+    model: str,
+    log: logging.Logger,
+    endpoint: str,
+    messages: Optional[list] = None,
+    on_partial=None,
+) -> dict:
+    """Stream a chat completion from the smart pipeline's llama-server
+    (OpenAI-compatible /v1/chat/completions SSE). Mirrors
+    run_inference's contract — same return dict, same on_partial
+    cadence — but raises on failure instead of falling back to mock:
+    a silently-mocked 'smart' answer would be worse than an error
+    bubble with a retry button."""
+    msgs = messages or [{"role": "user", "content": prompt}]
+    payload = {
+        "model": model,
+        "messages": msgs,
+        "stream": True,
+        # Ask for token usage on the final chunk. llama-server honors
+        # this; if a build doesn't, the estimate fallback below kicks in.
+        "stream_options": {"include_usage": True},
+    }
+    url = f"{endpoint.rstrip('/')}/v1/chat/completions"
+    text = ""
+    prompt_tokens: Optional[int] = None
+    completion_tokens: Optional[int] = None
+    last_flush = 0.0
+    with httpx.Client(timeout=httpx.Timeout(600.0, connect=10.0)) as c:
+        with c.stream("POST", url, json=payload) as resp:
+            resp.raise_for_status()
+            for line in resp.iter_lines():
+                data = _parse_sse_data(line)
+                if data is None:
+                    continue
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                choices = chunk.get("choices") or []
+                if choices:
+                    token = (choices[0].get("delta") or {}).get("content") or ""
+                    if token:
+                        text += token
+                usage = chunk.get("usage")
+                if isinstance(usage, dict):
+                    prompt_tokens = usage.get("prompt_tokens", prompt_tokens)
+                    completion_tokens = usage.get(
+                        "completion_tokens", completion_tokens,
+                    )
+                now = time.time()
+                if (
+                    on_partial
+                    and (now - last_flush) >= PARTIAL_FLUSH_INTERVAL_SECONDS
+                ):
+                    on_partial(text)
+                    last_flush = now
+    if on_partial:
+        on_partial(text)
+    return {
+        "text": text,
+        "prompt_tokens": int(prompt_tokens or estimate_tokens(prompt)),
+        "completion_tokens": int(completion_tokens or estimate_tokens(text)),
+        "model": model,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Inference (mock-only by default; real Ollama is opt-in)
 # ---------------------------------------------------------------------------
 def estimate_tokens(text: str) -> int:
@@ -4257,6 +4887,7 @@ def main_loop(
     once: bool,
     should_exit=lambda: False,
     tools: Optional[list[str]] = None,
+    smart_rt: Optional["SmartRuntime"] = None,
 ) -> None:
     last_earnings_print = time.time()
     # Periodic heartbeat-in-the-console: the operator wants to glance
@@ -4334,7 +4965,7 @@ def main_loop(
         emit_status("idle", reason)
 
         did_work, processed_job_id = process_one(
-            cfg, coord, state, log, tools=tools,
+            cfg, coord, state, log, tools=tools, smart_rt=smart_rt,
         )
         if did_work:
             just_drained_job_id = processed_job_id
@@ -4368,12 +4999,16 @@ def _ordered_queues(
     consumer of job_queue:tts, so a worker mid-chat can serve TTS in
     parallel on its idle CPU rather than queueing TTS behind a 10 s
     chat. See voice-phase1 design memory for the latency walkthrough
-    that motivates the dual-loop architecture."""
-    available = ["chat"]
-    if tools and "image" in tools:
-        available.append("image")
-    if tools and "search" in tools:
-        available.append("search")
+    that motivates the dual-loop architecture.
+
+    A smart-pipeline head advertises ["chat:smart"] INSTEAD of "chat"
+    (its VRAM belongs to the 14B shard, so the 3B canonical isn't
+    loaded), and a smart backend advertises no GPU tools at all — in
+    that case this returns [] and the main loop just idles between
+    heartbeats while rpc-server lends the GPU to the head."""
+    gpu_tools = ("chat", "chat:smart", "image", "search")
+    available = [t for t in (tools if tools is not None else ["chat"])
+                 if t in gpu_tools]
     if last_tool in available and last_tool != available[0]:
         return [last_tool] + [t for t in available if t != last_tool]
     return available
@@ -4385,6 +5020,7 @@ def process_one(
     state: dict,
     log: logging.Logger,
     tools: Optional[list[str]] = None,
+    smart_rt: Optional["SmartRuntime"] = None,
 ) -> tuple[bool, Optional[str]]:
     """Pop, claim, run, complete one job. Returns (did_work, job_id).
     The job_id is captured so the main loop can reference it in the
@@ -4397,6 +5033,18 @@ def process_one(
     window expires with no work — main loop falls through without an
     additional sleep (the wait already happened)."""
     queue_order = _ordered_queues(tools, state.get("last_tool"))
+    # Don't claim smart jobs while the pipeline is down (llama-server
+    # crashed / mid-restart) — the watchdog flips ready() back on once
+    # it's healthy again. Better that jobs wait on the queue than get
+    # claimed and errored.
+    if "chat:smart" in queue_order and (smart_rt is None or not smart_rt.ready()):
+        queue_order = [t for t in queue_order if t != "chat:smart"]
+    if not queue_order:
+        # Smart backend (no GPU tools) or smart head mid-restart:
+        # nothing to poll this tick. Sleep one polling interval so the
+        # main loop doesn't spin.
+        time.sleep(cfg.polling_interval)
+        return False, None
     job = coord.next_job(tools=queue_order, wait=LONG_POLL_WAIT_SECONDS)
     if not job:
         return False, None
@@ -4469,8 +5117,13 @@ def process_one(
             #  3. cfg.bootstrap_model — what the agent actually has
             #     loaded in Ollama. The right default; without this
             #     the rewrite job would fall through to run_inference's
-            #     hardcoded backstop on misconfigured installs.
-            use_model = cfg.model or job.get("model") or cfg.bootstrap_model
+            #     hardcoded backstop on misconfigured installs. On a
+            #     smart-pipeline head the loaded model is the smart one,
+            #     not the Ollama canonical.
+            smart_head = smart_rt is not None and smart_rt.role == "head"
+            use_model = cfg.model or job.get("model") or (
+                cfg.smart_model if smart_head else cfg.bootstrap_model
+            )
             # Voice-mode chat pipelining (Phase A). When the job carries
             # voice_mode=true, watch the streaming LLM output for the
             # first complete sentence and fire a parallel Piper synth
@@ -4652,6 +5305,20 @@ def process_one(
                 # out yet).
                 result = run_search_inference(
                     prompt, job, use_model, log, on_partial=on_partial,
+                )
+            elif smart_head:
+                # Pipeline head: every chat-tool job this worker claims
+                # (it only polls chat:smart) runs against the local
+                # llama-server, which splits the model across this GPU
+                # + the rpc backends. Raises on failure → the generic
+                # error path below reports it instead of mocking.
+                result = run_smart_inference(
+                    prompt,
+                    use_model,
+                    log,
+                    endpoint=smart_rt.endpoint,
+                    messages=job.get("messages"),
+                    on_partial=on_partial,
                 )
             else:
                 result = run_inference(
@@ -5817,8 +6484,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     # First-run bootstrap: install Ollama + default model. Best-effort;
     # on failure we fall back to mock inference and keep running.
     # Skipped if OLLAMA_URL is already set in the environment, so devs
-    # pointing at a remote/test Ollama keep that override.
-    if not os.getenv("OLLAMA_URL"):
+    # pointing at a remote/test Ollama keep that override. Also skipped
+    # entirely in smart mode: the pipeline shard owns this GPU's VRAM,
+    # so loading the Ollama canonical alongside it would OOM — a
+    # smart-enabled agent serves chat:smart (head) or nothing (backend)
+    # on the GPU, never standard chat.
+    if not cfg.smart_enabled and not os.getenv("OLLAMA_URL"):
         if not tray_active and cfg.bootstrap_enabled and IS_WINDOWS:
             try:
                 sys.stdout.write(
@@ -5849,8 +6520,17 @@ def main(argv: Optional[list[str]] = None) -> int:
     # succeeds the worker advertises tools=["chat","image"] and pulls
     # from the per-tool image queue; on failure we stay chat-only and
     # the coordinator flags this worker as a partial contributor.
-    image_ready = bootstrap_image_inference(cfg, log)
-    if not image_ready:
+    # Skipped in smart mode for the same VRAM-ownership reason as the
+    # chat bootstrap above.
+    if cfg.smart_enabled:
+        image_ready = False
+        log.info(
+            "smart mode on — skipping image bootstrap (the pipeline "
+            "shard owns this GPU's VRAM)"
+        )
+    else:
+        image_ready = bootstrap_image_inference(cfg, log)
+    if not image_ready and not cfg.smart_enabled:
         # Loud warning block — partial contributors are a documented
         # second-class state and the user should see it on first run
         # rather than discover it later via the account page badge.
@@ -5897,6 +6577,21 @@ def main(argv: Optional[list[str]] = None) -> int:
             "this worker (chat / image still served)"
         )
 
+    # Smart-mode bootstrap (multi-machine pipeline). Downloads the
+    # pinned llama.cpp build (+ the GGUF on the head), launches the
+    # role's sidecar, and on the head waits for /health — the first
+    # load streams the backend's layer shard over the LAN, so this can
+    # take minutes. Best-effort: on failure the agent keeps running
+    # with whatever else bootstrapped (which, with the chat/image
+    # skips above, is typically just TTS — clearly logged).
+    smart_rt = bootstrap_smart_runtime(cfg, log)
+    if cfg.smart_enabled and smart_rt is None:
+        log.warning(
+            "smart bootstrap failed — this machine is contributing "
+            "no smart capability this run; fix the issue above and "
+            "restart the agent"
+        )
+
     coord = Coordinator(cfg.coordinator_url, worker_id, log, cfg.api_token)
     # Advertise the model and tools we can actually serve. The chat
     # bootstrap above either confirmed the model is loaded into Ollama
@@ -5911,18 +6606,37 @@ def main(argv: Optional[list[str]] = None) -> int:
     # custom pyinstaller spec that excluded them) advertises chat
     # without search and the coordinator never hands it a search job.
     # TTS is its own capability (CPU-only Piper) — see voice-phase1.
-    tools = ["chat"]
-    if image_ready:
-        tools.append("image")
-    if _search_deps_available(log):
-        tools.append("search")
-    if tts_ready:
-        tools.append("tts")
     capabilities: Optional[dict] = None
-    if cfg.bootstrap_enabled and os.getenv("OLLAMA_URL"):
-        capabilities = {"models": [cfg.bootstrap_model], "tools": tools}
-    elif image_ready:
-        capabilities = {"models": [cfg.bootstrap_image_model], "tools": ["image"]}
+    if cfg.smart_enabled:
+        # Smart mode replaces the standard GPU toolset. The head
+        # advertises ONLY chat:smart (its VRAM holds the 14B shard, so
+        # serving 3B chat or SDXL alongside would OOM); a backend
+        # advertises no GPU tools at all — its contribution flows
+        # through the head. Explicit empty tools matters: it's what
+        # stops the coordinator treating this worker as legacy
+        # chat-capable. TTS stays — it's CPU-only.
+        tools = []
+        if smart_rt is not None and smart_rt.role == "head" and smart_rt.ready():
+            tools.append("chat:smart")
+        if tts_ready:
+            tools.append("tts")
+        capabilities = {
+            "models": [cfg.smart_model] if "chat:smart" in tools else [],
+            "tools": tools,
+            "notes": f"smart-pipeline {cfg.smart_role}",
+        }
+    else:
+        tools = ["chat"]
+        if image_ready:
+            tools.append("image")
+        if _search_deps_available(log):
+            tools.append("search")
+        if tts_ready:
+            tools.append("tts")
+        if cfg.bootstrap_enabled and os.getenv("OLLAMA_URL"):
+            capabilities = {"models": [cfg.bootstrap_model], "tools": tools}
+        elif image_ready:
+            capabilities = {"models": [cfg.bootstrap_image_model], "tools": ["image"]}
     if not coord.register(capabilities=capabilities):
         if keep_awake_active:
             keep_awake_end(log)
@@ -6051,6 +6765,14 @@ def main(argv: Optional[list[str]] = None) -> int:
             coord.stop_heartbeat(send_offline=True)
         except Exception:
             pass
+        if smart_rt is not None:
+            # Terminate the managed llama-server / rpc-server so the
+            # pipeline's VRAM is released with the agent — a gamer
+            # closing the agent expects their GPU back immediately.
+            try:
+                smart_rt.stop()
+            except Exception:
+                pass
         if (keep_awake_holder.get("active")
                 and not keep_awake_holder.get("exit_requested")):
             try:
@@ -6085,6 +6807,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 or stop_event.is_set()
             ),
             tools=tools,
+            smart_rt=smart_rt,
         )
     except KeyboardInterrupt:
         log.info("stopped by user")

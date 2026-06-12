@@ -125,10 +125,15 @@ class Reaper(threading.Thread):
                 }
             )
         )
-        # Route to the original tool's queue — an image job must land
+        # Route to the original routing queue — an image job must land
         # on job_queue:image so chat-only workers don't pick it up and
-        # error.
-        tool = (original.get("tool") or "chat") if isinstance(original, dict) else "chat"
+        # error, and a smart-mode chat job (envelope carries
+        # route="chat:smart") must go back to the pipeline head, not a
+        # standard 3B chat worker.
+        if isinstance(original, dict):
+            tool = original.get("route") or original.get("tool") or "chat"
+        else:
+            tool = "chat"
         try:
             queue = job_queue_for(tool)
         except Exception:

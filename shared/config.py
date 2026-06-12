@@ -140,13 +140,19 @@ def job_queue_for(tool: str) -> str:
     only this key, decoupled from the GPU chat/image loop so the two
     can run concurrently on the same worker (see voice-phase1 design),
     and (b) workers that haven't bootstrapped Piper must not accidentally
-    BLPOP an audio job they can't fulfil."""
+    BLPOP an audio job they can't fulfil. Smart-mode chat jobs
+    ("chat:smart" routing key — tool stays "chat" on the envelope) get
+    their own queue because only a multi-machine pipeline head can
+    serve the 14B-class model; a standard chat worker would answer
+    with its 3B and defeat the point."""
     if tool == "image":
         return "job_queue:image"
     if tool == "search":
         return "job_queue:search"
     if tool == "tts":
         return "job_queue:tts"
+    if tool == "chat:smart":
+        return "job_queue:chat:smart"
     return JOB_QUEUE
 JOB_RESULTS = "job_results"
 JOB_PROCESSING = "job_processing"
@@ -183,7 +189,7 @@ del _os
 # browser on next page load AND surfaces the new number in the UI so
 # operator and user can confirm at-a-glance which build is live.
 # Format: bare integer string. Display widget renders "v1.0.{N}".
-CLIENT_CACHE_VERSION = "18"
+CLIENT_CACHE_VERSION = "19"
 WORKER_REGISTRY = "worker_registry"
 WORKER_HEARTBEATS = "worker_heartbeats"
 WORKER_STATUS = "worker_status"

@@ -1469,12 +1469,20 @@ _NO_TTS_WORKERS_MESSAGE = (
     "No voice-capable community members are online right now. "
     "Please try again in a few minutes, or turn off voice mode."
 )
+_NO_SMART_WORKERS_MESSAGE = (
+    "The smart-mode pipeline is offline right now (it needs its "
+    "machines online and linked). Please try again in a few minutes, "
+    "or turn off smart mode."
+)
 
 
 def _worker_advertises_tool(worker_id: str, tool: str) -> bool:
     """Read the cached WorkerCapabilities for a worker and check whether
     it claims the given tool. Missing/legacy capabilities default to
-    chat-only (the pre-multi-tool behavior)."""
+    chat-only (the pre-multi-tool behavior). An explicit EMPTY tools
+    list is honored as "serves nothing on the GPU" — that's how a
+    smart-pipeline backend registers (its GPU is lent to the head via
+    rpc-server, so it must never count as a live chat worker)."""
     raw = r.hget(WORKER_CAPABILITIES, worker_id)
     if not raw:
         return tool == "chat"
@@ -1482,7 +1490,9 @@ def _worker_advertises_tool(worker_id: str, tool: str) -> bool:
         caps = json.loads(raw)
     except json.JSONDecodeError:
         return tool == "chat"
-    tools = caps.get("tools") or ["chat"]
+    tools = caps.get("tools")
+    if tools is None:
+        tools = ["chat"]
     return tool in tools
 
 
@@ -1513,6 +1523,8 @@ def _ensure_live_worker_or_503(tool: str = "chat") -> None:
         detail = _NO_SEARCH_WORKERS_MESSAGE
     elif tool == "tts":
         detail = _NO_TTS_WORKERS_MESSAGE
+    elif tool == "chat:smart":
+        detail = _NO_SMART_WORKERS_MESSAGE
     else:
         detail = _NO_WORKERS_MESSAGE
     raise HTTPException(status_code=503, detail=detail)
@@ -1627,6 +1639,14 @@ def generate(req: GenerateRequest, request: Request):
     # explicitly today.
     if tool == "tts" and not req.model:
         req.model = model_registry.DEFAULT_TTS_MODEL
+    # Smart mode: the UI sends a boolean, not a model name. Resolve it
+    # to the smart-tier default here so everything downstream (strict
+    # validation, queue routing via model_registry.route_for, the
+    # message rows' model stamp) sees a concrete model. An explicit
+    # req.model wins — a caller pinning a smart-tier model directly
+    # gets smart routing with or without the flag.
+    if tool == "chat" and req.smart and not req.model:
+        req.model = model_registry.DEFAULT_SMART_MODEL
 
     # optional model-registry validation (off unless STRICT_MODELS=true)
     try:
@@ -1690,8 +1710,11 @@ def generate(req: GenerateRequest, request: Request):
     # Refuse to accept the job if no worker advertising this tool has
     # heartbeated recently (REQUIRE_LIVE_WORKER=true on prod). Runs
     # after prompt/idempotency validation so 400s still win, and BEFORE
-    # any DB writes so a 503 leaves no orphan job/message rows.
-    _ensure_live_worker_or_503(tool=tool)
+    # any DB writes so a 503 leaves no orphan job/message rows. Smart-
+    # routed chat needs a pipeline head specifically — re-checked below
+    # once the conversation's pinned model is resolved, since a pinned
+    # smart model can flip the route after this first gate.
+    _ensure_live_worker_or_503(tool=model_registry.route_for(tool, req.model))
 
     member = getattr(request.state, "member", None)
     submitted_by = member.member_id if member is not None else None
@@ -1842,6 +1865,15 @@ def generate(req: GenerateRequest, request: Request):
     else:
         req_model = req.model
 
+    # Final routing key — req_model may differ from req.model after
+    # conversation-pin inheritance (e.g. a smart-mode conversation's
+    # follow-up turn arrives with no explicit model or flag). When the
+    # route flipped to chat:smart only now, the earlier liveness gate
+    # checked the wrong pool, so re-check before any DB writes.
+    route = model_registry.route_for(tool, req_model)
+    if route != model_registry.route_for(tool, req.model):
+        _ensure_live_worker_or_503(tool=route)
+
     job_id = str(uuid.uuid4())
     submitted_at = time.time()
     # IMPORTANT: do NOT include submitted_by_member_id in the worker-
@@ -1857,6 +1889,12 @@ def generate(req: GenerateRequest, request: Request):
         "submitted_at": submitted_at,
         "tool": tool,
     }
+    if route != tool:
+        # Routing key for requeue paths that only have the envelope in
+        # hand (reaper, abandon). tool stays "chat" so the agent's
+        # chat handler — streaming, partials, token accounting — runs
+        # unchanged; only the queue placement differs.
+        job["route"] = route
     if worker_messages is not None:
         # The worker prefers messages[] (routed to Ollama /api/chat) when
         # present, falling back to the bare prompt for single-shot
@@ -1991,7 +2029,7 @@ def generate(req: GenerateRequest, request: Request):
                 submitted_at=submitted_at,
             )
     else:
-        r.rpush(job_queue_for(tool), json.dumps(job))
+        r.rpush(job_queue_for(route), json.dumps(job))
     idem.remember(idem_key, job_id)
     log.info(
         "queued job",
@@ -2293,6 +2331,12 @@ def _job_row_to_envelope(row) -> dict:
         "submitted_at": row["submitted_at"],
         "tool": tool,
     }
+    # Smart-routed chat is derived from the persisted model, the same
+    # rule /generate applied — so a requeued smart job goes back to the
+    # pipeline head's queue instead of a 3B chat worker.
+    route = model_registry.route_for(tool, row["model"])
+    if route != tool:
+        env["route"] = route
     if tool in ("chat", "search"):
         msgs = _rebuild_messages_for_requeue(row)
         if msgs is not None:
@@ -2882,11 +2926,14 @@ def abandon(req: JobClaimRequest, request: Request):
         if row is not None:
             original = _job_row_to_envelope(row)
     if original is not None:
-        # Requeue to the original tool's queue so an abandoned image
+        # Requeue to the original routing queue so an abandoned image
         # job doesn't end up in front of chat workers (which would
-        # then 'error' on every claim).
+        # then 'error' on every claim), and an abandoned smart job
+        # goes back to the pipeline head rather than a 3B worker.
         r.rpush(
-            job_queue_for(original.get("tool", "chat")),
+            job_queue_for(
+                original.get("route") or original.get("tool", "chat")
+            ),
             json.dumps(original),
         )
     r.hdel(JOB_PROCESSING, req.job_id)
@@ -4585,7 +4632,12 @@ def retry_message(message_id: str, request: Request):
         "messages": worker_messages,
         "tool": orig_tool,
     }
-    r.rpush(job_queue_for(orig_tool), json.dumps(job))
+    # A retried smart-mode turn keeps its model, so it must also keep
+    # its queue — same model-derived rule as /generate and the reaper.
+    retry_route = model_registry.route_for(orig_tool, use_model)
+    if retry_route != orig_tool:
+        job["route"] = retry_route
+    r.rpush(job_queue_for(retry_route), json.dumps(job))
     log.info(
         "retry queued",
         extra={

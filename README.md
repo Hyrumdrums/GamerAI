@@ -67,6 +67,7 @@ for search) and credited to the contributor's ledger.
 | Status   | Tool          | Model class            | Why it fits a distributed network |
 | -------- | ------------- | ---------------------- | --------------------------------- |
 | **MVP, live** | Chat          | 7B–13B (currently 1B for VPS demo) | Independent jobs, latency-tolerant, low VRAM |
+| **New** | Smart-mode chat | 14B-class (Qwen2.5-14B Q4) split across two LAN-linked contributor machines via llama.cpp RPC | Pools VRAM no single contributor card has; slower, a capability class up — see [`docs/smart-mode.md`](docs/smart-mode.md) |
 | Next     | Web-augmented answers | small chat + search API | No GPU lift; centralized; biggest perceived-IQ bump for small models |
 | Next     | Image generation | SDXL-class (~8–12 GB VRAM) | Independent jobs, async-friendly, high demo wow |
 | Expansion | Document tools (summarize, rewrite, chunked analysis) | 7B–13B | High retention, same hardware envelope as chat |
@@ -734,6 +735,17 @@ Mixtral 8x22B, Llama 3.2 Vision) on top of the same gamer-GPU network.
 Strategy is staged: start by reselling an existing public swarm to prove
 demand, then bring the engine in-house once we have enough workers to form
 private pipeline groups.
+
+**Phase 4 pre-work — smart mode (shipped)**
+
+- [x] Two-machine pipeline-parallel chat via llama.cpp RPC: a "head"
+      agent runs llama-server with `--rpc` to a "backend" agent's
+      rpc-server, splitting a 14B Q4 model across both GPUs (e.g.
+      6 GB + 8 GB). Routed via a dedicated `job_queue:chat:smart`
+      queue + `chat:smart` worker capability; "Smart mode" toggle in
+      the chat composer. Static config pairing (one contributor's own
+      machines) — coordinator-scheduled pipeline groups are Phase 4b.
+      See `docs/smart-mode.md`. (Shipped 2026-06-12.)
 
 **Phase 4a — Petals-backed big-model tier**
 
