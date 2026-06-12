@@ -47,7 +47,7 @@ IS_WINDOWS = platform.system() == "Windows"
 # the moment it starts. The CI-generated version.txt (short-sha +
 # build timestamp) is still what the self-updater diffs against;
 # AGENT_VERSION is just the human-facing label.
-AGENT_VERSION = "1.3.1"
+AGENT_VERSION = "1.3.2"
 
 # Base64-encoded Ed25519 PUBLIC key used to verify self-update payloads.
 # When this is non-empty, the self-updater REQUIRES a valid signature on
@@ -1726,6 +1726,26 @@ class Config:
                     # below) — the on-disk migration just retries on
                     # next startup.
                     pass
+        # Operator overrides, layered LAST so they win. The frozen exe's
+        # bundled config.json (merged above) lives in an ephemeral
+        # _MEIPASS dir, so runtime edits — the `smart` console command —
+        # are persisted to %APPDATA%\GamerAI\config.json instead and
+        # merged here. Holds only the changed keys; the rest still comes
+        # from the bundle. Skipped when it IS the primary path (a launcher
+        # that points --config straight at it) to avoid a double-merge.
+        override = operator_config_path()
+        try:
+            if override.exists() and (
+                path is None or override.resolve() != path.resolve()
+            ):
+                with open(override, "r", encoding="utf-8") as f:
+                    ovr = json.load(f)
+                if isinstance(ovr, dict):
+                    _deep_merge(data, ovr)
+        except (OSError, ValueError):
+            # Malformed/locked override must never block startup — fall
+            # back to the bundled config.
+            pass
         idle = data["idle"]
         power = data.get("power", DEFAULTS["power"])
         update = data.get("update", DEFAULTS["update"])
@@ -1877,6 +1897,26 @@ def state_dir() -> Path:
         d = Path.home() / ".gamerai"
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def operator_config_path() -> Path:
+    """Persistent, user-writable config OVERRIDES — layered on top of the
+    bundled config.json at load time (see Config.load).
+
+    Why this exists: the shipped agent.exe is PyInstaller --onefile, so
+    its bundled config.json is extracted to a throwaway _MEIPASS temp dir
+    that's recreated every launch and deleted on exit. Anything written
+    there evaporates on the next start. This file lives next to state.json
+    in %APPDATA%\\GamerAI (the same persistent, always-writable location
+    that already survives restarts and self-updates), so the `smart`
+    console command's edits actually stick. It only needs to hold the
+    keys the operator changed; everything else still comes from the
+    bundled config. Computed WITHOUT mkdir so it's a side-effect-free
+    read used safely from Config.load and --diagnose."""
+    if IS_WINDOWS:
+        base = os.getenv("APPDATA") or os.path.expanduser("~")
+        return Path(base) / "GamerAI" / "config.json"
+    return Path.home() / ".gamerai" / "config.json"
 
 
 def local_state_dir() -> Path:
@@ -4852,11 +4892,13 @@ def _relaunch_in_place(
 def _apply_smart_config(
     config_path: Optional[Path], updates: dict, log: logging.Logger,
 ) -> bool:
-    """Merge ``updates`` into the ``smart`` block of config.json and write
-    it back atomically, preserving every other key the user has set (other
-    smart fields, coordinator_url, idle knobs, …). Reads the same path the
-    agent loads from, so what we write is what the next start reads.
-    Returns True on success."""
+    """Merge ``updates`` into the ``smart`` block of the persistent
+    operator-override file (operator_config_path) and write it back
+    atomically. This file holds ONLY the keys the operator changed — it's
+    layered on top of the bundled config at load time — so we read/merge
+    the existing override, never the bundled config. That keeps the
+    override a small delta and lets bundled updates (coordinator_url, new
+    smart defaults) keep flowing through. Returns True on success."""
     if config_path is None:
         log.warning("smart: no config path known — cannot persist")
         return False
@@ -4877,6 +4919,10 @@ def _apply_smart_config(
     smart.update(updates)
     data["smart"] = smart
     try:
+        # The override dir (%APPDATA%\GamerAI) normally already exists
+        # (state.json lives there), but create it defensively for a
+        # first-ever write before any state has been saved.
+        config_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = config_path.with_suffix(config_path.suffix + ".tmp")
         tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
         tmp.replace(config_path)
@@ -5129,7 +5175,7 @@ def stdin_command_loop(
                 _emit("smart: failed to write config.json (see log) - no change\n")
                 continue
             log.info("smart: wrote %s to config (via stdin command)", summary)
-            _emit(f"smart: wrote {summary} to config.json\n")
+            _emit(f"smart: saved {summary} (persisted in %APPDATA%\\GamerAI)\n")
             if _relaunch_in_place(log, relaunch_args):
                 _emit("smart: restarting to apply - the window will reopen.\n")
                 stop_event.set()
@@ -6979,7 +7025,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         target=stdin_command_loop,
         args=(
             log, worker_id, force_update_event, stop_event, cfg, state,
-            args.config, relaunch_args,
+            # The `smart` command persists to the operator-override file
+            # (%APPDATA%), NOT the ephemeral bundled config the agent was
+            # launched with — see operator_config_path / Config.load.
+            operator_config_path(), relaunch_args,
         ),
         name="gamerai-stdin",
         daemon=True,

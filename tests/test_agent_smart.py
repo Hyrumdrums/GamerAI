@@ -181,6 +181,57 @@ class SmartConsoleCommandTests(unittest.TestCase):
         self.assertIn(b":waitloop", raw)
         self.assertIn(b"EncodedCommand", raw)
 
+    def test_operator_config_path_is_persistent(self):
+        # Must resolve under the persistent per-user dir (%APPDATA% /
+        # ~/.gamerai), never the ephemeral PyInstaller _MEIPASS bundle.
+        p = agent.operator_config_path()
+        self.assertEqual(p.name, "config.json")
+        self.assertIn("gamerai", str(p).lower())
+
+    def test_operator_override_layers_over_bundled_config(self):
+        # Regression for the v1.3.1 frozen-build bug: the shipped exe is
+        # --onefile, so its bundled config.json lives in a throwaway
+        # _MEIPASS dir. The `smart` command therefore persists to a
+        # SEPARATE operator-override file that Config.load must layer on
+        # top — otherwise the change evaporates on the relaunch (the agent
+        # came back up with smart still disabled).
+        import tempfile
+        from unittest import mock
+        d = Path(tempfile.mkdtemp())
+        bundled = d / "bundled.json"
+        bundled.write_text(json.dumps({
+            "coordinator_url": "https://ai.dallinlayton.com",
+            "smart": {"enabled": False, "role": "head", "llama_release": "b9610"},
+        }))
+        override = d / "override.json"
+        log = logging.getLogger("test-smart-cmd")
+        with mock.patch.object(agent, "operator_config_path", lambda: override):
+            # Bundled-only: smart stays off (reproduces the reported state).
+            self.assertFalse(agent.Config.load(bundled).smart_enabled)
+            # `smart backend` writes a DELTA-ONLY override...
+            self.assertTrue(agent._apply_smart_config(
+                override, {"enabled": True, "role": "backend"}, log))
+            self.assertEqual(set(json.loads(override.read_text())), {"smart"})
+            # ...which the next load (the relaunch) layers on the bundle.
+            c = agent.Config.load(bundled)
+            self.assertTrue(c.smart_enabled, "smart did not persist across reload")
+            self.assertEqual(c.smart_role, "backend")
+            # Bundled values still flow through (override is delta-only).
+            self.assertEqual(c.coordinator_url, "https://ai.dallinlayton.com")
+            self.assertEqual(c.smart_llama_release, "b9610")
+
+    def test_override_skipped_when_it_is_the_primary_path(self):
+        # If a launcher points --config straight at the override file, the
+        # double-merge guard must not blow up or double-apply.
+        import tempfile
+        from unittest import mock
+        override = Path(tempfile.mkdtemp()) / "config.json"
+        override.write_text(json.dumps({"smart": {"enabled": True, "role": "backend"}}))
+        with mock.patch.object(agent, "operator_config_path", lambda: override):
+            c = agent.Config.load(override)
+        self.assertTrue(c.smart_enabled)
+        self.assertEqual(c.smart_role, "backend")
+
 
 class OrderedQueuesSmartTests(unittest.TestCase):
     def test_smart_head_polls_only_smart_queue(self):
