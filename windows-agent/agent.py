@@ -3486,6 +3486,19 @@ def llama_models_dir() -> Path:
     return d
 
 
+def llama_rpc_cache_dir() -> Path:
+    """Backend-side tensor cache (rpc-server -c). After the first load
+    streams the layer shard from the head, every tensor is cached here
+    by content hash — reloads hand the head a hash hit instead of
+    re-transferring, which is what makes the shard transfer a one-time
+    cost per model. Pinned via LLAMA_CACHE at launch so it lives under
+    the agent's own tree (deterministic, survives agent updates, and
+    deleting %APPDATA%\\GamerAI still removes everything)."""
+    d = llama_install_dir() / "rpc-cache"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def smart_gguf_path(model: str) -> Path:
     return llama_models_dir() / f"{_model_slug(model)}.gguf"
 
@@ -3723,6 +3736,11 @@ class SmartRuntime:
             out = open(log_path, "ab")
         except OSError:
             out = subprocess.DEVNULL  # type: ignore[assignment]
+        # LLAMA_CACHE pins rpc-server's tensor cache (the thing that
+        # makes the shard transfer one-time) to the agent's own tree
+        # instead of whatever HOME/%LOCALAPPDATA% resolves to for a
+        # tray-spawned process.
+        env = {**os.environ, "LLAMA_CACHE": str(llama_rpc_cache_dir())}
         try:
             self._proc = subprocess.Popen(
                 cmd,
@@ -3730,6 +3748,7 @@ class SmartRuntime:
                 stdout=out,
                 stderr=subprocess.STDOUT,
                 creationflags=_NO_WINDOW_FLAGS,
+                env=env,
             )
             return True
         except Exception as e:

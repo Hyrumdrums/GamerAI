@@ -5,6 +5,77 @@ entries on top. Skim for context before resuming work.
 
 ---
 
+## 2026-06-12 — Smart mode: 14B chat split across two machines (agent v1.3.0)
+
+First slice of the Phase 4 big-model plan: an opt-in "smart" chat tier
+where two contributor machines pool VRAM via llama.cpp's RPC backend.
+Head runs `llama-server --rpc <backend>`; backend runs `rpc-server`
+and lends its GPU. Reference pair is the founder's 6 GB + 8 GB boxes
+serving Qwen2.5-14B-Instruct Q4_K_M (~9 GB). Full setup + config
+reference + troubleshooting: `docs/smart-mode.md`.
+
+**Design decisions worth remembering:**
+
+- *14B, not a split 7B.* A 7B Q4 fits either card alone; the point of
+  pooling 14 GB is a whole model-class step up.
+- *Routing key, not a new tool.* Smart jobs keep `tool="chat"` (so
+  streaming/partials/earnings/conversations are untouched) but carry
+  `route="chat:smart"` and ride `job_queue:chat:smart`, which only
+  heads poll. Every requeue path (reaper, abandon, retry, row-rebuild)
+  re-derives the route so a 3B worker can never claim a smart job.
+- *Smart agents leave the standard pool.* The shard owns the VRAM, so
+  smart-enabled agents skip the Ollama/SD bootstraps; head advertises
+  `chat:smart` (+tts), backend advertises no GPU tools. The
+  coordinator now honors an explicit empty `tools` list (previously
+  it would default to chat).
+- *`SMART_MODEL` env override* on the coordinator repoints the tier at
+  a smaller model (`qwen2.5:7b`, `llama3.2:3b` have built-in GGUF
+  sources in the agent) for testing — exercises the entire path with
+  a 2–5 GB download.
+- *Any two peers, not just LAN.* llama.cpp's RPC protocol is
+  unauthenticated, so the supported cross-household path is an overlay
+  (Tailscale/WireGuard) with `rpc_listen_host` bound to the overlay
+  IP — never raw port-forwarding. Simplicity + security over speed,
+  per the founder's call. Coordinator-brokered pairing + a speed
+  endpoint for latency-aware matchmaking (pair *closest* nodes — RTT
+  dominates per-token speed) is the Phase 4b follow-on.
+- *Shard transfer is one-time per model per backend.* `rpc-server -c`
+  with `LLAMA_CACHE` pinned to `%APPDATA%\GamerAI\llama\rpc-cache\`;
+  reloads are hash-hits from local disk. Pre-seeding A/B halves was
+  considered and rejected — rpc-server never reads GGUFs and the cache
+  keys are llama.cpp-internal content hashes (see smart-mode.md).
+- *Head/backend must run the same pinned llama.cpp release* (RPC
+  protocol compat); the agent keys its install dir by the tag
+  (`b9610`) so a bump re-downloads on both sides in lockstep.
+- Latent bug fixed along the way: `Config.load` shallow-copied
+  DEFAULTS, so `_deep_merge` leaked user values into module state.
+
+**Release/deploy runbook for this change:**
+
+1. Merge to `main`. The `windows-agent build` workflow fires on the
+   `windows-agent/**` paths, builds agent.exe v1.3.0, and publishes it
+   to `/download/` — the fleet self-updates within ~6 h. (Smart mode
+   is config-off by default; updated agents behave identically until
+   a `smart` block is enabled.)
+2. On the VPS: `sudo /opt/gamerai/infra/deploy.sh` (pulls main,
+   rebuilds coordinator/client — picks up the smart routing, the
+   `/generate` `smart` flag, the UI toggle, PWA cache 18→19).
+3. Optional, for the testing phase: add `SMART_MODEL=qwen2.5:7b` to
+   `.env.prod` before the deploy so smart mode resolves to the 7B
+   while refining (remember the head agent's `smart.model` must
+   match; remove the env line to return to the 14B default).
+4. Enable `smart` blocks on the two paired machines per
+   `docs/smart-mode.md` (backend first, then head with the backend's
+   IP in `rpc_peers`).
+5. Until a head is online and healthy, the UI's Smart toggle returns
+   a clear 503 ("smart-mode pipeline is offline") — expected state,
+   not a bug.
+
+Tests: 546 passing (35 new across coordinator routing e2e + agent
+config/CLI/SSE incl. a stub-server streaming round-trip).
+
+---
+
 ## 2026-06-05 — Security pass: access-control, SSRF, IDOR, pairing phishing, signed updates
 
 Full security review of the project, then fixes in three commits.

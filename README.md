@@ -769,6 +769,11 @@ private pipeline groups.
 - [ ] Pipeline-group scheduling as a first-class coordinator primitive:
       bind N workers into an ephemeral group with shared health/reaper
       semantics, keep groups warm across jobs to amortize cold-start.
+- [ ] Latency-aware matchmaking — a coordinator speed endpoint (or
+      coordinator-directed peer pings) measures RTT between
+      smart-capable agents so pipeline halves are paired by proximity;
+      per-token speed is RTT-dominated, so closest-nodes beats
+      biggest-GPUs. See `docs/smart-mode.md`.
 - [ ] Worker-to-worker activation routing (WebSockets / QUIC). Coordinator
       stays on the control plane; activations flow worker-to-worker.
 - [ ] Peer-to-peer weight distribution (SHARDCAST-style) so adding a new

@@ -230,6 +230,50 @@ without the user installing anything — is exactly the Phase 4b
 pipeline-groups work in `research/big-models-feasibility.md`. The
 Tailscale path is how we validate demand before building that.
 
+Part of that brokering should be **latency-aware matchmaking**: a
+speed endpoint on the coordinator (or coordinator-directed agent-to-
+agent pings) that measures RTT between smart-capable peers, so the
+coordinator pairs the two *closest* nodes as the halves of a pipeline
+rather than any two volunteers. Since per-token speed is dominated by
+the RTT between the halves, picking neighbors is worth more than
+picking the biggest GPUs.
+
+## About the shard transfer (one-time, and why we don't pre-seed it)
+
+**Is the first-load transfer one-time forever?** Effectively yes — per
+model, per backend. The mechanics: in llama.cpp's RPC design the head
+is the only process that ever reads the GGUF; on load it streams each
+backend's tensors over the link. We run `rpc-server` with its tensor
+cache on, and pin the cache to `%APPDATA%\GamerAI\llama\rpc-cache\`,
+so every received tensor is stored on the backend's disk keyed by
+content hash. On every later load the head sends hashes first and the
+backend answers from disk — no re-transfer. The cache survives agent
+restarts, agent self-updates, and reboots. You pay the slow transfer
+again only when the tensors actually change: a different model, a
+different quant, or a `tensor_split` change (which moves layers
+between machines — and only the moved layers re-transfer).
+
+**Why not pre-package A/B shard halves both agents download up front?**
+It's a natural idea and we considered it; it doesn't fit how the
+engine works, and forcing it would make things less simple, not more:
+
+- `rpc-server` has no code path that reads model files. Giving the
+  backend the GGUF (or a pre-cut half) gives it bytes it cannot use.
+- The cache is keyed by llama.cpp-internal content hashes of tensors
+  *as transformed at load time*. Pre-seeding it would mean
+  re-implementing that hashing and layout outside llama.cpp — a
+  fragile coupling that breaks silently on every release bump.
+- A fixed A/B cut would also hard-code the split, losing the
+  free-VRAM-proportional placement that makes mismatched cards (6+8,
+  6+12, …) work without configuration.
+
+The honest cost today is therefore: **one slow first load per model
+per backend** (minutes on LAN, potentially an hour-class wait over a
+residential WAN link), and near-instant loads forever after. That
+matches the project's bias — simple and secure beats fast — and the
+config already softens the first load (`startup_timeout_seconds`,
+plus the smaller test models above for iteration).
+
 ## Config reference (`smart` block)
 
 | key | default | meaning |
