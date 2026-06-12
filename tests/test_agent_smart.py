@@ -159,6 +159,28 @@ class SmartConsoleCommandTests(unittest.TestCase):
             agent._relaunch_in_place(logging.getLogger("test-smart-cmd"), []),
         )
 
+    def test_relaunch_batch_is_ascii_clean(self):
+        # Regression for the v1.3.0 crash: a .bat is interpreted in the
+        # console's OEM code page, so its content MUST be pure ASCII. A
+        # stray em-dash made write_text(encoding="ascii") raise
+        # UnicodeEncodeError and killed the stdin thread. Force the
+        # Windows write path on Linux (the cmd.exe spawn then fails, so
+        # the call returns False, but the .bat is written first — that's
+        # what we inspect).
+        import tempfile
+        from unittest import mock
+        exe = Path(tempfile.mkdtemp()) / "agent.exe"
+        exe.write_bytes(b"MZ")
+        with mock.patch.object(agent, "IS_WINDOWS", True), \
+                mock.patch.object(agent, "_agent_exe_path", lambda: exe):
+            agent._relaunch_in_place(logging.getLogger("test-smart-cmd"), ["--tray"])
+        bat = exe.with_name("smart-relaunch.bat")
+        self.assertTrue(bat.exists(), "relaunch batch was not written")
+        raw = bat.read_bytes()
+        raw.decode("ascii")  # must not raise
+        self.assertIn(b":waitloop", raw)
+        self.assertIn(b"EncodedCommand", raw)
+
 
 class OrderedQueuesSmartTests(unittest.TestCase):
     def test_smart_head_polls_only_smart_queue(self):
