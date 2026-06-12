@@ -154,7 +154,32 @@ DEFAULT_TTS_MODEL = "piper:en_us-libritts-high"
 # when the caller didn't pin a model. The agent's smart bootstrap pulls
 # this model's GGUF, so the two stay in sync the same way the image /
 # TTS defaults do.
-DEFAULT_SMART_MODEL = "qwen2.5:14b"
+#
+# Overridable via the SMART_MODEL env var so an operator can point the
+# smart tier at a smaller model during testing/refinement (e.g.
+# SMART_MODEL=qwen2.5:7b loads in seconds instead of minutes and fits
+# a single mid-range card) without touching this file. The configured
+# name is treated as smart-TIER for routing even when its catalog
+# entry says "standard" — the whole point of the override is borrowing
+# a standard model for the smart pipeline. Remember to set the head
+# agent's smart.model to the same name.
+DEFAULT_SMART_MODEL = (os.getenv("SMART_MODEL") or "").strip() or "qwen2.5:14b"
+
+
+def is_smart_model(name: str | None) -> bool:
+    """True if *name* should route to the smart pipeline: either a
+    chat model registered at the "smart" tier, or whatever model
+    DEFAULT_SMART_MODEL currently names (the SMART_MODEL env override
+    path). Non-chat catalog entries are never smart, whatever the env
+    says — an image model on the chat:smart queue helps nobody."""
+    if not name:
+        return False
+    m = _CATALOG.get(name)
+    if m is not None and m.kind != "chat":
+        return False
+    if name == DEFAULT_SMART_MODEL:
+        return True
+    return m is not None and m.tier == "smart"
 
 
 def is_image_model(name: str | None) -> bool:
@@ -165,16 +190,6 @@ def is_image_model(name: str | None) -> bool:
         return False
     m = _CATALOG.get(name)
     return m is not None and m.kind == "image"
-
-
-def is_smart_model(name: str | None) -> bool:
-    """True if *name* is a chat model registered at the "smart" tier
-    (needs the multi-machine pipeline, not a single worker). Unknown
-    names return False so they keep riding the standard chat queue."""
-    if not name:
-        return False
-    m = _CATALOG.get(name)
-    return m is not None and m.kind == "chat" and m.tier == "smart"
 
 
 def route_for(tool: str, model: str | None) -> str:

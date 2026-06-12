@@ -1594,7 +1594,10 @@ DEFAULTS = {
         "rpc_peers": [],
         # backend only: where rpc-server listens. 0.0.0.0 exposes it on
         # the LAN — llama.cpp's RPC protocol is unauthenticated, so
-        # NEVER port-forward this. Home-LAN-only by design.
+        # NEVER port-forward this. To pair peers across the internet,
+        # use an overlay (Tailscale/WireGuard) and bind to the overlay
+        # IP instead — see docs/smart-mode.md "Pairing over the
+        # internet".
         "rpc_listen_host": "0.0.0.0",
         "rpc_listen_port": 50052,
         # llama.cpp release pin. The RPC protocol is only guaranteed
@@ -3433,12 +3436,24 @@ def bootstrap_inference(cfg: "Config", log: logging.Logger) -> Optional[str]:
 # Best-effort like the image/TTS bootstraps: any failure leaves the
 # agent running without the smart capability. See docs/smart-mode.md.
 
-# Single-file Q4_K_M GGUFs for the registered smart-tier models.
-# Overridable per-install via smart.gguf_url in config.json.
+# Single-file Q4_K_M GGUFs for the models the smart pipeline knows how
+# to fetch. Overridable per-install via smart.gguf_url in config.json.
+# The smaller entries exist for testing/refinement: pair them with the
+# coordinator's SMART_MODEL env override so the whole smart path can be
+# exercised with a 2-5 GB download and fast loads — see
+# docs/smart-mode.md "Testing with a smaller model".
 _SMART_GGUF_URLS = {
     "qwen2.5:14b": (
         "https://huggingface.co/bartowski/Qwen2.5-14B-Instruct-GGUF/"
         "resolve/main/Qwen2.5-14B-Instruct-Q4_K_M.gguf"
+    ),
+    "qwen2.5:7b": (
+        "https://huggingface.co/bartowski/Qwen2.5-7B-Instruct-GGUF/"
+        "resolve/main/Qwen2.5-7B-Instruct-Q4_K_M.gguf"
+    ),
+    "llama3.2:3b": (
+        "https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/"
+        "resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf"
     ),
 }
 

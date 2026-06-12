@@ -64,6 +64,11 @@ services:
       RATE_LIMIT_PER_MIN: ${RATE_LIMIT_PER_MIN:-0}
       IDEMPOTENCY_TTL_SECONDS: ${IDEMPOTENCY_TTL_SECONDS:-86400}
       REQUIRE_LIVE_WORKER: ${REQUIRE_LIVE_WORKER:-false}
+      # Smart-tier model override (empty = registry default, currently
+      # qwen2.5:14b). Point at a smaller chat model (e.g. qwen2.5:7b)
+      # to test/refine the smart pipeline without the 9 GB download —
+      # see docs/smart-mode.md "Testing with a smaller model".
+      SMART_MODEL: ${SMART_MODEL:-}
       # Web Push (Phase 6 of pwa-refactor.txt). All three are optional
       # — coordinator gracefully no-ops push delivery when unset.
       # Defaults preserve the "unset" sentinel, not a literal empty

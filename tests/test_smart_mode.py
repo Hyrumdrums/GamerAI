@@ -91,6 +91,44 @@ class RegistryTierTests(unittest.TestCase):
         d = model_registry.get(SMART_MODEL).to_dict()
         self.assertEqual(d["tier"], "smart")
 
+    def test_smart_model_env_override_borrows_a_standard_model(self):
+        # SMART_MODEL=qwen2.5:7b (read into DEFAULT_SMART_MODEL at
+        # import) must make that model route as smart even though its
+        # catalog tier is "standard" — that's the documented
+        # test-with-a-smaller-model path.
+        prev = model_registry.DEFAULT_SMART_MODEL
+        model_registry.DEFAULT_SMART_MODEL = "qwen2.5:7b"
+        try:
+            self.assertTrue(model_registry.is_smart_model("qwen2.5:7b"))
+            self.assertEqual(
+                model_registry.route_for("chat", "qwen2.5:7b"), "chat:smart",
+            )
+            # The 14B keeps its registry-driven smart tier too.
+            self.assertTrue(model_registry.is_smart_model("qwen2.5:14b"))
+        finally:
+            model_registry.DEFAULT_SMART_MODEL = prev
+        self.assertFalse(model_registry.is_smart_model("qwen2.5:7b"))
+
+    def test_env_override_never_makes_a_non_chat_model_smart(self):
+        prev = model_registry.DEFAULT_SMART_MODEL
+        model_registry.DEFAULT_SMART_MODEL = "sdxl"
+        try:
+            self.assertFalse(model_registry.is_smart_model("sdxl"))
+            self.assertEqual(model_registry.route_for("chat", "sdxl"), "chat")
+        finally:
+            model_registry.DEFAULT_SMART_MODEL = prev
+
+    def test_env_override_unknown_name_still_routes_smart(self):
+        # An operator pointing SMART_MODEL at a name outside the
+        # catalog (custom GGUF) gets smart routing in lax mode; only
+        # STRICT_MODELS would reject it, at validation not routing.
+        prev = model_registry.DEFAULT_SMART_MODEL
+        model_registry.DEFAULT_SMART_MODEL = "my-custom-gguf"
+        try:
+            self.assertTrue(model_registry.is_smart_model("my-custom-gguf"))
+        finally:
+            model_registry.DEFAULT_SMART_MODEL = prev
+
     def test_queue_key(self):
         self.assertEqual(job_queue_for("chat:smart"), SMART_QUEUE)
         # And the standard mappings are untouched.
@@ -138,6 +176,23 @@ class SmartRoutingE2ETests(unittest.TestCase):
         self.assertEqual(self.r.llen(SMART_QUEUE), 0)
         job = json.loads(self.r.lpop("job_queue"))
         self.assertNotIn("route", job)
+
+    def test_env_override_flows_through_generate(self):
+        # With DEFAULT_SMART_MODEL repointed (the SMART_MODEL env
+        # path), smart submissions resolve to the smaller model AND
+        # still land on the smart queue.
+        prev = model_registry.DEFAULT_SMART_MODEL
+        model_registry.DEFAULT_SMART_MODEL = "qwen2.5:7b"
+        try:
+            resp = self.client.post(
+                "/generate", json={"prompt": "hi", "smart": True},
+            )
+            self.assertEqual(resp.status_code, 200)
+            job = json.loads(self.r.lpop(SMART_QUEUE))
+            self.assertEqual(job["model"], "qwen2.5:7b")
+            self.assertEqual(job["route"], "chat:smart")
+        finally:
+            model_registry.DEFAULT_SMART_MODEL = prev
 
     def test_smart_flag_ignored_for_non_chat_tools(self):
         resp = self.client.post(

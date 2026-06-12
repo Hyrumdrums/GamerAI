@@ -75,6 +75,15 @@ class SmartConfigTests(unittest.TestCase):
         cfg = agent.Config.load(None)
         self.assertIn(cfg.smart_model, agent._SMART_GGUF_URLS)
 
+    def test_builtin_gguf_sources_cover_the_test_models(self):
+        # The "test with a smaller model" doc promises these names
+        # work with no gguf_url override.
+        for name in ("qwen2.5:14b", "qwen2.5:7b", "llama3.2:3b"):
+            self.assertIn(name, agent._SMART_GGUF_URLS)
+            self.assertTrue(
+                agent._SMART_GGUF_URLS[name].startswith("https://"),
+            )
+
 
 class OrderedQueuesSmartTests(unittest.TestCase):
     def test_smart_head_polls_only_smart_queue(self):
