@@ -904,6 +904,58 @@ def _agent_exe_path() -> Optional[Path]:
     return Path(sys.executable).resolve()
 
 
+def _ps_relaunch_line(target: Path, args: list[str]) -> str:
+    """Build the PowerShell line that a post-exit batch invokes to launch
+    a frozen agent.exe. Shared by the self-update swap (_write_update_batch)
+    and the in-place restart (_relaunch_in_place) so both spawn the new
+    process the exact same proven way.
+
+    v1.1.15+ uses WMI's Win32_Process.Create rather than Start-Process.
+    Why: the v1.1.13 -> v1.1.14 test exposed a silent-relaunch failure
+    where the new agent.exe was spawned (Start-Process returned
+    errorlevel=0) but its PyInstaller bootloader exited before extracting
+    (no _MEI orphan, no event log entry, no agent-boot.log line). Manual
+    launches of the SAME exe immediately afterward worked. The strongest
+    theory is that the chain `subprocess.Popen(cmd, DETACHED_PROCESS) ->
+    cmd.exe -> powershell.exe -> Start-Process -> agent.exe` keeps the new
+    agent.exe inside the parent PyInstaller worker's job object — and when
+    the bat finishes and the job's last handle goes away, the new
+    bootstrap gets terminated as a side-effect.
+
+    Win32_Process.Create routes the spawn through WmiPrvSE (svchost), so
+    the new agent.exe's parent is the WMI service. Complete escape from
+    any inherited job, console state, or env-var chain (WMI gives the
+    spawned process its own clean env, so the _MEIPASS2 inheritance fix
+    from v1.1.13 is now redundant — left as belt-and-suspenders for anyone
+    bypassing WMI in a custom build).
+
+    Encoding via -EncodedCommand sidesteps the cmd-quote / PowerShell-quote
+    escaping nightmare. The base64-encoded UTF-16LE string is opaque to
+    cmd, so paths with spaces, single quotes, etc. all pass through
+    cleanly.
+    """
+    target_str = str(target).replace("'", "''")
+    dir_str = str(target.parent).replace("'", "''")
+    args_str = " ".join(args)
+    # Build the new process's command line in PowerShell rather than baking
+    # it into a single literal — keeps the embedded double-quotes around
+    # the exe path out of the surrounding encoding chain.
+    ps_inner = (
+        f"$exe = '{target_str}'; "
+        f"$dir = '{dir_str}'; "
+        f"$cmd = '\"' + $exe + '\" {args_str}'.Trim(); "
+        f"$r = Invoke-WmiMethod -Class Win32_Process -Name Create "
+        f"-ArgumentList $cmd, $dir; "
+        f"Write-Host ('wmi-spawn ReturnValue=' + $r.ReturnValue + "
+        f"' ProcessId=' + $r.ProcessId)"
+    )
+    encoded = base64.b64encode(ps_inner.encode("utf-16-le")).decode("ascii")
+    return (
+        f'powershell -NoProfile -WindowStyle Hidden '
+        f'-EncodedCommand {encoded}\r\n'
+    )
+
+
 def _write_update_batch(
     exe: Path, new_exe: Path, relaunch_args: Optional[list[str]] = None,
 ) -> Path:
@@ -939,60 +991,9 @@ def _write_update_batch(
     # the PowerShell host's own window; agent.exe gets its default
     # console (matches the user's foreground experience). Pre-v1.1.8
     # this was the silent bug behind every "agent never relaunched
-    # after update" failure on contributor machines.
-    def _ps_relaunch(target: Path, args: list[str]) -> str:
-        """Build the PowerShell line that update.bat invokes to launch
-        the swapped agent.exe.
-
-        v1.1.15+ uses WMI's Win32_Process.Create rather than
-        Start-Process. Why: the v1.1.13 -> v1.1.14 test exposed a
-        silent-relaunch failure where the new agent.exe was spawned
-        (Start-Process returned errorlevel=0) but its PyInstaller
-        bootloader exited before extracting (no _MEI orphan, no event
-        log entry, no agent-boot.log line). Manual launches of the
-        SAME exe immediately afterward worked. The strongest theory
-        is that the chain `subprocess.Popen(cmd, DETACHED_PROCESS) ->
-        cmd.exe -> powershell.exe -> Start-Process -> agent.exe`
-        keeps the new agent.exe inside the parent PyInstaller worker's
-        job object — and when the bat finishes and the job's last
-        handle goes away, the new bootstrap gets terminated as a
-        side-effect.
-
-        Win32_Process.Create routes the spawn through WmiPrvSE
-        (svchost), so the new agent.exe's parent is the WMI service.
-        Complete escape from any inherited job, console state, or
-        env-var chain (WMI gives the spawned process its own clean
-        env, so the _MEIPASS2 inheritance fix from v1.1.13 is now
-        redundant — left as belt-and-suspenders for anyone bypassing
-        WMI in a custom build).
-
-        Encoding via -EncodedCommand sidesteps the cmd-quote /
-        PowerShell-quote escaping nightmare. The base64-encoded
-        UTF-16LE string is opaque to cmd, so paths with spaces,
-        single quotes, etc. all pass through cleanly.
-        """
-        target_str = str(target).replace("'", "''")
-        dir_str = str(target.parent).replace("'", "''")
-        args_str = " ".join(args)
-        # Build the new process's command line in PowerShell rather
-        # than baking it into a single literal — keeps the embedded
-        # double-quotes around the exe path out of the surrounding
-        # encoding chain.
-        ps_inner = (
-            f"$exe = '{target_str}'; "
-            f"$dir = '{dir_str}'; "
-            f"$cmd = '\"' + $exe + '\" {args_str}'.Trim(); "
-            f"$r = Invoke-WmiMethod -Class Win32_Process -Name Create "
-            f"-ArgumentList $cmd, $dir; "
-            f"Write-Host ('wmi-spawn ReturnValue=' + $r.ReturnValue + "
-            f"' ProcessId=' + $r.ProcessId)"
-        )
-        encoded = base64.b64encode(ps_inner.encode("utf-16-le")).decode("ascii")
-        return (
-            f'powershell -NoProfile -WindowStyle Hidden '
-            f'-EncodedCommand {encoded}\r\n'
-        )
-    relaunch_line = _ps_relaunch(exe, relaunch_args)
+    # after update" failure on contributor machines. See
+    # _ps_relaunch_line for the full WMI-spawn rationale.
+    relaunch_line = _ps_relaunch_line(exe, relaunch_args)
     # taskkill matches the running exe's actual filename — required for
     # users who renamed their binary (e.g. "GamerAI-Agent (1).exe" from
     # a re-download). The previous hard-coded "agent.exe" missed those.
@@ -4781,6 +4782,129 @@ def log_status_line(
     )
 
 
+def _relaunch_in_place(
+    log: logging.Logger, relaunch_args: Optional[list[str]] = None,
+) -> bool:
+    """Restart the running agent.exe in place — same binary, no download
+    or swap — so a just-written config change is picked up by a fresh
+    Config.load(). Used by the `smart` console command after it edits
+    config.json.
+
+    Writes a tiny detached batch that waits for THIS process's PID to
+    disappear (so the new agent doesn't race the old one for the rpc /
+    llama-server ports or a duplicate coordinator registration), then
+    fires the same WMI relaunch line the updater uses. Returns True if the
+    relaunch was scheduled — the caller is then responsible for signalling
+    a clean shutdown. Returns False on non-Windows or a non-frozen (dev)
+    build, where there's nothing to relaunch; the caller falls back to
+    'restart to apply'.
+    """
+    exe = _agent_exe_path()
+    if exe is None or not IS_WINDOWS:
+        return False
+    pid = os.getpid()
+    relaunch_line = _ps_relaunch_line(exe, relaunch_args or [])
+    bat = exe.with_name("smart-relaunch.bat")
+    try:
+        bat.write_text(
+            "@echo off\r\n"
+            ":: Auto-generated by the `smart` console command — restarts\r\n"
+            ":: agent.exe in place (no binary swap) to apply config.json.\r\n"
+            "title GamerAI - applying smart-mode config\r\n"
+            "echo.\r\n"
+            "echo  Restarting agent to apply smart-mode config...\r\n"
+            ":: Wait for the old agent (this PID) to fully exit so the new\r\n"
+            ":: one can bind the rpc / llama-server ports cleanly.\r\n"
+            ":waitloop\r\n"
+            f'tasklist /FI "PID eq {pid}" 2>nul | find "{pid}" >nul\r\n'
+            "if not errorlevel 1 (\r\n"
+            "  timeout /t 1 /nobreak >nul\r\n"
+            "  goto waitloop\r\n"
+            ")\r\n"
+            + relaunch_line
+            + "del \"%~f0\"\r\n",
+            encoding="ascii",
+        )
+    except OSError as e:
+        log.warning("smart: could not write smart-relaunch.bat (%s)", e)
+        return False
+    try:
+        creationflags = (
+            subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+            | subprocess.CREATE_NEW_CONSOLE  # type: ignore[attr-defined]
+        )
+        subprocess.Popen(
+            ["cmd.exe", "/c", str(bat)],
+            close_fds=True,
+            creationflags=creationflags,
+        )
+    except Exception as e:
+        log.warning("smart: could not launch smart-relaunch.bat (%s)", e)
+        return False
+    log.info("smart: in-place relaunch scheduled (pid=%s) — exiting agent", pid)
+    return True
+
+
+def _apply_smart_config(
+    config_path: Optional[Path], updates: dict, log: logging.Logger,
+) -> bool:
+    """Merge ``updates`` into the ``smart`` block of config.json and write
+    it back atomically, preserving every other key the user has set (other
+    smart fields, coordinator_url, idle knobs, …). Reads the same path the
+    agent loads from, so what we write is what the next start reads.
+    Returns True on success."""
+    if config_path is None:
+        log.warning("smart: no config path known — cannot persist")
+        return False
+    try:
+        if config_path.exists():
+            with open(config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                data = {}
+        else:
+            data = {}
+    except (OSError, ValueError) as e:
+        log.warning("smart: could not read %s (%s)", config_path, e)
+        return False
+    smart = data.get("smart")
+    if not isinstance(smart, dict):
+        smart = {}
+    smart.update(updates)
+    data["smart"] = smart
+    try:
+        tmp = config_path.with_suffix(config_path.suffix + ".tmp")
+        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        tmp.replace(config_path)
+    except OSError as e:
+        log.warning("smart: could not write %s (%s)", config_path, e)
+        return False
+    return True
+
+
+def _parse_host_port(token: str, default_port: int) -> Optional[tuple[str, int]]:
+    """Validate a ``host[:port]`` token (an rpc peer or a listen address).
+    Returns (host, port) or None when it doesn't look like one — the
+    caller prints usage rather than relaunching into a broken config.
+    Splits on the LAST colon so IPv6 literals in brackets survive."""
+    token = token.strip()
+    if not token:
+        return None
+    if ":" in token:
+        host, _, port_str = token.rpartition(":")
+        host = host.strip()
+        port_str = port_str.strip()
+        if not host or not port_str.isdigit():
+            return None
+        port = int(port_str)
+    else:
+        host = token
+        port = default_port
+    if not (1 <= port <= 65535):
+        return None
+    return host, port
+
+
 _STDIN_HELP = (
     "commands:\n"
     "  update          download the latest agent.exe and relaunch\n"
@@ -4789,8 +4913,15 @@ _STDIN_HELP = (
     "  stayalive       toggle the user-input idle gate (or use 'on'/'off')\n"
     "  stayalive on    ignore user-input idleness (CPU-only gate)\n"
     "  stayalive off   restore normal user-input idle gate\n"
+    "  smart status    print the current smart-mode config\n"
+    "  smart backend   make this the backend (rpc-server); writes config + restarts\n"
+    "  smart head IP:PORT [MODEL]\n"
+    "                  make this the head, with the backend at IP:PORT\n"
+    "  smart off       disable smart mode; writes config + restarts\n"
     "  help            show this list\n"
     "  quit            exit the agent\n"
+    "(smart * is a temporary convenience for bringing the pipeline up\n"
+    " from the console — it edits config.json and restarts the agent.)\n"
 )
 
 
@@ -4801,6 +4932,8 @@ def stdin_command_loop(
     stop_event: threading.Event,
     cfg: "Config",
     state: dict,
+    config_path: Optional[Path] = None,
+    relaunch_args: Optional[list[str]] = None,
 ) -> None:
     """Read line-oriented commands from the console window. Runs in
     both foreground and tray modes — in tray mode the console starts
@@ -4893,6 +5026,114 @@ def stdin_command_loop(
                 sys.stdout.flush()
             except Exception:
                 pass
+        elif cmd.startswith("smart"):
+            # Temporary convenience for the rollout: configure + enable
+            # smart mode (or turn it off) from the console, then restart
+            # in place so a fresh Config.load() brings the pipeline up.
+            # role/peers differ per machine, so this writes the whole
+            # block rather than flipping a single flag. Args are parsed
+            # from the original-case line — IPs and model names must not
+            # be lowercased.
+            raw_parts = line.strip().split()
+            sub = raw_parts[1].lower() if len(raw_parts) > 1 else "status"
+
+            def _emit(msg: str) -> None:
+                try:
+                    sys.stdout.write(msg)
+                    sys.stdout.flush()
+                except Exception:
+                    pass
+
+            if sub == "status":
+                peers = ", ".join(cfg.smart_rpc_peers) or "(none)"
+                _emit(
+                    f"smart mode: {'ENABLED' if cfg.smart_enabled else 'disabled'}\n"
+                    f"  role   = {cfg.smart_role}\n"
+                    f"  model  = {cfg.smart_model}\n"
+                    f"  peers  = {peers}\n"
+                    f"  listen = {cfg.smart_rpc_listen_host}:"
+                    f"{cfg.smart_rpc_listen_port}\n"
+                )
+                continue
+
+            updates: Optional[dict] = None
+            summary = ""
+            if sub == "backend":
+                # Optional HOST:PORT override for what the rpc-server binds;
+                # default to the configured/standard listen address.
+                if len(raw_parts) > 2:
+                    hp = _parse_host_port(raw_parts[2], cfg.smart_rpc_listen_port)
+                    if hp is None:
+                        _emit(
+                            f"smart: bad listen address {raw_parts[2]!r} — "
+                            f"want HOST:PORT\n"
+                        )
+                        continue
+                    host, port = hp
+                else:
+                    host, port = cfg.smart_rpc_listen_host, cfg.smart_rpc_listen_port
+                updates = {
+                    "enabled": True,
+                    "role": "backend",
+                    "rpc_listen_host": host,
+                    "rpc_listen_port": port,
+                }
+                summary = f"role=backend, listen {host}:{port}"
+            elif sub == "head":
+                if len(raw_parts) < 3:
+                    _emit(
+                        "smart: 'smart head' needs the backend address — "
+                        "e.g. 'smart head 192.168.1.50:50052 [model]'\n"
+                    )
+                    continue
+                # One or more comma-separated IP:PORT backends.
+                peers: Optional[list[str]] = []
+                for tok in raw_parts[2].split(","):
+                    hp = _parse_host_port(tok, cfg.smart_rpc_listen_port)
+                    if hp is None:
+                        _emit(f"smart: bad peer {tok!r} — want IP:PORT\n")
+                        peers = None
+                        break
+                    peers.append(f"{hp[0]}:{hp[1]}")
+                if peers is None:
+                    continue
+                # Optional model override (positional, after the peer
+                # token); else SMART_MODEL env (the testing knob from the
+                # docs), else whatever config already resolves to.
+                model = (
+                    raw_parts[3] if len(raw_parts) > 3
+                    else os.getenv("SMART_MODEL") or cfg.smart_model
+                )
+                updates = {
+                    "enabled": True,
+                    "role": "head",
+                    "rpc_peers": peers,
+                    "model": model,
+                }
+                summary = f"role=head, model={model}, peers {', '.join(peers)}"
+            elif sub in ("off", "disable", "false"):
+                updates = {"enabled": False}
+                summary = "disabled"
+            else:
+                _emit(
+                    f"smart: unknown subcommand {sub!r} — use "
+                    f"'status' / 'backend' / 'head IP:PORT' / 'off'\n"
+                )
+                continue
+
+            if not _apply_smart_config(config_path, updates, log):
+                _emit("smart: failed to write config.json (see log) — no change\n")
+                continue
+            log.info("smart: wrote %s to config (via stdin command)", summary)
+            _emit(f"smart: wrote {summary} to config.json\n")
+            if _relaunch_in_place(log, relaunch_args):
+                _emit("smart: restarting to apply — the window will reopen.\n")
+                stop_event.set()
+                return
+            _emit(
+                "smart: config written — restart the agent (close & reopen, "
+                "or type 'update') to apply.\n"
+            )
         elif cmd in ("help", "?", "h"):
             try:
                 sys.stdout.write(_STDIN_HELP)
@@ -6732,7 +6973,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     # console just waits silently, so the thread is harmless.
     stdin_thread = threading.Thread(
         target=stdin_command_loop,
-        args=(log, worker_id, force_update_event, stop_event, cfg, state),
+        args=(
+            log, worker_id, force_update_event, stop_event, cfg, state,
+            args.config, relaunch_args,
+        ),
         name="gamerai-stdin",
         daemon=True,
     )

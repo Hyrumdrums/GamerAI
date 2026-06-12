@@ -85,6 +85,81 @@ class SmartConfigTests(unittest.TestCase):
             )
 
 
+class SmartConsoleCommandTests(unittest.TestCase):
+    """The temporary `smart` stdin command: parse + persist helpers that
+    let an operator enable smart mode from a machine's console window."""
+
+    def test_parse_host_port_valid_and_invalid(self):
+        self.assertEqual(
+            agent._parse_host_port("192.168.1.50:50052", 50052),
+            ("192.168.1.50", 50052),
+        )
+        # Bare host falls back to the default port.
+        self.assertEqual(
+            agent._parse_host_port("10.0.0.5", 50052), ("10.0.0.5", 50052),
+        )
+        self.assertEqual(
+            agent._parse_host_port("0.0.0.0:50053", 50052), ("0.0.0.0", 50053),
+        )
+        for bad in ("bad:port", "host:0", "host:70000", "  ", ""):
+            self.assertIsNone(
+                agent._parse_host_port(bad, 50052), f"{bad!r} should reject",
+            )
+
+    def test_apply_smart_config_merges_and_preserves(self):
+        import tempfile
+        d = Path(tempfile.mkdtemp())
+        path = d / "config.json"
+        path.write_text(json.dumps({
+            "coordinator_url": "http://x:8000",
+            "smart": {"llama_release": "b9610", "enabled": False},
+        }))
+        log = logging.getLogger("test-smart-cmd")
+
+        self.assertTrue(agent._apply_smart_config(path, {
+            "enabled": True, "role": "backend",
+            "rpc_listen_host": "0.0.0.0", "rpc_listen_port": 50052,
+        }, log))
+        data = json.loads(path.read_text())
+        # Unrelated top-level + sibling smart keys survive the write.
+        self.assertEqual(data["coordinator_url"], "http://x:8000")
+        self.assertEqual(data["smart"]["llama_release"], "b9610")
+        self.assertEqual(data["smart"]["role"], "backend")
+        self.assertTrue(data["smart"]["enabled"])
+
+        # A second write (head) still preserves the release pin and the
+        # agent loads exactly what we persisted.
+        self.assertTrue(agent._apply_smart_config(path, {
+            "enabled": True, "role": "head",
+            "rpc_peers": ["192.168.1.50:50052"], "model": "qwen2.5:7b",
+        }, log))
+        cfg = agent.Config.load(path)
+        self.assertTrue(cfg.smart_enabled)
+        self.assertEqual(cfg.smart_role, "head")
+        self.assertEqual(cfg.smart_model, "qwen2.5:7b")
+        self.assertEqual(cfg.smart_rpc_peers, ["192.168.1.50:50052"])
+        self.assertEqual(cfg.smart_llama_release, "b9610")
+
+    def test_apply_smart_config_creates_missing_file(self):
+        import tempfile
+        path = Path(tempfile.mkdtemp()) / "config.json"
+        log = logging.getLogger("test-smart-cmd")
+        self.assertTrue(
+            agent._apply_smart_config(path, {"enabled": True, "role": "backend"}, log),
+        )
+        self.assertTrue(path.exists())
+        self.assertEqual(json.loads(path.read_text())["smart"]["role"], "backend")
+
+    def test_relaunch_in_place_noop_off_windows(self):
+        # On non-Windows / non-frozen dev builds there's nothing to
+        # relaunch — the caller falls back to "restart to apply".
+        if agent.IS_WINDOWS and agent._agent_exe_path() is not None:
+            self.skipTest("frozen Windows build — would actually relaunch")
+        self.assertFalse(
+            agent._relaunch_in_place(logging.getLogger("test-smart-cmd"), []),
+        )
+
+
 class OrderedQueuesSmartTests(unittest.TestCase):
     def test_smart_head_polls_only_smart_queue(self):
         self.assertEqual(
