@@ -190,8 +190,8 @@ hours; users felt the rest.
   default to `["chat"]` so the historical contract holds. Two
   regression tests added; whole suite 442/442 still green.
 
-**Cause 2 (the underlying root cause):** When Carol restarted her
-agent we got a log line:
+**Cause 2 (the underlying root cause):** When the head-machine
+operator restarted their agent we got a log line:
 
 ```
 bootstrap: download of https://ai.dallinlayton.com/download/ollama-setup.exe
@@ -240,13 +240,14 @@ nobody ever ran the Ollama one.
     one, verification curl, and `FORCE=1` for refreshing an asset
     after a model bump.
 
-**Carol-machine specifics (not the root cause, but adjacent):**
-She launched `agent.exe` via the foreground Start Menu shortcut
-(`installer.iss:65`), not the `(tray)` variant on line 66. The
-agent is doing exactly what the installer offered — two shortcuts,
-foreground vs hidden. The autostart-at-boot task (`installer.iss:71`)
-DOES use `--tray`, so if she re-runs the installer with "Run at
-Windows startup" checked, the agent goes hidden on every login.
+**Head-machine specifics (not the root cause, but adjacent):**
+The operator launched `agent.exe` via the foreground Start Menu
+shortcut (`installer.iss:65`), not the `(tray)` variant on line 66.
+The agent is doing exactly what the installer offered — two
+shortcuts, foreground vs hidden. The autostart-at-boot task
+(`installer.iss:71`) DOES use `--tray`, so if they re-run the
+installer with "Run at Windows startup" checked, the agent goes
+hidden on every login.
 No code change needed.
 
 ---

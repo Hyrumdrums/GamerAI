@@ -12,10 +12,12 @@ tasks, in the suggested order. Status legend: [ ] pending  [x] done+verified
          that exact registered key. No fix needed. (2026-08-19)
 
 --- Step 2: scrub personal details -----------------------------------------
-[ ] 2.1  Replace the named family member ("Carol") in docs/devlog.md with a
+[x] 2.1  Replace the named family member ("Carol") in docs/devlog.md with a
          role label (e.g. "the head-machine operator"); keep all technical
          content unchanged.
-         verify: `grep -in carol docs/*.md README.md` returns nothing.
+         verify: `grep -in carol docs/*.md README.md` returns only the
+         generic Alice/Bob/Carol invite-chain example in auth-design.md
+         (not the real person) — devlog.md is clean. (2026-08-19)
 
 --- Step 3: prompt size cap -------------------------------------------------
 [ ] 3.1  Add MAX_PROMPT_BYTES env-configurable cap on POST /generate in
