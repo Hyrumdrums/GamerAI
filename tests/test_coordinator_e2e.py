@@ -1058,5 +1058,48 @@ class CancelEndpointTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 404)
 
 
+class PromptSizeLimitTests(unittest.TestCase):
+    """MAX_PROMPT_BYTES on POST /generate. Monkeypatches the already-
+    imported module constant directly rather than re-importing with a
+    fresh env, since it's a plain int read once at request time (no
+    startup wiring depends on its value)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.client = TestClient(coordinator_main.app)
+
+    def setUp(self):
+        self._orig = coordinator_main.MAX_PROMPT_BYTES
+
+    def tearDown(self):
+        coordinator_main.MAX_PROMPT_BYTES = self._orig
+
+    def test_disabled_by_default_accepts_any_size(self):
+        self.assertEqual(coordinator_main.MAX_PROMPT_BYTES, 0)
+        resp = self.client.post("/generate", json={"prompt": "x" * 5000})
+        self.assertEqual(resp.status_code, 200, resp.text)
+
+    def test_under_cap_accepted(self):
+        coordinator_main.MAX_PROMPT_BYTES = 100
+        resp = self.client.post("/generate", json={"prompt": "hello"})
+        self.assertEqual(resp.status_code, 200, resp.text)
+
+    def test_over_cap_rejected_with_413(self):
+        coordinator_main.MAX_PROMPT_BYTES = 100
+        resp = self.client.post("/generate", json={"prompt": "x" * 101})
+        self.assertEqual(resp.status_code, 413, resp.text)
+        self.assertIn("MAX_PROMPT_BYTES", resp.json()["detail"])
+
+    def test_cap_counts_utf8_bytes_not_characters(self):
+        # Multi-byte characters should count by encoded size, not by
+        # Python string length, so the cap can't be undercounted with
+        # non-ASCII input.
+        coordinator_main.MAX_PROMPT_BYTES = 10
+        # "e"-acute is 1 char but 2 UTF-8 bytes: 6 chars == 6 (would
+        # pass a char-length check) but 12 bytes (fails a 10-byte cap).
+        resp = self.client.post("/generate", json={"prompt": "é" * 6})
+        self.assertEqual(resp.status_code, 413, resp.text)
+
+
 if __name__ == "__main__":
     unittest.main()

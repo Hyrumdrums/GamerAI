@@ -20,10 +20,11 @@ tasks, in the suggested order. Status legend: [ ] pending  [x] done+verified
          (not the real person) — devlog.md is clean. (2026-08-19)
 
 --- Step 3: prompt size cap -------------------------------------------------
-[ ] 3.1  Add MAX_PROMPT_BYTES env-configurable cap on POST /generate in
+[x] 3.1  Add MAX_PROMPT_BYTES env-configurable cap on POST /generate in
          coordinator/main.py; reject oversized prompts with 413.
-         verify: new unit test (tests/test_prompt_limits.py) covers
-         under-cap accepted, over-cap rejected, cap disabled when unset.
+         verify: PromptSizeLimitTests in tests/test_coordinator_e2e.py —
+         disabled-by-default, under-cap, over-cap, and UTF-8-byte-vs-char
+         counting all covered. Full suite: 558/558 green. (2026-08-19)
 
 --- Step 4: capacity ceiling -------------------------------------------------
 [ ] 4.1  Add a global in-flight-jobs ceiling on POST /generate tied to live

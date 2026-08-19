@@ -51,6 +51,7 @@ from shared.config import (
     JOB_TIMEOUT_SECONDS,
     LOGIN_FAIL_MAX,
     LOGIN_FAIL_WINDOW_SECONDS,
+    MAX_PROMPT_BYTES,
     RATE_LIMIT_PER_MIN,
     RATE_PER_TOKEN,
     REQUIRE_LIVE_WORKER,
@@ -1610,6 +1611,11 @@ def tos_raw():
 def generate(req: GenerateRequest, request: Request):
     if not req.prompt or not req.prompt.strip():
         raise HTTPException(status_code=400, detail="prompt required")
+    if MAX_PROMPT_BYTES > 0 and len(req.prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"prompt exceeds MAX_PROMPT_BYTES ({MAX_PROMPT_BYTES})",
+        )
     tool = (req.tool or "chat").lower()
     if tool not in ("chat", "image", "search", "tts"):
         raise HTTPException(

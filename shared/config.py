@@ -98,6 +98,13 @@ IDEMPOTENCY_TTL_SECONDS = _int("IDEMPOTENCY_TTL_SECONDS", 86400)  # 24h
 # for flood protection, size it well above the polling rate (e.g. 1200).
 RATE_LIMIT_PER_MIN = _int("RATE_LIMIT_PER_MIN", 0)
 
+# Hard ceiling on a single prompt's size. Unbounded prompts get stored
+# in SQLite and shoveled whole to a contributor's machine — cheap DoS
+# once /generate is reachable by the public internet. 0 disables the
+# check (kept off by default so existing deployments and tests aren't
+# surprised; prod should set this once public).
+MAX_PROMPT_BYTES = _int("MAX_PROMPT_BYTES", 0)
+
 # --- login brute-force throttle (per client IP; ON by default) ---
 # Separate from RATE_LIMIT_PER_MIN because it targets only POST /login
 # and so can't interfere with the streaming poll path. After
