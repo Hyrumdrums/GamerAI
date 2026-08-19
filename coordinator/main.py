@@ -54,6 +54,8 @@ from shared.config import (
     LOGIN_FAIL_WINDOW_SECONDS,
     MAX_PROMPT_BYTES,
     RATE_LIMIT_PER_MIN,
+    SIGNUP_MAX_PER_IP,
+    SIGNUP_WINDOW_SECONDS,
     RATE_PER_TOKEN,
     REQUIRE_LIVE_WORKER,
     STRICT_MODELS,
@@ -92,6 +94,7 @@ from shared.models import (
     LoginRequest,
     MachineScheduleUpdate,
     PasswordChangeRequest,
+    SignupRequest,
     WorkerIdent,
 )
 
@@ -1284,6 +1287,10 @@ def _is_public(method: str, path: str) -> bool:
     if method == "GET" and path in ("/tos", "/tos/raw"):
         return True
     if method == "POST" and path == "/login":
+        return True
+    # Public, invite-free account creation — see POST /signup below.
+    # Throttled separately (SIGNUP_MAX_PER_IP), not by RATE_LIMIT_PER_MIN.
+    if method == "POST" and path == "/signup":
         return True
     # Agent pairing — the agent has no token yet, so all three of these
     # are public. Security relies on the short-lived pair_code (5-min
@@ -4405,6 +4412,111 @@ def login(req: LoginRequest):
         "token": raw_token,
         "role": row["role"],
         "username": row["username"],
+    }
+
+
+def _signup_throttle_key(client_ip: str) -> str:
+    return f"signup_count:{client_ip}"
+
+
+@app.post("/signup")
+def signup(req: SignupRequest, request: Request):
+    """Public, invite-free account creation. This is the thing
+    business.md calls "contribute-to-use" made literal: showing up and
+    creating an account is how you join the network — no existing
+    member has to vouch for you first. The new member is a
+    ``contributor`` with no ``parent_member_id`` (they're the root of
+    their own branch, not anyone's invitee) and can immediately hit
+    ``POST /invites`` with their new bearer token to invite friends,
+    the same as any other contributor.
+
+    Throttled per client IP (SIGNUP_MAX_PER_IP / SIGNUP_WINDOW_SECONDS)
+    rather than by the generic RATE_LIMIT_PER_MIN, which is sized for
+    the streaming-poll path and usually off — account creation needs
+    its own, much tighter ceiling once there's no invite gate keeping
+    strangers out. Only successful creations count against the quota;
+    a mistyped password or a username collision doesn't burn it."""
+    if not req.tos_accepted:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Community ToS must be accepted to create an account "
+                "(see /tos)."
+            ),
+        )
+    email = (req.email or "").strip()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="a valid email is required")
+    try:
+        username = member_auth.validate_username(req.username)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    try:
+        password = member_auth.validate_password(req.password)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    client_ip = _client_ip(request)
+    throttle_key = _signup_throttle_key(client_ip)
+    if SIGNUP_MAX_PER_IP > 0:
+        current = r.get(throttle_key)
+        if current is not None and int(current) >= SIGNUP_MAX_PER_IP:
+            ttl = r.ttl(throttle_key)
+            retry_after = int(ttl) if ttl and ttl > 0 else SIGNUP_WINDOW_SECONDS
+            raise HTTPException(
+                status_code=429,
+                detail="too many accounts created from this network recently; try again later",
+                headers={"Retry-After": str(max(1, retry_after))},
+            )
+
+    now = time.time()
+    new_member_id = "mem_" + uuid.uuid4().hex[:12]
+    raw_token = member_auth.generate_token()
+    token_hash = member_auth.hash_token(raw_token)
+    password_hash = member_auth.hash_password(password)
+    quota = _tier_quota_for("BRONZE")
+
+    member_row, failure = db.create_signup_member(
+        member_id=new_member_id,
+        username=username,
+        password_hash=password_hash,
+        email=email,
+        token_hash=token_hash,
+        daily_quota_tokens=quota["tokens"],
+        daily_quota_images=quota["images"],
+        daily_quota_voice_minutes=quota["voice_minutes"],
+        created_at=now,
+        tos_version=TOS_VERSION,
+    )
+    if member_row is None:
+        if failure == "username_taken":
+            raise HTTPException(
+                status_code=409,
+                detail=f"username {username!r} is already taken",
+            )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "that email is already claimed by another GamerAI "
+                "account — sign in with your existing one, or use a "
+                "different email"
+            ),
+        )
+
+    if SIGNUP_MAX_PER_IP > 0:
+        n = int(r.incr(throttle_key))
+        if n == 1:
+            r.expire(throttle_key, SIGNUP_WINDOW_SECONDS)
+
+    log.info("signup ok", extra={"event": "signup_ok"})
+    return {
+        "member_id": new_member_id,
+        "token": raw_token,
+        "username": username,
+        "role": "contributor",
+        "parent_member_id": None,
+        "daily_quota_tokens": quota["tokens"],
+        "tos_version": TOS_VERSION,
     }
 
 

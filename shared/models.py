@@ -278,6 +278,21 @@ class InviteAcceptRequest(BaseModel):
     tos_accepted: bool = False
 
 
+class SignupRequest(BaseModel):
+    """Public, invite-free account creation. Mirrors
+    ``InviteAcceptRequest`` in shape (username + password + email +
+    tos_accepted) since it produces the same kind of thing — a member
+    row with working u/p login — but with no invite code and no
+    inviter: the new member's ``parent_member_id`` is NULL and their
+    role is ``contributor``, matching the "running the agent is how
+    you join" story in business.md rather than the invitee path.
+    """
+    username: str
+    password: str
+    email: str
+    tos_accepted: bool = False
+
+
 class FriendQuotaUpdateRequest(BaseModel):
     """Host edits an accepted invitee's two-dimensional daily cap.
     Both fields are sent on every update — the form always carries

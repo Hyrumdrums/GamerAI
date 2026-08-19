@@ -829,6 +829,77 @@ class DB:
                 ),
             )
 
+    def create_signup_member(
+        self,
+        member_id: str,
+        username: str,
+        password_hash: str,
+        email: str,
+        token_hash: str,
+        daily_quota_tokens: Optional[int],
+        daily_quota_images: Optional[int],
+        daily_quota_voice_minutes: Optional[int],
+        created_at: float,
+        tos_version: Optional[str],
+    ) -> tuple[Optional[sqlite3.Row], Optional[str]]:
+        """Atomic, invite-free member creation for public POST /signup.
+        Same collision-checked shape as ``accept_invite_atomic`` (which
+        this is deliberately kept parallel to) but with no invites-table
+        interaction: ``role='contributor'`` and ``parent_member_id=NULL``
+        — this member is the root of their own branch of the network,
+        not someone else's invitee. Returns ``(member_row, None)`` on
+        success or ``(None, reason)`` where ``reason`` is
+        ``"username_taken"`` or ``"email_taken"``."""
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                clash = self._conn.execute(
+                    "SELECT member_id FROM members "
+                    "WHERE LOWER(username)=LOWER(?) AND revoked_at IS NULL",
+                    (username,),
+                ).fetchone()
+                if clash is not None:
+                    self._conn.execute("ROLLBACK")
+                    return None, "username_taken"
+                clash = self._conn.execute(
+                    "SELECT member_id FROM members "
+                    "WHERE LOWER(email)=LOWER(?) AND revoked_at IS NULL",
+                    (email,),
+                ).fetchone()
+                if clash is not None:
+                    self._conn.execute("ROLLBACK")
+                    return None, "email_taken"
+                self._conn.execute(
+                    "INSERT INTO members (member_id, email, role, parent_member_id, "
+                    "token_hash, tier, daily_quota_tokens, daily_quota_images, "
+                    "daily_quota_voice_minutes, created_at, tos_accepted_at, "
+                    "tos_version, username, password_hash, password_set_at) "
+                    "VALUES (?, ?, 'contributor', NULL, ?, 'BRONZE', ?, ?, ?, "
+                    "?, ?, ?, ?, ?, ?)",
+                    (
+                        member_id,
+                        email,
+                        token_hash,
+                        daily_quota_tokens,
+                        daily_quota_images,
+                        daily_quota_voice_minutes,
+                        created_at,
+                        created_at,  # tos_accepted_at — checkbox required at submit
+                        tos_version,
+                        username,
+                        password_hash,
+                        created_at,
+                    ),
+                )
+                row = self._conn.execute(
+                    "SELECT * FROM members WHERE member_id=?", (member_id,)
+                ).fetchone()
+                self._conn.execute("COMMIT")
+                return row, None
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+
     def get_member_by_token_hash(self, token_hash: str) -> Optional[sqlite3.Row]:
         with self._lock:
             cur = self._conn.execute(

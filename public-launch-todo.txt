@@ -40,12 +40,25 @@ tasks, in the suggested order. Status legend: [ ] pending  [x] done+verified
          563/563 green. (2026-08-19)
 
 --- Step 5: public signup ----------------------------------------------------
-[ ] 5.1  Add public POST /signup (no bearer, rate-limited like /login) that
-         creates a BRONZE member with no parent, via db.create_member(),
-         stamping current TOS_VERSION. Returns a bearer token + the new
-         member's own invite code.
-         verify: e2e test — signup succeeds, returned token authenticates,
-         member has no parent_member_id, rate limit engages after N tries.
+[x] 5.1  Add public POST /signup (no bearer, rate-limited like /login) that
+         creates a BRONZE member with no parent, via a new atomic
+         db.create_signup_member() (mirrors accept_invite_atomic's
+         collision-checked insert), stamping current TOS_VERSION.
+         Note: adjusted scope during build — invites in this system are
+         pre-addressed to a specific invitee_email at creation time, so
+         "your own invite code" to hand out like a coupon doesn't fit the
+         data model. /signup instead returns role="contributor" (the
+         exact role POST /invites already authorizes to create invites),
+         so a new member can immediately call POST /invites themselves.
+         Throttled per-IP (SIGNUP_MAX_PER_IP=5/SIGNUP_WINDOW_SECONDS=1h,
+         counts successes only) rather than reusing RATE_LIMIT_PER_MIN,
+         which is sized for the streaming-poll path and usually off.
+         verify: SignupTests in tests/test_coordinator_e2e.py — token
+         resolves to the right member, contributor role satisfies the
+         /invites authorization check, ToS required, duplicate
+         username/email 409, throttle blocks after N successful
+         signups from one IP and does NOT count failed attempts. Full
+         suite: 570/570 green. (2026-08-19)
 [ ] 5.2  Wire windows-agent first run: if the agent has no paired member
          token yet, call /signup automatically, persist the token to
          config.json, and print the member's invite link to console.

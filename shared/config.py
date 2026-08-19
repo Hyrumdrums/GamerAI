@@ -127,6 +127,17 @@ MAX_PROMPT_BYTES = _int("MAX_PROMPT_BYTES", 0)
 LOGIN_FAIL_MAX = _int("LOGIN_FAIL_MAX", 15)
 LOGIN_FAIL_WINDOW_SECONDS = _int("LOGIN_FAIL_WINDOW_SECONDS", 900)  # 15 min
 
+# --- public signup throttle (per client IP; ON by default) ---
+# Separate from RATE_LIMIT_PER_MIN (sized for the streaming poll path,
+# usually off) — this caps how many accounts one IP can mint in a
+# window, which is the abuse vector that matters once /signup has no
+# invite gate. Mirrors the LOGIN_FAIL_MAX pattern above but keyed on
+# IP (there's no username yet at signup time) and counts successful
+# creations, not failed attempts (a mistyped password shouldn't burn a
+# real signup's quota). Set SIGNUP_MAX_PER_IP=0 to disable.
+SIGNUP_MAX_PER_IP = _int("SIGNUP_MAX_PER_IP", 5)
+SIGNUP_WINDOW_SECONDS = _int("SIGNUP_WINDOW_SECONDS", 3600)  # 1h
+
 # --- model registry (off by default = legacy "any model name accepted") ---
 STRICT_MODELS = _bool("STRICT_MODELS", False)
 

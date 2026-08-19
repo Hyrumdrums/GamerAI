@@ -510,6 +510,8 @@ All services read from environment variables (see `shared/config.py`).
 | `RATE_LIMIT_PER_MIN`      | `0` (disabled)                   | coordinator |
 | `MAX_PROMPT_BYTES`        | `0` (disabled)                   | coordinator |
 | `CAPACITY_JOBS_PER_WORKER` | `0` (disabled, unbounded queueing) | coordinator |
+| `SIGNUP_MAX_PER_IP`       | `5` per `SIGNUP_WINDOW_SECONDS`   | coordinator |
+| `SIGNUP_WINDOW_SECONDS`   | `3600` (1h)                       | coordinator |
 | `IDEMPOTENCY_TTL_SECONDS` | `86400`                          | coordinator |
 | `STRICT_MODELS`           | `false` (any model name accepted) | coordinator |
 | `SMART_MODEL`             | _unset_ (registry default `qwen2.5:14b`) | coordinator |

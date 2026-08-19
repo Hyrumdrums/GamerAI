@@ -51,6 +51,7 @@ coordinator.redis_client.get_client = lambda: _FAKE  # type: ignore[assignment]
 from fastapi.testclient import TestClient  # noqa: E402
 
 from coordinator import main as coordinator_main  # noqa: E402
+from coordinator import member_auth  # noqa: E402
 from coordinator import model_registry  # noqa: E402
 from coordinator.scheduler import Reaper  # noqa: E402
 
@@ -1200,6 +1201,110 @@ class CapacityCeilingTests(unittest.TestCase):
             self.client.post("/generate", json={"prompt": "three"}).status_code,
             503,
         )
+
+
+def _signup_payload(**overrides):
+    payload = {
+        "username": "newcontributor",
+        "password": "correct horse battery staple",
+        "email": "new@example.com",
+        "tos_accepted": True,
+    }
+    payload.update(overrides)
+    return payload
+
+
+class SignupTests(unittest.TestCase):
+    """Public, invite-free POST /signup — the task-5.1 gap the launch
+    review flagged: today running the agent registers a *worker* but
+    never creates a *member*, so nobody can join without an existing
+    member vouching for them. These tests cover the new door in."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.client = TestClient(coordinator_main.app)
+        cls.db = coordinator_main.db
+
+    def setUp(self):
+        _FAKE.flushall()
+        # Other test classes in this module never create members, so
+        # nothing else in the suite depends on this table's contents —
+        # safe (and necessary, since signups persist to SQLite, not
+        # the per-test-flushed fake Redis) to reset it here.
+        self.db._conn.execute("DELETE FROM members")
+        self._orig_max = coordinator_main.SIGNUP_MAX_PER_IP
+
+    def tearDown(self):
+        coordinator_main.SIGNUP_MAX_PER_IP = self._orig_max
+
+    def test_signup_creates_a_working_account(self):
+        resp = self.client.post("/signup", json=_signup_payload())
+        self.assertEqual(resp.status_code, 200, resp.text)
+        body = resp.json()
+        self.assertEqual(body["role"], "contributor")
+        self.assertIsNone(body["parent_member_id"])
+        self.assertTrue(body["token"])
+        self.assertEqual(body["username"], "newcontributor")
+
+        # The returned token actually resolves to this member. Checked
+        # via member_auth directly (the same lookup the live bearer-auth
+        # middleware calls) rather than a real HTTP round-trip, since
+        # this test module runs with API_TOKEN unset (AUTH_ENABLED=False
+        # module-wide) and the middleware no-ops entirely in that mode —
+        # see the file's own docstring on the env setup.
+        looked_up = member_auth.lookup_member_by_token(self.db, body["token"])
+        self.assertIsNotNone(looked_up)
+        self.assertEqual(looked_up.member_id, body["member_id"])
+
+    def test_signup_creates_a_contributor_who_can_invite(self):
+        # role="contributor" is what POST /invites' authorization check
+        # actually tests for (member.role in ("admin", "contributor")) —
+        # assert the signup path produces a role that satisfies it, so
+        # the two sides can't silently drift apart.
+        resp = self.client.post(
+            "/signup", json=_signup_payload(username="hostuser"),
+        )
+        self.assertIn(resp.json()["role"], ("admin", "contributor"))
+
+    def test_signup_requires_tos_acceptance(self):
+        resp = self.client.post(
+            "/signup", json=_signup_payload(tos_accepted=False),
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_signup_rejects_duplicate_username(self):
+        self.client.post("/signup", json=_signup_payload(email="a@example.com"))
+        resp = self.client.post(
+            "/signup", json=_signup_payload(email="b@example.com"),
+        )
+        self.assertEqual(resp.status_code, 409)
+
+    def test_signup_rejects_duplicate_email(self):
+        self.client.post("/signup", json=_signup_payload(username="userone"))
+        resp = self.client.post(
+            "/signup", json=_signup_payload(username="usertwo"),
+        )
+        self.assertEqual(resp.status_code, 409)
+
+    def test_throttle_blocks_after_max_signups_from_one_ip(self):
+        coordinator_main.SIGNUP_MAX_PER_IP = 2
+        self.client.post("/signup", json=_signup_payload(
+            username="capuser1", email="cap1@example.com"))
+        self.client.post("/signup", json=_signup_payload(
+            username="capuser2", email="cap2@example.com"))
+        third = self.client.post("/signup", json=_signup_payload(
+            username="capuser3", email="cap3@example.com"))
+        self.assertEqual(third.status_code, 429, third.text)
+
+    def test_throttle_does_not_count_failed_attempts(self):
+        # A rejected (bad ToS) attempt shouldn't burn a real user's quota.
+        coordinator_main.SIGNUP_MAX_PER_IP = 1
+        rejected = self.client.post(
+            "/signup", json=_signup_payload(tos_accepted=False),
+        )
+        self.assertEqual(rejected.status_code, 400)
+        ok = self.client.post("/signup", json=_signup_payload())
+        self.assertEqual(ok.status_code, 200, ok.text)
 
 
 if __name__ == "__main__":
