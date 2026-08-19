@@ -98,6 +98,17 @@ IDEMPOTENCY_TTL_SECONDS = _int("IDEMPOTENCY_TTL_SECONDS", 86400)  # 24h
 # for flood protection, size it well above the polling rate (e.g. 1200).
 RATE_LIMIT_PER_MIN = _int("RATE_LIMIT_PER_MIN", 0)
 
+# Global in-flight-jobs ceiling, expressed per live worker rather than
+# as a flat number, so a two-machine contributor fleet and a
+# hundred-machine one each get a sane queue depth automatically. 0
+# disables the check (today's behavior: unbounded queueing). When
+# enabled, /generate refuses new jobs once
+# (queued + processing) >= max(live_workers, 1) * CAPACITY_JOBS_PER_WORKER,
+# returning a 503 with an honest "network is at capacity" message
+# instead of letting the queue grow indefinitely against hardware that
+# can't keep up.
+CAPACITY_JOBS_PER_WORKER = _int("CAPACITY_JOBS_PER_WORKER", 0)
+
 # Hard ceiling on a single prompt's size. Unbounded prompts get stored
 # in SQLite and shoveled whole to a contributor's machine — cheap DoS
 # once /generate is reachable by the public internet. 0 disables the

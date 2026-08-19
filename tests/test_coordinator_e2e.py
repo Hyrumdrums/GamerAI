@@ -1101,5 +1101,106 @@ class PromptSizeLimitTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 413, resp.text)
 
 
+class CapacityCeilingTests(unittest.TestCase):
+    """CAPACITY_JOBS_PER_WORKER on POST /generate — the ceiling scales
+    with live worker count, so tests register real workers via
+    /register (which also stamps a heartbeat) rather than faking
+    liveness."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.client = TestClient(coordinator_main.app)
+        cls.r = _FAKE
+
+    def setUp(self):
+        self.r.flushall()
+        self._orig = coordinator_main.CAPACITY_JOBS_PER_WORKER
+
+    def tearDown(self):
+        coordinator_main.CAPACITY_JOBS_PER_WORKER = self._orig
+
+    def test_disabled_by_default_allows_unbounded_queueing(self):
+        self.assertEqual(coordinator_main.CAPACITY_JOBS_PER_WORKER, 0)
+        for _ in range(10):
+            resp = self.client.post("/generate", json={"prompt": "hi"})
+            self.assertEqual(resp.status_code, 200, resp.text)
+
+    def test_blocks_once_ceiling_reached_with_one_worker(self):
+        coordinator_main.CAPACITY_JOBS_PER_WORKER = 1
+        self.client.post("/register", json={"worker_id": "wkr-cap-1"})
+        # First job fills the ceiling (1 worker * 1 = 1).
+        first = self.client.post("/generate", json={"prompt": "one"})
+        self.assertEqual(first.status_code, 200, first.text)
+        second = self.client.post("/generate", json={"prompt": "two"})
+        self.assertEqual(second.status_code, 503, second.text)
+        self.assertIn("at capacity", second.json()["detail"])
+
+    def test_ceiling_scales_with_live_worker_count(self):
+        coordinator_main.CAPACITY_JOBS_PER_WORKER = 1
+        self.client.post("/register", json={"worker_id": "wkr-cap-a"})
+        self.client.post("/register", json={"worker_id": "wkr-cap-b"})
+        # Ceiling is now 2 workers * 1 = 2.
+        self.assertEqual(
+            self.client.post("/generate", json={"prompt": "one"}).status_code,
+            200,
+        )
+        self.assertEqual(
+            self.client.post("/generate", json={"prompt": "two"}).status_code,
+            200,
+        )
+        self.assertEqual(
+            self.client.post("/generate", json={"prompt": "three"}).status_code,
+            503,
+        )
+
+    def test_completing_a_job_frees_up_capacity(self):
+        coordinator_main.CAPACITY_JOBS_PER_WORKER = 1
+        self.client.post("/register", json={"worker_id": "wkr-cap-c"})
+        job_id = self.client.post(
+            "/generate", json={"prompt": "one"},
+        ).json()["job_id"]
+        self.assertEqual(
+            self.client.post("/generate", json={"prompt": "two"}).status_code,
+            503,
+        )
+        # Mimic the real worker: BLPOP off the queue before claiming,
+        # same as CoordinatorE2ETests does — otherwise the job stays
+        # double-counted (still on the list AND in JOB_PROCESSING).
+        self.r.lpop("job_queue")
+        claim = self.client.post(
+            "/jobs/claim", json={"worker_id": "wkr-cap-c", "job_id": job_id},
+        ).json()
+        self.client.post(
+            "/jobs/complete",
+            json=_job_complete_payload(
+                "wkr-cap-c", job_id, claim_token=claim["claim_token"],
+            ),
+        )
+        # The completed job is off the queue and out of JOB_PROCESSING,
+        # so capacity is free again.
+        self.assertEqual(
+            self.client.post("/generate", json={"prompt": "three"}).status_code,
+            200,
+        )
+
+    def test_zero_live_workers_still_allows_a_floor_of_one_batch(self):
+        # No workers registered at all; ceiling uses max(live, 1) so a
+        # cold-started network can still queue its first batch of jobs
+        # rather than 503ing everyone before any worker has connected.
+        coordinator_main.CAPACITY_JOBS_PER_WORKER = 2
+        self.assertEqual(
+            self.client.post("/generate", json={"prompt": "one"}).status_code,
+            200,
+        )
+        self.assertEqual(
+            self.client.post("/generate", json={"prompt": "two"}).status_code,
+            200,
+        )
+        self.assertEqual(
+            self.client.post("/generate", json={"prompt": "three"}).status_code,
+            503,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

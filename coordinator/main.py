@@ -49,6 +49,7 @@ from shared.config import (
     JOB_QUEUE,
     JOB_RESULTS,
     JOB_TIMEOUT_SECONDS,
+    CAPACITY_JOBS_PER_WORKER,
     LOGIN_FAIL_MAX,
     LOGIN_FAIL_WINDOW_SECONDS,
     MAX_PROMPT_BYTES,
@@ -1475,6 +1476,22 @@ _NO_SMART_WORKERS_MESSAGE = (
     "machines online and linked). Please try again in a few minutes, "
     "or turn off smart mode."
 )
+_AT_CAPACITY_MESSAGE = (
+    "The network is at capacity right now — every contributor machine "
+    "is busy with earlier requests. Please try again in a minute or two."
+)
+
+# All Redis list keys jobs can queue on, across every tool. Kept as a
+# literal tuple (mirroring job_queue_for's own literals) rather than
+# calling job_queue_for for every known tool, since that function's
+# contract is "route one job", not "enumerate all queues".
+_ALL_JOB_QUEUES = (
+    JOB_QUEUE,
+    "job_queue:image",
+    "job_queue:search",
+    "job_queue:tts",
+    "job_queue:chat:smart",
+)
 
 
 def _worker_advertises_tool(worker_id: str, tool: str) -> bool:
@@ -1529,6 +1546,40 @@ def _ensure_live_worker_or_503(tool: str = "chat") -> None:
     else:
         detail = _NO_WORKERS_MESSAGE
     raise HTTPException(status_code=503, detail=detail)
+
+
+def _live_worker_count() -> int:
+    now = time.time()
+    heartbeats = r.hgetall(WORKER_HEARTBEATS) or {}
+    live = 0
+    for worker_id, _raw in heartbeats.items():
+        ts, _ = _read_heartbeat(worker_id)
+        if ts and (now - ts) <= WORKER_TIMEOUT_SECONDS:
+            live += 1
+    return live
+
+
+def _current_inflight_count() -> int:
+    """Jobs queued (any tool) plus jobs currently claimed/processing.
+    A coarse global count, not per-tool — the ceiling this backs is
+    meant to protect the fleet's total capacity, not any one queue."""
+    total = r.hlen(JOB_PROCESSING)
+    for q in _ALL_JOB_QUEUES:
+        total += r.llen(q)
+    return total
+
+
+def _ensure_capacity_or_503() -> None:
+    """Refuse new jobs once the network is saturated relative to its
+    live worker count, instead of letting the queue grow unbounded
+    against what might be one or two contributor machines. Opt-in —
+    0/unset CAPACITY_JOBS_PER_WORKER disables the check entirely
+    (today's default: unbounded queueing)."""
+    if CAPACITY_JOBS_PER_WORKER <= 0:
+        return
+    ceiling = max(_live_worker_count(), 1) * CAPACITY_JOBS_PER_WORKER
+    if _current_inflight_count() >= ceiling:
+        raise HTTPException(status_code=503, detail=_AT_CAPACITY_MESSAGE)
 
 
 # ---------- public API ----------
@@ -1721,6 +1772,11 @@ def generate(req: GenerateRequest, request: Request):
     # once the conversation's pinned model is resolved, since a pinned
     # smart model can flip the route after this first gate.
     _ensure_live_worker_or_503(tool=model_registry.route_for(tool, req.model))
+    # Same placement rationale as the live-worker gate above: after
+    # validation, before any DB writes, so a 503 here leaves no orphan
+    # rows. Independent of REQUIRE_LIVE_WORKER — this protects fleet
+    # capacity even when the live-worker gate is off.
+    _ensure_capacity_or_503()
 
     member = getattr(request.state, "member", None)
     submitted_by = member.member_id if member is not None else None

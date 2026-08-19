@@ -508,6 +508,8 @@ All services read from environment variables (see `shared/config.py`).
 | `WORKER_SHARE`            | `0.7`                            | platform    |
 | `API_TOKEN`               | _unset_ (auth disabled)          | all         |
 | `RATE_LIMIT_PER_MIN`      | `0` (disabled)                   | coordinator |
+| `MAX_PROMPT_BYTES`        | `0` (disabled)                   | coordinator |
+| `CAPACITY_JOBS_PER_WORKER` | `0` (disabled, unbounded queueing) | coordinator |
 | `IDEMPOTENCY_TTL_SECONDS` | `86400`                          | coordinator |
 | `STRICT_MODELS`           | `false` (any model name accepted) | coordinator |
 | `SMART_MODEL`             | _unset_ (registry default `qwen2.5:14b`) | coordinator |
