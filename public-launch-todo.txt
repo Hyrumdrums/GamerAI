@@ -80,12 +80,25 @@ tasks, in the suggested order. Status legend: [ ] pending  [x] done+verified
          without persisting. Full suite: 574/574 green. (2026-08-19)
 
 --- Step 6: no-install demo mode ---------------------------------------------
-[ ] 6.1  Seed a single GUEST member at boot (same pattern as
-         ensure_admin_seed) and add a tight per-IP rate limit
-         (e.g. 5 msgs/hour) on a public demo chat path, served only by the
-         small VPS model, with an explicit "demo mode" banner in the UI.
-         verify: unit test — 6th request within an hour from the same IP is
-         rejected with a clear message; 5th succeeds.
+[x] 6.1  Seed a single GUEST member at boot (ensure_guest_seed, same
+         pattern as ensure_admin_seed) and add a public, tight per-IP
+         rate limit (DEMO_MAX_PER_IP=5/hour default) on a demo chat
+         path, plus a small shared daily-token backstop
+         (DEMO_DAILY_TOKEN_CAP) against many-IP abuse. Built a real
+         page, not just the backend: GET /demo (client/routes/demo.py +
+         demo.html.j2) with an explicit "demo mode" banner and a link
+         to download the agent, backed by coordinator POST /demo/generate
+         + GET /demo/result/{job_id} (forces tool=chat, ignores any other
+         field, reuses the real generate()/result() gates — capacity
+         ceiling, live-worker check, prompt cap — by attaching the guest
+         member to the request the same way real auth does).
+         verify: DemoModeTests in tests/test_coordinator_e2e.py (backend:
+         throttle blocks the 6th message and doesn't count 503s against
+         it, daily-cap backstop, job ownership scoping, smuggled
+         tool/model ignored, disabled->404) + 3 new cases in
+         tests/test_web_ui_smoke.py (page renders anonymously, generate+
+         result round-trips with no session/auth header). Full suite:
+         587/587 green. (2026-08-19)
 
 --- Step 7: OSS repo hygiene --------------------------------------------------
 [ ] 7.1  Add CONTRIBUTING.md (state current PR/issue posture honestly).

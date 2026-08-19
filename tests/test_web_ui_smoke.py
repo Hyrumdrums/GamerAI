@@ -86,6 +86,7 @@ class WebUISmokeTests(unittest.TestCase):
         cls.db = coordinator_main.db
         cls.r = _FAKE
         coordinator_main.ensure_admin_seed()
+        coordinator_main.ensure_guest_seed()
         # Browser-auth slice: the web UI gates non-public pages on the
         # session cookie. For tests we stamp it as the admin so existing
         # smoke coverage of /, /dashboard, /admin/* keeps working. The
@@ -101,7 +102,7 @@ class WebUISmokeTests(unittest.TestCase):
             "DELETE FROM member_usage; "
             "DELETE FROM invites; "
             "DELETE FROM member_tokens; "
-            "DELETE FROM members WHERE role <> 'admin';"
+            "DELETE FROM members WHERE role NOT IN ('admin', 'guest');"
         )
         # The invite-accept flow now sets a fresh session cookie when
         # auto-logging the new member in — that would otherwise clobber
@@ -1160,6 +1161,34 @@ class WebUISmokeTests(unittest.TestCase):
                   "tz": "Mars/Olympus"},
         )
         self.assertEqual(resp.status_code, 422)
+
+
+    # ------------------------------------------------------------------
+    # no-install public demo (task 6.1)
+    # ------------------------------------------------------------------
+    def test_demo_page_renders_without_a_session(self):
+        anon = TestClient(client_web.app, follow_redirects=False)
+        resp = anon.get("/demo")
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertIn(b"Try GamerAI", resp.content)
+
+    def test_demo_generate_and_result_round_trip_without_a_session(self):
+        anon = TestClient(client_web.app, follow_redirects=False)
+        gen = anon.post("/api/demo/generate", json={"prompt": "hi there"})
+        self.assertEqual(gen.status_code, 200, gen.text)
+        job_id = gen.json()["job_id"]
+        res = anon.get(f"/api/demo/result/{job_id}")
+        self.assertEqual(res.status_code, 200, res.text)
+        self.assertEqual(res.json()["status"], "pending")
+
+    def test_demo_generate_proxy_requires_no_auth_header(self):
+        # Confirms the proxy really goes through the public client, not
+        # the admin one this test module patches by default elsewhere —
+        # a plain unauthenticated request must succeed.
+        anon = TestClient(client_web.app, follow_redirects=False)
+        anon.headers.pop("Authorization", None)
+        resp = anon.post("/api/demo/generate", json={"prompt": "no auth here"})
+        self.assertEqual(resp.status_code, 200, resp.text)
 
 
 if __name__ == "__main__":

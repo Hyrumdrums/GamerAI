@@ -138,6 +138,26 @@ LOGIN_FAIL_WINDOW_SECONDS = _int("LOGIN_FAIL_WINDOW_SECONDS", 900)  # 15 min
 SIGNUP_MAX_PER_IP = _int("SIGNUP_MAX_PER_IP", 5)
 SIGNUP_WINDOW_SECONDS = _int("SIGNUP_WINDOW_SECONDS", 3600)  # 1h
 
+# --- no-install public demo mode ---
+# Lets someone try the chat tool from a public page with no account,
+# no agent install, and no invite — the "actually try it" path for
+# someone evaluating the project (an interviewer, a curious visitor)
+# who isn't going to run a background agent first. Backed by a single
+# shared GUEST member (seeded at boot, see ensure_guest_seed) so usage
+# is trivially distinguishable from real member traffic in the ledger.
+# The real protection is the per-IP throttle below, NOT the shared
+# member's own daily cap — many anonymous IPs share one member row,
+# so a per-member daily quota alone would let the first visitor of
+# the day exhaust it for everyone.
+DEMO_ENABLED = _bool("DEMO_ENABLED", True)
+DEMO_MAX_PER_IP = _int("DEMO_MAX_PER_IP", 5)
+DEMO_WINDOW_SECONDS = _int("DEMO_WINDOW_SECONDS", 3600)  # 1h
+# Backstop against many-IP abuse (the per-IP throttle can't catch a
+# botnet spreading requests across addresses). Deliberately much
+# smaller than a real BRONZE member's 100k/day — this quota is shared
+# by every anonymous demo visitor on a given day, not one person.
+DEMO_DAILY_TOKEN_CAP = _int("DEMO_DAILY_TOKEN_CAP", 20_000)
+
 # --- model registry (off by default = legacy "any model name accepted") ---
 STRICT_MODELS = _bool("STRICT_MODELS", False)
 

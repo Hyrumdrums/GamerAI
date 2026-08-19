@@ -9,6 +9,7 @@ Wires:
 * :mod:`client.routes.invites` — public ``/invite/{code}`` flow.
 * :mod:`client.routes.admin_ui` — ``/admin/members``, ``/admin/invites``.
 * :mod:`client.routes.api` — every ``/api/*`` BFF proxy.
+* :mod:`client.routes.demo` — public, no-install ``/demo`` chat page.
 
 Where to add a new page:
 
@@ -26,7 +27,7 @@ from fastapi import FastAPI
 from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
 
-from client.routes import account, admin_ui, api, auth, chat, invites, machines
+from client.routes import account, admin_ui, api, auth, chat, demo, invites, machines
 
 app = FastAPI(title="GamerAI Web UI")
 
@@ -78,3 +79,4 @@ app.include_router(account.router)
 app.include_router(machines.router)
 app.include_router(admin_ui.router)
 app.include_router(api.router)
+app.include_router(demo.router)

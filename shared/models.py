@@ -293,6 +293,15 @@ class SignupRequest(BaseModel):
     tos_accepted: bool = False
 
 
+class DemoGenerateRequest(BaseModel):
+    """Public, no-install demo chat. Deliberately just a prompt — no
+    tool, model, conversation_id, or smart flag. The demo path forces
+    tool="chat" against whatever model the deployment already defaults
+    to; letting a caller pick would defeat the point of a narrow,
+    easy-to-reason-about public surface."""
+    prompt: str
+
+
 class FriendQuotaUpdateRequest(BaseModel):
     """Host edits an accepted invitee's two-dimensional daily cap.
     Both fields are sent on every update — the form always carries
