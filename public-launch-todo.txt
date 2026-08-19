@@ -144,6 +144,10 @@ tasks, in the suggested order. Status legend: [ ] pending  [x] done+verified
          checked off.
 
 --- Step 10: distribution -------------------------------------------------------
-[ ] 10.1 Write a 3-sentence LinkedIn/resume blurb (problem -> mechanism ->
+[x] 10.1 Write a 3-sentence LinkedIn/resume blurb (problem -> mechanism ->
          what's live today) with repo + live-demo links.
-         verify: content review only.
+         Done — docs/blurb.md: a one-liner for a resume line, a ~3-
+         sentence version for a LinkedIn post/portfolio card, and a
+         note to swap wording once the repo is actually public (the
+         GitHub link 404s for outsiders until step 9 happens).
+         verify: content review only, as planned. (2026-08-19)
