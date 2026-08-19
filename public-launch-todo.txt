@@ -101,11 +101,25 @@ tasks, in the suggested order. Status legend: [ ] pending  [x] done+verified
          587/587 green. (2026-08-19)
 
 --- Step 7: OSS repo hygiene --------------------------------------------------
-[ ] 7.1  Add CONTRIBUTING.md (state current PR/issue posture honestly).
-[ ] 7.2  Add SECURITY.md (private vulnerability reporting contact/process).
-[ ] 7.3  Set the GitHub repo description + topics via `gh repo edit`.
-         verify: files exist in repo root; `gh repo view` shows the new
-         description.
+[x] 7.1  Add CONTRIBUTING.md (state current PR/issue posture honestly).
+         Done — sets expectations (small focused PRs welcome, open an
+         issue first for anything nontrivial, points at
+         docs/project-gaps.md for what's worth working on). (2026-08-19)
+[x] 7.2  Add SECURITY.md (private vulnerability reporting contact/process).
+         Went with GitHub's private-advisory flow (no email published),
+         per explicit choice when asked. Note: tried to enable "Private
+         vulnerability reporting" via `gh api -X PUT .../private-
+         vulnerability-reporting` — 404'd (feature likely needs to be
+         turned on manually in Settings -> Security once the repo is
+         public, or isn't available on this plan). SECURITY.md says so
+         explicitly and gives a fallback (open a detail-free issue
+         asking the maintainer to enable it). REMAINING MANUAL STEP:
+         flip on Settings -> Security -> "Private vulnerability
+         reporting" after go-public (step 9). (2026-08-19)
+[x] 7.3  Set the GitHub repo description + topics via `gh repo edit`.
+         Done — description + 7 topics (distributed-systems, docker,
+         fastapi, llm, p2p, redis, self-hosted-ai) set and confirmed via
+         `gh repo view`. (2026-08-19)
 
 --- Step 8: README hero pass --------------------------------------------------
 [ ] 8.1  Add an above-the-fold hero to README.md: screenshot/GIF of the chat
