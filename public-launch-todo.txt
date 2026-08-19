@@ -3,10 +3,13 @@ Generated from the 2026-08-19 launch-readiness review. Small, one-commit-sized
 tasks, in the suggested order. Status legend: [ ] pending  [x] done+verified
 
 --- Step 1: repo safety check ---------------------------------------------
-[ ] 1.1  SSH to VPS, confirm the GitHub deploy key (/root/.ssh/github_deploy)
+[x] 1.1  SSH to VPS, confirm the GitHub deploy key (/root/.ssh/github_deploy)
          is a read-only per-repo Deploy Key, not a write-enabled key or a
          personal PAT. Fix in GitHub settings if wrong.
-         verify: `gh repo deploy-key list` (or GitHub UI) shows read-only.
+         verify: `gh api repos/Hyrumdrums/GamerAI/keys` shows
+         "gamerai-github-deploy", read_only:true. Confirmed the VPS's actual
+         key (`ssh-keygen -y -f /root/.ssh/github_deploy`) fingerprint-matches
+         that exact registered key. No fix needed. (2026-08-19)
 
 --- Step 2: scrub personal details -----------------------------------------
 [ ] 2.1  Replace the named family member ("Carol") in docs/devlog.md with a
