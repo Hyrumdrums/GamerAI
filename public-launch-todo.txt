@@ -1,0 +1,73 @@
+GamerAI — Public Launch Todo
+Generated from the 2026-08-19 launch-readiness review. Small, one-commit-sized
+tasks, in the suggested order. Status legend: [ ] pending  [x] done+verified
+
+--- Step 1: repo safety check ---------------------------------------------
+[ ] 1.1  SSH to VPS, confirm the GitHub deploy key (/root/.ssh/github_deploy)
+         is a read-only per-repo Deploy Key, not a write-enabled key or a
+         personal PAT. Fix in GitHub settings if wrong.
+         verify: `gh repo deploy-key list` (or GitHub UI) shows read-only.
+
+--- Step 2: scrub personal details -----------------------------------------
+[ ] 2.1  Replace the named family member ("Carol") in docs/devlog.md with a
+         role label (e.g. "the head-machine operator"); keep all technical
+         content unchanged.
+         verify: `grep -in carol docs/*.md README.md` returns nothing.
+
+--- Step 3: prompt size cap -------------------------------------------------
+[ ] 3.1  Add MAX_PROMPT_BYTES env-configurable cap on POST /generate in
+         coordinator/main.py; reject oversized prompts with 413.
+         verify: new unit test (tests/test_prompt_limits.py) covers
+         under-cap accepted, over-cap rejected, cap disabled when unset.
+
+--- Step 4: capacity ceiling -------------------------------------------------
+[ ] 4.1  Add a global in-flight-jobs ceiling on POST /generate tied to live
+         worker count; return 503 with a friendly "network at capacity, try
+         again shortly" message when exceeded, instead of an unbounded queue.
+         verify: unit test simulates ceiling reached -> 503 with the
+         friendly message; under ceiling -> 200 as normal.
+
+--- Step 5: public signup ----------------------------------------------------
+[ ] 5.1  Add public POST /signup (no bearer, rate-limited like /login) that
+         creates a BRONZE member with no parent, via db.create_member(),
+         stamping current TOS_VERSION. Returns a bearer token + the new
+         member's own invite code.
+         verify: e2e test — signup succeeds, returned token authenticates,
+         member has no parent_member_id, rate limit engages after N tries.
+[ ] 5.2  Wire windows-agent first run: if the agent has no paired member
+         token yet, call /signup automatically, persist the token to
+         config.json, and print the member's invite link to console.
+         verify: existing agent bootstrap test suite extended to cover the
+         no-token-yet -> auto-signup path (mocked HTTP).
+
+--- Step 6: no-install demo mode ---------------------------------------------
+[ ] 6.1  Seed a single GUEST member at boot (same pattern as
+         ensure_admin_seed) and add a tight per-IP rate limit
+         (e.g. 5 msgs/hour) on a public demo chat path, served only by the
+         small VPS model, with an explicit "demo mode" banner in the UI.
+         verify: unit test — 6th request within an hour from the same IP is
+         rejected with a clear message; 5th succeeds.
+
+--- Step 7: OSS repo hygiene --------------------------------------------------
+[ ] 7.1  Add CONTRIBUTING.md (state current PR/issue posture honestly).
+[ ] 7.2  Add SECURITY.md (private vulnerability reporting contact/process).
+[ ] 7.3  Set the GitHub repo description + topics via `gh repo edit`.
+         verify: files exist in repo root; `gh repo view` shows the new
+         description.
+
+--- Step 8: README hero pass --------------------------------------------------
+[ ] 8.1  Add an above-the-fold hero to README.md: screenshot/GIF of the chat
+         UI, one line on what the project demonstrates, and the live +
+         demo-mode links, ahead of the architecture diagram.
+         verify: manual read-through; no automated test for this one.
+
+--- Step 9: go public (manual confirmation gate) -------------------------------
+[ ] 9.1  Flip the GitHub repo from private -> public.
+         STOP: requires your explicit live go-ahead at the time — not done
+         automatically as part of this list, even once every prior item is
+         checked off.
+
+--- Step 10: distribution -------------------------------------------------------
+[ ] 10.1 Write a 3-sentence LinkedIn/resume blurb (problem -> mechanism ->
+         what's live today) with repo + live-demo links.
+         verify: content review only.
