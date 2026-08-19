@@ -759,5 +759,90 @@ class ScheduleCacheTests(unittest.TestCase):
         self.assertEqual(c._heartbeat_interval(), agent.DOWNTIME_POLL_DEFAULT_SECONDS)
 
 
+class _FakeSignupResponse:
+    def __init__(self, status_code, body):
+        self.status_code = status_code
+        self._body = body
+        self.text = str(body)
+
+    def json(self):
+        return self._body
+
+
+class RunSignupFlowTests(unittest.TestCase):
+    """Public, invite-free account creation from the agent's first-run
+    onboarding (task 5.2 of the launch review) — running the agent
+    with no existing account should be able to mint one via the
+    coordinator's POST /signup, without a browser handoff (there's no
+    existing session to approve it against, unlike --pair)."""
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        self._tmp = Path(tempfile.mkstemp(suffix=".json")[1])
+        self._orig_state_path = agent.STATE_PATH
+        agent.STATE_PATH = self._tmp
+
+    def tearDown(self):
+        agent.STATE_PATH = self._orig_state_path
+        try:
+            self._tmp.unlink()
+        except OSError:
+            pass
+
+    def test_declining_tos_confirmation_does_not_call_signup(self):
+        with mock.patch.object(agent.httpx, "post") as post:
+            token = agent.run_signup_flow(
+                "http://coord.example", {}, _confirm=lambda _: "n",
+            )
+        self.assertIsNone(token)
+        post.assert_not_called()
+
+    def test_accepting_creates_account_and_persists_token(self):
+        fake_resp = _FakeSignupResponse(200, {"token": "gai_faketoken123"})
+        with mock.patch.object(agent.httpx, "post", return_value=fake_resp) as post:
+            state = {}
+            token = agent.run_signup_flow(
+                "http://coord.example", state, _confirm=lambda _: "y",
+            )
+        self.assertEqual(token, "gai_faketoken123")
+        self.assertEqual(state["api_token"], "gai_faketoken123")
+        # Persisted to disk, same as pairing does.
+        import json
+        on_disk = json.loads(agent.STATE_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(on_disk["api_token"], "gai_faketoken123")
+        # Called the right endpoint with a ToS-accepted, non-empty
+        # username/password/email — not silently passing blanks.
+        post.assert_called_once()
+        args, kwargs = post.call_args
+        self.assertEqual(args[0], "http://coord.example/signup")
+        body = kwargs["json"]
+        self.assertTrue(body["tos_accepted"])
+        self.assertTrue(body["username"])
+        self.assertGreaterEqual(len(body["password"]), 8)
+        self.assertIn("@", body["email"])
+
+    def test_coordinator_rejection_returns_none_and_does_not_persist(self):
+        fake_resp = _FakeSignupResponse(
+            409, {"detail": "username taken"},
+        )
+        with mock.patch.object(agent.httpx, "post", return_value=fake_resp):
+            state = {}
+            token = agent.run_signup_flow(
+                "http://coord.example", state, _confirm=lambda _: "y",
+            )
+        self.assertIsNone(token)
+        self.assertNotIn("api_token", state)
+
+    def test_network_failure_returns_none(self):
+        with mock.patch.object(
+            agent.httpx, "post", side_effect=httpx.ConnectError("refused"),
+        ):
+            token = agent.run_signup_flow(
+                "http://coord.example", {}, _confirm=lambda _: "y",
+            )
+        self.assertIsNone(token)
+
+
 if __name__ == "__main__":
     unittest.main()

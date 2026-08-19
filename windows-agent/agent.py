@@ -6250,6 +6250,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         "page, wait for the signed-in user to click "
                         "Pair this PC, then save the issued token to "
                         "state.json and exit.")
+    p.add_argument("--signup", action="store_true",
+                   help="create a brand-new GamerAI account for this PC "
+                        "(no existing account or invite needed) via the "
+                        "coordinator's public POST /signup, save the "
+                        "issued token to state.json, and exit. Prefer "
+                        "--pair instead if you already have an account.")
     p.add_argument("--unpair", action="store_true",
                    help="retire this agent's bearer with the coordinator "
                         "(POST /agents/pair/unpair) and wipe the local "
@@ -6387,6 +6393,110 @@ def run_pair_flow(
         "Run --pair again when ready.\n"
     )
     return None
+
+
+def run_signup_flow(
+    coordinator_url: str,
+    state: dict,
+    *,
+    _confirm=None,
+) -> Optional[str]:
+    """Public, invite-free account creation — the literal version of
+    business.md's "contribute-to-use" pitch: running the agent for the
+    first time, with no existing GamerAI account and nobody to invite
+    you, is how you join. Calls the coordinator's public ``POST
+    /signup`` directly (no browser handoff needed, unlike
+    ``run_pair_flow`` — there's no existing session to approve this
+    against) with a generated username + a strong random password,
+    then persists the returned bearer to ``state.json`` exactly like
+    pairing does.
+
+    Requires an explicit y/n ToS confirmation before calling the
+    endpoint — same bar as the web redemption page's click-through
+    checkbox; a background/non-interactive run should not silently
+    accept terms on the operator's behalf. ``_confirm`` is injectable
+    for tests (defaults to a real ``input()`` prompt).
+
+    Returns the new token on success, None on failure/decline. Prints
+    the generated credentials once, clearly, since this is the only
+    time the password is ever shown — the coordinator only stores its
+    hash."""
+    confirm = _confirm or (lambda prompt: input(prompt).strip().lower())
+
+    sys.stdout.write(
+        "\n"
+        "No GamerAI account found for this PC.\n"
+        "-----------------------------------------\n"
+        "Running the agent is how you join the network — no invite\n"
+        "required. This will create a new account for you.\n"
+        "\n"
+        f"Community terms: {coordinator_url.rstrip('/')}/tos\n"
+        "Accept and create an account? [y/N] "
+    )
+    sys.stdout.flush()
+    try:
+        answer = confirm("")
+    except (EOFError, KeyboardInterrupt):
+        sys.stderr.write("\nsignup: aborted.\n")
+        return None
+    if answer not in ("y", "yes"):
+        sys.stdout.write(
+            "signup: declined. Run --pair instead if you already have "
+            "an account.\n"
+        )
+        return None
+
+    username = f"gamer-{uuid.uuid4().hex[:10]}"
+    password = uuid.uuid4().hex + uuid.uuid4().hex[:8]
+    # A signup account needs a recovery address on file same as an
+    # invite-accepted one does, but there's no invite form to collect
+    # it from here — synthesize a clearly-fake, clearly-unique
+    # placeholder the member can replace later. Never actually mailed
+    # to (no SMTP delivery exists yet — see docs/project-gaps.md).
+    email = f"{username}@agent.gamerai.local"
+
+    base = coordinator_url.rstrip("/")
+    try:
+        r = httpx.post(
+            f"{base}/signup",
+            json={
+                "username": username,
+                "password": password,
+                "email": email,
+                "tos_accepted": True,
+            },
+            timeout=10,
+        )
+    except httpx.HTTPError as e:
+        sys.stderr.write(f"signup: couldn't reach coordinator at {base}: {e}\n")
+        return None
+    if r.status_code != 200:
+        sys.stderr.write(
+            f"signup: coordinator rejected the request "
+            f"({r.status_code}): {r.text[:200]}\n"
+        )
+        return None
+    body = r.json()
+    token = body.get("token")
+    if not token:
+        sys.stderr.write(f"signup: unexpected response: {body!r}\n")
+        return None
+
+    state["api_token"] = token
+    save_state(state)
+    sys.stdout.write(
+        "\n"
+        "Account created.\n"
+        "-----------------------------------------\n"
+        f"  username: {username}\n"
+        f"  password: {password}\n"
+        "\n"
+        "Save this password now — it is shown only this once (the\n"
+        "coordinator stores only its hash). Sign in with it in the\n"
+        "chat UI to invite friends from your account. This agent is\n"
+        f"already paired — the token is saved to {STATE_PATH}.\n"
+    )
+    return token
 
 
 def run_unpair_flow(coordinator_url: str, state: dict) -> int:
@@ -6549,6 +6659,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         cfg = Config.load(args.config if args.config.exists() else None)
         state = load_state()
         token = run_pair_flow(cfg.coordinator_url, state)
+        return 0 if token else 2
+    if args.signup:
+        cfg = Config.load(args.config if args.config.exists() else None)
+        state = load_state()
+        token = run_signup_flow(cfg.coordinator_url, state)
         return 0 if token else 2
     if args.unpair:
         cfg = Config.load(args.config if args.config.exists() else None)
@@ -6751,20 +6866,43 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not have_token:
         if tray_active:
             _toast(
-                "GamerAI Agent needs to pair this PC",
-                "Opening your browser to confirm pairing under your account.",
+                "GamerAI Agent needs an account",
+                "Opening the console to pair or create your account.",
                 icon_path=_tray_icon_path(),
             )
             _show_console(console_hwnd)
             auto_unhidden_for_token = True
-        token = run_pair_flow(cfg.coordinator_url, state)
+        # Two doors in, matching business.md's actor model: someone who
+        # already has a GamerAI account (invited, or signed up on the
+        # web) pairs this PC to it via browser handoff; someone with
+        # neither creates a brand-new account right here — running the
+        # agent for the first time IS how they join, no invite needed.
+        # Default to the signup path on a bare Enter — most first
+        # installs are exactly that case, not a returning contributor
+        # re-pairing a second machine.
+        sys.stdout.write(
+            "\nDo you already have a GamerAI account to pair this PC "
+            "with? [y/N] "
+        )
+        sys.stdout.flush()
+        try:
+            has_account = input("").strip().lower() in ("y", "yes")
+        except (EOFError, KeyboardInterrupt):
+            has_account = False
+        if has_account:
+            token = run_pair_flow(cfg.coordinator_url, state)
+        else:
+            token = run_signup_flow(cfg.coordinator_url, state)
         if not token:
             msg = (
-                "pairing didn't complete. Open the agent console and "
-                "run `agent --pair` to try again, or paste a bearer "
-                "token into %APPDATA%\\GamerAI\\state.json manually."
+                "account setup didn't complete. Open the agent console "
+                "and run `agent --pair` (existing account) or "
+                "`agent --signup` (new account) to try again, or paste "
+                "a bearer token into %APPDATA%\\GamerAI\\state.json "
+                "manually."
                 if IS_WINDOWS else
-                "pairing didn't complete. Run `agent --pair` to try again."
+                "account setup didn't complete. Run `agent --pair` or "
+                "`agent --signup` to try again."
             )
             log.error(msg)
             sys.stderr.write(msg + "\n")

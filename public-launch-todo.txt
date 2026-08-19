@@ -59,11 +59,25 @@ tasks, in the suggested order. Status legend: [ ] pending  [x] done+verified
          username/email 409, throttle blocks after N successful
          signups from one IP and does NOT count failed attempts. Full
          suite: 570/570 green. (2026-08-19)
-[ ] 5.2  Wire windows-agent first run: if the agent has no paired member
-         token yet, call /signup automatically, persist the token to
-         config.json, and print the member's invite link to console.
-         verify: existing agent bootstrap test suite extended to cover the
-         no-token-yet -> auto-signup path (mocked HTTP).
+[x] 5.2  Wire windows-agent first run: if the agent has no paired member
+         token yet, offer to call /signup, persist the token to
+         state.json, and print the new username/password to console.
+         Note: adjusted scope during build — there's no per-member
+         "invite link" to print (see 5.1's note); instead the agent
+         prints the new account's username/password (shown once) so
+         the contributor can sign into the chat UI and invite friends
+         from there. Added a new `run_signup_flow()` (mirrors
+         run_pair_flow's shape) + `--signup` CLI flag, and wired the
+         real first-run gate (the `have_token` block in main(), NOT the
+         unused `resolve_api_token()` prompt) to ask "already have an
+         account? [y/N]" and route to --pair or --signup accordingly.
+         Requires an explicit y/n ToS confirmation before calling the
+         endpoint, matching the web redemption page's click-through bar.
+         verify: RunSignupFlowTests in tests/test_agent_bootstrap.py
+         (mocked httpx) — decline skips the call, acceptance persists
+         the token to state.json and sends a well-formed signup body,
+         coordinator rejection and network failure both fail closed
+         without persisting. Full suite: 574/574 green. (2026-08-19)
 
 --- Step 6: no-install demo mode ---------------------------------------------
 [ ] 6.1  Seed a single GUEST member at boot (same pattern as
