@@ -4,6 +4,25 @@
 > where contributing a gaming PC earns you tier-based access for yourself and
 > the people you invite.**
 
+**[Try it now](https://ai.dallinlayton.com/demo)** — no account, no install,
+just a chat box. Full access (bigger model, image generation, invites) needs
+the [agent](https://ai.dallinlayton.com/download/), which is also how you
+join: running it *is* signing up, no invite code required.
+
+<p align="center">
+  <img src="docs/images/demo-page.png" alt="The no-install /demo chat page" width="620">
+</p>
+
+This is a real, running distributed system, not a demo repo: a FastAPI
+coordinator doing job routing and quota enforcement, a Redis-backed queue,
+per-member auth with an invite graph, a Windows agent that self-updates with
+signed releases, and — the part I'd point a reviewer at first — [smart
+mode](docs/smart-mode.md), which splits a 14B-class model's layers across two
+separate contributor machines over llama.cpp RPC so their combined VRAM runs
+a model neither card could hold alone. `docs/project-gaps.md` is a maintained,
+dated, severity-tagged list of what's still rough — the kind of doc I'd want
+from anyone handing me a production system.
+
 This repo is a fully local, containerized MVP. One command brings up a
 coordinator, Redis queue, SQLite store, a web UI, and any number of worker
 nodes that simulate contributor machines.

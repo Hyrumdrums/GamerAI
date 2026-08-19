@@ -122,10 +122,20 @@ tasks, in the suggested order. Status legend: [ ] pending  [x] done+verified
          `gh repo view`. (2026-08-19)
 
 --- Step 8: README hero pass --------------------------------------------------
-[ ] 8.1  Add an above-the-fold hero to README.md: screenshot/GIF of the chat
+[x] 8.1  Add an above-the-fold hero to README.md: screenshot/GIF of the chat
          UI, one line on what the project demonstrates, and the live +
          demo-mode links, ahead of the architecture diagram.
-         verify: manual read-through; no automated test for this one.
+         Done — added right under the tagline: a "Try it now" link to
+         /demo, a real screenshot (docs/images/demo-page.png), and a
+         paragraph naming what to actually look at (smart-mode 14B
+         model-split across two machines, the invite/quota system,
+         project-gaps.md as a maintained honest gap list).
+         verify: booted coordinator+client in-process (fakeredis-backed,
+         no Docker/Redis available in this sandbox) via a throwaway
+         script, drove a real /demo/generate -> /jobs/next -> /jobs/
+         complete round trip over HTTP, and captured the actual
+         rendered page with headless Chrome — not a mockup. Full test
+         suite re-run clean after the doc edit: 587/587. (2026-08-19)
 
 --- Step 9: go public (manual confirmation gate) -------------------------------
 [ ] 9.1  Flip the GitHub repo from private -> public.
