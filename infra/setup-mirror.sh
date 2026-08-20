@@ -90,3 +90,13 @@ echo
 echo "verify from a client:"
 echo "  curl -I https://ai.dallinlayton.com/download/ollama-setup.exe"
 echo "  curl -I https://ai.dallinlayton.com/download/models/${MODEL_SLUG}.gguf"
+
+# Caddy's file_server serves an index.html before falling back to the
+# raw directory listing (see infra/Caddyfile's /download/* handler).
+# Without this, a visitor hitting /download/ sees a dozen internal
+# mirror files/folders with no indication which one (if any) is the
+# thing they actually want. Lands in MIRROR_ROOT — the same directory
+# every other file in this script writes into, i.e. wherever the
+# operator has pointed the public download mirror.
+cp "$(dirname "${BASH_SOURCE[0]}")/downloads-index.html" "${MIRROR_ROOT}/index.html"
+echo "wrote ${MIRROR_ROOT}/index.html"

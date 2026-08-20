@@ -423,6 +423,7 @@ of Caddy.
 | `deploy.sh`                | re-pull + rebuild after a code change                  |
 | `Caddyfile`                | TLS reverse proxy (auth lives in the coordinator). Routes `/sw.js`, `/offline`, `/api/*`, `/static/*` to the client container. |
 | `docker-compose.prod.yml`  | overlay: adds Caddy, restricts internal ports          |
+| `downloads-index.html`     | landing page for `/download/` — copied into the mirror root by `setup-mirror.sh` so visitors get a "here's the installer" page instead of a raw file listing |
 | `README.md`                | this file                                              |
 
 ## Per-host state files (created at runtime, NOT in this repo)
