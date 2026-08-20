@@ -427,6 +427,18 @@ Switch model: `MODEL=mistral docker compose up --build`.
 MOCK_INFERENCE=true docker compose up --build
 ```
 
+### Run without Docker at all
+
+For quick UI iteration without a Docker install: `tools/run_local.py`
+runs the coordinator, client, and a mock worker in one Python process
+against an in-memory fake Redis — same venv used for tests, no Redis or
+Ollama needed.
+
+```bash
+.venv/bin/python tools/run_local.py
+# open http://localhost:8080
+```
+
 ### Scale workers
 
 ```bash
