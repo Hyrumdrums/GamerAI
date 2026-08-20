@@ -1177,7 +1177,10 @@ class WebUISmokeTests(unittest.TestCase):
         anon = TestClient(client_web.app, follow_redirects=False)
         resp = anon.get("/demo")
         self.assertEqual(resp.status_code, 200, resp.text)
-        self.assertIn(b"Try GamerAI", resp.content)
+        self.assertIn(b"Message GamerAI", resp.content)
+        # Premium toggles are shown (not hidden) but disabled, so the
+        # real feature set is visible to sell the product.
+        self.assertIn(b'title="Sign up to unlock image generation"', resp.content)
 
     def test_demo_generate_and_result_round_trip_without_a_session(self):
         anon = TestClient(client_web.app, follow_redirects=False)
