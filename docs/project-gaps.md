@@ -400,6 +400,76 @@ mid-job — takes the whole system down.
 **Fix:** acceptable for MVP test. Documented in the graduation
 criteria; resolved by Phase 2b AWS multi-AZ.
 
+### 🟡 A 503 silently destroys the user's message — no retry, no memory of what was asked
+
+Observed live (2026-08-20) during the canary-backlog incident above, but
+this recurs on *any* transient "no worker available" gap, not just that
+one. Transcript:
+
+```
+user:      tallest building in the world?
+assistant: No community members are available right now. Please try again in a few minutes.
+user:      now?
+assistant: No community members are available right now. Please try again in a few minutes.
+user:      now?
+assistant: I'm available now. What can I help you with?
+user:      answer my question
+assistant: You didn't ask a question. This conversation just started. What's on your mind?
+```
+
+The original question never comes back. What's actually happening,
+traced through `client/static/js/chat.js` and `coordinator/main.py`:
+
+1. **The composer clears on submit, not on success.** `textarea.value = ''`
+   runs immediately after the optimistic user-bubble is appended
+   (`chat.js` submit handler), before the `/api/generate` fetch even
+   fires. The instant "Send" is pressed, the original prompt text is
+   gone from the input — there's nothing to recover it from even if the
+   user wanted to hit "retry."
+2. **A 503 leaves zero trace, by design.** `_ensure_live_worker_or_503()`
+   runs in `coordinator/main.py:generate()` *before* any `db.insert_job`
+   or message-row write, specifically "so a 503 leaves no orphan
+   job/message rows" (see the comment at `main.py:1822`). Reasonable for
+   keeping the ledger clean, but it means the failed turn isn't
+   recoverable from the server either — a page refresh mid-outage loses
+   it completely, and even within the same tab there's no stored copy.
+3. **No retry affordance on the error bubble.** The 503 handler
+   (`chat.js` ~line 534-559) renders the error text into the assistant
+   bubble and re-enables the composer — that's it. No "retry" button, no
+   automatic resubmission. The `body` object with the original prompt is
+   still sitting in the closure scope at that point in the code but
+   nothing offers to resend it.
+
+Net effect: the user's only path forward is to *remember and manually
+retype* their actual question. In the transcript above they
+(reasonably) typed a quick "now?" instead — which is contentless on its
+own, and since the real question was never persisted anywhere, the
+assistant has genuinely no way to know what "now?" refers to once a
+worker comes online. The conversation looks broken/confused, but the
+model never actually forgot anything — the question just never reached
+it.
+
+**Fix (client-side only, no backend design change needed):**
+- Don't clear the textarea until the fetch succeeds; restore the exact
+  prompt text into it on any error path (network failure and 503 both
+  already fall into an existing `catch`/`!gr.ok` branch — just don't
+  clobber the input).
+- Give the error bubble a "retry" button that re-POSTs the same `body`
+  already captured in the submit handler's closure — one tap, exact
+  same prompt, no retyping. `chat.js`'s own comment at line ~352
+  ("eventual error state can offer a retry button") shows this was
+  anticipated for the mid-stream-interruption case; it just was never
+  built for the submit-time 503 case.
+
+**Heavier alternative (changes the backend contract, not recommended
+first):** persist the user's turn before the live-worker check with a
+terminal `status="failed_no_worker"` instead of skipping the write
+entirely. Survives a refresh, but reverses the "no orphan rows on 503"
+decision — the client-side fix above solves the observed symptom
+without that trade-off.
+
+Scope estimate: ~1-2 hours for the client-only fix.
+
 ### 🟢 No log retention strategy
 
 Logs go to stdout / `docker logs`. Restarts wipe history. Useful for
