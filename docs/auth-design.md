@@ -83,6 +83,18 @@ ghost AND her recovery escalation is broken (her host can't be
 reached to revoke + reissue). Without an email recovery channel
 that goes around the host, deep-tree contributors are fragile.
 
+**The admin/root has no host above them, so they get a different
+recovery path: operator access to the box itself.**
+`ensure_admin_seed()` (coordinator/main.py) only ever seeds a bearer
+from `API_TOKEN` once — after the founding admin claims u/p
+credentials, that seeded token is gone for good (by design; see its
+docstring), so a lost password there isn't a "contact your host"
+case. `coordinator.admin reset-password --username <u>` resets a
+password by username with no existing token required — deliberately
+not a public web endpoint, since it's only reachable via `docker exec`
+on the VPS, which already gates `.env.prod` and the SQLite file
+directly. No new trust boundary, nothing to commit to the repo.
+
 **End state (when email service is wired):**
 
 1. **Self-service email reset** — standard form: enter email, click

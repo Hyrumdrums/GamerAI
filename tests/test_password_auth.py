@@ -167,6 +167,52 @@ class PasswordAuthTests(unittest.TestCase):
             ])
 
     # ------------------------------------------------------------------
+    # reset-password (operator recovery, no token required)
+    # ------------------------------------------------------------------
+    def test_reset_password_works_with_no_token_at_all(self):
+        coordinator_admin.main([
+            "set-credentials",
+            "--token", ADMIN_TOKEN,
+            "--username", "rootadmin",
+            "--password", "original-password-1",
+        ])
+        # Deliberately no --token here — this is the whole point: the
+        # bearer the admin logged in with is not available/known.
+        coordinator_admin.main([
+            "reset-password",
+            "--username", "rootadmin",
+            "--password", "brand-new-password-2",
+        ])
+        r = self.client.post(
+            "/login",
+            json={"username": "rootadmin", "password": "brand-new-password-2"},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        # Old password no longer works.
+        r2 = self.client.post(
+            "/login",
+            json={"username": "rootadmin", "password": "original-password-1"},
+        )
+        self.assertEqual(r2.status_code, 401)
+
+    def test_reset_password_rejects_unknown_username(self):
+        with self.assertRaises(SystemExit):
+            coordinator_admin.main([
+                "reset-password",
+                "--username", "ghost",
+                "--password", "brand-new-password-2",
+            ])
+
+    def test_reset_password_rejects_weak_password(self):
+        self._make_admin_with_username("rootadmin")
+        with self.assertRaises(SystemExit):
+            coordinator_admin.main([
+                "reset-password",
+                "--username", "rootadmin",
+                "--password", "short",
+            ])
+
+    # ------------------------------------------------------------------
     # POST /login
     # ------------------------------------------------------------------
     def test_login_is_public_no_bearer_required(self):

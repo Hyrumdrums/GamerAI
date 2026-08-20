@@ -12,6 +12,22 @@ Usage (run inside the coordinator container, where the SQLite DB is mounted):
 
 `create-member` prints the new bearer token to stdout exactly once.
 There is no recovery — losing it means revoke + reissue.
+
+Locked out entirely (forgot your password, and no bearer token works
+either — e.g. ensure_admin_seed() won't re-issue one once u/p
+credentials exist, see its docstring in coordinator/main.py)? Use
+`reset-password`, keyed by username with no token required:
+
+    docker exec -it gamerai-coordinator python -m coordinator.admin \\
+        reset-password --username dallin
+
+This is intentionally the recovery path of last resort rather than a
+public "forgot password" web flow: it requires `docker exec` on the
+host, which already gates .env.prod and the SQLite file directly, so
+it adds no new trust boundary and nothing needs to be committed to
+the repo. See docs/auth-design.md "Password recovery" for why there's
+no self-service reset yet (no email service) and why the admin/root
+specifically has no host above them to fall back on.
 """
 from __future__ import annotations
 
@@ -154,6 +170,47 @@ def cmd_set_credentials(args: argparse.Namespace) -> None:
     print(f"member_id={row['member_id']}")
     print(f"username={clean_username}")
     print("password set; sign in at /login")
+
+
+def cmd_reset_password(args: argparse.Namespace) -> None:
+    """Operator-only recovery: reset a member's password by username,
+    no existing bearer required. Only reachable via `docker exec` on the
+    host, which already has full DB access, so skipping the token check
+    (unlike cmd_set_credentials) adds no new trust boundary — it just
+    covers the case that command can't: you don't have a working token
+    to prove ownership with."""
+    db = DB()
+    row = db.get_member_by_username(args.username)
+    if row is None:
+        print(f"error: no member with username {args.username!r}", file=sys.stderr)
+        sys.exit(2)
+    if row["revoked_at"] is not None:
+        print("error: that member is revoked", file=sys.stderr)
+        sys.exit(2)
+
+    if args.password:
+        password = args.password
+    else:
+        password = getpass.getpass("new password: ")
+        confirm = getpass.getpass("confirm:      ")
+        if password != confirm:
+            print("error: passwords did not match", file=sys.stderr)
+            sys.exit(2)
+    try:
+        member_auth.validate_password(password)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    db.set_member_credentials(
+        member_id=row["member_id"],
+        username=row["username"],
+        password_hash=member_auth.hash_password(password),
+        when=time.time(),
+    )
+    print(f"member_id={row['member_id']}")
+    print(f"username={row['username']}")
+    print("password reset; sign in at /login")
 
 
 def cmd_set_email(args: argparse.Namespace) -> None:
@@ -405,6 +462,22 @@ def _build_parser() -> argparse.ArgumentParser:
         help="new password; omitted to prompt interactively (safer for shell history)",
     )
     p_sc.set_defaults(fn=cmd_set_credentials)
+
+    p_rp = sub.add_parser(
+        "reset-password",
+        help="operator-only recovery: reset a member's password by "
+             "username, no existing bearer required (use when locked "
+             "out entirely — see module docstring)",
+    )
+    p_rp.add_argument(
+        "--username", required=True,
+        help="member to reset (case-insensitive)",
+    )
+    p_rp.add_argument(
+        "--password", default=None,
+        help="new password; omitted to prompt interactively (safer for shell history)",
+    )
+    p_rp.set_defaults(fn=cmd_reset_password)
 
     p_inv = sub.add_parser("create-invite", help="create an invite for an outsider")
     p_inv.add_argument(
