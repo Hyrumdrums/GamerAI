@@ -100,6 +100,16 @@ tasks, in the suggested order. Status legend: [ ] pending  [x] done+verified
          result round-trips with no session/auth header). Full suite:
          587/587 green. (2026-08-19)
 
+         Superseded (2026-08-20): the live worker-backed demo meant a
+         public, no-account page could still burn real inference cost
+         under sustained/distributed abuse — throttle + daily cap raise
+         the bar but don't remove the cost. Replaced with a fully
+         client-side canned-response library (demo.html.j2); no request
+         ever reaches the coordinator. GUEST_MEMBER_ID, ensure_guest_seed,
+         POST /demo/generate, GET /demo/result/{job_id}, and the
+         DEMO_ENABLED/DEMO_MAX_PER_IP/DEMO_WINDOW_SECONDS/
+         DEMO_DAILY_TOKEN_CAP config all removed as dead surface.
+
 --- Step 7: OSS repo hygiene --------------------------------------------------
 [x] 7.1  Add CONTRIBUTING.md (state current PR/issue posture honestly).
          Done — sets expectations (small focused PRs welcome, open an

@@ -69,11 +69,10 @@
     # Public onboarding pitch + Windows install TL;DR. Reachable
     # while signed in (topbar CTA) and anonymously.
     @web_ui_contribute path /contribute
-    # No-install public demo page (task 6.1). Without this it falls
-    # through to the coordinator catch-all below, which has no GET
-    # /demo route (only the JSON /demo/generate + /demo/result APIs),
-    # so the page itself 404s/401s even though /api/demo/* already
-    # works via @web_ui_api.
+    # No-install public demo page (task 6.1). Fully client-side (a
+    # canned-response library, no backend call) — without this matcher
+    # it'd fall through to the coordinator catch-all below, which has
+    # no GET /demo route at all.
     @web_ui_demo path /demo
     # Vendored JS (marked + DOMPurify) — referenced by both the chat
     # UI (client:8080) and the ToS page (served by coordinator:8000,

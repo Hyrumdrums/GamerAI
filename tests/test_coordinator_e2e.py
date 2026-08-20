@@ -1308,131 +1308,22 @@ class SignupTests(unittest.TestCase):
 
 
 class DemoModeTests(unittest.TestCase):
-    """No-install public demo chat (POST /demo/generate + GET
-    /demo/result/{job_id}) — task 6.1 of the launch review: someone
-    evaluating the project shouldn't have to run a background agent
-    just to see it work."""
+    """The no-install public demo (task 6.1) moved to a fully
+    client-side canned-response library — see demo.html.j2 — so a
+    bot can no longer spam real inference cost via the public page.
+    This just pins that the old coordinator surface stays gone."""
 
     @classmethod
     def setUpClass(cls):
         cls.client = TestClient(coordinator_main.app)
-        cls.r = _FAKE
-        cls.db = coordinator_main.db
 
-    def setUp(self):
-        self.r.flushall()
-        self.db._conn.executescript(
-            "DELETE FROM jobs; DELETE FROM workers; DELETE FROM earnings; "
-            "DELETE FROM members; DELETE FROM member_usage;"
-        )
-        self._orig_max = coordinator_main.DEMO_MAX_PER_IP
-        self._orig_enabled = coordinator_main.DEMO_ENABLED
-
-    def tearDown(self):
-        coordinator_main.DEMO_MAX_PER_IP = self._orig_max
-        coordinator_main.DEMO_ENABLED = self._orig_enabled
-
-    def test_demo_generate_queues_a_job_owned_by_the_guest_member(self):
+    def test_demo_generate_endpoint_is_gone(self):
         resp = self.client.post("/demo/generate", json={"prompt": "hello"})
-        self.assertEqual(resp.status_code, 200, resp.text)
-        job_id = resp.json()["job_id"]
-        row = self.db.get_job(job_id)
-        self.assertEqual(row["submitted_by_member_id"], coordinator_main.GUEST_MEMBER_ID)
-
-    def test_demo_generate_self_heals_when_seed_missing(self):
-        # Simulate the lifespan-never-ran case (plain TestClient, or a
-        # fresh-boot race): no guest row exists yet.
-        self.db._conn.execute(
-            "DELETE FROM members WHERE member_id=?",
-            (coordinator_main.GUEST_MEMBER_ID,),
-        )
-        resp = self.client.post("/demo/generate", json={"prompt": "hi"})
-        self.assertEqual(resp.status_code, 200, resp.text)
-
-    def test_demo_generate_ignores_smuggled_tool_and_model(self):
-        # The request body only has a `prompt` field in the pydantic
-        # model, so there's nothing to smuggle at the schema level —
-        # this pins that guarantee against a future field addition.
-        resp = self.client.post(
-            "/demo/generate",
-            json={"prompt": "hi", "tool": "image", "model": "sdxl"},
-        )
-        self.assertEqual(resp.status_code, 200, resp.text)
-        job_id = resp.json()["job_id"]
-        row = self.db.get_job(job_id)
-        self.assertEqual(row["tool"], "chat")
-
-    def test_demo_result_returns_pending_for_a_guest_job(self):
-        job_id = self.client.post(
-            "/demo/generate", json={"prompt": "hi"},
-        ).json()["job_id"]
-        resp = self.client.get(f"/demo/result/{job_id}")
-        self.assertEqual(resp.status_code, 200, resp.text)
-        self.assertEqual(resp.json()["status"], "pending")
-
-    def test_demo_result_404s_for_a_non_guest_job(self):
-        # A job submitted by a real (non-guest) caller must not be
-        # readable through the public demo result endpoint.
-        real_job_id = self.client.post(
-            "/generate", json={"prompt": "not a demo job"},
-        ).json()["job_id"]
-        resp = self.client.get(f"/demo/result/{real_job_id}")
         self.assertEqual(resp.status_code, 404)
 
-    def test_demo_result_404s_for_unknown_job(self):
-        resp = self.client.get("/demo/result/no-such-job")
+    def test_demo_result_endpoint_is_gone(self):
+        resp = self.client.get("/demo/result/anything")
         self.assertEqual(resp.status_code, 404)
-
-    def test_throttle_blocks_after_max_demo_messages_from_one_ip(self):
-        coordinator_main.DEMO_MAX_PER_IP = 2
-        self.client.post("/demo/generate", json={"prompt": "one"})
-        self.client.post("/demo/generate", json={"prompt": "two"})
-        third = self.client.post("/demo/generate", json={"prompt": "three"})
-        self.assertEqual(third.status_code, 429, third.text)
-        self.assertIn("Retry-After", third.headers)
-
-    def test_throttle_does_not_count_requests_rejected_by_capacity(self):
-        # A 503 from the shared capacity/live-worker gates isn't the
-        # visitor's fault and shouldn't burn their demo allotment.
-        coordinator_main.DEMO_MAX_PER_IP = 1
-        orig_require = coordinator_main.REQUIRE_LIVE_WORKER
-        coordinator_main.REQUIRE_LIVE_WORKER = True
-        try:
-            rejected = self.client.post(
-                "/demo/generate", json={"prompt": "no workers yet"},
-            )
-            self.assertEqual(rejected.status_code, 503)
-        finally:
-            coordinator_main.REQUIRE_LIVE_WORKER = orig_require
-        # The throttle wasn't consumed — this should still succeed.
-        ok = self.client.post("/demo/generate", json={"prompt": "now it works"})
-        self.assertEqual(ok.status_code, 200, ok.text)
-
-    def test_daily_token_cap_backstops_the_per_ip_throttle(self):
-        # Simulate many-IP abuse by exhausting the guest member's own
-        # shared daily quota directly, bypassing the per-IP throttle
-        # entirely (as a botnet spreading across addresses would).
-        coordinator_main.DEMO_MAX_PER_IP = 0  # isolate: only test the quota backstop
-        self.db._conn.execute(
-            "UPDATE members SET daily_quota_tokens=1 WHERE member_id=?",
-            (coordinator_main.GUEST_MEMBER_ID,),
-        )
-        import time as _time
-        today = _time.strftime("%Y-%m-%d", _time.gmtime())
-        self.db._conn.execute(
-            "INSERT INTO member_usage (member_id, day, tokens_out) "
-            "VALUES (?, ?, 999999)",
-            (coordinator_main.GUEST_MEMBER_ID, today),
-        )
-        resp = self.client.post("/demo/generate", json={"prompt": "over the cap"})
-        self.assertEqual(resp.status_code, 429, resp.text)
-
-    def test_disabled_returns_404(self):
-        coordinator_main.DEMO_ENABLED = False
-        resp = self.client.post("/demo/generate", json={"prompt": "hi"})
-        self.assertEqual(resp.status_code, 404)
-        resp2 = self.client.get("/demo/result/anything")
-        self.assertEqual(resp2.status_code, 404)
 
 
 if __name__ == "__main__":

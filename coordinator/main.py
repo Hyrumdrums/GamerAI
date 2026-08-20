@@ -51,10 +51,6 @@ from shared.config import (
     JOB_RESULTS,
     JOB_TIMEOUT_SECONDS,
     CAPACITY_JOBS_PER_WORKER,
-    DEMO_DAILY_TOKEN_CAP,
-    DEMO_ENABLED,
-    DEMO_MAX_PER_IP,
-    DEMO_WINDOW_SECONDS,
     LOGIN_FAIL_MAX,
     LOGIN_FAIL_WINDOW_SECONDS,
     MAX_PROMPT_BYTES,
@@ -84,7 +80,6 @@ from shared.models import (
     AgentPairConfirmRequest,
     AgentPairPollRequest,
     ConversationCreateRequest,
-    DemoGenerateRequest,
     FriendQuotaUpdateRequest,
     GenerateRequest,
     GenerateResponse,
@@ -1220,44 +1215,10 @@ def ensure_admin_seed() -> None:
     )
 
 
-GUEST_MEMBER_ID = "mem_guest_demo"
-
-
-def ensure_guest_seed() -> None:
-    """Ensure the single shared GUEST member backing the no-install demo
-    mode (see POST /demo/generate) exists. Idempotent, same shape as
-    ``ensure_admin_seed``. No-ops entirely when DEMO_ENABLED is off.
-
-    The guest's token_hash is a throwaway random value re-generated
-    every time this runs (including every restart) — nothing ever logs
-    in *as* the guest via a real bearer lookup; /demo/generate attaches
-    the Member object to the request directly, server-side. The value
-    only needs to satisfy the column's NOT NULL UNIQUE constraint."""
-    if not DEMO_ENABLED:
-        return
-    if db.get_member(GUEST_MEMBER_ID) is not None:
-        return
-    db.create_member(
-        member_id=GUEST_MEMBER_ID,
-        email=None,
-        role="guest",
-        parent_member_id=None,
-        token_hash=member_auth.hash_token(member_auth.generate_token()),
-        tier="BRONZE",
-        daily_quota_tokens=DEMO_DAILY_TOKEN_CAP,
-        daily_quota_images=0,
-        daily_quota_voice_minutes=0,
-        tos_accepted_at=time.time(),
-        tos_version=TOS_VERSION,
-    )
-    log.info("seeded guest demo member", extra={"event": "guest_seed"})
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _reaper, _canary_injector, _uptime_sampler, _tier_engine
     ensure_admin_seed()
-    ensure_guest_seed()
     _reaper = Reaper(r, db)
     _reaper.start()
     if CANARY_INTERVAL_SECONDS > 0:
@@ -1331,12 +1292,6 @@ def _is_public(method: str, path: str) -> bool:
     # Public, invite-free account creation — see POST /signup below.
     # Throttled separately (SIGNUP_MAX_PER_IP), not by RATE_LIMIT_PER_MIN.
     if method == "POST" and path == "/signup":
-        return True
-    # No-install public demo chat — see POST /demo/generate below.
-    # Throttled separately (DEMO_MAX_PER_IP), not by RATE_LIMIT_PER_MIN.
-    if method == "POST" and path == "/demo/generate":
-        return True
-    if method == "GET" and path.startswith("/demo/result/"):
         return True
     # Agent pairing — the agent has no token yet, so all three of these
     # are public. Security relies on the short-lived pair_code (5-min
@@ -4568,102 +4523,6 @@ def signup(req: SignupRequest, request: Request):
         "daily_quota_tokens": quota["tokens"],
         "tos_version": TOS_VERSION,
     }
-
-
-def _demo_throttle_key(client_ip: str) -> str:
-    return f"demo_count:{client_ip}"
-
-
-@app.post("/demo/generate")
-def demo_generate(req: DemoGenerateRequest, request: Request):
-    """No-install public demo chat. Someone evaluating the project —
-    an interviewer, a curious visitor — can send a message without an
-    account, an invite, or a locally-running agent. Deliberately thin:
-    forces tool="chat" (ignoring anything else a caller might try to
-    smuggle in) and delegates every real protection (prompt-size cap,
-    capacity ceiling, live-worker gate, daily quota) to the same
-    generate() path real traffic goes through, by attaching the shared
-    GUEST member to the request the same way the auth middleware
-    attaches a real one.
-
-    Throttled per client IP (DEMO_MAX_PER_IP / DEMO_WINDOW_SECONDS) —
-    the primary protection, since every anonymous visitor shares one
-    member row and its one daily_quota_tokens backstop."""
-    if not DEMO_ENABLED:
-        raise HTTPException(
-            status_code=404, detail="demo mode is not enabled on this deployment",
-        )
-    if not req.prompt or not req.prompt.strip():
-        raise HTTPException(status_code=400, detail="prompt required")
-
-    client_ip = _client_ip(request)
-    throttle_key = _demo_throttle_key(client_ip)
-    if DEMO_MAX_PER_IP > 0:
-        current = r.get(throttle_key)
-        if current is not None and int(current) >= DEMO_MAX_PER_IP:
-            ttl = r.ttl(throttle_key)
-            retry_after = int(ttl) if ttl and ttl > 0 else DEMO_WINDOW_SECONDS
-            raise HTTPException(
-                status_code=429,
-                detail=(
-                    "The demo is limited to a few messages per hour per "
-                    "visitor. Run the agent for full, unthrottled access — "
-                    "or try again later."
-                ),
-                headers={"Retry-After": str(max(1, retry_after))},
-            )
-
-    guest_row = db.get_member(GUEST_MEMBER_ID)
-    if guest_row is None:
-        # Demo enabled but the seed hasn't run yet — e.g. a test
-        # harness that never fires lifespan, or a rare fresh-boot
-        # race. Self-heal instead of 500ing every request until the
-        # next restart.
-        ensure_guest_seed()
-        guest_row = db.get_member(GUEST_MEMBER_ID)
-    if guest_row is None:
-        raise HTTPException(
-            status_code=503, detail="demo mode is temporarily unavailable",
-        )
-
-    request.state.member = member_auth._row_to_member(guest_row)
-    response = generate(GenerateRequest(prompt=req.prompt, tool="chat"), request)
-
-    # Only a request that actually made it through generate()'s own
-    # gates (capacity, live-worker, quota) counts against the throttle
-    # — a 503 caused by the network being busy isn't the visitor's
-    # fault and shouldn't burn their allotment.
-    if DEMO_MAX_PER_IP > 0:
-        n = int(r.incr(throttle_key))
-        if n == 1:
-            r.expire(throttle_key, DEMO_WINDOW_SECONDS)
-    return response
-
-
-@app.get("/demo/result/{job_id}")
-def demo_result(job_id: str, request: Request):
-    """Public result poll for a demo job. Scoped to jobs actually
-    submitted by the shared guest member — job IDs are unguessable
-    UUIDs, so this is defense-in-depth on top of that, not the primary
-    guarantee, matching the same reasoning /result's own ownership gate
-    documents."""
-    if not DEMO_ENABLED:
-        raise HTTPException(
-            status_code=404, detail="demo mode is not enabled on this deployment",
-        )
-    row = db.get_job(job_id)
-    submitted_by = (
-        row["submitted_by_member_id"]
-        if row is not None and "submitted_by_member_id" in row.keys()
-        else None
-    )
-    if row is None or submitted_by != GUEST_MEMBER_ID:
-        raise HTTPException(status_code=404, detail="job not found")
-    guest_row = db.get_member(GUEST_MEMBER_ID)
-    request.state.member = (
-        member_auth._row_to_member(guest_row) if guest_row is not None else None
-    )
-    return result(job_id, request)
 
 
 @app.post("/me/password")

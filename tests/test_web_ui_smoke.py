@@ -86,7 +86,6 @@ class WebUISmokeTests(unittest.TestCase):
         cls.db = coordinator_main.db
         cls.r = _FAKE
         coordinator_main.ensure_admin_seed()
-        coordinator_main.ensure_guest_seed()
         # Browser-auth slice: the web UI gates non-public pages on the
         # session cookie. For tests we stamp it as the admin so existing
         # smoke coverage of /, /dashboard, /admin/* keeps working. The
@@ -1182,23 +1181,21 @@ class WebUISmokeTests(unittest.TestCase):
         # real feature set is visible to sell the product.
         self.assertIn(b'title="Sign up to unlock image generation"', resp.content)
 
-    def test_demo_generate_and_result_round_trip_without_a_session(self):
+    def test_demo_page_makes_no_backend_calls(self):
+        # The demo used to proxy to a real /demo/generate job on the
+        # coordinator (real inference cost, bot-spammable). It's now
+        # entirely client-side — confirm both that the old API surface
+        # is gone and that the page's own script never references it,
+        # so a bot hitting the page (or the old URLs directly) can't
+        # trigger real inference.
         anon = TestClient(client_web.app, follow_redirects=False)
-        gen = anon.post("/api/demo/generate", json={"prompt": "hi there"})
-        self.assertEqual(gen.status_code, 200, gen.text)
-        job_id = gen.json()["job_id"]
-        res = anon.get(f"/api/demo/result/{job_id}")
-        self.assertEqual(res.status_code, 200, res.text)
-        self.assertEqual(res.json()["status"], "pending")
-
-    def test_demo_generate_proxy_requires_no_auth_header(self):
-        # Confirms the proxy really goes through the public client, not
-        # the admin one this test module patches by default elsewhere —
-        # a plain unauthenticated request must succeed.
-        anon = TestClient(client_web.app, follow_redirects=False)
-        anon.headers.pop("Authorization", None)
-        resp = anon.post("/api/demo/generate", json={"prompt": "no auth here"})
-        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(
+            anon.post("/api/demo/generate", json={"prompt": "hi"}).status_code, 404,
+        )
+        self.assertEqual(anon.get("/api/demo/result/anything").status_code, 404)
+        page = anon.get("/demo")
+        self.assertNotIn(b"/api/demo", page.content)
+        self.assertIn(b"CANNED_REPLIES", page.content)
 
 
 if __name__ == "__main__":

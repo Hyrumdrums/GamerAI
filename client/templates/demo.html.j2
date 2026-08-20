@@ -78,6 +78,32 @@
   const sendBtn = document.getElementById('demo-send');
   const status = document.getElementById('demo-status');
 
+  // Entirely client-side — no request ever leaves the browser. A
+  // public, no-account page is bot bait; hand-picking a canned line
+  // from this list costs nothing no matter how much traffic it gets,
+  // and it means the banner above ("canned sample replies, not a live
+  // model") is literally true rather than aspirational.
+  const CANNED_REPLIES = [
+    "This is a demo screen, not a live model — just one of a handful of scripted replies. The real thing can also **generate images** right in the chat. Download the agent to try it for real.",
+    "Canned response here, no model behind it. On the real network you can flip on **web search** and I'll cite live sources in the answer.",
+    "Just a scripted line — this page never calls the network. Real members can enable **Smart Mode**, which routes to a much larger 14B-parameter model for harder questions.",
+    "This reply is fixed text, not a generated one. On the full app, conversations are saved, so I actually remember what we talked about five minutes ago.",
+    "Demo mode: canned text, zero GPU cycles spent. The real GamerAI runs entirely on volunteers' gaming PCs — no subscription, and nobody trains on your prompts.",
+    "No model wrote this — it's one of a handful of scripted demo lines. The real app can **read responses aloud**; tap the speaker icon on any message.",
+    "Static placeholder text, not a real answer. Running the agent on your own PC earns you a higher daily quota — the more you contribute, the more you get back.",
+    "This is a demo reply picked at random, not a response to what you actually asked. Download the agent and every message after that runs on a real model, not a script.",
+    "Nothing but scripted text so far — this page makes no network calls at all. The real app supports multi-turn conversations, image generation, live web search, and read-aloud, all in one place.",
+    "Canned demo output — no inference happened. Contributors keep the network running by sharing spare GPU time; in return, everyone on their invite tree gets free access to the whole toolbox.",
+  ];
+  let lastIndex = -1;
+  function pickReply() {
+    if (CANNED_REPLIES.length === 1) return CANNED_REPLIES[0];
+    let i;
+    do { i = Math.floor(Math.random() * CANNED_REPLIES.length); } while (i === lastIndex);
+    lastIndex = i;
+    return CANNED_REPLIES[i];
+  }
+
   function addBubble(text, role) {
     if (empty) { empty.remove(); empty = null; }
     const msg = document.createElement('div');
@@ -99,37 +125,7 @@
     return msg;
   }
 
-  async function poll(jobId, pendingMsg) {
-    const started = Date.now();
-    while (Date.now() - started < 60000) {
-      await new Promise((res) => setTimeout(res, 1000));
-      let resp;
-      try {
-        resp = await fetch('/api/demo/result/' + encodeURIComponent(jobId));
-      } catch (e) {
-        continue; // transient network hiccup — keep polling within the deadline
-      }
-      if (!resp.ok) {
-        pendingMsg.remove();
-        status.textContent = 'That request failed (status ' + resp.status + ').';
-        return;
-      }
-      const data = await resp.json();
-      if (data.done) {
-        pendingMsg.remove();
-        if (data.status === 'error') {
-          status.textContent = data.error || 'The demo worker reported an error.';
-        } else {
-          addBubble(data.text || '(empty response)', 'assistant');
-        }
-        return;
-      }
-    }
-    pendingMsg.remove();
-    status.textContent = 'Timed out waiting for a response. Please try again.';
-  }
-
-  form.addEventListener('submit', async (ev) => {
+  form.addEventListener('submit', (ev) => {
     ev.preventDefault();
     const prompt = input.value.trim();
     if (!prompt) return;
@@ -140,27 +136,16 @@
     sendBtn.disabled = true;
     const pendingMsg = addBubble('…thinking…', 'assistant');
     pendingMsg.querySelector('.bubble').classList.add('pending');
-    try {
-      const resp = await fetch('/api/demo/generate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt }),
-      });
-      const data = await resp.json();
-      if (!resp.ok) {
-        pendingMsg.remove();
-        status.textContent = data.detail || ('Request failed (status ' + resp.status + ').');
-      } else {
-        await poll(data.job_id, pendingMsg);
-      }
-    } catch (e) {
+    // Small random delay so the reply doesn't pop in instantly — makes
+    // the "thinking" state read as intentional rather than broken.
+    const delay = 500 + Math.random() * 700;
+    setTimeout(() => {
       pendingMsg.remove();
-      status.textContent = 'Network error — please try again.';
-    } finally {
+      addBubble(pickReply(), 'assistant');
       input.disabled = false;
       sendBtn.disabled = false;
       input.focus();
-    }
+    }, delay);
   });
 
   input.addEventListener('keydown', (ev) => {
