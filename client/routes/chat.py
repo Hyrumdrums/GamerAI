@@ -1,6 +1,6 @@
-"""Chat shell and admin dashboard. Both gate on session — the chat
-route redirects anonymous visitors to /login; the dashboard additionally
-requires the admin role."""
+"""Chat shell and admin dashboard. Anonymous visitors to / get a public
+landing page (not a /login redirect — a stranger with no context needs
+somewhere to land); the dashboard requires the admin role."""
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
@@ -18,7 +18,7 @@ router = APIRouter()
 async def index(request: Request):
     bearer = session_bearer(request)
     if not bearer or not await identify(bearer):
-        return login_redirect("/")
+        return templates.TemplateResponse(request, "landing.html.j2", {})
     return templates.TemplateResponse(
         request, "chat.html.j2",
         {"cache_version": CLIENT_CACHE_VERSION},

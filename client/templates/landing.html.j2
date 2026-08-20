@@ -1,0 +1,38 @@
+{% extends "base.html.j2" %}
+{% block title %}GamerAI — a distributed AI compute network{% endblock %}
+{% block extra_css %}
+<style>
+  .landing-actions { display: flex; flex-wrap: wrap; gap: .6rem; margin: 1.25rem 0; }
+  .hint { color: var(--muted); font-size: .9rem; margin-top: 1rem; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="page">
+  <h1>GamerAI</h1>
+  <div class="muted" style="margin-bottom:1.25rem">
+    A distributed AI compute network — members run a small agent on their
+    own PC, and idle GPU/CPU time gets pooled into a shared job queue that
+    serves chat requests across the network. Signing up and running the
+    agent is how you join; there's no central inference bill because the
+    compute comes from the members themselves.
+  </div>
+
+  <div class="card">
+    <div class="landing-actions">
+      <a class="btn" href="/demo">Try the demo</a>
+      <a class="btn btn-quiet" href="/download/">Download the agent</a>
+      <a class="btn btn-quiet" href="https://github.com/Hyrumdrums/GamerAI">View on GitHub</a>
+    </div>
+    <div class="muted">
+      The demo needs no install — a rate-limited preview running on the
+      network's smallest model. Download the agent to join the network for
+      real: it walks you through creating an account on first run.
+    </div>
+  </div>
+
+  <div class="hint">
+    Already have an account? <a href="/login">Sign in</a>.
+  </div>
+</div>
+{% endblock %}

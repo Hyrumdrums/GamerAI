@@ -617,12 +617,19 @@ class WebUISmokeTests(unittest.TestCase):
     # ------------------------------------------------------------------
     # session-cookie auth (browser-auth slice)
     # ------------------------------------------------------------------
-    def test_index_redirects_to_login_without_session(self):
-        """A visitor without a session cookie cannot see the chat UI."""
+    def test_index_shows_landing_page_without_session(self):
+        """A visitor without a session cookie gets the public landing page
+        (not the chat UI, and not a bare redirect to /login — a stranger
+        with no account needs somewhere to land with context)."""
         anon = TestClient(client_web.app, follow_redirects=False)
         resp = anon.get("/")
-        self.assertIn(resp.status_code, (302, 303, 307))
-        self.assertIn("/login", resp.headers["location"])
+        self.assertEqual(resp.status_code, 200)
+        body = resp.text
+        self.assertIn("GamerAI", body)
+        self.assertIn('href="/demo"', body)
+        self.assertIn('href="/login"', body)
+        # Must NOT be the authenticated chat shell.
+        self.assertNotIn('id="composer"', body)
 
     def test_login_page_renders(self):
         anon = TestClient(client_web.app, follow_redirects=False)
