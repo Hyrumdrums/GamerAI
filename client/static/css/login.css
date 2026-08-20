@@ -1,4 +1,5 @@
 .page { max-width: 420px; }
+.page h1 a { color: inherit; text-decoration: none; }
 form .label { display: block; margin-top: .75rem; margin-bottom: .25rem;
               color: var(--muted); font-size: .85rem; }
 form input[type=text],
