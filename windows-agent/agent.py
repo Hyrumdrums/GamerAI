@@ -9,7 +9,7 @@ Usage:
     python agent.py --background         # deprecated alias for --tray
     python agent.py --config config.json
     python agent.py --once               # process at most one job, then exit
-    python agent.py --status             # print local earnings totals and exit
+    python agent.py --status             # print local job stats and exit
 
 This file is single-file by design so it can be packaged with:
     pyinstaller --onefile --name agent agent.py
@@ -47,7 +47,7 @@ IS_WINDOWS = platform.system() == "Windows"
 # the moment it starts. The CI-generated version.txt (short-sha +
 # build timestamp) is still what the self-updater diffs against;
 # AGENT_VERSION is just the human-facing label.
-AGENT_VERSION = "1.3.2"
+AGENT_VERSION = "1.3.3"
 
 # Base64-encoded Ed25519 PUBLIC key used to verify self-update payloads.
 # When this is non-empty, the self-updater REQUIRES a valid signature on
@@ -4797,11 +4797,9 @@ def is_system_idle(cfg: Config, *, check_gpu: bool = True) -> tuple[bool, str]:
 # Main loop
 # ---------------------------------------------------------------------------
 def print_earnings(state: dict, log: logging.Logger) -> None:
-    log.info(
-        "Jobs completed: %d | Earnings: $%.6f",
-        int(state.get("jobs", 0)),
-        float(state.get("earnings_usd", 0.0)),
-    )
+    # No $ figure here — we're not paying contributors yet, so the
+    # terminal only shows jobs done, not an implied balance.
+    log.info("Jobs completed: %d", int(state.get("jobs", 0)))
 
 
 # How often the main loop logs a "status: idle/busy/offline" line for
@@ -5423,8 +5421,8 @@ def process_one(
                     state, last_tool="image", earnings=earnings,
                 )
                 log.info(
-                    "job %s finished (image): $%.8f, %.2fs",
-                    job_id, earnings, duration,
+                    "job %s finished (image): %.2fs",
+                    job_id, duration,
                 )
             else:
                 log.info(
@@ -5726,8 +5724,8 @@ def process_one(
                     tokens=int(result["completion_tokens"]),
                 )
                 log.info(
-                    "job %s finished (%s): %d tokens, $%.8f, %.2fs",
-                    job_id, tool, result["completion_tokens"], earnings, duration,
+                    "job %s finished (%s): %d tokens, %.2fs",
+                    job_id, tool, result["completion_tokens"], duration,
                 )
             else:
                 log.info(
@@ -5861,8 +5859,8 @@ def process_tts_one(
                 state, last_tool=None, earnings=earnings,
             )
             log.info(
-                "tts job %s finished: %.2fs audio, $%.8f, %.2fs synth",
-                job_id, audio_seconds, earnings, duration,
+                "tts job %s finished: %.2fs audio, %.2fs synth",
+                job_id, audio_seconds, duration,
             )
         else:
             log.info(
@@ -6157,7 +6155,6 @@ def cmd_diagnose(cfg: Config) -> int:
     section("State")
     info("jobs done", str(int(state.get("jobs", 0))))
     info("tokens", str(int(state.get("tokens", 0))))
-    info("earnings", f"${float(state.get('earnings_usd', 0.0)):.6f}")
     info("last tool", str(state.get("last_tool") or "(none yet)"))
     print()
 
@@ -6231,7 +6228,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--once", action="store_true",
                    help="process at most one job and exit (useful for tests)")
     p.add_argument("--status", action="store_true",
-                   help="print local earnings totals and exit")
+                   help="print local job stats and exit")
     p.add_argument("--version", action="store_true",
                    help="print agent version + build id and exit")
     p.add_argument("--diagnose", action="store_true",
@@ -6819,7 +6816,6 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"worker_id: {worker_id}")
         print(f"jobs:      {state.get('jobs', 0)}")
         print(f"tokens:    {state.get('tokens', 0)}")
-        print(f"earnings:  ${float(state.get('earnings_usd', 0.0)):.6f}")
         return 0
 
     # Update-applied toast + welcome-banner marker. Uses the

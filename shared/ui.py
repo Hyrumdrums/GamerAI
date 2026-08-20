@@ -54,10 +54,16 @@ body {{
   -webkit-text-size-adjust: 100%;
 }}
 a {{ color: var(--brand); text-decoration: none; }}
+a:visited {{ color: var(--brand); }}
 a:hover {{ text-decoration: underline; }}
 h1, h2, h3 {{ line-height: 1.25; }}
 h1 {{ font-size: 1.4rem; margin: 0 0 .5rem; }}
 h2 {{ font-size: 1.1rem; margin: 1.5rem 0 .5rem; }}
+/* Site-title-as-home-link (e.g. /tos's <h1><a href="/">GamerAI</a></h1>,
+   mirrors the client's login page): pin to the body text color in both
+   link states so clicking it never leaves it looking like a "visited"
+   blue link. */
+.page h1 a, .page h1 a:visited {{ color: var(--text); text-decoration: none; }}
 code {{
   background: var(--code-bg); padding: .05rem .3rem; border-radius: 3px;
   font-size: .9em; font-family: var(--mono);
@@ -116,8 +122,10 @@ input:focus, textarea:focus {{ outline: 0; border-color: var(--brand); }}
   gap: .5rem;
 }}
 .topbar .brand {{ font-weight: 600; color: var(--text); }}
+.topbar .brand:visited {{ color: var(--text); }}
 .topbar .topbar-actions {{ display: flex; gap: .9rem; align-items: center; }}
 .topbar a {{ color: var(--brand); }}
+.topbar a:visited {{ color: var(--brand); }}
 /* On phones, hide non-essential topbar items; admin/terms/logout still
    reachable from the dashboard. Override per page if needed. */
 .topbar .hide-mobile {{ display: none; }}

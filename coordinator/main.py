@@ -1624,6 +1624,7 @@ _TOS_HTML_TEMPLATE = _Template(
     + "<title>GamerAI — Community ToS</title>"
     + "<style>" + _BASE_CSS + _TOS_CSS + "</style></head>"
     + '<body><div class="page">'
+    + '<h1><a href="/">GamerAI</a></h1>'
     + '<div class="meta">Version <strong>$version</strong> · '
       '<a href="/tos/raw">view raw</a></div>'
     + '<div id="content"><span id="loading">Loading terms…</span></div>'
