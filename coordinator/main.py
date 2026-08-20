@@ -35,6 +35,7 @@ from shared.auth import API_TOKEN, AUTH_ENABLED, is_public_path
 from shared.config import (
     CANARY_INTERVAL_SECONDS,
     CANARY_PENDING,
+    CANARY_REAL_JOBS_SINCE,
     IMAGE_REWRITE_PENDING,
     IMAGE_UNIT_COST_BASE,
     SEARCH_REWRITE_PENDING,
@@ -2082,6 +2083,10 @@ def generate(req: GenerateRequest, request: Request):
         tool=tool,
         status=("awaiting_rewrite" if needs_rewrite else "pending"),
     )
+    # Feeds the canary injector's traffic gate (see coordinator/canaries.py)
+    # — counts real, customer-facing submissions only, not the hidden
+    # rewrite/summary jobs this handler may also enqueue below.
+    r.incr(CANARY_REAL_JOBS_SINCE)
     # Persist the user turn and an empty pending assistant turn now,
     # not at /jobs/complete time. This means: (a) a client that
     # disconnects mid-stream can reload /conversations and see its
@@ -4938,6 +4943,8 @@ def retry_message(message_id: str, request: Request):
         # rare but possible. Release the cooldown and surface a 409.
         r.delete(cd_key)
         raise HTTPException(status_code=409, detail="message no longer in error state")
+    # Feeds the canary injector's traffic gate — see coordinator/canaries.py.
+    r.incr(CANARY_REAL_JOBS_SINCE)
     db.touch_conversation(msg["conversation_id"], submitted_at)
     job = {
         "job_id": new_job_id,

@@ -9,6 +9,18 @@ tampered-with model.
 
 The worker never sees a canary marker — that mapping (job_id ->
 canary_id) lives in Redis only on the coordinator side.
+
+Injection is gated on real traffic (CANARY_MIN_REAL_JOBS): on an idle
+network a canary would be the *only* job a worker sees, trivially
+identifiable and wasteful of a canary slot besides. /generate INCRs
+CANARY_REAL_JOBS_SINCE for each customer-facing job; this module reads
+it, and only fires once real traffic has crossed the threshold.
+
+Injection is also gated on tool liveness (shared/worker_liveness.py):
+the traffic counter above is tool-agnostic, so real chat:smart/image/
+search jobs alone can satisfy it while zero workers actually serve
+plain "chat" — the tool every canary envelope targets. Without this
+second gate, canaries queue up behind nothing and never get consumed.
 """
 from __future__ import annotations
 
@@ -21,9 +33,12 @@ import uuid
 
 from shared.config import (
     CANARY_INTERVAL_SECONDS,
+    CANARY_MIN_REAL_JOBS,
     CANARY_PENDING,
+    CANARY_REAL_JOBS_SINCE,
     job_queue_for,
 )
+from shared.worker_liveness import has_live_worker_for_tool
 
 log = logging.getLogger("coordinator.canaries")
 
@@ -63,11 +78,13 @@ class CanaryInjector(threading.Thread):
         redis_client,
         db,
         interval: float = CANARY_INTERVAL_SECONDS,
+        min_real_jobs: int = CANARY_MIN_REAL_JOBS,
     ):
         super().__init__(name="canary-injector")
         self.r = redis_client
         self.db = db
         self.interval = float(interval)
+        self.min_real_jobs = int(min_real_jobs)
         self._stop = threading.Event()
         self._rng = random.Random()
 
@@ -92,11 +109,31 @@ class CanaryInjector(threading.Thread):
             self._stop.wait(self.interval)
 
     def _tick(self) -> None:
+        # Skip the tick entirely on an idle network — no point spending
+        # a canary slot when there's been no real traffic to hide it in
+        # (or no workers around to have submitted any). Doesn't reset
+        # the counter: a quiet stretch just lets real jobs accumulate
+        # toward the threshold for the next tick.
+        if self.min_real_jobs > 0:
+            real_jobs = int(self.r.get(CANARY_REAL_JOBS_SINCE) or 0)
+            if real_jobs < self.min_real_jobs:
+                return
+        # Canary envelopes are pinned to tool="chat" (see _inject). Real
+        # traffic on ANY tool satisfies the gate above, so without this
+        # check a chat:smart-only network (a live worker, just not one
+        # that serves plain "chat") looks identical to a busy, healthy
+        # one — and canaries keep piling into a queue nobody is
+        # draining. This is exactly what produced a ~68-day, ~9,900-job
+        # backlog in prod (2026-06-13 to 2026-08-20) once the only
+        # online workers advertised chat:smart/tts instead of chat.
+        if not has_live_worker_for_tool(self.r, "chat"):
+            return
         canaries = self.db.list_active_canaries()
         if not canaries:
             return
         canary = self._rng.choice(canaries)
         self._inject(canary)
+        self.r.set(CANARY_REAL_JOBS_SINCE, 0)
 
     def _inject(self, canary) -> None:
         job_id = str(uuid.uuid4())

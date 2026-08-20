@@ -291,6 +291,104 @@ class CanaryEndToEndTests(_BaseE2E):
         self.assertEqual(found["canary_score"]["score"], 1.0)
 
 
+class CanaryTrafficGateTests(_BaseE2E):
+    """A canary tick should be a no-op on an idle network — no real
+    jobs submitted since the last injection — regardless of how many
+    active canaries are seeded, and should fire once enough real
+    traffic has accumulated."""
+
+    def _seed_canary(self, prompt: str = "planet?", tokens=None, model: str = "llama3.2:1b") -> str:
+        canary_id = "can_" + uuid.uuid4().hex[:12]
+        self.db.create_canary(
+            canary_id=canary_id,
+            prompt=prompt,
+            required_tokens_json=json.dumps(tokens or ["earth"]),
+            model=model,
+            active=True,
+        )
+        return canary_id
+
+    def test_tick_skips_when_no_real_traffic(self):
+        from shared.config import CANARY_PENDING, CANARY_REAL_JOBS_SINCE
+        from coordinator.canaries import CanaryInjector
+
+        self._seed_canary()
+        self.r.delete(CANARY_REAL_JOBS_SINCE)
+        before = self.r.hlen(CANARY_PENDING)
+        injector = CanaryInjector(self.r, self.db, min_real_jobs=3)
+        injector._tick()
+        self.assertEqual(self.r.hlen(CANARY_PENDING), before)
+
+    def test_tick_skips_below_threshold(self):
+        from shared.config import CANARY_PENDING, CANARY_REAL_JOBS_SINCE
+        from coordinator.canaries import CanaryInjector
+
+        self._seed_canary()
+        self.r.set(CANARY_REAL_JOBS_SINCE, 2)
+        before = self.r.hlen(CANARY_PENDING)
+        injector = CanaryInjector(self.r, self.db, min_real_jobs=3)
+        injector._tick()
+        self.assertEqual(self.r.hlen(CANARY_PENDING), before)
+
+    def test_tick_fires_once_threshold_met_and_resets_counter(self):
+        from shared.config import CANARY_PENDING, CANARY_REAL_JOBS_SINCE
+        from coordinator.canaries import CanaryInjector
+
+        self._seed_canary()
+        # A live chat worker must be online for the tool-liveness gate
+        # to allow firing — see test_tick_skips_when_no_live_chat_worker.
+        _, t = self._make_contributor(email="canary-fire-worker@x.com")
+        wid = f"wkr-canary-{uuid.uuid4().hex[:6]}"
+        self.client.post(
+            "/register", json={"worker_id": wid},
+            headers={"Authorization": f"Bearer {t}"},
+        )
+        self.r.set(CANARY_REAL_JOBS_SINCE, 3)
+        before = self.r.hlen(CANARY_PENDING)
+        injector = CanaryInjector(self.r, self.db, min_real_jobs=3)
+        injector._tick()
+        self.assertEqual(self.r.hlen(CANARY_PENDING), before + 1)
+        self.assertEqual(int(self.r.get(CANARY_REAL_JOBS_SINCE)), 0)
+
+    def test_tick_skips_when_no_live_chat_worker(self):
+        """Reproduces the 2026-06-13 prod incident: real traffic on
+        other tools (chat:smart, image, ...) satisfies the traffic
+        gate, but no worker actually serves plain "chat" — the tool
+        every canary envelope targets. A canary must not fire into a
+        queue nobody is going to drain."""
+        from shared.config import CANARY_PENDING, CANARY_REAL_JOBS_SINCE, WORKER_HEARTBEATS
+        from coordinator.canaries import CanaryInjector
+
+        self._seed_canary()
+        self.r.set(CANARY_REAL_JOBS_SINCE, 3)
+        # No worker registered — simulates a chat:smart-only network.
+        # Explicit clear: this class shares one fakeredis instance across
+        # all its tests (no per-test reset), and a sibling test registers
+        # a worker of its own.
+        self.r.delete(WORKER_HEARTBEATS)
+        before = self.r.hlen(CANARY_PENDING)
+        injector = CanaryInjector(self.r, self.db, min_real_jobs=3)
+        injector._tick()
+        self.assertEqual(self.r.hlen(CANARY_PENDING), before)
+        # Counter stays put — a real job once a chat worker actually
+        # comes online should still be able to trip the gate.
+        self.assertEqual(int(self.r.get(CANARY_REAL_JOBS_SINCE)), 3)
+
+    def test_generate_increments_real_job_counter(self):
+        from shared.config import CANARY_REAL_JOBS_SINCE
+
+        self.r.delete(CANARY_REAL_JOBS_SINCE)
+        before = int(self.r.get(CANARY_REAL_JOBS_SINCE) or 0)
+        resp = self.client.post(
+            "/generate",
+            json={"prompt": "hello canary gate", "tool": "chat"},
+            headers=self._admin_headers(),
+        )
+        self.assertEqual(resp.status_code, 200)
+        after = int(self.r.get(CANARY_REAL_JOBS_SINCE) or 0)
+        self.assertEqual(after, before + 1)
+
+
 class WorkerOwnershipTests(_BaseE2E):
     """Worker→member binding (2026-05-13 security slice). A
     non-admin member cannot act on a worker_id owned by someone else.

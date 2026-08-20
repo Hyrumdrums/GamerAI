@@ -163,9 +163,15 @@ STRICT_MODELS = _bool("STRICT_MODELS", False)
 
 # --- canaries (community-trust monitoring) ---
 # Background task injects one canary every CANARY_INTERVAL_SECONDS, but
-# only if there's at least one live worker AND at least one active
-# canary seeded. Set to 0 to disable injection entirely.
+# only if there's at least one active canary seeded AND at least
+# CANARY_MIN_REAL_JOBS real (customer-facing) jobs have been submitted
+# since the last injection. Set to 0 to disable injection entirely.
 CANARY_INTERVAL_SECONDS = _int("CANARY_INTERVAL_SECONDS", 600)  # 10 min
+# Below this many real jobs since the last canary, skip the tick
+# entirely — an idle network (no traffic, or no workers to generate
+# any) shouldn't keep burning canary slots that no one is around to
+# cheat on. Set to 0 to go back to firing on the timer alone.
+CANARY_MIN_REAL_JOBS = _int("CANARY_MIN_REAL_JOBS", 3)
 # Recent-window depth used to compute per-worker canary scores.
 CANARY_SCORE_WINDOW = _int("CANARY_SCORE_WINDOW", 50)
 
@@ -248,6 +254,10 @@ WORKER_CAPABILITIES = "worker_capabilities"
 # as canaries. Coordinator consults this on /jobs/complete to recognize
 # canary results; workers never see this key.
 CANARY_PENDING = "canary_pending"
+# Redis counter: real (customer-facing) jobs submitted since the last
+# canary injection. /generate INCRs it; CanaryInjector reads it against
+# CANARY_MIN_REAL_JOBS and resets it to 0 after each injection.
+CANARY_REAL_JOBS_SINCE = "canary_real_jobs_since"
 
 # Redis hash mapping rewrite_chat_job_id -> JSON({image_job_id,
 # image_envelope, original_prompt}). Set by /generate when an image
