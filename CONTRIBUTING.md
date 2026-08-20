@@ -6,13 +6,28 @@ walking into.
 ## Where this project is right now
 
 GamerAI is a working, publicly-deployed system with one operator and
-one production coordinator (`ai.dallinlayton.com`). It's open source
-so you can read it, run it, fork it, and see how a real distributed
-job-queue + membership system is put together — not because it's
-staffed to review a high volume of external pull requests. Issues and
-small, focused PRs (bug fixes, doc corrections, test additions) are
-genuinely welcome; large feature PRs are more likely to sit unless we
+one production coordinator (`ai.dallinlayton.com`). It's source-available
+(see [Licensing](#licensing) below — not a traditional open-source license)
+so you can read it, run it, fork it for noncommercial purposes, and see how
+a real distributed job-queue + membership system is put together — not
+because it's staffed to review a high volume of external pull requests.
+Issues and small, focused PRs (bug fixes, doc corrections, test additions)
+are genuinely welcome; large feature PRs are more likely to sit unless we
 talk first.
+
+## Licensing
+
+This project is licensed under [PolyForm Noncommercial
+1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0), not a
+standard OSI open-source license — noncommercial use (reading, running,
+modifying, forking, learning from it) is unrestricted, but commercial use
+requires a separate agreement with the copyright holder. **By submitting a
+pull request, you agree that your contribution is licensed under the same
+terms as the rest of the project, and you grant the maintainer the right to
+relicense the project (including your contribution) under different terms
+in the future** — e.g. if a commercial license gets negotiated with a
+company. If that's a dealbreaker for a contribution you have in mind, open
+an issue first and say so before sending a PR.
 
 ## Before opening a PR
 

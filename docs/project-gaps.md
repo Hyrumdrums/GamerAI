@@ -905,7 +905,12 @@ expands for paid pricing in 3b.ii.
 
 ### 🟡 No legal: ToS, privacy policy — partial
 
-Code now licensed Apache-2.0 (see `LICENSE`). Still missing under the
+Code now licensed under PolyForm Noncommercial 1.0.0 (see `LICENSE`) —
+switched from the original Apache-2.0 pick ahead of going public, so
+free/noncommercial use (reading, running, forking, learning from it)
+stays open with no gate, but a company wanting to actually deploy or
+sell on top of it needs to come talk to the copyright holder first.
+Still missing under the
 community-powered framing:
 - **Community ToS + acceptable-use policy** — covers all members
   (contributors and invitees), not just paid customers.
@@ -978,7 +983,8 @@ work them in. Highest leverage first.
 
 1. ~~**Ship bearer-auth end-to-end**.~~ ✅ Done.
 2. ~~**Idempotency keys + rate limit + GitHub Actions CI.**~~ ✅ Done.
-3. ~~**License the code (Apache-2.0).**~~ ✅ Done.
+3. ~~**License the code.**~~ ✅ Done — PolyForm Noncommercial 1.0.0
+   (originally Apache-2.0; switched pre-launch, see § 5 "No legal" above).
 4. ~~**Coordinator integration tests** (job round-trip, reaper requeue,
    idempotency, capabilities).~~ ✅ Done — `test_coordinator_e2e.py`
    with ``fakeredis``.

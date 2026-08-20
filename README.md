@@ -865,4 +865,9 @@ this?" objection from enterprise customers.
 
 ## 15. License
 
-Apache-2.0. See `LICENSE` for the full text.
+[PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0) —
+see `LICENSE` for the full text. In short: you can read, run, modify, and
+share this code freely for noncommercial purposes (personal use, learning,
+research, evaluating it) with no need to ask first. Any commercial use
+requires a separate license from the copyright holder — reach out if that's
+what you have in mind.
