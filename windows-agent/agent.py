@@ -47,7 +47,7 @@ IS_WINDOWS = platform.system() == "Windows"
 # the moment it starts. The CI-generated version.txt (short-sha +
 # build timestamp) is still what the self-updater diffs against;
 # AGENT_VERSION is just the human-facing label.
-AGENT_VERSION = "1.3.4"
+AGENT_VERSION = "1.3.5"
 
 # Base64-encoded Ed25519 PUBLIC key used to verify self-update payloads.
 # When this is non-empty, the self-updater REQUIRES a valid signature on
@@ -2665,16 +2665,23 @@ def _download_to(url: str, dest: Path, log: logging.Logger, label: str) -> bool:
     static file). Falls back to byte counts when Content-Length is
     absent (e.g. a chunked-encoded response).
 
-    Recovery: if a prior run left a *.part file whose size matches the
-    server's Content-Length, skip the redownload and go straight to
-    the rename. Saves a 1.5 GB redo when only the rename failed
-    previously (the Windows Defender / WinError 32 case)."""
+    Recovery: if `dest` itself already exists (a prior run completed
+    this download and nothing has cleaned it up since — e.g. a restart
+    after an unrelated failure later in bootstrap), or a prior run left
+    a *.part file, whose size matches the server's Content-Length,
+    skip the redownload. Saves re-pulling a multi-GB file (the
+    ollama/image/tts installers and model weights) on every retry, and
+    a 1.5 GB redo when only the rename failed previously (the Windows
+    Defender / WinError 32 case). Verified against a live HEAD each
+    time rather than trusted blindly, so a mirror update to a new
+    build doesn't silently get skipped as already-downloaded."""
     staged = dest.with_suffix(dest.suffix + ".part")
-    if (
-        not dest.exists()
-        and staged.exists()
-        and staged.stat().st_size > 0
-    ):
+    existing = None
+    if dest.exists() and dest.stat().st_size > 0:
+        existing = dest
+    elif staged.exists() and staged.stat().st_size > 0:
+        existing = staged
+    if existing is not None:
         try:
             with httpx.Client(timeout=30.0, follow_redirects=True) as c:
                 head = c.head(url)
@@ -2685,7 +2692,13 @@ def _download_to(url: str, dest: Path, log: logging.Logger, label: str) -> bool:
                 label, e,
             )
             remote_total = 0
-        if remote_total > 0 and staged.stat().st_size == remote_total:
+        if remote_total > 0 and existing.stat().st_size == remote_total:
+            if existing is dest:
+                log.info(
+                    "bootstrap: %s already present (%.0f MB); skipping redownload",
+                    label, remote_total / (1024 * 1024),
+                )
+                return True
             log.info(
                 "bootstrap: %s found complete %s (%.0f MB); skipping redownload",
                 label, staged.name, remote_total / (1024 * 1024),
@@ -2779,6 +2792,13 @@ def _install_ollama(mirror_base: str, log: logging.Logger) -> Optional[Path]:
     if not _download_to(setup_url, setup_dest, log, "ollama-setup.exe"):
         return None
     log.info("bootstrap: running ollama installer (silent)")
+    log.info(
+        "bootstrap: if a 'User Account Control' / Windows Security prompt "
+        "appears asking to install a Microsoft Visual C++ Redistributable, "
+        "click Yes — that's Ollama's own installer pulling a dependency "
+        "it needs. It's expected and safe; nothing will proceed until "
+        "you answer it."
+    )
     try:
         # Ollama's Windows installer is Inno Setup-based, not NSIS/Squirrel
         # (confirmed: docs.ollama.com documents /DIR="...", which is the
@@ -2804,6 +2824,24 @@ def _install_ollama(mirror_base: str, log: logging.Logger) -> Optional[Path]:
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         log.info("bootstrap: ollama installer exited rc=%s", rc.returncode)
+        if rc.returncode != 0:
+            log.warning(
+                "bootstrap: ollama installer returned rc=%s (0 is the only "
+                "clean-success code) — most likely the Windows Security "
+                "prompt above was closed/declined rather than accepted. "
+                "Restart the agent to retry.",
+                rc.returncode,
+            )
+    except subprocess.TimeoutExpired:
+        log.warning(
+            "bootstrap: ollama installer did not finish within 600s — this "
+            "almost always means the Windows Security prompt for the VC++ "
+            "Redistributable is still sitting there waiting for a click "
+            "and nobody's watching (e.g. an unattended auto-start). If "
+            "you're at the console now, look for it; otherwise restart "
+            "the agent while logged in so you can accept it."
+        )
+        return None
     except Exception as e:
         log.warning("bootstrap: ollama installer failed to run: %s", e)
         return None
@@ -2813,7 +2851,11 @@ def _install_ollama(mirror_base: str, log: logging.Logger) -> Optional[Path]:
         if exe is not None:
             return exe
         time.sleep(1.0)
-    log.warning("bootstrap: ollama.exe not found after install")
+    log.warning(
+        "bootstrap: ollama.exe not found after install — if a security "
+        "prompt appeared and was closed/declined instead of accepted, "
+        "that's the likely cause. Restart the agent to retry."
+    )
     return None
 
 
