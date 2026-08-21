@@ -56,7 +56,6 @@ from shared.config import (
     LOGIN_FAIL_MAX,
     LOGIN_FAIL_WINDOW_SECONDS,
     MAX_PROMPT_BYTES,
-    PUBLIC_BASE_URL,
     RATE_LIMIT_PER_MIN,
     SIGNUP_MAX_PER_IP,
     SIGNUP_WINDOW_SECONDS,
@@ -4459,20 +4458,28 @@ def _email_verify_key(code: str) -> str:
     return f"email_verify:{code}"
 
 
-def _start_email_verification(member_id: str, email: str) -> bool:
+def _start_email_verification(member_id: str, email: str, request: Request) -> bool:
     """Generate a single-use verification code, store it, and try to
     send the email. Returns True iff the member should be LEFT
     unverified pending that click (Resend is configured and accepted
     the send); False means the caller should auto-verify instead
     (Resend unconfigured, or the send attempt itself failed — an
     inbox that will never see the link is not a reason to lock
-    someone out of an account they just created)."""
+    someone out of an account they just created).
+
+    ``PUBLIC_BASE_URL`` (module-level, set below in the agent-pairing
+    section — same var, reused rather than re-imported from
+    shared.config to avoid two names resolving two different ways)
+    falls back to the live request's own host, same pattern as
+    /agents/pair/start, so an unconfigured deploy still emails a
+    working absolute link instead of a bare "/verify-email?..." path."""
     if not email_send.is_configured():
         return False
     code = secrets.token_urlsafe(32)
     key = _email_verify_key(code)
     r.set(key, member_id, ex=EMAIL_VERIFY_TTL_SECONDS)
-    verify_url = f"{PUBLIC_BASE_URL}/verify-email?code={code}"
+    base = PUBLIC_BASE_URL or str(request.base_url).rstrip("/")
+    verify_url = f"{base}/verify-email?code={code}"
     if not email_send.send_verification_email(email, verify_url):
         r.delete(key)
         return False
@@ -4578,7 +4585,7 @@ def signup(req: SignupRequest, request: Request):
     # send failing) auto-verifies instead of permanently locking the
     # account out. Contributing (running the agent as a worker) is
     # never gated by this either way.
-    pending_verification = _start_email_verification(new_member_id, email)
+    pending_verification = _start_email_verification(new_member_id, email, request)
     if not pending_verification:
         db.verify_member_email(new_member_id)
 
@@ -4635,7 +4642,7 @@ def resend_verification(request: Request):
             status_code=400,
             detail="no email on file for this account",
         )
-    pending = _start_email_verification(member.member_id, member.email)
+    pending = _start_email_verification(member.member_id, member.email, request)
     if not pending:
         # Resend unconfigured, or the send failed — same fallback as
         # signup: don't leave the member stuck with no path forward.

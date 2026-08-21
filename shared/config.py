@@ -145,10 +145,10 @@ SIGNUP_WINDOW_SECONDS = _int("SIGNUP_WINDOW_SECONDS", 3600)  # 1h
 # exactly as before this slice landed. See coordinator/email_send.py.
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "").strip()
 EMAIL_FROM = os.getenv("EMAIL_FROM", "GamerAI <noreply@dallinlayton.com>")
-# Used to build the link a verification email points at (no scheme/host
-# validation — operator's responsibility per environment).
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://localhost:8000").rstrip("/")
 EMAIL_VERIFY_TTL_SECONDS = _int("EMAIL_VERIFY_TTL_SECONDS", 86400)  # 24h
+# Verification-link host: reuses coordinator.main's PUBLIC_BASE_URL
+# (agent-pairing section) rather than a second os.getenv here — same
+# env var, one source of truth, with request.base_url as its fallback.
 
 
 # --- model registry (off by default = legacy "any model name accepted") ---

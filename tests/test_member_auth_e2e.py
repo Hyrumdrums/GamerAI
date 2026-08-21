@@ -1277,6 +1277,25 @@ class SignupEmailVerificationTests(unittest.TestCase):
         reused = self.client.get(f"/verify-email?code={code}")
         self.assertEqual(reused.status_code, 400)
 
+    @mock.patch.object(coordinator_main.email_send, "send_verification_email",
+                        return_value=True)
+    @mock.patch.object(coordinator_main.email_send, "is_configured",
+                        return_value=True)
+    def test_verify_link_is_an_absolute_url(self, _is_cfg, send_mock):
+        # PUBLIC_BASE_URL is unset in this test env, so the link must
+        # fall back to the live request's own host (TestClient's
+        # "http://testserver") rather than emailing a bare
+        # "/verify-email?code=..." path with no host — a link like
+        # that renders as dead text in a real inbox. Regression guard
+        # for a shadowed-PUBLIC_BASE_URL bug caught before this shipped.
+        self.client.post("/signup", json=_signup_payload())
+        send_mock.assert_called_once()
+        _to_email, verify_url = send_mock.call_args[0]
+        self.assertTrue(
+            verify_url.startswith("http://testserver/verify-email?code="),
+            verify_url,
+        )
+
     def test_verify_email_rejects_unknown_code(self):
         resp = self.client.get("/verify-email?code=not-a-real-code")
         self.assertEqual(resp.status_code, 400)
