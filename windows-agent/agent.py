@@ -47,7 +47,7 @@ IS_WINDOWS = platform.system() == "Windows"
 # the moment it starts. The CI-generated version.txt (short-sha +
 # build timestamp) is still what the self-updater diffs against;
 # AGENT_VERSION is just the human-facing label.
-AGENT_VERSION = "1.3.3"
+AGENT_VERSION = "1.3.4"
 
 # Base64-encoded Ed25519 PUBLIC key used to verify self-update payloads.
 # When this is non-empty, the self-updater REQUIRES a valid signature on
@@ -2780,15 +2780,25 @@ def _install_ollama(mirror_base: str, log: logging.Logger) -> Optional[Path]:
         return None
     log.info("bootstrap: running ollama installer (silent)")
     try:
-        # Squirrel-based installer; /S is the silent flag. CREATE_NO_WINDOW
-        # is the Windows-only piece that actually keeps the launcher
-        # window from surfacing on first-run machines — without it, /S
-        # suppresses the install dialogs but Python still hands the
-        # child its own console window. Same pattern as _start_ollama_server
-        # below. getattr() falls back to 0 on non-Windows so the agent's
-        # unit tests (which import this module on Linux CI) stay green.
+        # Ollama's Windows installer is Inno Setup-based, not NSIS/Squirrel
+        # (confirmed: docs.ollama.com documents /DIR="...", which is the
+        # Inno Setup custom-install-path convention, not NSIS's /D=). NSIS's
+        # /S is meaningless to it and gets silently ignored, so the
+        # installer falls back to its full interactive UI — exactly what
+        # surfaced and blocked an unattended (auto-start, no one watching)
+        # install until the 600s subprocess timeout killed it. The correct
+        # Inno Setup silent set: /VERYSILENT suppresses the wizard entirely,
+        # /SUPPRESSMSGBOXES auto-answers any message box with its default,
+        # /NORESTART stops it from rebooting the box on our behalf, /SP-
+        # skips the "This will install... continue?" prompt. CREATE_NO_WINDOW
+        # is the separate Windows-only piece that keeps the launcher's own
+        # console window from surfacing — without it, even a fully silent
+        # installer still hands Python's child process its own console.
+        # Same pattern as _start_ollama_server below. getattr() falls back
+        # to 0 on non-Windows so the agent's unit tests (which import this
+        # module on Linux CI) stay green.
         rc = subprocess.run(
-            [str(setup_dest), "/S"],
+            [str(setup_dest), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-"],
             timeout=600,
             check=False,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),

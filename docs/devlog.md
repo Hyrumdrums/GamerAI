@@ -5,6 +5,53 @@ entries on top. Skim for context before resuming work.
 
 ---
 
+## 2026-08-21 — TODO: Ollama bootstrap wait timeout is too tight
+
+First real-world join test after going public: a fresh Windows GPU VPS
+running the installer, plus a re-launch on the founder's existing
+Home-PC box. The Home-PC agent hit `bootstrap: ollama did not respond
+on http://localhost:11434 within 60s` (`BOOTSTRAP_OLLAMA_WAIT_SECONDS`,
+agent.py) even though Ollama has served chat from that same machine
+before — so it registered as `tools: ["image"]` only, and chat showed
+"no community members are available" while image gen worked fine.
+Confirmed live in the coordinator's worker registry (Redis
+`worker_capabilities`) that the affected worker is still chat-less.
+
+**TODO:** come back to this. Likely just needs a longer wait window
+(a cold-start Ollama launch competing with Defender scanning the
+freshly-spawned exe — the same class of delay this file already
+documents for the image/model rename retries — could plausibly beat
+60s), but confirm the real cause on that machine first rather than
+guessing at a new constant blind.
+
+**Update — confirmed + fixed, same session:** the new GPU VPS's Ollama
+installer hung the full 600s on its first auto-start run, then on a
+second run (after the VPS itself rebooted) its window visibly popped
+up and got manually closed. Root cause: `_install_ollama` passed `/S`
+(the NSIS silent flag) to `ollama-setup.exe`, but Ollama's Windows
+installer is actually Inno Setup-based — confirmed via
+docs.ollama.com documenting `/DIR="..."` (Inno Setup's custom-path
+flag, not NSIS's `/D=`). `/S` was silently ignored, so the installer
+fell back to its full interactive wizard, which nobody was there to
+click through on an unattended auto-start box. Fixed: swapped in the
+real Inno Setup silent set — `/VERYSILENT /SUPPRESSMSGBOXES
+/NORESTART /SP-`.
+
+The `/register` 401 loop this same VPS hit turned out to be unrelated
+and much simpler once traced end-to-end (verbose curl + hashing the
+actual token against the prod DB by hand): the token persisted to
+`state.json` right after signup never matched what the coordinator
+actually issued for that account, for reasons that didn't resolve
+under code review — `run_signup_flow`'s token-write path is about as
+simple as code gets, single `state` dict threaded through `main()`,
+nothing else touches `api_token`. The VPS crashed/rebooted mid-session,
+which may or may not be related. Not chasing further without a
+reproducible case — next occurrence, verify the fresh token
+immediately post-signup before letting bootstrap run for 13 minutes
+first.
+
+---
+
 ## 2026-06-12 — Smart mode: 14B chat split across two machines (agent v1.3.0)
 
 First slice of the Phase 4 big-model plan: an opt-in "smart" chat tier
