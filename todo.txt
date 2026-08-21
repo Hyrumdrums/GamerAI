@@ -40,8 +40,7 @@ DONE 2026-08-21: search-toggle bug ("cool"/"hi"/"error?" came back as fully
     which routes through the existing except-Exception handler and reports
     status="error" instead — client shows "Generation failed." + a retry
     button, and the agent log gets a proper log.exception line. Applies to
-    chat, search, and smart-mode jobs (same code path). Not yet
-    version-bumped/deployed — pending go-ahead.
+    chat, search, and smart-mode jobs (same code path). Shipped in v1.3.6.
 
 DONE 2026-08-21: image-gen crash on the GPU VPS test machine, sd.exe rc=
   3221226505 (STATUS_STACK_BUFFER_OVERRUN) loading dreamshaperXL-lightning
@@ -70,3 +69,16 @@ DONE 2026-08-21: image-gen crash on the GPU VPS test machine, sd.exe rc=
     more -- options on the table if so: pin a newer sd.exe release, swap
     to a uniformly-quantized (non-mixed-dtype) model variant, or file
     upstream with leejet/stable-diffusion.cpp.
+
+DONE 2026-08-21: /register 401 token-mismatch mystery (state.json's token
+  never matching the coordinator DB) recurred a second time on the same GPU
+  VPS during a clean re-install flight test. Root-caused with direct machine
+  access (a Claude session running on the VPS via Remote Control): the
+  installer's postinstall "Launch now" checkbox + plain Start Menu/Desktop
+  icons launch agent.exe with no --tray flag, and single-instance protection
+  (_claim_single_instance) only ran for --tray launches -- so a plain console
+  launch had zero protection against a second agent.exe process existing at
+  the same time, and the two would silently clobber each other's state.json
+  writes (including a just-issued signup token) with no coordination at all.
+  Fixed: single-instance claiming now runs for any long-running launch, not
+  just tray mode (still exempts --once/--status). Shipped in v1.3.7.

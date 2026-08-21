@@ -5,6 +5,42 @@ entries on top. Skim for context before resuming work.
 
 ---
 
+## 2026-08-21 — v1.3.7: single-instance protection for non-tray launches
+
+Third round of the same field-test session, following up on the
+`/register` 401 token-mismatch mystery from the entry two below this
+one — it recurred on the same GPU VPS with a second fresh account
+(`gamer-a8d471645a`) during a clean re-install flight test, root-caused
+this time with direct machine access (a Claude session running on the
+VPS itself, via Remote Control) instead of a pasted log. Confirmed via
+the coordinator's prod DB, same as before: `sha256(token in state.json)
+!= token_hash` for the account the agent itself had just signed up.
+
+Root cause: `installer.iss`'s postinstall "Launch now" checkbox and the
+plain Start Menu / Desktop icons all launch `agent.exe` with no
+`--tray` flag — only the Startup-folder autorun shortcut passes
+`--tray`. `main()`'s single-instance claim (`_claim_single_instance`)
+only ran when `--tray` was set, so a plain console launch had **zero**
+protection against a second `agent.exe` process existing at the same
+time (two people/processes launching around the same time, an autorun
+racing a manual launch, etc.). With no coordination between two live
+processes, one's `state.json` write — including a just-issued
+signup/pair token — can get silently clobbered by the other's stale
+in-memory copy on its own next save. (The specific vanishing-processes
+detail from this incident turned out to be the founder RDP'd into the
+same VPS for their own manual test at the same time as the Remote
+Control session — not a crash — but the underlying single-instance gap
+is real and independent of how this particular pair of processes came
+to exist.)
+
+Fixed: single-instance claiming now runs for any long-running launch,
+tray or not — only `--once` / `--status` (already-standalone
+subcommands) stay exempt. A second console-mode launch now prints
+"GamerAI agent is already running ... — exiting." and defers instead
+of running a fully independent, uncoordinated copy.
+
+---
+
 ## 2026-08-21 — v1.3.6: silent-empty-reply guard + sd.exe crash message
 
 Same field-test session as the entry below, continued with fresh reports

@@ -47,7 +47,7 @@ IS_WINDOWS = platform.system() == "Windows"
 # the moment it starts. The CI-generated version.txt (short-sha +
 # build timestamp) is still what the self-updater diffs against;
 # AGENT_VERSION is just the human-facing label.
-AGENT_VERSION = "1.3.6"
+AGENT_VERSION = "1.3.7"
 
 # Base64-encoded Ed25519 PUBLIC key used to verify self-update payloads.
 # When this is non-empty, the self-updater REQUIRES a valid signature on
@@ -6793,14 +6793,26 @@ def main(argv: Optional[list[str]] = None) -> int:
     _was_last_seen_version = state.get("last_seen_version")
     _boot_log(f"main: state loaded, last_seen_version={_was_last_seen_version!r}")
 
-    # Tray-mode init: hide the console window and claim 127.0.0.1:48591
-    # as the single-instance + IPC port. Done BEFORE the greeting and
-    # logger setup so a second launch exits immediately without
+    # Tray-mode init: hide the console window. Done BEFORE the greeting
+    # and logger setup so a second launch exits immediately without
     # touching state. --once / --status / --version skip tray setup;
     # they're foreground subcommands a user invoked directly.
     console_hwnd = 0
     ipc_sock: Optional[socket.socket] = None
     tray_active = args.tray and not args.once and not args.status
+    # Single-instance protection is claimed for ANY long-running launch,
+    # not just --tray. The installer's postinstall "Launch now" checkbox
+    # and the plain Start Menu / Desktop icons all launch with no --tray
+    # flag (only the Startup-folder autorun shortcut passes --tray) — a
+    # foreground console launch used to skip _claim_single_instance()
+    # entirely, so a manual launch racing an already-running tray
+    # instance (or another manual launch) got two fully independent
+    # processes with no coordination between them, each free to
+    # clobber the other's state.json write (including a just-issued
+    # signup/pair token) with its own stale in-memory copy. --once /
+    # --status still skip it — those are meant to run standalone
+    # alongside an existing instance, not collide with it.
+    wants_singleton = not args.once and not args.status
     show_welcome = False
     if tray_active:
         _set_aumid()
@@ -6830,10 +6842,22 @@ def main(argv: Optional[list[str]] = None) -> int:
             # menu.
             _persist_console_hidden(console_hwnd)
             _boot_log("tray: console hidden (welcome already shown for this version)")
+    if wants_singleton:
         ipc_sock, is_first = _claim_single_instance()
         if not is_first:
             # Another agent is already running; we already told it to
-            # surface its console. Exit silently.
+            # surface its console (tray mode) or IPC handoff alone
+            # covers it (console mode — print an explicit line since
+            # there's no tray to surface here).
+            if not tray_active:
+                try:
+                    sys.stdout.write(
+                        "GamerAI agent is already running (check your "
+                        "system tray or Task Manager) — exiting.\n"
+                    )
+                    sys.stdout.flush()
+                except Exception:
+                    pass
             _boot_log("exit: deferred to existing instance via single-instance handoff")
             return 0
         _boot_log(f"single-instance: proceeding as first instance (ipc_sock={'bound' if ipc_sock else 'none/collision'})")
