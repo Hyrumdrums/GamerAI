@@ -799,11 +799,15 @@ class RunSignupFlowTests(unittest.TestCase):
         post.assert_not_called()
 
     def test_accepting_creates_account_and_persists_token(self):
-        fake_resp = _FakeSignupResponse(200, {"token": "gai_faketoken123"})
+        fake_resp = _FakeSignupResponse(
+            200, {"token": "gai_faketoken123", "email_verified": True},
+        )
         with mock.patch.object(agent.httpx, "post", return_value=fake_resp) as post:
             state = {}
             token = agent.run_signup_flow(
-                "http://coord.example", state, _confirm=lambda _: "y",
+                "http://coord.example", state,
+                _confirm=lambda _: "y",
+                _email_prompt=lambda _: "tester@example.com",
             )
         self.assertEqual(token, "gai_faketoken123")
         self.assertEqual(state["api_token"], "gai_faketoken123")
@@ -812,7 +816,8 @@ class RunSignupFlowTests(unittest.TestCase):
         on_disk = json.loads(agent.STATE_PATH.read_text(encoding="utf-8"))
         self.assertEqual(on_disk["api_token"], "gai_faketoken123")
         # Called the right endpoint with a ToS-accepted, non-empty
-        # username/password/email — not silently passing blanks.
+        # username/password, and the real (prompted) email — not a
+        # synthesized, unmailable placeholder.
         post.assert_called_once()
         args, kwargs = post.call_args
         self.assertEqual(args[0], "http://coord.example/signup")
@@ -820,7 +825,21 @@ class RunSignupFlowTests(unittest.TestCase):
         self.assertTrue(body["tos_accepted"])
         self.assertTrue(body["username"])
         self.assertGreaterEqual(len(body["password"]), 8)
-        self.assertIn("@", body["email"])
+        self.assertEqual(body["email"], "tester@example.com")
+
+    def test_invalid_email_reprompts_then_aborts(self):
+        # Three bad answers (blank, no "@", contains whitespace) should
+        # exhaust the retry budget and abort without ever calling
+        # POST /signup — mirrors the y/n decline path's behavior.
+        attempts = iter(["", "not-an-email", "has a space@example.com"])
+        with mock.patch.object(agent.httpx, "post") as post:
+            token = agent.run_signup_flow(
+                "http://coord.example", {},
+                _confirm=lambda _: "y",
+                _email_prompt=lambda _: next(attempts),
+            )
+        self.assertIsNone(token)
+        post.assert_not_called()
 
     def test_coordinator_rejection_returns_none_and_does_not_persist(self):
         fake_resp = _FakeSignupResponse(
@@ -829,7 +848,9 @@ class RunSignupFlowTests(unittest.TestCase):
         with mock.patch.object(agent.httpx, "post", return_value=fake_resp):
             state = {}
             token = agent.run_signup_flow(
-                "http://coord.example", state, _confirm=lambda _: "y",
+                "http://coord.example", state,
+                _confirm=lambda _: "y",
+                _email_prompt=lambda _: "tester@example.com",
             )
         self.assertIsNone(token)
         self.assertNotIn("api_token", state)
@@ -839,7 +860,9 @@ class RunSignupFlowTests(unittest.TestCase):
             agent.httpx, "post", side_effect=httpx.ConnectError("refused"),
         ):
             token = agent.run_signup_flow(
-                "http://coord.example", {}, _confirm=lambda _: "y",
+                "http://coord.example", {},
+                _confirm=lambda _: "y",
+                _email_prompt=lambda _: "tester@example.com",
             )
         self.assertIsNone(token)
 

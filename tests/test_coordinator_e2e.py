@@ -1245,6 +1245,11 @@ class SignupTests(unittest.TestCase):
         self.assertIsNone(body["parent_member_id"])
         self.assertTrue(body["token"])
         self.assertEqual(body["username"], "newcontributor")
+        # RESEND_API_KEY is unset in this test env, so email_send is
+        # unconfigured and signup auto-verifies rather than gating on
+        # a link that can never be sent — see SignupEmailVerificationTests
+        # in test_member_auth_e2e.py for the Resend-configured path.
+        self.assertTrue(body["email_verified"])
 
         # The returned token actually resolves to this member. Checked
         # via member_auth directly (the same lookup the live bearer-auth

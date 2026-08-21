@@ -5,6 +5,82 @@ entries on top. Skim for context before resuming work.
 
 ---
 
+## 2026-08-21 — v1.3.8: signup email verification (Resend) + Win11 tray-hide writeup
+
+Two more items off todo.txt after the field-test round below.
+
+**Windows 11 tray-hide — documented, not code-fixed.** "windows 11
+doesn't hide in the tray like on pre-11": root cause is that Win11
+defaults to Windows Terminal as the console host, and
+`GetConsoleWindow()` there returns conhost's invisible ConPTY window,
+not the visible WT tab — so `ShowWindow(hwnd, SW_HIDE)` hides a window
+nobody is looking at. Pre-11 (and Win11 with the legacy console host
+set as default) works because `GetConsoleWindow()` *is* the visible
+window there. No clean in-app fix exists — Win32 doesn't expose "which
+Windows Terminal window is mine" from a console subprocess, and
+guessing (e.g. "the first visible `CASCADIA_HOSTING_WINDOW_CLASS`
+window") risks hiding some *other* terminal window the user has open,
+which is worse than the current no-op. Owner's call: document it as a
+known limitation + workaround (switch default terminal app to Windows
+Console Host) in `windows-agent/README_addendum.md` rather than ship a
+heuristic. Real fix, if this keeps recurring: relaunch tray mode as a
+fully consoleless `CREATE_NO_WINDOW` child process, trading away the
+"Show console" tray menu item since there'd be no window left to show.
+
+**Open-signup abuse — email verification shipped.** Since `/signup`
+went invite-free, anyone could mint a throwaway account with an
+unverified email and get a full BRONZE quota (100k tokens/day, 20
+images/day, 30 voice min/day) with zero requirement to ever run the
+agent — the "contribute-to-use" pitch wasn't actually enforced, only
+`SIGNUP_MAX_PER_IP` (5/hour) stood in the way, trivially routed around
+with rotating IPs.
+
+Added Resend-backed email verification (owner picked it over SMTP
+through a personal mailbox — free tier covers current volume, better
+deliverability, no risk of tripping spam limits on a real inbox):
+
+- `members.email_verified` (new column, default 1 so invite/admin rows
+  are unaffected — only `create_signup_member` inserts 0).
+- `POST /signup` generates a single-use code (redis, 24h TTL), emails
+  a `/verify-email?code=...` link via `coordinator/email_send.py`
+  (Resend's REST API over stdlib `urllib`, no new dependency).
+- The `/generate` quota-check block 403s an unverified member before
+  even reaching the daily-cap checks. **Contributing (running the
+  agent as a worker) is never gated by this** — only submitting a job
+  is.
+- If Resend is unconfigured (no `RESEND_API_KEY`) or the send itself
+  fails, the member auto-verifies instead of being locked out of an
+  email that will never arrive. Same fallback backs the new `POST
+  /me/resend-verification` for a lost/never-received email.
+- Bigger discovery mid-implementation: `windows-agent/agent.py`'s
+  `run_signup_flow` — the *only* place `/signup` is ever called from,
+  there's no web signup form — was synthesizing a fake
+  `@agent.gamerai.local` placeholder email, since nothing downstream
+  ever read it before now. Had to add an interactive email prompt (3
+  attempts, then abort) so verification has somewhere real to land.
+  Agent prints a "check your inbox" note when the signup response
+  comes back unverified. Shipped as agent v1.3.8.
+
+Not yet live: `RESEND_API_KEY` / `EMAIL_FROM` / `PUBLIC_BASE_URL` are
+in local `.env` + `docker-compose.yml`, but still need adding to
+`.env.prod` on the VPS before deploy — until then this silently
+no-ops to auto-verify (same behavior as today, not broken, just
+inert).
+
+Tests: 6 new cases in
+`tests/test_member_auth_e2e.py::SignupEmailVerificationTests` (Resend
+mocked, no real network calls), plus updated
+`tests/test_agent_bootstrap.py::RunSignupFlowTests` for the new email
+prompt. Full suite: 592 passed.
+
+**Secret-handling note:** the owner pasted a live Resend API key
+directly into `todo.txt` (a tracked file) mid-session. Caught before
+any commit — moved it into the gitignored `.env` instead and stripped
+it from `todo.txt`. Worth a reminder next time credentials come up in
+chat: paste secrets into `.env`/`.secrets`, never into a tracked file.
+
+---
+
 ## 2026-08-21 — v1.3.7: single-instance protection for non-tray launches
 
 Third round of the same field-test session, following up on the

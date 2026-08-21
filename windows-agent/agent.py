@@ -47,7 +47,7 @@ IS_WINDOWS = platform.system() == "Windows"
 # the moment it starts. The CI-generated version.txt (short-sha +
 # build timestamp) is still what the self-updater diffs against;
 # AGENT_VERSION is just the human-facing label.
-AGENT_VERSION = "1.3.7"
+AGENT_VERSION = "1.3.8"
 
 # Base64-encoded Ed25519 PUBLIC key used to verify self-update payloads.
 # When this is non-empty, the self-updater REQUIRES a valid signature on
@@ -6488,6 +6488,7 @@ def run_signup_flow(
     state: dict,
     *,
     _confirm=None,
+    _email_prompt=None,
 ) -> Optional[str]:
     """Public, invite-free account creation — the literal version of
     business.md's "contribute-to-use" pitch: running the agent for the
@@ -6495,21 +6496,24 @@ def run_signup_flow(
     you, is how you join. Calls the coordinator's public ``POST
     /signup`` directly (no browser handoff needed, unlike
     ``run_pair_flow`` — there's no existing session to approve this
-    against) with a generated username + a strong random password,
-    then persists the returned bearer to ``state.json`` exactly like
-    pairing does.
+    against) with a generated username + a strong random password + a
+    real, prompted-for email (required — chat/image/voice gate on
+    verifying it, see coordinator's POST /signup), then persists the
+    returned bearer to ``state.json`` exactly like pairing does.
 
     Requires an explicit y/n ToS confirmation before calling the
     endpoint — same bar as the web redemption page's click-through
     checkbox; a background/non-interactive run should not silently
-    accept terms on the operator's behalf. ``_confirm`` is injectable
-    for tests (defaults to a real ``input()`` prompt).
+    accept terms on the operator's behalf. ``_confirm`` and
+    ``_email_prompt`` are both injectable for tests (default to real
+    ``input()`` prompts).
 
     Returns the new token on success, None on failure/decline. Prints
     the generated credentials once, clearly, since this is the only
     time the password is ever shown — the coordinator only stores its
     hash."""
     confirm = _confirm or (lambda prompt: input(prompt).strip().lower())
+    email_prompt = _email_prompt or (lambda prompt: input(prompt).strip())
 
     sys.stdout.write(
         "\n"
@@ -6536,12 +6540,32 @@ def run_signup_flow(
 
     username = f"gamer-{uuid.uuid4().hex[:10]}"
     password = uuid.uuid4().hex + uuid.uuid4().hex[:8]
-    # A signup account needs a recovery address on file same as an
-    # invite-accepted one does, but there's no invite form to collect
-    # it from here — synthesize a clearly-fake, clearly-unique
-    # placeholder the member can replace later. Never actually mailed
-    # to (no SMTP delivery exists yet — see docs/project-gaps.md).
-    email = f"{username}@agent.gamerai.local"
+
+    # Chat/image/voice now gate on a confirmed real email (coordinator
+    # email-verification slice) — ask for one instead of synthesizing
+    # an unmailable placeholder like earlier versions did, since nobody
+    # could ever click a link sent to that. Same retry bar as the y/n
+    # decline above: a few tries, then give up rather than loop forever.
+    email = None
+    for _attempt in range(3):
+        try:
+            candidate = email_prompt(
+                "\nEmail address (used to verify your account and "
+                "recover access — never shown publicly): "
+            )
+        except (EOFError, KeyboardInterrupt):
+            sys.stderr.write("\nsignup: aborted.\n")
+            return None
+        candidate = (candidate or "").strip()
+        if candidate and "@" in candidate and " " not in candidate:
+            email = candidate
+            break
+        sys.stderr.write(
+            "That doesn't look like a valid email — try again.\n"
+        )
+    if email is None:
+        sys.stderr.write("signup: no valid email provided, aborting.\n")
+        return None
 
     base = coordinator_url.rstrip("/")
     try:
@@ -6572,17 +6596,27 @@ def run_signup_flow(
 
     state["api_token"] = token
     save_state(state)
+    verified = bool(body.get("email_verified", True))
+    verify_note = (
+        "\n"
+        "Check your inbox to verify your email — chat, image\n"
+        "generation, and voice stay locked until you do. This does\n"
+        "NOT affect contributing compute; the agent runs either way.\n"
+        if not verified else ""
+    )
     sys.stdout.write(
         "\n"
         "Account created.\n"
         "-----------------------------------------\n"
         f"  username: {username}\n"
         f"  password: {password}\n"
+        f"  email:    {email}\n"
         "\n"
         "Save this password now — it is shown only this once (the\n"
         "coordinator stores only its hash). Sign in with it in the\n"
         "chat UI to invite friends from your account. This agent is\n"
         f"already paired — the token is saved to {STATE_PATH}.\n"
+        f"{verify_note}"
     )
     return token
 

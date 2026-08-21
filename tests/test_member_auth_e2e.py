@@ -13,6 +13,7 @@ import tempfile
 import time
 import unittest
 import uuid
+from unittest import mock
 
 # 1. Env BEFORE imports — auth on, fresh DB, no rate limit.
 _TMPDIR = tempfile.mkdtemp(prefix="gamerai-test-mauth-")
@@ -1182,6 +1183,140 @@ class MemberAuthE2ETests(unittest.TestCase):
         )
         usage = self.db.member_usage_today(invitee_member.member_id)
         self.assertAlmostEqual(usage["voice_seconds"], 2.0, places=2)
+
+
+def _signup_payload(**overrides):
+    payload = {
+        "username": "verifyuser-" + uuid.uuid4().hex[:8],
+        "password": "correct horse battery staple",
+        "email": "verify-" + uuid.uuid4().hex[:8] + "@example.com",
+        "tos_accepted": True,
+    }
+    payload.update(overrides)
+    return payload
+
+
+class SignupEmailVerificationTests(unittest.TestCase):
+    """POST /signup gates chat/image/voice on a confirmed email once
+    Resend is configured (open, invite-free signup means an unverified
+    throwaway address is the only thing standing between a stranger
+    and free BRONZE quota — see todo.txt). Resend itself is never
+    actually called: send_verification_email is mocked so these tests
+    don't make network calls or need a real API key."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.client = TestClient(coordinator_main.app)
+        cls.r = _FAKE
+        cls.db = coordinator_main.db
+        coordinator_main.ensure_admin_seed()
+
+    def setUp(self):
+        self.r.flushall()
+        self.db._conn.executescript(
+            "DELETE FROM jobs; "
+            "DELETE FROM workers; "
+            "DELETE FROM earnings; "
+            "DELETE FROM member_usage; "
+            "DELETE FROM invites; "
+            "DELETE FROM members WHERE role <> 'admin';"
+        )
+
+    def _find_verify_code(self) -> str:
+        keys = self.r.keys("email_verify:*")
+        self.assertEqual(len(keys), 1, f"expected exactly one pending code, got {keys}")
+        return keys[0].split(":", 1)[1]
+
+    def test_signup_auto_verifies_when_resend_unconfigured(self):
+        # Module-wide default: RESEND_API_KEY is unset in this test
+        # env, so email_send.is_configured() is False and signup must
+        # not lock the new account out of an email that can never
+        # arrive.
+        resp = self.client.post("/signup", json=_signup_payload())
+        self.assertEqual(resp.status_code, 200, resp.text)
+        body = resp.json()
+        self.assertTrue(body["email_verified"])
+        generate = self.client.post(
+            "/generate",
+            json={"prompt": "hi"},
+            headers={"Authorization": f"Bearer {body['token']}"},
+        )
+        self.assertEqual(generate.status_code, 200)
+
+    @mock.patch.object(coordinator_main.email_send, "send_verification_email",
+                        return_value=True)
+    @mock.patch.object(coordinator_main.email_send, "is_configured",
+                        return_value=True)
+    def test_signup_gates_generate_until_verified(self, _is_cfg, _send):
+        resp = self.client.post("/signup", json=_signup_payload())
+        self.assertEqual(resp.status_code, 200, resp.text)
+        body = resp.json()
+        self.assertFalse(body["email_verified"])
+        token = body["token"]
+
+        blocked = self.client.post(
+            "/generate",
+            json={"prompt": "hi"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(blocked.status_code, 403)
+
+        code = self._find_verify_code()
+        verified = self.client.get(f"/verify-email?code={code}")
+        self.assertEqual(verified.status_code, 200)
+
+        allowed = self.client.post(
+            "/generate",
+            json={"prompt": "hi"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(allowed.status_code, 200)
+
+        # Single-use: the same link again is a clean 400, not a repeat
+        # 200 that could re-verify a different (reassigned) code.
+        reused = self.client.get(f"/verify-email?code={code}")
+        self.assertEqual(reused.status_code, 400)
+
+    def test_verify_email_rejects_unknown_code(self):
+        resp = self.client.get("/verify-email?code=not-a-real-code")
+        self.assertEqual(resp.status_code, 400)
+
+    @mock.patch.object(coordinator_main.email_send, "send_verification_email",
+                        return_value=True)
+    @mock.patch.object(coordinator_main.email_send, "is_configured",
+                        return_value=True)
+    def test_resend_verification_rejects_already_verified_member(self, _c, _s):
+        resp = self.client.post(
+            "/me/resend-verification",
+            headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    @mock.patch.object(coordinator_main.email_send, "send_verification_email",
+                        return_value=True)
+    @mock.patch.object(coordinator_main.email_send, "is_configured",
+                        return_value=True)
+    def test_resend_verification_issues_a_new_working_code(self, _c, _s):
+        signup = self.client.post("/signup", json=_signup_payload()).json()
+        token = signup["token"]
+        # Burn the original code so only the resent one is live.
+        self.r.delete(*self.r.keys("email_verify:*"))
+
+        resend = self.client.post(
+            "/me/resend-verification",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        self.assertEqual(resend.status_code, 200)
+        self.assertFalse(resend.json()["email_verified"])
+
+        code = self._find_verify_code()
+        self.assertEqual(
+            self.client.get(f"/verify-email?code={code}").status_code, 200,
+        )
+        me = self.client.get(
+            "/me", headers={"Authorization": f"Bearer {token}"}
+        ).json()
+        self.assertTrue(me["email_verified"])
 
 
 if __name__ == "__main__":

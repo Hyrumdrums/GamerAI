@@ -77,7 +77,13 @@ CREATE TABLE IF NOT EXISTS members (
     daily_quota_images INTEGER,
     revoked_at REAL,
     created_at REAL NOT NULL,
-    last_active_at REAL
+    last_active_at REAL,
+    -- 1 = can consume (chat/image/voice); 0 = pending email confirm.
+    -- Defaults to 1 (verified) so admin-seed and invite-accept rows
+    -- (both already gated by a stronger trust signal than an
+    -- unverified inbox) aren't affected. Only create_signup_member()
+    -- inserts 0 explicitly — see POST /signup and GET /verify-email.
+    email_verified INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE INDEX IF NOT EXISTS idx_members_token ON members(token_hash);
@@ -426,6 +432,18 @@ class DB:
                 self._conn.execute(ddl)
             except sqlite3.OperationalError:
                 pass
+        # Signup email verification. DEFAULT 1 backfills every existing
+        # row (pre-dating this column) as verified — they were created
+        # via invite/admin, a stronger trust signal than an unconfirmed
+        # inbox, so this migration doesn't retroactively lock anyone
+        # out. Only new POST /signup rows are inserted with 0.
+        try:
+            self._conn.execute(
+                "ALTER TABLE members ADD COLUMN email_verified "
+                "INTEGER NOT NULL DEFAULT 1"
+            )
+        except sqlite3.OperationalError:
+            pass
         # Voice (TTS + future STT) accounting — added with the
         # voice-phase1 slice. Same shape as image: a daily-min cap on
         # members/invites (NULL = fall through to the tier default cap
@@ -873,9 +891,10 @@ class DB:
                     "INSERT INTO members (member_id, email, role, parent_member_id, "
                     "token_hash, tier, daily_quota_tokens, daily_quota_images, "
                     "daily_quota_voice_minutes, created_at, tos_accepted_at, "
-                    "tos_version, username, password_hash, password_set_at) "
+                    "tos_version, username, password_hash, password_set_at, "
+                    "email_verified) "
                     "VALUES (?, ?, 'contributor', NULL, ?, 'BRONZE', ?, ?, ?, "
-                    "?, ?, ?, ?, ?, ?)",
+                    "?, ?, ?, ?, ?, ?, 0)",
                     (
                         member_id,
                         email,
@@ -899,6 +918,17 @@ class DB:
             except Exception:
                 self._conn.execute("ROLLBACK")
                 raise
+
+    def verify_member_email(self, member_id: str) -> None:
+        """Mark a member's email confirmed — POST /signup's auto-verify
+        fallback (Resend unconfigured) and GET /verify-email's success
+        path both call this. Idempotent (a re-click of an already-used
+        link is a harmless no-op, not an error)."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE members SET email_verified=1 WHERE member_id=?",
+                (member_id,),
+            )
 
     def get_member_by_token_hash(self, token_hash: str) -> Optional[sqlite3.Row]:
         with self._lock:

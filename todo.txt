@@ -82,3 +82,56 @@ DONE 2026-08-21: /register 401 token-mismatch mystery (state.json's token
   writes (including a just-issued signup token) with no coordination at all.
   Fixed: single-instance claiming now runs for any long-running launch, not
   just tray mode (still exempts --once/--status). Shipped in v1.3.7.
+
+
+DONE 2026-08-21: "windows 11 doesn't hide in the tray like on pre-11".
+  Root cause: Win11 defaults to Windows Terminal as the console host, and
+  GetConsoleWindow() returns conhost's invisible ConPTY window in that
+  case, not the visible WT tab -- so ShowWindow(SW_HIDE) hides a window
+  nobody sees. Pre-11 (and Win11 with legacy console host set as default)
+  works fine because GetConsoleWindow() there IS the visible window. No
+  clean in-app fix exists (Win32 doesn't expose "which WT window is
+  mine," and guessing risks hiding an unrelated terminal window of the
+  user's) -- per owner's call, documented as a known limitation +
+  workaround (switch default terminal app to Windows Console Host) in
+  windows-agent/README_addendum.md instead of shipping a heuristic fix.
+  Revisit with a real fix (consoleless CREATE_NO_WINDOW relaunch, trading
+  away "Show console") if this keeps coming up.
+
+DONE 2026-08-21: open signup abuse -- anyone could /signup with a
+  throwaway, unverified email and immediately get a full BRONZE quota
+  (100k tokens/day, 20 images/day, 30 voice min/day) with zero
+  requirement to ever install/run the agent. Fixed with Resend-backed
+  email verification (owner's choice over SMTP-via-personal-mailbox --
+  free tier covers current volume, better deliverability, no risk to a
+  real inbox):
+  - members.email_verified (new column, defaults to 1 -- only signup
+    rows are inserted with 0; invite/admin-created members are
+    unaffected). New signup gates chat/image/voice submission (the
+    /generate quota-check block) with a 403 until verified; contributing
+    (running the agent as a worker) is NOT gated by this either way.
+  - POST /signup generates a single-use code (redis, 24h TTL) and
+    emails a /verify-email?code=... link via coordinator/email_send.py
+    (Resend REST API, stdlib urllib, no new dependency). If
+    RESEND_API_KEY is unset OR the send itself fails, the member
+    auto-verifies instead of being locked out of an email that can
+    never arrive -- same fallback used by the new POST
+    /me/resend-verification for a lost/never-received email.
+  - windows-agent/agent.py's run_signup_flow (the ONLY place /signup is
+    called from -- there's no web signup form) used to synthesize a
+    fake, unmailable placeholder email (@agent.gamerai.local) since
+    nothing read the email field before now. Now prompts the console
+    user for a real one (3 attempts, then aborts) and prints a
+    "check your inbox" note when the signup response comes back
+    unverified. Shipped in agent v1.3.8.
+  - RESEND_API_KEY / EMAIL_FROM / PUBLIC_BASE_URL added to .env (local)
+    and docker-compose.yml passthrough -- STILL NEEDS ADDING TO
+    .env.prod ON THE VPS before this does anything in production (until
+    then it silently no-ops to auto-verify, same as today -- not
+    broken, just inert).
+  - Tests: tests/test_member_auth_e2e.py::SignupEmailVerificationTests
+    (6 new, Resend mocked, no real network calls) + updated
+    tests/test_agent_bootstrap.py::RunSignupFlowTests for the email
+    prompt. Full suite (592 tests) green.
+
+refactor god files like main.py... 4k+ lines

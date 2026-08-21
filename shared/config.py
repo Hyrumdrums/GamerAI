@@ -138,6 +138,18 @@ LOGIN_FAIL_WINDOW_SECONDS = _int("LOGIN_FAIL_WINDOW_SECONDS", 900)  # 15 min
 SIGNUP_MAX_PER_IP = _int("SIGNUP_MAX_PER_IP", 5)
 SIGNUP_WINDOW_SECONDS = _int("SIGNUP_WINDOW_SECONDS", 3600)  # 1h
 
+# --- email (Resend transactional API; signup verification) ---
+# Empty RESEND_API_KEY = verification emails aren't sent, and new
+# signups fall back to auto-verified instead of gated — keeps local
+# dev/test and any deploy that hasn't configured Resend working
+# exactly as before this slice landed. See coordinator/email_send.py.
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "").strip()
+EMAIL_FROM = os.getenv("EMAIL_FROM", "GamerAI <noreply@dallinlayton.com>")
+# Used to build the link a verification email points at (no scheme/host
+# validation — operator's responsibility per environment).
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://localhost:8000").rstrip("/")
+EMAIL_VERIFY_TTL_SECONDS = _int("EMAIL_VERIFY_TTL_SECONDS", 86400)  # 24h
+
 
 # --- model registry (off by default = legacy "any model name accepted") ---
 STRICT_MODELS = _bool("STRICT_MODELS", False)

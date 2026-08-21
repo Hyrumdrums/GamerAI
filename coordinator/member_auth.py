@@ -158,6 +158,11 @@ class Member:
     username: Optional[str] = None
     has_password: bool = False
     password_set_at: Optional[float] = None
+    # True for every pre-existing member (invite/admin origin) and for
+    # a signup member who has clicked their verification link. False
+    # only for a freshly-signed-up member still waiting on that click —
+    # see POST /signup / GET /verify-email in coordinator/main.py.
+    email_verified: bool = True
 
 
 def _row_to_member(row) -> Member:
@@ -201,6 +206,9 @@ def _row_to_member(row) -> Member:
         has_password=bool(password_hash),
         password_set_at=(
             float(password_set_at) if password_set_at is not None else None
+        ),
+        email_verified=(
+            bool(row["email_verified"]) if "email_verified" in keys else True
         ),
     )
 

@@ -18,6 +18,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTex
 from fastapi.staticfiles import StaticFiles
 
 from coordinator import canaries as canary_lib
+from coordinator import email_send
 from coordinator import member_auth, model_registry, notifications
 from coordinator import schedule as machine_schedule
 from coordinator.canaries import CanaryInjector
@@ -47,6 +48,7 @@ from shared.config import (
     JOB_PARTIALS,
     MAX_HISTORY_TOKENS,
     JOB_PROCESSING,
+    EMAIL_VERIFY_TTL_SECONDS,
     JOB_QUEUE,
     JOB_RESULTS,
     JOB_TIMEOUT_SECONDS,
@@ -54,6 +56,7 @@ from shared.config import (
     LOGIN_FAIL_MAX,
     LOGIN_FAIL_WINDOW_SECONDS,
     MAX_PROMPT_BYTES,
+    PUBLIC_BASE_URL,
     RATE_LIMIT_PER_MIN,
     SIGNUP_MAX_PER_IP,
     SIGNUP_WINDOW_SECONDS,
@@ -1293,6 +1296,11 @@ def _is_public(method: str, path: str) -> bool:
     # Throttled separately (SIGNUP_MAX_PER_IP), not by RATE_LIMIT_PER_MIN.
     if method == "POST" and path == "/signup":
         return True
+    # Email-verification link — clicked from an email, no bearer to
+    # send. Security relies on the code itself (opaque, 24h TTL,
+    # single-use — see POST /signup and GET /verify-email below).
+    if method == "GET" and path == "/verify-email":
+        return True
     # Agent pairing — the agent has no token yet, so all three of these
     # are public. Security relies on the short-lived pair_code (5-min
     # TTL) plus the requirement that an authenticated browser session
@@ -1789,6 +1797,20 @@ def generate(req: GenerateRequest, request: Request):
 
     member = getattr(request.state, "member", None)
     submitted_by = member.member_id if member is not None else None
+
+    # Signup accounts with an unconfirmed email can't consume until
+    # they click the link — see POST /signup / GET /verify-email.
+    # Contributing (running the agent as a worker) is never gated by
+    # this; only submitting a job (this endpoint) is.
+    if member is not None and not member.email_verified:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "verify your email to unlock chat, image generation, "
+                "and voice — check your inbox, or POST "
+                "/me/resend-verification if it didn't arrive"
+            ),
+        )
 
     # Two-dimensional daily-quota enforcement (slice 2 + image-limits
     # slice). NULL on either column = unlimited for that dimension
@@ -3891,6 +3913,7 @@ def me(request: Request):
         "username": member.username,
         "has_password": member.has_password,
         "password_set_at": member.password_set_at,
+        "email_verified": member.email_verified,
         # Count of additional bearers in member_tokens — i.e. paired
         # agents. Zero means "no contributing machine yet" and the
         # web UI shows the contribute pitch in the topbar.
@@ -4432,6 +4455,30 @@ def login(req: LoginRequest):
     }
 
 
+def _email_verify_key(code: str) -> str:
+    return f"email_verify:{code}"
+
+
+def _start_email_verification(member_id: str, email: str) -> bool:
+    """Generate a single-use verification code, store it, and try to
+    send the email. Returns True iff the member should be LEFT
+    unverified pending that click (Resend is configured and accepted
+    the send); False means the caller should auto-verify instead
+    (Resend unconfigured, or the send attempt itself failed — an
+    inbox that will never see the link is not a reason to lock
+    someone out of an account they just created)."""
+    if not email_send.is_configured():
+        return False
+    code = secrets.token_urlsafe(32)
+    key = _email_verify_key(code)
+    r.set(key, member_id, ex=EMAIL_VERIFY_TTL_SECONDS)
+    verify_url = f"{PUBLIC_BASE_URL}/verify-email?code={code}"
+    if not email_send.send_verification_email(email, verify_url):
+        r.delete(key)
+        return False
+    return True
+
+
 def _signup_throttle_key(client_ip: str) -> str:
     return f"signup_count:{client_ip}"
 
@@ -4525,6 +4572,16 @@ def signup(req: SignupRequest, request: Request):
         if n == 1:
             r.expire(throttle_key, SIGNUP_WINDOW_SECONDS)
 
+    # Chat/image/voice consumption gates on email_verified (see the
+    # quota-check block in submit_job below) — a signup with no way to
+    # ever receive that email (Resend unconfigured, or this particular
+    # send failing) auto-verifies instead of permanently locking the
+    # account out. Contributing (running the agent as a worker) is
+    # never gated by this either way.
+    pending_verification = _start_email_verification(new_member_id, email)
+    if not pending_verification:
+        db.verify_member_email(new_member_id)
+
     log.info("signup ok", extra={"event": "signup_ok"})
     return {
         "member_id": new_member_id,
@@ -4534,7 +4591,57 @@ def signup(req: SignupRequest, request: Request):
         "parent_member_id": None,
         "daily_quota_tokens": quota["tokens"],
         "tos_version": TOS_VERSION,
+        "email_verified": not pending_verification,
     }
+
+
+@app.get("/verify-email", response_class=HTMLResponse)
+def verify_email(code: str = ""):
+    """Public landing page for the link in the verification email
+    (see _start_email_verification / POST /signup). Single-use — the
+    redis key is deleted on the first successful hit, so a forwarded
+    or reused link fails cleanly instead of quietly re-verifying."""
+    member_id = r.get(_email_verify_key(code)) if code else None
+    if not member_id:
+        return HTMLResponse(
+            "<h1>Link expired or invalid</h1>"
+            "<p>Verification links expire 24 hours after signup. Sign "
+            "in and request a new one from your account page.</p>",
+            status_code=400,
+        )
+    r.delete(_email_verify_key(code))
+    db.verify_member_email(member_id)
+    return HTMLResponse(
+        "<h1>Email verified</h1>"
+        "<p>Your GamerAI account is confirmed — chat, image "
+        "generation, and voice are unlocked. You can close this tab.</p>"
+    )
+
+
+@app.post("/me/resend-verification")
+def resend_verification(request: Request):
+    """Authenticated re-send for a member who never got (or lost) the
+    original verification email. No extra throttle beyond the bearer
+    requirement — this is a low-volume, single-member action, not an
+    open endpoint an attacker can hammer to spam an inbox they don't
+    control (the email is fixed at signup, not caller-supplied here)."""
+    member = getattr(request.state, "member", None)
+    if member is None:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    if member.email_verified:
+        raise HTTPException(status_code=400, detail="already verified")
+    if not member.email:
+        raise HTTPException(
+            status_code=400,
+            detail="no email on file for this account",
+        )
+    pending = _start_email_verification(member.member_id, member.email)
+    if not pending:
+        # Resend unconfigured, or the send failed — same fallback as
+        # signup: don't leave the member stuck with no path forward.
+        db.verify_member_email(member.member_id)
+        return {"email_verified": True}
+    return {"email_verified": False}
 
 
 @app.post("/me/password")

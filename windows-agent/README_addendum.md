@@ -124,6 +124,27 @@ always-visible row, drag it out of the overflow flyout, or
 **Settings → Personalization → Taskbar → Other system tray icons**.
 This is a Windows policy — apps cannot force-promote themselves.
 
+### "Hide console" doesn't hide anything on Windows 11
+
+On Windows 11 (22H2+), **Windows Terminal is the default host for console
+apps**, and `GetConsoleWindow()` returns the handle of conhost's invisible
+ConPTY surface, not the actual Windows Terminal tab you see on screen —
+`ShowWindow(..., SW_HIDE)` hides a window nobody was looking at, so the
+console appears to stay put. Pre-Windows-11 (and Windows 11 with the
+legacy console host, not Windows Terminal, set as default) hides fine,
+since `GetConsoleWindow()` there *is* the visible window.
+
+There's no reliable, side-effect-free fix from inside the app: locating
+"the" Windows Terminal window from a console subprocess isn't something
+Win32 exposes cleanly, and a wrong guess risks hiding some *other* window
+of the user's (Windows Terminal is usually one process for all of a
+user's terminal windows/tabs). Workaround for now: set **Settings →
+Privacy & security → For developers → Terminal → Default terminal
+application** to *Windows Console Host* instead of *Windows Terminal* —
+tray hide/show then behaves like pre-11. Revisit a real fix (e.g.
+relaunching tray mode as a fully consoleless `CREATE_NO_WINDOW` child,
+trading away the "Show console" menu item) if this keeps coming up.
+
 ### Notifications
 
 The agent uses Windows Action Center toasts for:
