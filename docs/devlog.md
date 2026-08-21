@@ -5,6 +5,58 @@ entries on top. Skim for context before resuming work.
 
 ---
 
+## 2026-08-21 — v1.3.6: silent-empty-reply guard + sd.exe crash message
+
+Same field-test session as the entry below, continued with fresh reports
+from the same GPU VPS plus the founder's own account.
+
+**Silent empty chat replies.** Several short messages ("cool", "hi",
+"error?") came back as a bare `(empty)` bubble — no text, no error
+styling, no retry button. Traced to `run_inference` (agent.py): it
+streams from Ollama's `/api/chat` / `/api/generate` and only raises on
+an HTTP/transport failure. If Ollama's generation dies mid-request
+server-side (GPU hiccup, OOM, crash) without a transport-level error,
+Ollama can still return a clean `200` that goes straight to `done:true`
+with zero content tokens — `run_inference` had no way to tell that
+apart from a legitimate (if unlikely) empty answer, so `process_one`
+reported `status="complete"` with `text=""`. Fixed: `process_one` now
+treats a blank result as a failure and raises, which routes through the
+existing exception handler and reports `status="error"` instead — the
+client shows "Generation failed." with a retry button, and the agent
+log gets a real `log.exception` line. Applies to chat, search, and
+smart-mode jobs (same code path).
+
+**sd.exe crash on `dreamshaperXL-lightning`.** Image gen crashed with
+`rc=3221226505` on the GPU VPS. Root-caused with direct machine access
+(a second Claude session running on the VPS itself, via Remote
+Control) rather than guessing from a pasted log — Windows Event Viewer
+showed no TDR/driver-reset event anywhere near the crash window, ruling
+out the AMD driver-timeout popup the founder saw as the cause. WER
+(Event ID 1000/1001) pinned it instead: `sd.exe` hit `0xC0000409` in
+`ucrtbase.dll` — the CRT's `/GS` stack-cookie check killing the process
+because the GGUF loader corrupted its own stack while tallying
+per-tensor weight dtypes at load time, before any generation/GPU work
+started. Looks like a fixed-size stack buffer overflowing on a model
+with more distinct quant types than expected —
+`dreamshaperXL-lightning`'s GGUF mixes f16 + q4_K. This is a bug in the
+upstream prebuilt `stable-diffusion.cpp` release binary (pulled by
+`infra/setup-image-mirror.sh`, not built from source here) and affects
+every contributor's default image model, not just this one VPS. Fixed
+the symptom for now: `run_image_inference` catches this specific rc and
+raises a clear "known stable-diffusion.cpp bug ... not a driver or VRAM
+problem" message instead of a raw rc + truncated stdout snippet.
+Deferred: swapping the pinned sd.exe release, swapping the default
+model to a uniformly-quantized variant, or filing upstream — parked in
+todo.txt, revisit if this starts recurring instead of staying a
+one-off.
+
+**Also this session:** the admin dashboard's "All Workers" table only
+showed `worker_id`, with no way to tell which account owned which
+worker — added an "Account" column (`/workers` now joins
+`owner_member_id` → the member's username/email).
+
+---
+
 ## 2026-08-21 — TODO: Ollama bootstrap wait timeout is too tight
 
 First real-world join test after going public: a fresh Windows GPU VPS

@@ -47,7 +47,7 @@ IS_WINDOWS = platform.system() == "Windows"
 # the moment it starts. The CI-generated version.txt (short-sha +
 # build timestamp) is still what the self-updater diffs against;
 # AGENT_VERSION is just the human-facing label.
-AGENT_VERSION = "1.3.5"
+AGENT_VERSION = "1.3.6"
 
 # Base64-encoded Ed25519 PUBLIC key used to verify self-update payloads.
 # When this is non-empty, the self-updater REQUIRES a valid signature on
@@ -4564,6 +4564,29 @@ def run_image_inference(
             pass
     if result.returncode != 0:
         snippet = (result.stderr or result.stdout or "").strip()[:500]
+        # rc=3221226505 (0xC0000409 / STATUS_STACK_BUFFER_OVERRUN, seen
+        # as -1073741623 on some Python/Windows builds) is a confirmed
+        # crash in the bundled sd.exe's GGUF loader: the CRT's /GS
+        # stack-cookie check kills the process while it's tallying
+        # per-tensor weight dtypes at load time, on a model whose GGUF
+        # mixes more distinct quant types (e.g. f16 + q4_K, as
+        # dreamshaperXL-lightning does) than the loader's stack buffer
+        # was sized for. Root-caused via Windows Event Viewer (WER
+        # event 1000/1001, exception 0xC0000409 in ucrtbase.dll) on a
+        # 2026-08-21 field test — it's a stable-diffusion.cpp bug in
+        # the upstream binary, not a GPU driver/VRAM issue (crash
+        # happens during model load, before any generation work or
+        # TDR-sized GPU activity). Not fixable from here since we pull
+        # a prebuilt release (see infra/setup-image-mirror.sh); this
+        # just swaps the raw rc + truncated stdout for a message that
+        # tells contributors what actually happened.
+        if result.returncode in (3221226505, -1073741623):
+            raise RuntimeError(
+                f"sd.exe crashed loading {model_slug} (stack buffer "
+                "overrun in the GGUF loader — a known stable-diffusion.cpp "
+                "bug with this model's mixed-precision weights, not a "
+                "driver or VRAM problem)"
+            )
         raise RuntimeError(
             f"sd.exe failed (rc={result.returncode}): {snippet}"
         )
@@ -5704,6 +5727,22 @@ def process_one(
                     on_partial=on_partial,
                 )
             duration = round(time.time() - started, 3)
+            if not (result.get("text") or "").strip():
+                # Ollama's streaming endpoint can return an HTTP 200
+                # with a `done: true` chunk and zero content tokens
+                # when generation dies mid-request server-side (GPU
+                # driver timeout/reset, OOM, model crash) rather than
+                # raising — run_inference has nothing to except on, so
+                # it hands back a clean-looking empty string. Reporting
+                # that as status="complete" produces a silent blank
+                # reply the user can't tell apart from a real failure
+                # and can't retry. Raise instead so the outer except
+                # below reports status="error" — retryable, and logged.
+                raise RuntimeError(
+                    f"{tool} inference returned no text (likely a "
+                    "local Ollama/GPU hiccup mid-generation, not a "
+                    "real empty answer)"
+                )
             complete_payload = {
                 "worker_id": coord.worker_id,
                 "job_id": job_id,

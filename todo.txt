@@ -1,0 +1,72 @@
+consider markdownn strategy.
+
+Utilize a full CI deploy, so no git keys need to be on server.
+
+maybe revisit the read alloud feature, either dissable or go back to the line by line speach (or maybe exponentially increase the sentances sent so the first is read fast, and we have time to generate the rest).
+
+admin link should only show to admins, though it's correctly showing a 403 when used by non admins
+  - checked 2026-08-21: both places that render the admin link (account.html.j2
+    server-side {% if me.role == 'admin' %}, and chat.js's adminlink.hidden
+    toggle keyed on state.me.role) are already correctly gated. Couldn't find
+    a code path where it shows unconditionally. Leaving this line in case it
+    resurfaces in the field — if seen again, capture which page it appeared on.
+
+DONE 2026-08-21: "All Workers" admin dashboard table only showed worker_id,
+  couldn't tell which account owned which worker. Added an "Account" column
+  (coordinator /workers now joins workers.owner_member_id -> members.username
+  /email, dashboard.html.j2 renders it).
+
+DONE 2026-08-21: search-toggle bug ("cool"/"hi"/"error?" came back as fully
+  empty assistant replies). Root-caused via code read, not live repro:
+  - The search checkbox auto-unchecking after "cool" was NOT a bug — it's
+    an existing by-design feature (streamingEngine.js: res.search_was_skipped
+    auto-unchecks the box when the rewrite classifier decides a follow-up
+    doesn't need search, e.g. "That's cool!" after a news thread). The
+    Sources shown FOR "cool" itself were the small 3B routing classifier
+    imperfectly judging a short ack as needing a definition lookup
+    (Wikipedia/Merriam-Webster/Cambridge hits) -- a model-accuracy edge
+    case in _build_search_query_meta_prompt, not a wiring bug. Left alone;
+    could tighten the meta-prompt's short-ack examples later if it recurs.
+  - The REAL bug: windows-agent/agent.py's run_inference() streams from
+    Ollama and only raises on an HTTP/transport failure. If Ollama's GPU
+    inference dies mid-request (driver timeout/reset, OOM, crash — the
+    GPU driver hiccup, unrelated to the sd.exe crash below which turned
+    out NOT to be driver-related) it can return a clean
+    HTTP 200 stream that goes straight to done:true with zero content
+    tokens. process_one then reported that as status="complete" with
+    text="", which the client renders as a bare "(empty)" bubble with no
+    error styling and no retry button -- a silent, unactionable failure.
+    Fixed: process_one now raises when result["text"] comes back blank,
+    which routes through the existing except-Exception handler and reports
+    status="error" instead — client shows "Generation failed." + a retry
+    button, and the agent log gets a proper log.exception line. Applies to
+    chat, search, and smart-mode jobs (same code path). Not yet
+    version-bumped/deployed — pending go-ahead.
+
+DONE 2026-08-21: image-gen crash on the GPU VPS test machine, sd.exe rc=
+  3221226505 (STATUS_STACK_BUFFER_OVERRUN) loading dreamshaperXL-lightning
+  .gguf. Root-caused with direct machine access (Remote Control session on
+  the VPS) instead of guessing from a pasted log:
+  - NOT a driver/VRAM issue. Windows System event log is completely silent
+    in the crash window -- no TDR/driver-reset event fired. The "AMD
+    Software" driver-timeout popup the user saw was coincidental.
+  - Real cause, confirmed via WER (Event ID 1000/1001): sd.exe hit
+    exception 0xC0000409 in ucrtbase.dll -- the CRT's /GS stack-cookie
+    check killing the process because the GGUF loader corrupted its own
+    stack while tallying per-tensor weight dtypes at model-load time
+    (crashed before any generation/GPU work started). Looks like a fixed-
+    size stack array overflowing on a model with more distinct quant types
+    than expected -- dreamshaperXL-lightning's GGUF mixes f16 + q4_K.
+  - This is a bug in the upstream stable-diffusion.cpp release binary
+    (sd.exe is pulled prebuilt per infra/setup-image-mirror.sh, pinned to
+    master-637-ef92a00 -- not built from source here, so not patchable
+    directly), and dreamshaperXL-lightning is the one hardcoded default
+    image model every Windows agent bootstraps -- not a one-VPS quirk.
+  - Fixed (scoped, per go-ahead to "leave it for now" beyond this): agent.py
+    now catches this specific rc and raises a clear message ("stack buffer
+    overrun in the GGUF loader -- a known stable-diffusion.cpp bug ...
+    not a driver or VRAM problem") instead of a raw rc + truncated stdout
+    snippet. Revisit the model/binary swap only if this starts recurring
+    more -- options on the table if so: pin a newer sd.exe release, swap
+    to a uniformly-quantized (non-mixed-dtype) model variant, or file
+    upstream with leejet/stable-diffusion.cpp.

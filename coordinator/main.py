@@ -3789,6 +3789,10 @@ def workers(request: Request):
     _require_admin(request)
     rows = db.list_workers()
     earnings_by_worker = {row["worker_id"]: row for row in db.list_earnings()}
+    # One bulk read instead of a per-worker get_member() query — the
+    # admin dashboard renders every row at once, so N+1 here would mean
+    # N+1 SQLite round-trips per page load.
+    members_by_id = {m["member_id"]: m for m in db.list_members()}
     now = time.time()
     out = []
     for w in rows:
@@ -3796,6 +3800,11 @@ def workers(request: Request):
         live_status = _worker_status(wid, now)
         last_seen = float(w["last_seen"] or 0)
         e = earnings_by_worker.get(wid)
+        owner_id = w["owner_member_id"] if "owner_member_id" in w.keys() else None
+        owner = members_by_id.get(owner_id) if owner_id else None
+        owner_label = (
+            (owner["username"] or owner["email"] or owner_id) if owner else owner_id
+        )
         out.append(
             {
                 "worker_id": wid,
@@ -3803,6 +3812,8 @@ def workers(request: Request):
                 "last_seen": last_seen,
                 "seconds_since_heartbeat": round(now - last_seen, 2) if last_seen else None,
                 "alive": live_status != "offline",
+                "owner_member_id": owner_id,
+                "owner_label": owner_label,
                 "total_tokens": int(e["total_tokens"]) if e else 0,
                 "total_jobs": int(e["total_jobs"]) if e else 0,
                 "total_usd": round(float(e["total_usd"]), 8) if e else 0.0,
