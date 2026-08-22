@@ -7,7 +7,18 @@ code. Verification is link-based, not a typed code: the coordinator
 emails a confirming link (see coordinator's GET /verify-email) once
 Resend is configured, and account.html.j2 carries the ongoing
 verified/not-verified status + a resend button — this route just
-handles first creation."""
+handles first creation.
+
+The browser-facing page lives at ``/join``, NOT ``/signup`` — Caddy
+routes the public domain's bare ``/signup`` straight through to the
+coordinator container (see infra/Caddyfile), because the Windows
+agent's console signup flow POSTs JSON directly to
+``{coordinator_url}/signup`` and expects the coordinator's own
+handler, not this form-encoded one. Reusing the same path here would
+have silently swallowed the agent's API calls behind this page's
+Form(...) parsing. This route still calls the coordinator's
+``/signup`` internally (container-to-container, never through Caddy)
+— only the browser-facing URL differs."""
 from urllib.parse import quote
 
 from fastapi import APIRouter, Form, Request
@@ -36,7 +47,7 @@ def _render_form(
     )
 
 
-@router.get("/signup", response_class=HTMLResponse)
+@router.get("/join", response_class=HTMLResponse)
 async def signup_page(request: Request):
     # Already signed in? Nothing to do here.
     bearer = session_bearer(request)
@@ -45,7 +56,7 @@ async def signup_page(request: Request):
     return _render_form(request, error=None)
 
 
-@router.post("/signup")
+@router.post("/join")
 async def signup_submit(
     request: Request,
     username: str = Form(default=""),

@@ -68,6 +68,25 @@ Shipped: `RESEND_API_KEY` / `EMAIL_FROM` added to `.env.prod` on the VPS
 `infra/docker-compose.prod.yml` already derives it from `DOMAIN`. 6 new
 tests in `tests/test_web_ui_smoke.py`. Full suite: 606 passed.
 
+**Second bug, caught by the deploy itself, not by testing.** `curl
+https://ai.dallinlayton.com/signup` returned the coordinator's own bare
+`{"detail":"unauthorized"}` right after this shipped — Caddy routes an
+explicit allowlist of paths to the client container (`infra/Caddyfile`)
+and falls everything else through to the coordinator directly. The
+coordinator already owns a public `/signup` (the Windows agent's console
+flow POSTs JSON straight to `{coordinator_url}/signup`), so my new
+browser page at the same path was unreachable — worse, if I'd added a
+Caddy matcher for `/signup` → client, it would have hijacked the agent's
+JSON API calls behind a form-encoded handler expecting multipart data,
+silently breaking every agent signup in the field. None of the test
+suite (ASGI-transport-only, no Caddy in the loop) could have caught
+this — it's a routing-layer conflict, not an app-layer one. Renamed the
+browser-facing page to `/join` (kept the file/route module names as
+`signup.py`/`signup.html.j2` — that's the feature, `/join` is just the
+URL) and added the matching Caddy block. Worth remembering for any
+future client-side page: check `infra/Caddyfile`'s allowlist AND
+whether the coordinator already owns that path before picking a URL.
+
 One test-infra note for later: two of the new web tests initially
 passed standalone (`python -m unittest tests.test_web_ui_smoke`) but
 failed under the full `pytest tests/` sweep — turned out to be this

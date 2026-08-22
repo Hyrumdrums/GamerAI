@@ -283,7 +283,7 @@ class WebUISmokeTests(unittest.TestCase):
 
     def test_signup_page_renders_for_anonymous(self):
         self.web.cookies.clear()
-        resp = self.web.get("/signup")
+        resp = self.web.get("/join")
         self.assertEqual(resp.status_code, 200)
         self.assertIn('name="username"', resp.text)
         self.assertIn('name="email"', resp.text)
@@ -291,7 +291,7 @@ class WebUISmokeTests(unittest.TestCase):
 
     def test_signup_page_redirects_already_signed_in_user(self):
         # setUp leaves the admin cookie set.
-        resp = self.web.get("/signup", follow_redirects=False)
+        resp = self.web.get("/join", follow_redirects=False)
         self.assertEqual(resp.status_code, 303)
         self.assertEqual(resp.headers["location"], "/")
 
@@ -300,7 +300,7 @@ class WebUISmokeTests(unittest.TestCase):
         # auto-verifies rather than gating on an email that can't be sent.
         self.web.cookies.clear()
         resp = self.web.post(
-            "/signup", data=self._signup_form(), follow_redirects=False,
+            "/join", data=self._signup_form(), follow_redirects=False,
         )
         self.assertEqual(resp.status_code, 303, resp.text)
         self.assertEqual(resp.headers["location"], "/")
@@ -316,7 +316,7 @@ class WebUISmokeTests(unittest.TestCase):
     def test_signup_lands_on_account_with_flash_when_unverified(self, _c, _s):
         self.web.cookies.clear()
         form = self._signup_form()
-        resp = self.web.post("/signup", data=form, follow_redirects=False)
+        resp = self.web.post("/join", data=form, follow_redirects=False)
         self.assertEqual(resp.status_code, 303, resp.text)
         location = unquote(resp.headers["location"])
         self.assertTrue(location.startswith("/account?flash="))
@@ -328,7 +328,7 @@ class WebUISmokeTests(unittest.TestCase):
     def test_signup_requires_tos(self):
         self.web.cookies.clear()
         resp = self.web.post(
-            "/signup", data=self._signup_form(tos_accepted=""),
+            "/join", data=self._signup_form(tos_accepted=""),
             follow_redirects=False,
         )
         self.assertEqual(resp.status_code, 400)
@@ -337,7 +337,7 @@ class WebUISmokeTests(unittest.TestCase):
     def test_signup_mismatched_passwords_re_renders_form(self):
         self.web.cookies.clear()
         resp = self.web.post(
-            "/signup",
+            "/join",
             data=self._signup_form(password_confirm="something-else"),
             follow_redirects=False,
         )
@@ -347,14 +347,14 @@ class WebUISmokeTests(unittest.TestCase):
     def test_signup_duplicate_username_re_renders_form(self):
         self.web.cookies.clear()
         form = self._signup_form(username="dupeuser123")
-        first = self.web.post("/signup", data=form, follow_redirects=False)
+        first = self.web.post("/join", data=form, follow_redirects=False)
         self.assertEqual(first.status_code, 303, first.text)
         self.web.cookies.clear()
         second_form = self._signup_form(
             username="dupeuser123", email="different@example.com",
         )
         second = self.web.post(
-            "/signup", data=second_form, follow_redirects=False,
+            "/join", data=second_form, follow_redirects=False,
         )
         self.assertEqual(second.status_code, 409)
         self.assertIn("taken", second.text)
@@ -369,7 +369,7 @@ class WebUISmokeTests(unittest.TestCase):
     def test_account_page_shows_unverified_badge_and_resend_button(self, _c, _s):
         self.web.cookies.clear()
         signup = self.web.post(
-            "/signup", data=self._signup_form(), follow_redirects=False,
+            "/join", data=self._signup_form(), follow_redirects=False,
         )
         self.assertEqual(signup.status_code, 303, signup.text)
         self.assertIn(client_web.SESSION_COOKIE, signup.cookies)
@@ -391,7 +391,7 @@ class WebUISmokeTests(unittest.TestCase):
     def test_account_resend_verification_sends_a_new_email(self, _c, _s):
         self.web.cookies.clear()
         signup = self.web.post(
-            "/signup", data=self._signup_form(), follow_redirects=False,
+            "/join", data=self._signup_form(), follow_redirects=False,
         )
         self.assertEqual(signup.status_code, 303, signup.text)
         self.assertIn(client_web.SESSION_COOKIE, signup.cookies)

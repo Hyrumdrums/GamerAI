@@ -148,17 +148,31 @@ DONE 2026-08-21: web signup flow + admin test-email tool + downloads-page
     during testing never looks like an account prompt. Surfaces the
     actual Resend error (bad key, domain not verified, etc.) instead
     of a bare pass/fail.
-  - Web signup: new /signup page (client/routes/signup.py +
-    signup.html.j2), reachable from the landing page and the login
-    page (both previously had stale invite-only copy). Posts to the
-    coordinator's existing POST /signup, auto-logs in via session
-    cookie same as invite-accept. Verification stayed LINK-based (the
-    coordinator's existing GET /verify-email), not a typed code --
-    reused what was already built and tested rather than adding a
-    parallel code-entry mechanism. account.html.j2 now shows a
-    verified/not-verified badge + "Resend verification email" button
-    (new POST /account/resend-verification) so the status persists
-    past the first-signup moment, not just a one-time flash message.
+  - Web signup: new /join page (client/routes/signup.py +
+    signup.html.j2 -- URL is /join, NOT /signup; see below), reachable
+    from the landing page and the login page (both previously had
+    stale invite-only copy). Posts to the coordinator's existing POST
+    /signup, auto-logs in via session cookie same as invite-accept.
+    Verification stayed LINK-based (the coordinator's existing GET
+    /verify-email), not a typed code -- reused what was already built
+    and tested rather than adding a parallel code-entry mechanism.
+    account.html.j2 now shows a verified/not-verified badge + "Resend
+    verification email" button (new POST /account/resend-verification)
+    so the status persists past the first-signup moment, not just a
+    one-time flash message.
+  - Second bug, caught by the deploy itself: curl'ing the new page in
+    prod returned the coordinator's bare 401 -- infra/Caddyfile routes
+    an explicit path allowlist to the client container and falls
+    everything else through straight to the coordinator, which already
+    owns a public /signup (the Windows agent's console flow POSTs JSON
+    there directly). A Caddy matcher pointing /signup at the client
+    would have hijacked the agent's API calls behind a form-encoded
+    handler expecting multipart data -- silently broken every agent
+    signup in the field. Renamed the browser page's URL to /join
+    (kept the signup.py/signup.html.j2 filenames -- that's the
+    feature name, /join is just the route) and added the matching
+    Caddy block. No test suite could have caught this since it's a
+    routing-layer conflict, not an app-layer one.
   - Bug caught mid-build, fixed before touching prod: main.py already
     had its own PUBLIC_BASE_URL (agent-pairing section) that silently
     shadowed the shared.config import I'd added for the verify-email

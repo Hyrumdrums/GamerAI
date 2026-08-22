@@ -66,6 +66,13 @@
     # coordinator default and 401 (the coord owns /me/machines, but the
     # browser-facing /machines surface is the client's).
     @web_ui_machines path /machines /machines/*
+    # Public web signup form. Deliberately NOT at /signup — the
+    # coordinator already owns that path for its own public JSON API
+    # (POST /signup, used directly by the Windows agent's console
+    # signup flow), and that handler expects a JSON body, not this
+    # page's form-encoded POST. Reusing /signup here would silently
+    # swallow the agent's API calls behind this page instead.
+    @web_ui_join path /join
     # Public onboarding pitch + Windows install TL;DR. Reachable
     # while signed in (topbar CTA) and anonymously.
     @web_ui_contribute path /contribute
@@ -113,6 +120,9 @@
         reverse_proxy client:8080
     }
     handle @web_ui_machines {
+        reverse_proxy client:8080
+    }
+    handle @web_ui_join {
         reverse_proxy client:8080
     }
     handle @web_ui_contribute {
