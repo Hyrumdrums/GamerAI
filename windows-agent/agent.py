@@ -2792,6 +2792,7 @@ def _install_ollama(mirror_base: str, log: logging.Logger) -> Optional[Path]:
     if not _download_to(setup_url, setup_dest, log, "ollama-setup.exe"):
         return None
     log.info("bootstrap: running ollama installer (silent)")
+    log.info("")
     log.info(
         "bootstrap: if a 'User Account Control' / Windows Security prompt "
         "appears asking to install a Microsoft Visual C++ Redistributable, "
