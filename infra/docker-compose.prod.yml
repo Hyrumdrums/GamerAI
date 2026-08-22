@@ -25,6 +25,18 @@ services:
     restart: unless-stopped
     ports: !override
       - "127.0.0.1:8000:8000"
+    environment:
+      # Absolute host for the agent-pairing verification URL and the
+      # signup email-verification link (coordinator/main.py's
+      # _start_email_verification). Without this the coordinator falls
+      # back to request.base_url — fine when Caddy forwards the
+      # original Host header (pairing, browser traffic), but the
+      # emailed verify-email link isn't tied to any live request's
+      # Host at send time, so it silently fell back to this
+      # container's own bind address (http://localhost:8000) and
+      # mailed a dead link. Mirrors the client service's PUBLIC_BASE_URL
+      # below — same var, same derivation, just also needed here.
+      PUBLIC_BASE_URL: "https://${DOMAIN}"
 
   worker:
     # Gated behind the `mock-worker` profile — by default `docker compose
