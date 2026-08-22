@@ -47,6 +47,14 @@ def _send(to_email: str, subject: str, html: str) -> tuple[bool, str]:
         headers={
             "Authorization": f"Bearer {RESEND_API_KEY}",
             "Content-Type": "application/json",
+            # Cloudflare fronts api.resend.com and blocks the default
+            # "Python-urllib/3.x" User-Agent outright (403, CF error
+            # 1010 — "banned based on your browser's signature") before
+            # the request ever reaches Resend. Confirmed by comparing
+            # curl (gets a normal 4xx from Resend itself) against bare
+            # urllib (gets Cloudflare's 403) from the same host. Any
+            # non-default UA clears it; this one just says what we are.
+            "User-Agent": "GamerAI-Coordinator/1.0 (+https://ai.dallinlayton.com)",
         },
     )
     try:
