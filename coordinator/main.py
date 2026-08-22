@@ -17,8 +17,10 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
+from coordinator import admin_alerts  # noqa: F401 — import wires its event subscriptions
 from coordinator import canaries as canary_lib
 from coordinator import email_send
+from coordinator import events
 from coordinator import member_auth, model_registry, notifications
 from coordinator import schedule as machine_schedule
 from coordinator.canaries import CanaryInjector
@@ -2716,7 +2718,7 @@ def register(req: WorkerIdent, request: Request):
     # Ownership claim — atomic so concurrent registers can't race.
     # When AUTH is off (dev mode), member_id is None and the
     # ownership check inside claim_worker_ownership is permissive.
-    ok, existing_owner = db.claim_worker_ownership(
+    ok, existing_owner, is_new = db.claim_worker_ownership(
         req.worker_id, member_id, "idle", now,
     )
     if not ok:
@@ -2759,6 +2761,12 @@ def register(req: WorkerIdent, request: Request):
         "worker registered",
         extra={"event": "worker_registered", "worker_id": req.worker_id},
     )
+    if is_new:
+        events.emit(
+            "worker.registered",
+            worker_id=req.worker_id,
+            owner_member_id=member_id,
+        )
     return {"ok": True}
 
 
@@ -4591,6 +4599,10 @@ def signup(req: SignupRequest, request: Request):
         db.verify_member_email(new_member_id)
 
     log.info("signup ok", extra={"event": "signup_ok"})
+    events.emit(
+        "member.created",
+        member_id=new_member_id, username=username, email=email,
+    )
     return {
         "member_id": new_member_id,
         "token": raw_token,
@@ -5249,6 +5261,11 @@ def accept_invite(code: str, req: InviteAcceptRequest):
     log.info(
         "invite accepted",
         extra={"event": "invite_accepted"},
+    )
+    events.emit(
+        "member.created",
+        member_id=new_member_id, username=username, email=email,
+        invited=True,
     )
     return {
         "member_id": new_member_id,

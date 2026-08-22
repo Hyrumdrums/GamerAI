@@ -229,13 +229,13 @@ class ImageUsageAndEarningsTests(unittest.TestCase):
         # Two workers owned by our member, plus one owned by someone
         # else as a negative control.
         now = time.time()
-        ok1, _ = self.db.claim_worker_ownership(
+        ok1, _, _ = self.db.claim_worker_ownership(
             "w_owned_a", self.member_id, "idle", now,
         )
-        ok2, _ = self.db.claim_worker_ownership(
+        ok2, _, _ = self.db.claim_worker_ownership(
             "w_owned_b", self.member_id, "idle", now,
         )
-        ok3, _ = self.db.claim_worker_ownership(
+        ok3, _, _ = self.db.claim_worker_ownership(
             "w_stranger", "mem_stranger", "idle", now,
         )
         self.assertTrue(ok1 and ok2 and ok3)

@@ -154,6 +154,11 @@ EMAIL_VERIFY_TTL_SECONDS = _int("EMAIL_VERIFY_TTL_SECONDS", 86400)  # 24h
 # (agent-pairing section) rather than a second os.getenv here — same
 # env var, one source of truth, with request.base_url as its fallback.
 
+# Where to send operational alerts (new member, new worker, ...) — see
+# coordinator/admin_alerts.py. Empty = alerts are skipped, same
+# no-op-when-unconfigured pattern as RESEND_API_KEY above.
+ADMIN_ALERT_EMAIL = os.getenv("ADMIN_ALERT_EMAIL", "").strip()
+
 
 # --- model registry (off by default = legacy "any model name accepted") ---
 STRICT_MODELS = _bool("STRICT_MODELS", False)

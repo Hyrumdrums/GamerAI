@@ -687,16 +687,19 @@ class DB:
         member_id: Optional[str],
         status: str,
         last_seen: float,
-    ) -> tuple[bool, Optional[str]]:
+    ) -> tuple[bool, Optional[str], bool]:
         """Atomic ownership claim for /register. Returns
-        (ok, current_owner).
+        (ok, current_owner, is_new).
 
         - If the worker_id is new, inserts with member_id as owner.
         - If the worker_id exists with owner_member_id NULL (legacy),
           the calling member adopts ownership.
         - If the worker_id exists with the same owner, refresh status.
-        - If owned by a different member, returns (False, existing_owner)
+        - If owned by a different member, returns (False, existing_owner, False)
           so the caller can 403.
+
+        ``is_new`` lets the caller fire a "new agent" event exactly
+        once per worker_id, rather than on every reconnect/restart.
         """
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
@@ -714,7 +717,7 @@ class DB:
                         (worker_id, status, last_seen, last_seen, member_id),
                     )
                     self._conn.execute("COMMIT")
-                    return True, member_id
+                    return True, member_id, True
                 existing = row["owner_member_id"]
                 if (
                     existing is not None
@@ -722,7 +725,7 @@ class DB:
                     and existing != member_id
                 ):
                     self._conn.execute("ROLLBACK")
-                    return False, existing
+                    return False, existing, False
                 # Same owner OR adopting a legacy unowned worker.
                 self._conn.execute(
                     "UPDATE workers SET status=?, last_seen=?, "
@@ -731,7 +734,7 @@ class DB:
                     (status, last_seen, member_id, worker_id),
                 )
                 self._conn.execute("COMMIT")
-                return True, member_id if existing is None else existing
+                return True, (member_id if existing is None else existing), False
             except Exception:
                 self._conn.execute("ROLLBACK")
                 raise

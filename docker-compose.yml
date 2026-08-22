@@ -73,6 +73,9 @@ services:
       EMAIL_FROM: ${EMAIL_FROM:-}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8000}
       EMAIL_VERIFY_TTL_SECONDS: ${EMAIL_VERIFY_TTL_SECONDS:-86400}
+      # Admin alert emails (new member, new agent, ...). Empty = skipped.
+      # See coordinator/admin_alerts.py.
+      ADMIN_ALERT_EMAIL: ${ADMIN_ALERT_EMAIL:-}
       DEMO_ENABLED: ${DEMO_ENABLED:-true}
       DEMO_MAX_PER_IP: ${DEMO_MAX_PER_IP:-5}
       DEMO_WINDOW_SECONDS: ${DEMO_WINDOW_SECONDS:-3600}

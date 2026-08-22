@@ -15,7 +15,7 @@ import logging
 import urllib.error
 import urllib.request
 
-from shared.config import EMAIL_FROM, RESEND_API_KEY
+from shared.config import ADMIN_ALERT_EMAIL, EMAIL_FROM, RESEND_API_KEY
 
 log = logging.getLogger("gamerai.email")
 
@@ -84,6 +84,16 @@ def send_verification_email(to_email: str, verify_url: str) -> bool:
         "account, you can ignore this email.</p>"
     )
     ok, _detail = _send(to_email, "Verify your GamerAI account", html)
+    return ok
+
+
+def send_admin_alert(subject: str, html: str) -> bool:
+    """Best-effort send to ADMIN_ALERT_EMAIL (see coordinator/admin_alerts.py).
+    No-op (returns False) when ADMIN_ALERT_EMAIL isn't set — same
+    unconfigured-is-fine posture as the rest of this module."""
+    if not ADMIN_ALERT_EMAIL:
+        return False
+    ok, _detail = _send(ADMIN_ALERT_EMAIL, subject, html)
     return ok
 
 
