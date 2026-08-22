@@ -2794,6 +2794,10 @@ def _install_ollama(mirror_base: str, log: logging.Logger) -> Optional[Path]:
     log.info("bootstrap: running ollama installer (silent)")
     log.info("")
     log.info(
+        "bootstrap: please wait — this can take a minute or two before "
+        "anything else appears. It is not frozen."
+    )
+    log.info(
         "bootstrap: if a 'User Account Control' / Windows Security prompt "
         "appears asking to install a Microsoft Visual C++ Redistributable, "
         "click Yes — that's Ollama's own installer pulling a dependency "
