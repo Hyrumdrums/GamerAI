@@ -67,8 +67,12 @@ async def dashboard(
     _, workers_body = await api_client.fetch_safe(bearer=bearer, path="/workers")
     _, earnings_body = await api_client.fetch_safe(bearer=bearer, path="/earnings")
 
-    workers = workers_body["workers"]
-    active_workers_count = sum(1 for w in workers if w["status"] == "online")
+    workers = sorted(
+        workers_body["workers"],
+        key=lambda w: w.get("last_seen") or 0,
+        reverse=True,
+    )
+    active_workers_count = sum(1 for w in workers if w["status"] != "offline")
     total_earnings = sum(w.get("total_usd", 0) for w in workers)
     top_earners = sorted(
         earnings_body.get("workers", []) or [],
