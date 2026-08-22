@@ -718,6 +718,133 @@ class MemberAuthE2ETests(unittest.TestCase):
         )
         self.assertEqual(img_resp.status_code, 200)
 
+    # ------------------------------------------------------------------
+    # sponsored-user isolation — a contributor's own usage/quota must
+    # stay a fully separate ledger from each invitee they sponsor, and
+    # invitees under the same host must not share a ledger with each
+    # other either. This is the actual "invite my family to use from
+    # my quota" mechanic: the host sets each invitee's cap (see
+    # business.md), but consumption is metered per-member, not pooled.
+    # ------------------------------------------------------------------
+    def _submit_and_complete(
+        self, token: str, completion_tokens: int, prompt_tokens: int = 1,
+    ) -> None:
+        """Full round-trip through the real crediting path (submit ->
+        worker claim -> complete), not a direct DB seed — this is what
+        actually calls db.add_member_usage in production, so a bug in
+        who gets credited would show up here and not in a shortcut
+        test."""
+        admin_headers = self._admin_headers()
+        job_id = self.client.post(
+            "/generate",
+            json={"prompt": "usage isolation check"},
+            headers={"Authorization": f"Bearer {token}"},
+        ).json()["job_id"]
+        worker_id = "wkr-" + uuid.uuid4().hex[:8]
+        self.client.post(
+            "/register", json={"worker_id": worker_id}, headers=admin_headers,
+        )
+        self.assertIsNotNone(self.r.lpop("job_queue"))
+        claim_token = self.client.post(
+            "/jobs/claim",
+            json={"worker_id": worker_id, "job_id": job_id},
+            headers=admin_headers,
+        ).json()["claim_token"]
+        complete_resp = self.client.post(
+            "/jobs/complete",
+            json={
+                "worker_id": worker_id,
+                "job_id": job_id,
+                "text": "[mock] reply",
+                "model": "mock",
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "duration_seconds": 0.1,
+                "status": "complete",
+                "claim_token": claim_token,
+            },
+            headers=admin_headers,
+        )
+        self.assertEqual(complete_resp.status_code, 200, complete_resp.text)
+
+    def test_invitee_usage_does_not_debit_hosts_quota(self):
+        """The host runs their own agent and games on their own quota;
+        their invited family member's consumption must not touch the
+        host's own ledger, and vice versa."""
+        host_token = self._create_member_via_cli(
+            "create-member", "--role", "contributor",
+            "--daily-quota-tokens", "5",
+        )
+        host_member = member_auth.lookup_member_by_token(self.db, host_token)
+        code = self._create_invite(host_token, daily_quota_tokens=5)
+        invitee_token = self.client.post(
+            f"/invites/{code}/accept", json=self._accept_payload()
+        ).json()["token"]
+        invitee_member = member_auth.lookup_member_by_token(self.db, invitee_token)
+
+        # Invitee burns well past their own 5-token cap.
+        self._submit_and_complete(invitee_token, completion_tokens=10)
+
+        # Host's ledger is untouched by the invitee's usage — still
+        # zero, and the host can still submit under their own cap.
+        host_usage = self.db.member_usage_today(host_member.member_id)
+        self.assertEqual(host_usage["tokens_out"], 0)
+        host_resp = self.client.post(
+            "/generate",
+            json={"prompt": "host's own turn"},
+            headers={"Authorization": f"Bearer {host_token}"},
+        )
+        self.assertEqual(host_resp.status_code, 200)
+
+        # The invitee, having exceeded their own cap, is now blocked —
+        # on their own ledger, independent of the host's fresh usage.
+        invitee_resp = self.client.post(
+            "/generate",
+            json={"prompt": "invitee tries again"},
+            headers={"Authorization": f"Bearer {invitee_token}"},
+        )
+        self.assertEqual(invitee_resp.status_code, 429)
+        invitee_usage = self.db.member_usage_today(invitee_member.member_id)
+        self.assertEqual(invitee_usage["tokens_out"], 10)
+
+    def test_sibling_invitees_have_independent_quota_ledgers(self):
+        """Two family members invited by the same host must not share
+        a usage ledger — one sibling maxing out their cap must not
+        block (or silently credit) the other."""
+        host_token = self._create_member_via_cli(
+            "create-member", "--role", "contributor",
+        )
+        code_a = self._create_invite(host_token, daily_quota_tokens=5)
+        code_b = self._create_invite(host_token, daily_quota_tokens=5)
+        token_a = self.client.post(
+            f"/invites/{code_a}/accept",
+            json=self._accept_payload(invitee_email="sibling-a@example.com"),
+        ).json()["token"]
+        token_b = self.client.post(
+            f"/invites/{code_b}/accept",
+            json=self._accept_payload(invitee_email="sibling-b@example.com"),
+        ).json()["token"]
+        member_b = member_auth.lookup_member_by_token(self.db, token_b)
+
+        # Sibling A blows through their own cap.
+        self._submit_and_complete(token_a, completion_tokens=10)
+        resp_a = self.client.post(
+            "/generate",
+            json={"prompt": "a tries again"},
+            headers={"Authorization": f"Bearer {token_a}"},
+        )
+        self.assertEqual(resp_a.status_code, 429)
+
+        # Sibling B is unaffected — zero usage, still under cap.
+        usage_b = self.db.member_usage_today(member_b.member_id)
+        self.assertEqual(usage_b["tokens_out"], 0)
+        resp_b = self.client.post(
+            "/generate",
+            json={"prompt": "b's first turn"},
+            headers={"Authorization": f"Bearer {token_b}"},
+        )
+        self.assertEqual(resp_b.status_code, 200)
+
     def test_me_returns_tier_quota_and_earnings_envelope(self):
         """/me grows three new fields: tier_quota, daily_quota_images,
         earnings — the account-page activity card depends on all
