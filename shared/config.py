@@ -144,7 +144,11 @@ SIGNUP_WINDOW_SECONDS = _int("SIGNUP_WINDOW_SECONDS", 3600)  # 1h
 # dev/test and any deploy that hasn't configured Resend working
 # exactly as before this slice landed. See coordinator/email_send.py.
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "").strip()
-EMAIL_FROM = os.getenv("EMAIL_FROM", "GamerAI <noreply@dallinlayton.com>")
+# Sender address must be on a domain verified in Resend — the bare
+# apex (dallinlayton.com) is NOT verified, only the ai.dallinlayton.com
+# subdomain is (confirmed 2026-08-22; sending from the apex 403s with
+# "domain is not verified" even with a valid API key).
+EMAIL_FROM = os.getenv("EMAIL_FROM", "GamerAI <noreply@ai.dallinlayton.com>")
 EMAIL_VERIFY_TTL_SECONDS = _int("EMAIL_VERIFY_TTL_SECONDS", 86400)  # 24h
 # Verification-link host: reuses coordinator.main's PUBLIC_BASE_URL
 # (agent-pairing section) rather than a second os.getenv here — same
