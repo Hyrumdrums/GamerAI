@@ -26,24 +26,18 @@ def is_configured() -> bool:
     return bool(RESEND_API_KEY)
 
 
-def send_verification_email(to_email: str, verify_url: str) -> bool:
-    """Best-effort send. Returns True on a 2xx from Resend, False on
-    any failure (missing key, network error, non-2xx) — callers treat
-    False as "couldn't confirm delivery," not a reason to fail the
-    request that triggered the send."""
+def _send(to_email: str, subject: str, html: str) -> tuple[bool, str]:
+    """Shared low-level POST. Returns (ok, detail) — detail is empty on
+    success, otherwise a short human-readable reason (missing key,
+    HTTP status + Resend's error body, or the exception string) so
+    callers that surface this to a human (the admin test-email tool)
+    can show something actionable instead of a bare False."""
     if not RESEND_API_KEY:
-        return False
-    html = (
-        "<p>Welcome to GamerAI! Confirm your email to unlock chat, "
-        "image generation, and voice:</p>"
-        f'<p><a href="{verify_url}">{verify_url}</a></p>'
-        "<p>This link expires in 24 hours. If you didn't create this "
-        "account, you can ignore this email.</p>"
-    )
+        return False, "RESEND_API_KEY is not configured"
     payload = json.dumps({
         "from": EMAIL_FROM,
         "to": [to_email],
-        "subject": "Verify your GamerAI account",
+        "subject": subject,
         "html": html,
     }).encode("utf-8")
     req = urllib.request.Request(
@@ -57,11 +51,42 @@ def send_verification_email(to_email: str, verify_url: str) -> bool:
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
-            return 200 <= resp.status < 300
+            if 200 <= resp.status < 300:
+                return True, ""
+            return False, f"HTTP {resp.status}"
     except urllib.error.HTTPError as e:
-        body = e.read()[:300]
+        body = e.read()[:300].decode("utf-8", "replace")
         log.warning("resend send failed: HTTP %s %r", e.code, body)
-        return False
+        return False, f"HTTP {e.code}: {body}"
     except Exception as e:
         log.warning("resend send failed: %s", e)
-        return False
+        return False, str(e)
+
+
+def send_verification_email(to_email: str, verify_url: str) -> bool:
+    """Best-effort send. Returns True on a 2xx from Resend, False on
+    any failure (missing key, network error, non-2xx) — callers treat
+    False as "couldn't confirm delivery," not a reason to fail the
+    request that triggered the send."""
+    html = (
+        "<p>Welcome to GamerAI! Confirm your email to unlock chat, "
+        "image generation, and voice:</p>"
+        f'<p><a href="{verify_url}">{verify_url}</a></p>'
+        "<p>This link expires in 24 hours. If you didn't create this "
+        "account, you can ignore this email.</p>"
+    )
+    ok, _detail = _send(to_email, "Verify your GamerAI account", html)
+    return ok
+
+
+def send_test_email(to_email: str) -> tuple[bool, str]:
+    """Admin-only deliverability check (dashboard's "Email delivery
+    test" card) — a plain, unmistakably-a-test message, distinct from
+    send_verification_email so a real Resend send during testing never
+    looks like an account-verification prompt. Returns (ok, detail)."""
+    html = (
+        "<p>This is a test email from your GamerAI coordinator, sent "
+        "from the admin dashboard to confirm Resend delivery is "
+        "working. No action needed.</p>"
+    )
+    return _send(to_email, "GamerAI test email", html)

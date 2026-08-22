@@ -13,6 +13,7 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
+from urllib.parse import unquote
 
 # 1. Env BEFORE imports — auth on, fresh DB, no rate limit.
 _TMPDIR = tempfile.mkdtemp(prefix="gamerai-test-webui-")
@@ -264,6 +265,166 @@ class WebUISmokeTests(unittest.TestCase):
         )
         self.assertEqual(second.status_code, 409)
         self.assertIn("already taken", second.text)
+
+    # ------------------------------------------------------------------
+    # public web signup flow (distinct from the invite-accept flow above
+    # — no code, posts to the coordinator's own invite-free POST /signup)
+    # ------------------------------------------------------------------
+    def _signup_form(self, **overrides):
+        form = {
+            "username": "websignup" + str(id(overrides))[-6:],
+            "email": "websignup" + str(id(overrides))[-6:] + "@example.com",
+            "password": "correct horse battery staple",
+            "password_confirm": "correct horse battery staple",
+            "tos_accepted": "on",
+        }
+        form.update(overrides)
+        return form
+
+    def test_signup_page_renders_for_anonymous(self):
+        self.web.cookies.clear()
+        resp = self.web.get("/signup")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn('name="username"', resp.text)
+        self.assertIn('name="email"', resp.text)
+        self.assertIn('name="tos_accepted"', resp.text)
+
+    def test_signup_page_redirects_already_signed_in_user(self):
+        # setUp leaves the admin cookie set.
+        resp = self.web.get("/signup", follow_redirects=False)
+        self.assertEqual(resp.status_code, 303)
+        self.assertEqual(resp.headers["location"], "/")
+
+    def test_signup_auto_verifies_and_logs_in_when_resend_unconfigured(self):
+        # RESEND_API_KEY is unset in this test env, so the coordinator
+        # auto-verifies rather than gating on an email that can't be sent.
+        self.web.cookies.clear()
+        resp = self.web.post(
+            "/signup", data=self._signup_form(), follow_redirects=False,
+        )
+        self.assertEqual(resp.status_code, 303, resp.text)
+        self.assertEqual(resp.headers["location"], "/")
+        self.assertIn(client_web.SESSION_COOKIE, resp.cookies)
+        self.assertTrue(
+            resp.cookies[client_web.SESSION_COOKIE].startswith("gai_")
+        )
+
+    @mock.patch.object(coordinator_main.email_send, "send_verification_email",
+                        return_value=True)
+    @mock.patch.object(coordinator_main.email_send, "is_configured",
+                        return_value=True)
+    def test_signup_lands_on_account_with_flash_when_unverified(self, _c, _s):
+        self.web.cookies.clear()
+        form = self._signup_form()
+        resp = self.web.post("/signup", data=form, follow_redirects=False)
+        self.assertEqual(resp.status_code, 303, resp.text)
+        location = unquote(resp.headers["location"])
+        self.assertTrue(location.startswith("/account?flash="))
+        self.assertIn("confirmation link", location)
+        # Still auto-logged in — verification only gates chat/image/voice,
+        # not browsing the account page or pairing a machine.
+        self.assertIn(client_web.SESSION_COOKIE, resp.cookies)
+
+    def test_signup_requires_tos(self):
+        self.web.cookies.clear()
+        resp = self.web.post(
+            "/signup", data=self._signup_form(tos_accepted=""),
+            follow_redirects=False,
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("community terms", resp.text)
+
+    def test_signup_mismatched_passwords_re_renders_form(self):
+        self.web.cookies.clear()
+        resp = self.web.post(
+            "/signup",
+            data=self._signup_form(password_confirm="something-else"),
+            follow_redirects=False,
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("Passwords didn", resp.text)
+
+    def test_signup_duplicate_username_re_renders_form(self):
+        self.web.cookies.clear()
+        form = self._signup_form(username="dupeuser123")
+        first = self.web.post("/signup", data=form, follow_redirects=False)
+        self.assertEqual(first.status_code, 303, first.text)
+        self.web.cookies.clear()
+        second_form = self._signup_form(
+            username="dupeuser123", email="different@example.com",
+        )
+        second = self.web.post(
+            "/signup", data=second_form, follow_redirects=False,
+        )
+        self.assertEqual(second.status_code, 409)
+        self.assertIn("taken", second.text)
+
+    # ------------------------------------------------------------------
+    # account page email verification (status badge + resend button)
+    # ------------------------------------------------------------------
+    @mock.patch.object(coordinator_main.email_send, "send_verification_email",
+                        return_value=True)
+    @mock.patch.object(coordinator_main.email_send, "is_configured",
+                        return_value=True)
+    def test_account_page_shows_unverified_badge_and_resend_button(self, _c, _s):
+        self.web.cookies.clear()
+        signup = self.web.post(
+            "/signup", data=self._signup_form(), follow_redirects=False,
+        )
+        self.assertEqual(signup.status_code, 303, signup.text)
+        self.assertIn(client_web.SESSION_COOKIE, signup.cookies)
+        # Explicit cookie carry (not relying on jar persistence across
+        # separate calls) — matches every other multi-request test in
+        # this file, e.g. test_invite_accept_duplicate_username_re_renders_form.
+        self.web.cookies.set(
+            client_web.SESSION_COOKIE, signup.cookies[client_web.SESSION_COOKIE],
+        )
+        resp = self.web.get("/account")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("not verified", resp.text)
+        self.assertIn("Resend verification email", resp.text)
+
+    @mock.patch.object(coordinator_main.email_send, "send_verification_email",
+                        return_value=True)
+    @mock.patch.object(coordinator_main.email_send, "is_configured",
+                        return_value=True)
+    def test_account_resend_verification_sends_a_new_email(self, _c, _s):
+        self.web.cookies.clear()
+        signup = self.web.post(
+            "/signup", data=self._signup_form(), follow_redirects=False,
+        )
+        self.assertEqual(signup.status_code, 303, signup.text)
+        self.assertIn(client_web.SESSION_COOKIE, signup.cookies)
+        self.web.cookies.set(
+            client_web.SESSION_COOKIE, signup.cookies[client_web.SESSION_COOKIE],
+        )
+        resp = self.web.post(
+            "/account/resend-verification", follow_redirects=False,
+        )
+        self.assertEqual(resp.status_code, 303)
+        self.assertIn(
+            "Verification email sent", unquote(resp.headers["location"]),
+        )
+
+    def test_account_page_shows_verified_badge_for_invitee(self):
+        # Invite-accepted members (unlike signup members) default
+        # email_verified=1 — the badge should reflect that, not the
+        # signup-only gate.
+        _, code = self._make_contributor_and_invite()
+        self.web.cookies.clear()
+        accept = self.web.post(
+            f"/invite/{code}", data=self._accept_form(),
+            follow_redirects=False,
+        )
+        self.assertEqual(accept.status_code, 303, accept.text)
+        self.assertIn(client_web.SESSION_COOKIE, accept.cookies)
+        self.web.cookies.set(
+            client_web.SESSION_COOKIE, accept.cookies[client_web.SESSION_COOKIE],
+        )
+        resp = self.web.get("/account")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("verified", resp.text)
+        self.assertNotIn("not verified", resp.text)
 
     # ------------------------------------------------------------------
     # account page
@@ -732,6 +893,41 @@ class WebUISmokeTests(unittest.TestCase):
         resp = self.web.get("/dashboard")
         self.assertEqual(resp.status_code, 200)
         self.assertIn("wkr-dashtest"[-12:], resp.text)
+
+    # ------------------------------------------------------------------
+    # admin "Email delivery test" card
+    # ------------------------------------------------------------------
+    @mock.patch.object(coordinator_main.email_send, "send_test_email",
+                        return_value=(True, ""))
+    @mock.patch.object(coordinator_main.email_send, "is_configured",
+                        return_value=True)
+    def test_admin_test_email_success_shows_confirmation(self, _c, _s):
+        resp = self.web.post(
+            "/admin/test-email", data={"to": "ops@example.com"},
+            follow_redirects=True,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("Sent to ops@example.com", resp.text)
+
+    def test_admin_test_email_surfaces_unconfigured_failure(self):
+        # RESEND_API_KEY is unset in this test env — the coordinator
+        # rejects the request instead of silently no-oping, since this
+        # tool exists specifically to catch that misconfiguration.
+        resp = self.web.post(
+            "/admin/test-email", data={"to": "ops@example.com"},
+            follow_redirects=True,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("not configured", resp.text)
+
+    def test_admin_test_email_requires_admin_session(self):
+        self.web.cookies.clear()
+        resp = self.web.post(
+            "/admin/test-email", data={"to": "ops@example.com"},
+            follow_redirects=False,
+        )
+        self.assertEqual(resp.status_code, 303)
+        self.assertEqual(resp.headers["location"], "/login?next=/admin/test-email")
 
     # ------------------------------------------------------------------
     # /api/* proxy endpoints — exercise each one through the web UI so we

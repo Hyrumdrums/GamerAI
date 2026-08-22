@@ -1,0 +1,71 @@
+{% extends "base.html.j2" %}
+{% block title %}Create your account — GamerAI{% endblock %}
+{% block extra_css %}
+<link rel="stylesheet" href="/static/css/redeem.css">
+{% endblock %}
+
+{% block content %}
+<div class="page">
+  <h1><a href="/">GamerAI</a></h1>
+  <div class="muted" style="margin-bottom:1.25rem">
+    Running the agent is the usual way in — it walks you through this
+    same signup on first launch. Creating an account here works too,
+    whether you plan to install the agent right after or just want to
+    try chat under your own account first.
+  </div>
+
+  {% if error %}
+  <div class="alert-err">{{ error }}</div>
+  {% endif %}
+
+  <form method="POST" action="/signup">
+    <label for="username" class="label">Pick a username</label>
+    <input id="username" name="username" type="text"
+           value="{{ username }}"
+           autocomplete="username"
+           pattern="[A-Za-z0-9_.\-]{3,32}"
+           minlength="3" maxlength="32"
+           placeholder="e.g. alex_h"
+           required autofocus>
+
+    <label for="email" class="label">Email</label>
+    <input id="email" name="email" type="email"
+           value="{{ email }}"
+           autocomplete="email"
+           placeholder="you@example.com"
+           required>
+    <div class="muted" style="font-size:.85rem;margin-top:.2rem">
+      We'll send a confirmation link here — chat, image generation, and
+      voice unlock once you click it. (Running the agent to contribute
+      compute is never blocked on this.)
+    </div>
+
+    <label for="password" class="label">Password (at least 8 characters)</label>
+    <input id="password" name="password" type="password"
+           autocomplete="new-password"
+           minlength="8"
+           required>
+
+    <label for="password_confirm" class="label">Confirm password</label>
+    <input id="password_confirm" name="password_confirm" type="password"
+           autocomplete="new-password"
+           minlength="8"
+           required>
+
+    <div class="accept-row">
+      <input id="tos_accepted" name="tos_accepted" type="checkbox" required>
+      <label for="tos_accepted">I've read and accept the
+        <a href="/tos" target="_blank">community terms</a>.</label>
+    </div>
+    <button id="submit" type="submit" disabled>Create my account</button>
+  </form>
+
+  <div class="hint" style="margin-top:1rem">
+    Already have an account? <a href="/login">Sign in</a>.
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script src="/static/js/redeem.js"></script>
+{% endblock %}

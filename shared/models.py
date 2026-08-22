@@ -293,6 +293,11 @@ class SignupRequest(BaseModel):
     tos_accepted: bool = False
 
 
+class TestEmailRequest(BaseModel):
+    """Admin dashboard's "Email delivery test" card — POST /admin/test-email."""
+    to: str
+
+
 class FriendQuotaUpdateRequest(BaseModel):
     """Host edits an accepted invitee's two-dimensional daily cap.
     Both fields are sent on every update — the form always carries

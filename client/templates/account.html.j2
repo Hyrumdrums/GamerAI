@@ -26,7 +26,16 @@
       <div class="k">Username</div>
       <div class="v">{{ me.username or '(not set)' }}</div>
       <div class="k">Email</div>
-      <div class="v">{{ me.email or '(none)' }}</div>
+      <div class="v">
+        {{ me.email or '(none)' }}
+        {% if me.email %}
+          {% if me.email_verified %}
+          <span class="badge badge-ok">verified</span>
+          {% else %}
+          <span class="badge badge-warn">not verified</span>
+          {% endif %}
+        {% endif %}
+      </div>
       <div class="k">Role</div>
       <div class="v">{{ me.role }}</div>
       <div class="k">Tier</div>
@@ -48,6 +57,19 @@
         {% endif %}
       </div>
     </div>
+
+    {% if me.email and not me.email_verified %}
+    <p class="muted partial-warn">
+      <strong>Verify your email to unlock chat, image generation, and
+      voice.</strong> Check your inbox for the confirmation link —
+      contributing compute (running the agent) works either way.
+    </p>
+    <form method="POST" action="/account/resend-verification" class="inline">
+      <button type="submit" class="btn-quiet" style="width:auto">
+        Resend verification email
+      </button>
+    </form>
+    {% endif %}
 
     <h2>Change password</h2>
     <form method="POST" action="/account/password" class="stacked">

@@ -8,8 +8,7 @@
 <div class="page">
   <h1><a href="/">GamerAI</a></h1>
   <div class="muted" style="margin-bottom:1.5rem">
-    Sign in with the username and password you set when you accepted
-    your invite.
+    Sign in with your GamerAI username and password.
   </div>
   {% if error %}
   <div class="alert-err">{{ error }}</div>
@@ -29,7 +28,7 @@
     <button type="submit">Sign in</button>
   </form>
   <div class="hint">
-    No account? Ask the host who invited you for a fresh invite link.
+    No account? <a href="/signup">Create one</a> — no invite needed.
   </div>
   <details class="token-fallback">
     <summary>Sign in with a bearer token instead</summary>

@@ -11,3 +11,10 @@
   .row-2 { grid-template-columns: 1fr 1fr; }
   .stat-value { font-size: 2rem; }
 }
+.inline-form { display: flex; gap: .5rem; flex-wrap: wrap; }
+.inline-form input { flex: 1 1 260px; }
+.test-email-ok {
+  background: #eaf6ea; border: 1px solid #a9d7ad; color: #1f5c28;
+  border-radius: var(--radius); padding: .6rem .8rem; margin: .5rem 0 1rem;
+  font-size: .92rem;
+}

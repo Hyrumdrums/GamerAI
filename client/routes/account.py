@@ -142,6 +142,32 @@ async def account_unpair_machine(prefix: str, request: Request):
     )
 
 
+@router.post("/account/resend-verification")
+async def account_resend_verification(request: Request):
+    """Web wrapper for POST /me/resend-verification — the account
+    page's "Resend verification email" button for a signup member who
+    never got (or lost) the original link."""
+    bearer = session_bearer(request)
+    me = await identify(bearer) if bearer else None
+    if me is None:
+        return login_redirect("/account")
+    async with coordinator_client._client(bearer=bearer) as c:
+        r = await c.post("/me/resend-verification", timeout=10)
+    if r.status_code == 200:
+        flash = (
+            "Your email is already verified."
+            if r.json().get("email_verified")
+            else "Verification email sent — check your inbox."
+        )
+        return RedirectResponse(f"/account?flash={flash}", status_code=303)
+    detail = "Couldn't send verification email."
+    try:
+        detail = r.json().get("detail", detail)
+    except ValueError:
+        pass
+    return RedirectResponse(f"/account?flash={detail}", status_code=303)
+
+
 @router.post("/account/password")
 async def account_password(
     request: Request,

@@ -27,7 +27,17 @@ from fastapi import FastAPI
 from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
 
-from client.routes import account, admin_ui, api, auth, chat, demo, invites, machines
+from client.routes import (
+    account,
+    admin_ui,
+    api,
+    auth,
+    chat,
+    demo,
+    invites,
+    machines,
+    signup,
+)
 
 app = FastAPI(title="GamerAI Web UI")
 
@@ -75,6 +85,7 @@ async def service_worker():
 app.include_router(auth.router)
 app.include_router(chat.router)
 app.include_router(invites.router)
+app.include_router(signup.router)
 app.include_router(account.router)
 app.include_router(machines.router)
 app.include_router(admin_ui.router)

@@ -1,6 +1,8 @@
 """Chat shell and admin dashboard. Anonymous visitors to / get a public
 landing page (not a /login redirect — a stranger with no context needs
 somewhere to land); the dashboard requires the admin role."""
+from typing import Optional
+
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
@@ -41,7 +43,11 @@ def admin_redirect():
 
 
 @router.get("/dashboard", response_class=HTMLResponse)
-async def dashboard(request: Request):
+async def dashboard(
+    request: Request,
+    test_email_ok: Optional[str] = None,
+    test_email_msg: Optional[str] = None,
+):
     bearer = session_bearer(request)
     me = await identify(bearer) if bearer else None
     if me is None:
@@ -78,5 +84,7 @@ async def dashboard(request: Request):
             "active_workers_count": active_workers_count,
             "total_earnings": total_earnings,
             "top_earners": top_earners,
+            "test_email_ok": test_email_ok,
+            "test_email_msg": test_email_msg,
         },
     )

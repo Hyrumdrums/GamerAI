@@ -58,6 +58,24 @@
   </div>
 
   <div class="section">
+    <h2>Email delivery test</h2>
+    <p class="muted">
+      Send a one-off test message via Resend to confirm delivery is
+      working (domain/DNS verification, API key) without creating a
+      throwaway signup just to trigger an email.
+    </p>
+    {% if test_email_msg %}
+    <div class="{% if test_email_ok == '1' %}test-email-ok{% else %}alert-err{% endif %}">
+      {{ test_email_msg }}
+    </div>
+    {% endif %}
+    <form method="POST" action="/admin/test-email" class="inline-form">
+      <input type="email" name="to" placeholder="you@example.com" required>
+      <button type="submit">Send test email</button>
+    </form>
+  </div>
+
+  <div class="section">
     <h2>All Workers</h2>
     <table>
       <tr><th>Worker ID</th><th>Account</th><th>Status</th><th>Jobs</th><th>Tokens</th><th>Earnings</th></tr>

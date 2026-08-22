@@ -124,14 +124,57 @@ DONE 2026-08-21: open signup abuse -- anyone could /signup with a
     user for a real one (3 attempts, then aborts) and prints a
     "check your inbox" note when the signup response comes back
     unverified. Shipped in agent v1.3.8.
-  - RESEND_API_KEY / EMAIL_FROM / PUBLIC_BASE_URL added to .env (local)
-    and docker-compose.yml passthrough -- STILL NEEDS ADDING TO
-    .env.prod ON THE VPS before this does anything in production (until
-    then it silently no-ops to auto-verify, same as today -- not
-    broken, just inert).
+  - RESEND_API_KEY / EMAIL_FROM added to .env (local) and .env.prod (VPS,
+    added by hand over SSH); PUBLIC_BASE_URL already derived from DOMAIN
+    in infra/docker-compose.prod.yml, didn't need adding. Deployed live.
   - Tests: tests/test_member_auth_e2e.py::SignupEmailVerificationTests
     (6 new, Resend mocked, no real network calls) + updated
     tests/test_agent_bootstrap.py::RunSignupFlowTests for the email
-    prompt. Full suite (592 tests) green.
+    prompt. Full suite (592 tests) green at ship time.
+
+DONE 2026-08-21: web signup flow + admin test-email tool + downloads-page
+  copy actually deployed. Three asks bundled in one pass:
+  - The downloads-page copy fix from earlier this session was edited
+    locally but never committed/deployed -- it lives at
+    /var/www/downloads-chroot/uploads/index.html on the VPS (copied
+    there by infra/setup-mirror.sh), NOT inside a docker image, so the
+    regular deploy.sh never touches it. Committed + copied it over by
+    hand; confirmed live via curl.
+  - Admin "send a test email" tool: dashboard.html.j2 now has an
+    "Email delivery test" card (email input + button), wired through
+    a new coordinator POST /admin/test-email (admin-only) ->
+    email_send.send_test_email() -- a plain "this is a test" message,
+    distinct from the verification-link template, so a real send
+    during testing never looks like an account prompt. Surfaces the
+    actual Resend error (bad key, domain not verified, etc.) instead
+    of a bare pass/fail.
+  - Web signup: new /signup page (client/routes/signup.py +
+    signup.html.j2), reachable from the landing page and the login
+    page (both previously had stale invite-only copy). Posts to the
+    coordinator's existing POST /signup, auto-logs in via session
+    cookie same as invite-accept. Verification stayed LINK-based (the
+    coordinator's existing GET /verify-email), not a typed code --
+    reused what was already built and tested rather than adding a
+    parallel code-entry mechanism. account.html.j2 now shows a
+    verified/not-verified badge + "Resend verification email" button
+    (new POST /account/resend-verification) so the status persists
+    past the first-signup moment, not just a one-time flash message.
+  - Bug caught mid-build, fixed before touching prod: main.py already
+    had its own PUBLIC_BASE_URL (agent-pairing section) that silently
+    shadowed the shared.config import I'd added for the verify-email
+    link -- an unconfigured deploy would have emailed a bare
+    "/verify-email?code=..." with no host. Fixed to reuse the existing
+    var with the same request.base_url fallback pairing already uses;
+    regression test added (asserts the emailed link is absolute).
+  - Verified end-to-end against the real local dev stack (not just
+    coordinator-side unit tests): screenshotted /signup, /login,
+    landing, account (unverified badge + resend), and the dashboard's
+    test-email card (both the missing-key red-error state and the
+    happy-path green state) via Playwright against tools/run_local.py.
+  - Tests: 6 new tests in tests/test_web_ui_smoke.py covering the
+    signup page, auto-verify vs. gated-with-flash paths, duplicate
+    username, resend, the verified/unverified badge, and the admin
+    test-email tool (success, misconfigured, non-admin 403). Full
+    suite: 606 passed.
 
 refactor god files like main.py... 4k+ lines

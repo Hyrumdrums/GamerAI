@@ -98,6 +98,7 @@ from shared.models import (
     MachineScheduleUpdate,
     PasswordChangeRequest,
     SignupRequest,
+    TestEmailRequest,
     WorkerIdent,
 )
 
@@ -5414,6 +5415,28 @@ def admin_list_members(request: Request):
             for r in rows
         ]
     }
+
+
+@app.post("/admin/test-email")
+def admin_test_email(req: TestEmailRequest, request: Request):
+    """Admin dashboard's "Email delivery test" card — sends a plain,
+    unmistakably-a-test message (not the verification template) to a
+    typed-in address so the admin can confirm Resend is actually
+    delivering (DNS/domain verification, RESEND_API_KEY, etc.) without
+    creating a throwaway signup just to trigger an email."""
+    _require_admin(request)
+    to = (req.to or "").strip()
+    if not to or "@" not in to:
+        raise HTTPException(status_code=400, detail="a valid email is required")
+    if not email_send.is_configured():
+        raise HTTPException(
+            status_code=400,
+            detail="RESEND_API_KEY is not configured on this coordinator",
+        )
+    ok, detail = email_send.send_test_email(to)
+    if not ok:
+        raise HTTPException(status_code=502, detail=f"send failed: {detail}")
+    return {"sent": True, "to": to}
 
 
 @app.get("/models")

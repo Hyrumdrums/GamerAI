@@ -5,6 +5,83 @@ entries on top. Skim for context before resuming work.
 
 ---
 
+## 2026-08-21 — web signup page, admin test-email tool, deployed downloads-page fix
+
+Follow-up to the email-verification slice below, once the owner started
+DNS-verifying the sending domain in Resend and asked for three things:
+an admin tool to send a test email, an actual web signup flow (not just
+the Windows-agent console flow), and a re-check on the downloads-page
+copy — "I thought we fixed that."
+
+**Downloads page was never actually live.** Turned out the earlier fix
+was edited locally and committed, but `infra/downloads-index.html`
+isn't served from a docker image — `infra/setup-mirror.sh` copies it to
+`/var/www/downloads-chroot/uploads/index.html` on the VPS once, and
+`deploy.sh` (docker compose only) never touches that path. Copied the
+current file over by hand over SSH; confirmed via curl.
+
+**Admin test-email tool.** Dashboard gets a card: an email input + "Send
+test email" button, POSTing to a new admin-only coordinator endpoint
+(`POST /admin/test-email`) that calls `email_send.send_test_email()` — a
+plain "this is a test" message, deliberately not the verification-link
+template, so a real send while testing never reads like an account
+prompt. Surfaces Resend's actual error (bad key, domain not verified,
+etc.) instead of a bare pass/fail, which is the whole point of the tool
+existing during DNS setup.
+
+**Web signup flow.** New `/signup` page — plain username/email/password
+form, mirrors the invite-accept page almost exactly, posts to the
+coordinator's existing `POST /signup`, auto-logs in via session cookie.
+Landing page and login page both had stale invite-only copy ("ask the
+host who invited you") pointing nowhere — fixed both to link to
+`/signup`. Deliberately kept verification **link-based** (the
+coordinator's existing `GET /verify-email`) rather than adding a typed
+confirmation-code UI — the link flow was already built, tested, and
+working; a parallel code-entry mechanism would have been meaningfully
+more surface area for no clear UX win. `account.html.j2` now carries a
+persistent verified/not-verified badge + "Resend verification email"
+button, so the status isn't just a one-time post-signup flash message.
+
+**Bug caught before it reached prod.** While wiring the verify-email
+link's host, found that `coordinator/main.py` already defines its own
+`PUBLIC_BASE_URL` further down the file (agent-pairing section) — my
+`shared.config` import of the same name was silently shadowed at
+module-load time (Python resolves function globals at call time, so
+whichever assignment ran last in the module wins). The pairing section's
+version defaults to `""` with a `request.base_url` fallback; mine had no
+such fallback. An unconfigured deploy would have emailed a bare
+`/verify-email?code=...` with no host — dead text in an inbox. Fixed to
+reuse the one existing `PUBLIC_BASE_URL` with the same fallback pattern
+`/agents/pair/start` already uses, and dropped the shadowed import.
+Regression test added asserting the emailed link is absolute.
+
+**Verified for real, not just unit tests.** Ran `tools/run_local.py` and
+drove it with Playwright — screenshotted `/signup`, `/login`, the
+landing page, the account page's unverified badge + resend button (had
+to hand-flip a member's `email_verified` column in the dev sqlite db to
+see that state, since Resend isn't configured locally), and the
+dashboard's test-email card in both its red-error (unconfigured) and
+confirmed-working states.
+
+Shipped: `RESEND_API_KEY` / `EMAIL_FROM` added to `.env.prod` on the VPS
+(over SSH, not committed); `PUBLIC_BASE_URL` didn't need adding there —
+`infra/docker-compose.prod.yml` already derives it from `DOMAIN`. 6 new
+tests in `tests/test_web_ui_smoke.py`. Full suite: 606 passed.
+
+One test-infra note for later: two of the new web tests initially
+passed standalone (`python -m unittest tests.test_web_ui_smoke`) but
+failed under the full `pytest tests/` sweep — turned out to be this
+file's cookie jar not surviving cleanly across two separate `self.web.`
+calls within one test when many other e2e test files' import-time
+`sys.modules` surgery has already run in the same process. Every
+pre-existing multi-request test in this file explicitly reads the
+cookie off the first response and sets it before the second call rather
+than relying on jar persistence — matched that pattern and the
+flakiness went away. Worth remembering if a future test in this file
+mysteriously passes alone and fails in the full suite.
+
+---
+
 ## 2026-08-21 — v1.3.8: signup email verification (Resend) + Win11 tray-hide writeup
 
 Two more items off todo.txt after the field-test round below.
