@@ -47,7 +47,7 @@ IS_WINDOWS = platform.system() == "Windows"
 # the moment it starts. The CI-generated version.txt (short-sha +
 # build timestamp) is still what the self-updater diffs against;
 # AGENT_VERSION is just the human-facing label.
-AGENT_VERSION = "1.3.8"
+AGENT_VERSION = "1.3.9"
 
 # Base64-encoded Ed25519 PUBLIC key used to verify self-update payloads.
 # When this is non-empty, the self-updater REQUIRES a valid signature on
@@ -140,6 +140,79 @@ def gpu_busy_percent(timeout: float = 2.0) -> Optional[float]:
         except ValueError:
             continue
     return max(vals) if vals else None
+
+
+def gpu_hardware_info(timeout: float = 3.0) -> tuple[Optional[str], Optional[float]]:
+    """Best-effort GPU model name + VRAM (GB) for the /register
+    capabilities payload. Informational only — unlike gpu_busy_percent,
+    nothing gates on this, so a wrong or missing answer just means the
+    dashboard shows "—" instead of a hardware label.
+
+    Two-tier lookup, cheapest/most-accurate first:
+
+    1. ``nvidia-smi --query-gpu=name,memory.total`` — this fleet's
+       chat/image backends prefer CUDA, so most contributor boxes have
+       it. Reports real VRAM in MiB.
+    2. WMI, via ``Get-CimInstance Win32_VideoController``, name only —
+       covers AMD/Intel boxes (the vulkan sd.cpp backend) where
+       nvidia-smi is absent. VRAM is deliberately NOT read from this
+       path: WMI's AdapterRAM is a 32-bit field that silently
+       wraps/truncates around 4 GB on modern cards, so a WMI-only VRAM
+       number would frequently just be wrong. Better to report nothing
+       than a number we know can lie.
+
+    Multi-GPU boxes: only the first-listed adapter is reported (KISS —
+    almost every contributor rig is single-GPU, and this is a display
+    label, not a scheduling input)."""
+    try:
+        out = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            creationflags=_NO_WINDOW_FLAGS,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            first_line = out.stdout.strip().splitlines()[0]
+            name_part, _, mib_part = first_line.partition(",")
+            name = name_part.strip()
+            if name:
+                vram_gb: Optional[float] = None
+                try:
+                    vram_gb = round(float(mib_part.strip()) / 1024.0, 1)
+                except ValueError:
+                    pass
+                return name, vram_gb
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    if not IS_WINDOWS:
+        return None, None
+    try:
+        out = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "(Get-CimInstance Win32_VideoController | "
+                "Where-Object { $_.Name -notmatch 'Basic|Remote' } | "
+                "Select-Object -First 1 -ExpandProperty Name)",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            creationflags=_NO_WINDOW_FLAGS,
+        )
+        name = out.stdout.strip()
+        if out.returncode == 0 and name:
+            return name, None
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None, None
 
 
 def active_game_process(process_names: list[str]) -> Optional[str]:
@@ -7250,6 +7323,15 @@ def main(argv: Optional[list[str]] = None) -> int:
             capabilities = {"models": [cfg.bootstrap_model], "tools": tools}
         elif image_ready:
             capabilities = {"models": [cfg.bootstrap_image_model], "tools": ["image"]}
+    # Hardware label, merged in regardless of which branch above ran —
+    # it's informational (dashboard display), not a routing input, so
+    # it doesn't belong in the tools/models decision tree above.
+    if capabilities is not None:
+        gpu_name, gpu_vram_gb = gpu_hardware_info()
+        if gpu_name:
+            capabilities["gpu_model"] = gpu_name
+        if gpu_vram_gb is not None:
+            capabilities["vram_gb"] = gpu_vram_gb
     if not coord.register(capabilities=capabilities):
         if keep_awake_active:
             keep_awake_end(log)

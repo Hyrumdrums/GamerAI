@@ -207,6 +207,27 @@ class MachineScheduleE2ETests(unittest.TestCase):
         self.assertIn("schedule", m)
         self.assertTrue(m["allowed_now"])  # no schedule yet → allowed
 
+    def test_machines_surfaces_gpu_hardware_from_capabilities(self):
+        member_token = self._make_member()
+        member_id = self._member_id_for(member_token)
+        agent = self._pair_machine(member_id)
+        wid = f"win-DESKTOP-GPU-{uuid.uuid4().hex[:8]}"
+        resp = self.client.post(
+            "/register",
+            json={
+                "worker_id": wid,
+                "capabilities": {"gpu_model": "RTX 4090", "vram_gb": 24.0},
+            },
+            headers=self._agent_headers(agent),
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+
+        m = self.client.get(
+            "/me/machines", headers={"Authorization": f"Bearer {member_token}"}
+        ).json()["machines"][0]
+        self.assertEqual(m["gpu_model"], "RTX 4090")
+        self.assertEqual(m["vram_gb"], 24.0)
+
     def test_patch_schedule_persists_and_round_trips(self):
         member_token = self._make_member()
         member_id = self._member_id_for(member_token)

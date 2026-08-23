@@ -1342,7 +1342,7 @@ def _is_public(method: str, path: str) -> bool:
 # (after a substantive change to docs/community-tos.md) will cause
 # existing members to be flagged as "needs re-accept" by the per-
 # member ToS check.
-TOS_VERSION = "2026-05-13"
+TOS_VERSION = "2026-08-22"
 _TOS_PATH = Path(__file__).resolve().parent.parent / "docs" / "community-tos.md"
 
 
@@ -3913,11 +3913,14 @@ def jobs_listing(
     filter_worker = None
     if worker_id:
         owner_id = db.worker_owner(worker_id)
+        caps = _load_capabilities(worker_id) or {}
         filter_worker = {
             "worker_id": worker_id,
             "label": worker_id[-12:],
             "owner_member_id": owner_id,
             "owner_label": _member_label(members_by_id.get(owner_id), owner_id) if owner_id else None,
+            "gpu_model": caps.get("gpu_model"),
+            "vram_gb": caps.get("vram_gb"),
         }
 
     filter_member = None
@@ -4068,6 +4071,7 @@ def my_machines(request: Request):
         if wid is None:
             # Paired but the agent hasn't called /register yet.
             status, last_seen, tools, is_partial = "pending", None, [], False
+            gpu_model, vram_gb = None, None
         else:
             raw_tools = row["worker_tools_json"]
             try:
@@ -4076,6 +4080,9 @@ def my_machines(request: Request):
                 tools = ["chat"]
             is_partial = "image" not in tools
             last_seen = float(row["worker_last_seen"] or 0) or None
+            caps = _load_capabilities(wid) or {}
+            gpu_model = caps.get("gpu_model")
+            vram_gb = caps.get("vram_gb")
             # Schedule state overlays the live worker status: a sleeping
             # or paused machine is intentionally not working, which reads
             # very differently from "offline" (crashed / powered off).
@@ -4096,6 +4103,8 @@ def my_machines(request: Request):
             "status": status,
             "tools": tools,
             "is_partial": is_partial,
+            "gpu_model": gpu_model,
+            "vram_gb": vram_gb,
             "allowed_now": allowed,
             "sleeping_until": sleeping_until,
             "schedule": {

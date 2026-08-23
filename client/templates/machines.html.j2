@@ -63,6 +63,10 @@
     <div class="machine-meta muted small">
       {% set parts = [] %}
       {% if m.worker_id %}{% set _ = parts.append(m.worker_id) %}{% endif %}
+      {% if m.gpu_model %}
+        {% set gpu_label = m.gpu_model ~ (' (' ~ m.vram_gb ~ ' GB)' if m.vram_gb else '') %}
+        {% set _ = parts.append(gpu_label) %}
+      {% endif %}
       {% if m.tools %}{% set _ = parts.append(m.tools | join(', ')) %}{% endif %}
       {% if m.created_at %}{% set _ = parts.append('paired ' ~ (m.created_at | epoch_date)) %}{% endif %}
       {{ parts | join(' · ') }}

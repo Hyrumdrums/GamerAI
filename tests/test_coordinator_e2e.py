@@ -230,6 +230,19 @@ class CoordinatorE2ETests(unittest.TestCase):
         complete = self.client.get("/jobs?status=complete").json()["jobs"]
         self.assertEqual([j["job_id"] for j in complete], [complete_job])
 
+    def test_jobs_listing_filter_worker_surfaces_gpu_hardware(self):
+        worker_id = "wkr-" + uuid.uuid4().hex[:6]
+        self.client.post(
+            "/register",
+            json={
+                "worker_id": worker_id,
+                "capabilities": {"gpu_model": "RTX 4090", "vram_gb": 24.0},
+            },
+        )
+        body = self.client.get(f"/jobs?worker_id={worker_id}").json()
+        self.assertEqual(body["filter_worker"]["gpu_model"], "RTX 4090")
+        self.assertEqual(body["filter_worker"]["vram_gb"], 24.0)
+
     # ------------------------------------------------------------------
     # no-workers-available gate (REQUIRE_LIVE_WORKER)
     # ------------------------------------------------------------------

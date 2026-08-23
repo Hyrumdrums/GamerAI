@@ -1,6 +1,6 @@
 # GamerAI Community Terms of Service
 
-*Plain-English version. Last updated 2026-05-13.*
+*Plain-English version. Last updated 2026-08-22.*
 
 GamerAI is a community-driven AI service. People donate spare GPU
 time to a shared pool; their invitees and (in time) paid customers
@@ -156,7 +156,13 @@ presence on your hardware.
 - **Contributor identity** consists of an email address (for
   invite chain) and a bearer token hash. We do not collect
   hostnames, MAC addresses, or hardware fingerprints beyond the
-  capabilities the agent voluntarily reports.
+  capabilities the agent voluntarily reports — which includes your
+  GPU's model name and VRAM amount (e.g. "RTX 4090, 24 GB"), shown
+  on your account's Machines page and to admins operating the
+  network. That's a shared model descriptor, the same string
+  millions of other owners of that card would report, not a unique
+  identifier — it's used to label your machine in the dashboard and
+  is not cross-referenced against anything to re-identify you.
 - **Logs** rotate. Stored prompts are eligible for purge after a
   reasonable retention window. If you want yours purged sooner,
   email the admin.

@@ -688,6 +688,44 @@ class GpuProbeTests(unittest.TestCase):
             self.assertIsNone(agent.gpu_busy_percent())
 
 
+class GpuHardwareInfoTests(unittest.TestCase):
+    def test_parses_nvidia_smi_name_and_vram(self):
+        completed = mock.Mock(returncode=0, stdout="NVIDIA GeForce RTX 4090, 24564\n")
+        with mock.patch.object(agent.subprocess, "run", return_value=completed):
+            name, vram_gb = agent.gpu_hardware_info()
+        self.assertEqual(name, "NVIDIA GeForce RTX 4090")
+        self.assertAlmostEqual(vram_gb, 23.99, places=1)
+
+    def test_falls_back_to_wmi_name_only_when_nvidia_smi_absent(self):
+        wmi_completed = mock.Mock(returncode=0, stdout="AMD Radeon RX 7900 XTX\n")
+        with mock.patch.object(agent.subprocess, "run",
+                                side_effect=[FileNotFoundError, wmi_completed]), \
+             mock.patch.object(agent, "IS_WINDOWS", True):
+            name, vram_gb = agent.gpu_hardware_info()
+        self.assertEqual(name, "AMD Radeon RX 7900 XTX")
+        # VRAM intentionally not reported from the WMI path — AdapterRAM
+        # silently truncates above 4 GB, so a number here would often lie.
+        self.assertIsNone(vram_gb)
+
+    def test_returns_none_when_both_probes_unavailable(self):
+        with mock.patch.object(agent.subprocess, "run", side_effect=FileNotFoundError), \
+             mock.patch.object(agent, "IS_WINDOWS", True):
+            name, vram_gb = agent.gpu_hardware_info()
+        self.assertIsNone(name)
+        self.assertIsNone(vram_gb)
+
+    def test_skips_wmi_probe_on_non_windows(self):
+        # nvidia-smi is still attempted (a Linux/Mac dev box may have
+        # it); force it to fail, then confirm subprocess.run was only
+        # called once — no WMI/PowerShell fallback off Windows.
+        with mock.patch.object(agent.subprocess, "run", side_effect=FileNotFoundError) as run, \
+             mock.patch.object(agent, "IS_WINDOWS", False):
+            name, vram_gb = agent.gpu_hardware_info()
+        run.assert_called_once()
+        self.assertIsNone(name)
+        self.assertIsNone(vram_gb)
+
+
 class GameProcessProbeTests(unittest.TestCase):
     def _fake_iter(self, names):
         for n in names:

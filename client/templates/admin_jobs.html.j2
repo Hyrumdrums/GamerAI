@@ -12,6 +12,9 @@
   <p class="muted">
     {% if filter_worker %}
       Machine <code>{{ filter_worker.label }}</code>
+      {% if filter_worker.gpu_model %}
+        · {{ filter_worker.gpu_model }}{% if filter_worker.vram_gb %} ({{ filter_worker.vram_gb }} GB){% endif %}
+      {% endif %}
       {% if filter_worker.owner_member_id %}
         · owned by <a href="/admin/jobs?member_id={{ filter_worker.owner_member_id }}">{{ filter_worker.owner_label }}</a>
       {% endif %}
