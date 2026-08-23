@@ -45,6 +45,48 @@ async def admin_invites(request: Request):
     )
 
 
+@router.get("/admin/jobs", response_class=HTMLResponse)
+async def admin_jobs(
+    request: Request,
+    worker_id: str = "",
+    member_id: str = "",
+    status: str = "",
+    tool: str = "",
+):
+    """Job history, most-recent-first, filtered by URL query params
+    (KISS — no filter form, just links in from the dashboard's All
+    Workers table and shareable URLs). worker_id/member_id are what
+    those links use; status/tool are there because the coordinator
+    query already supports them."""
+    bearer, fail = await require_admin_session(request)
+    if fail is not None:
+        return fail
+    params = {
+        k: v for k, v in {
+            "worker_id": worker_id,
+            "member_id": member_id,
+            "status": status,
+            "tool": tool,
+        }.items() if v
+    }
+    async with coordinator_client._client(bearer=bearer) as c:
+        r = await c.get("/jobs", params=params, timeout=10)
+    if r.status_code >= 400:
+        raise HTTPException(status_code=r.status_code, detail=r.text)
+    body = r.json()
+    return templates.TemplateResponse(
+        request,
+        "admin_jobs.html.j2",
+        {
+            "jobs": body["jobs"],
+            "filter_worker": body["filter_worker"],
+            "filter_member": body["filter_member"],
+            "active_status": status,
+            "active_tool": tool,
+        },
+    )
+
+
 @router.post("/admin/test-email")
 async def admin_test_email(request: Request, to: str = Form(default="")):
     """Dashboard's "Email delivery test" card — sends a one-off test

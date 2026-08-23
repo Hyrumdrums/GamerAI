@@ -3854,6 +3854,92 @@ def workers(request: Request):
     return {"workers": out}
 
 
+def _member_label(member, member_id: Optional[str]) -> Optional[str]:
+    if member is None:
+        return member_id
+    return member["username"] or member["email"] or member_id
+
+
+@app.get("/jobs")
+def jobs_listing(
+    request: Request,
+    worker_id: Optional[str] = None,
+    member_id: Optional[str] = None,
+    status: Optional[str] = None,
+    tool: Optional[str] = None,
+    limit: int = 200,
+):
+    """Most-recent-first job history for the admin dashboard's job
+    listing page. Every filter is optional and URL-driven (KISS) —
+    ``worker_id``/``member_id`` are what the dashboard's All Workers
+    table links to, ``status``/``tool`` are free extras since the
+    query already builds a WHERE clause.
+
+    Also resolves display labels for the active worker_id/member_id
+    filter (if any) so the page can render "jump to the other view"
+    links at the top without a second round-trip."""
+    _require_admin(request)
+    rows = db.list_jobs(
+        worker_id=worker_id or None,
+        submitted_by_member_id=member_id or None,
+        status=status or None,
+        tool=tool or None,
+        limit=limit,
+    )
+    members_by_id = {m["member_id"]: m for m in db.list_members()}
+    jobs_out = []
+    for j in rows:
+        jobs_out.append({
+            "job_id": j["job_id"],
+            "prompt": j["prompt"],
+            "status": j["status"],
+            "tool": j["tool"] if "tool" in j.keys() else "chat",
+            "worker_id": j["worker_id"],
+            "model": j["model"],
+            "prompt_tokens": j["prompt_tokens"],
+            "completion_tokens": j["completion_tokens"],
+            "earnings": j["earnings"],
+            "duration_seconds": j["duration_seconds"],
+            "submitted_at": j["submitted_at"],
+            "completed_at": j["completed_at"],
+            "error": j["error"],
+            "submitted_by_member_id": j["submitted_by_member_id"],
+            "submitted_by_label": _member_label(
+                members_by_id.get(j["submitted_by_member_id"]),
+                j["submitted_by_member_id"],
+            ),
+        })
+
+    filter_worker = None
+    if worker_id:
+        owner_id = db.worker_owner(worker_id)
+        filter_worker = {
+            "worker_id": worker_id,
+            "label": worker_id[-12:],
+            "owner_member_id": owner_id,
+            "owner_label": _member_label(members_by_id.get(owner_id), owner_id) if owner_id else None,
+        }
+
+    filter_member = None
+    if member_id:
+        m = members_by_id.get(member_id)
+        owned_workers = db.list_workers_for_member(member_id)
+        filter_member = {
+            "member_id": member_id,
+            "label": _member_label(m, member_id),
+            "workers": [
+                {"worker_id": w["worker_id"], "label": w["worker_id"][-12:]}
+                for w in owned_workers
+            ],
+        }
+
+    return {
+        "jobs": jobs_out,
+        "filter_worker": filter_worker,
+        "filter_member": filter_member,
+    }
+
+
 def _host_summary(parent_member_id: Optional[str]) -> Optional[dict]:
     """Display-safe summary of an invitee's host. Returns None when
     there's no parent (admin and root contributors). The summary is the

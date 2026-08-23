@@ -65,9 +65,13 @@
       <tr>
         <td>
           <span style="color:{% if x.status != 'offline' %}#4CAF50{% else %}#FF5722{% endif %};">●</span>
-          {{ x.worker_id[-12:] }}
+          <a href="/admin/jobs?worker_id={{ x.worker_id }}">{{ x.worker_id[-12:] }}</a>
         </td>
-        <td>{{ x.owner_label or '—' }}</td>
+        <td>
+          {% if x.owner_member_id %}
+            <a href="/admin/jobs?member_id={{ x.owner_member_id }}">{{ x.owner_label or '—' }}</a>
+          {% else %}—{% endif %}
+        </td>
         <td>{{ x.status }}</td>
         <td>{{ x.total_jobs }}</td>
         <td>{{ x.total_tokens }}</td>

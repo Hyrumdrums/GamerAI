@@ -1,0 +1,68 @@
+{% extends "base.html.j2" %}
+{% block title %}GamerAI — jobs{% endblock %}
+{% block extra_css %}
+<link rel="stylesheet" href="/static/css/admin.css">
+{% endblock %}
+
+{% block content %}
+<div class="page">
+  <h1>Jobs ({{ jobs|length }})</h1>
+
+  {% if filter_worker or filter_member or active_status or active_tool %}
+  <p class="muted">
+    {% if filter_worker %}
+      Machine <code>{{ filter_worker.label }}</code>
+      {% if filter_worker.owner_member_id %}
+        · owned by <a href="/admin/jobs?member_id={{ filter_worker.owner_member_id }}">{{ filter_worker.owner_label }}</a>
+      {% endif %}
+    {% endif %}
+    {% if filter_worker and filter_member %} · {% endif %}
+    {% if filter_member %}
+      Person <code>{{ filter_member.label }}</code>
+      {% if filter_member.workers %}
+        · machines:
+        {% for w in filter_member.workers %}
+          <a href="/admin/jobs?worker_id={{ w.worker_id }}">{{ w.label }}</a>{% if not loop.last %}, {% endif %}
+        {% endfor %}
+      {% endif %}
+    {% endif %}
+    {% if active_status %} · status=<code>{{ active_status }}</code>{% endif %}
+    {% if active_tool %} · tool=<code>{{ active_tool }}</code>{% endif %}
+    · <a href="/admin/jobs">clear filters</a>
+  </p>
+  {% endif %}
+
+  <p class="muted">
+    <a href="/dashboard">← dashboard</a>
+  </p>
+
+  <table>
+    <tr>
+      <th>Submitted</th><th>Status</th><th>Tool</th><th>Model</th>
+      <th>Worker</th><th>Submitted by</th><th>Tokens</th><th>Duration</th>
+      <th>Prompt</th>
+    </tr>
+    {% for j in jobs %}
+    <tr>
+      <td>{{ j.submitted_at | epoch_datetime }}</td>
+      <td>{{ j.status }}{% if j.error %} — {{ j.error }}{% endif %}</td>
+      <td>{{ j.tool }}</td>
+      <td>{{ j.model or '—' }}</td>
+      <td>
+        {% if j.worker_id %}
+          <a href="/admin/jobs?worker_id={{ j.worker_id }}">{{ j.worker_id[-12:] }}</a>
+        {% else %}—{% endif %}
+      </td>
+      <td>
+        {% if j.submitted_by_member_id %}
+          <a href="/admin/jobs?member_id={{ j.submitted_by_member_id }}">{{ j.submitted_by_label }}</a>
+        {% else %}—{% endif %}
+      </td>
+      <td>{% if j.prompt_tokens is not none %}{{ j.prompt_tokens }}/{{ j.completion_tokens or 0 }}{% else %}—{% endif %}</td>
+      <td>{% if j.duration_seconds is not none %}{{ "%.1f"|format(j.duration_seconds) }}s{% else %}—{% endif %}</td>
+      <td title="{{ j.prompt }}">{{ j.prompt[:60] }}{% if j.prompt|length > 60 %}…{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+{% endblock %}

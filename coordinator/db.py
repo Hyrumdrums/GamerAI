@@ -665,6 +665,42 @@ class DB:
             cur = self._conn.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,))
             return cur.fetchone()
 
+    def list_jobs(
+        self,
+        worker_id: Optional[str] = None,
+        submitted_by_member_id: Optional[str] = None,
+        status: Optional[str] = None,
+        tool: Optional[str] = None,
+        limit: int = 200,
+    ) -> list[sqlite3.Row]:
+        """Most-recent-first job history for the admin job-listing page.
+        Every filter is optional and AND-ed together — the page uses
+        this to drive both the unfiltered feed and the per-worker/
+        per-member views linked from the dashboard's All Workers
+        table."""
+        clauses = []
+        params: list = []
+        if worker_id:
+            clauses.append("worker_id=?")
+            params.append(worker_id)
+        if submitted_by_member_id:
+            clauses.append("submitted_by_member_id=?")
+            params.append(submitted_by_member_id)
+        if status:
+            clauses.append("status=?")
+            params.append(status)
+        if tool:
+            clauses.append("tool=?")
+            params.append(tool)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(max(1, min(limit, 1000)))
+        with self._lock:
+            cur = self._conn.execute(
+                f"SELECT * FROM jobs {where} ORDER BY submitted_at DESC LIMIT ?",
+                params,
+            )
+            return cur.fetchall()
+
     # ---------- workers ----------
     def upsert_worker(self, worker_id: str, status: str, last_seen: float) -> None:
         """Legacy upsert — preserves the pre-ownership signature for

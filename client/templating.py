@@ -24,4 +24,15 @@ def _epoch_date(value) -> str:
         return ""
 
 
+def _epoch_datetime(value) -> str:
+    """Format a unix timestamp as a UTC ``YYYY-MM-DD HH:MM:SS`` datetime
+    — used where same-day entries need to sort visibly (the job
+    listing), unlike ``epoch_date``'s day-granularity elsewhere."""
+    try:
+        return datetime.fromtimestamp(float(value), tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError, OSError):
+        return ""
+
+
 templates.env.filters["epoch_date"] = _epoch_date
+templates.env.filters["epoch_datetime"] = _epoch_datetime

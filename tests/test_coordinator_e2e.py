@@ -164,6 +164,73 @@ class CoordinatorE2ETests(unittest.TestCase):
         self.assertEqual(resp.status_code, 400)
 
     # ------------------------------------------------------------------
+    # /jobs — admin job-listing feed (dashboard drill-down page)
+    # ------------------------------------------------------------------
+    def test_jobs_listing_sorted_most_recent_first(self):
+        job_a = self.client.post("/generate", json={"prompt": "first"}).json()["job_id"]
+        job_b = self.client.post("/generate", json={"prompt": "second"}).json()["job_id"]
+        listing = self.client.get("/jobs").json()["jobs"]
+        ids = [j["job_id"] for j in listing]
+        # Most-recent-first: job_b was submitted after job_a.
+        self.assertLess(ids.index(job_b), ids.index(job_a))
+
+    def test_jobs_listing_filters_by_worker_id(self):
+        job_id = self.client.post("/generate", json={"prompt": "hi"}).json()["job_id"]
+        other_worker = "wkr-" + uuid.uuid4().hex[:6]
+        target_worker = "wkr-" + uuid.uuid4().hex[:6]
+        self.client.post("/register", json={"worker_id": other_worker})
+        self.client.post("/register", json={"worker_id": target_worker})
+        self.r.lpop("job_queue")
+        claim_token = self.client.post(
+            "/jobs/claim",
+            json={"worker_id": target_worker, "job_id": job_id},
+        ).json()["claim_token"]
+        self.client.post(
+            "/jobs/complete",
+            json=_job_complete_payload(target_worker, job_id, claim_token=claim_token),
+        )
+
+        matched = self.client.get(f"/jobs?worker_id={target_worker}").json()
+        self.assertEqual([j["job_id"] for j in matched["jobs"]], [job_id])
+        self.assertEqual(matched["filter_worker"]["worker_id"], target_worker)
+
+        unmatched = self.client.get(f"/jobs?worker_id={other_worker}").json()
+        self.assertEqual(unmatched["jobs"], [])
+
+    def test_jobs_listing_filters_by_member_id(self):
+        # This suite runs with AUTH disabled, so /generate never stamps
+        # a submitted_by_member_id (member auth is exercised in
+        # test_member_auth_e2e.py instead). What's testable here: an
+        # unmatched member_id filters down to an empty list rather than
+        # erroring, and the filter-context block reflects the id even
+        # with no owned workers.
+        self.client.post("/generate", json={"prompt": "anonymous submit"})
+        empty = self.client.get("/jobs?member_id=mem_nobody").json()
+        self.assertEqual(empty["jobs"], [])
+        self.assertEqual(empty["filter_member"]["member_id"], "mem_nobody")
+        self.assertEqual(empty["filter_member"]["workers"], [])
+
+    def test_jobs_listing_status_filter(self):
+        pending_job = self.client.post("/generate", json={"prompt": "stays pending"}).json()["job_id"]
+        complete_job = self.client.post("/generate", json={"prompt": "will finish"}).json()["job_id"]
+        worker_id = "wkr-" + uuid.uuid4().hex[:6]
+        self.client.post("/register", json={"worker_id": worker_id})
+        self.r.lpop("job_queue")
+        claim_token = self.client.post(
+            "/jobs/claim",
+            json={"worker_id": worker_id, "job_id": complete_job},
+        ).json()["claim_token"]
+        self.client.post(
+            "/jobs/complete",
+            json=_job_complete_payload(worker_id, complete_job, claim_token=claim_token),
+        )
+
+        pending = self.client.get("/jobs?status=pending").json()["jobs"]
+        self.assertEqual([j["job_id"] for j in pending], [pending_job])
+        complete = self.client.get("/jobs?status=complete").json()["jobs"]
+        self.assertEqual([j["job_id"] for j in complete], [complete_job])
+
+    # ------------------------------------------------------------------
     # no-workers-available gate (REQUIRE_LIVE_WORKER)
     # ------------------------------------------------------------------
     def test_generate_503s_when_required_and_no_workers(self):

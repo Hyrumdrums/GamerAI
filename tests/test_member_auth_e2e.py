@@ -845,6 +845,64 @@ class MemberAuthE2ETests(unittest.TestCase):
         )
         self.assertEqual(resp_b.status_code, 200)
 
+    def test_jobs_listing_resolves_worker_and_member_labels(self):
+        """The admin job-listing page (GET /jobs) links each row to its
+        worker and submitting member, and resolves the filter-context
+        block (dashboard's 'jump to owner' / 'jump to machine' links)
+        by real ownership, not just by echoing the query param back."""
+        token = self._create_member_via_cli(
+            "create-member", "--role", "contributor", "--email", "carol@example.com",
+        )
+        member = member_auth.lookup_member_by_token(self.db, token)
+        headers = {"Authorization": f"Bearer {token}"}
+        worker_id = "wkr-" + uuid.uuid4().hex[:8]
+
+        self.assertEqual(
+            self.client.post("/register", json={"worker_id": worker_id}, headers=headers).status_code,
+            200,
+        )
+        job_id = self.client.post(
+            "/generate", json={"prompt": "carol's own job"}, headers=headers,
+        ).json()["job_id"]
+        self.assertIsNotNone(self.r.lpop("job_queue"))
+        claim_token = self.client.post(
+            "/jobs/claim",
+            json={"worker_id": worker_id, "job_id": job_id},
+            headers=headers,
+        ).json()["claim_token"]
+        self.client.post(
+            "/jobs/complete",
+            json={
+                "worker_id": worker_id,
+                "job_id": job_id,
+                "text": "[mock] reply",
+                "model": "mock",
+                "prompt_tokens": 3,
+                "completion_tokens": 4,
+                "duration_seconds": 0.1,
+                "status": "complete",
+                "claim_token": claim_token,
+            },
+            headers=headers,
+        )
+
+        by_worker = self.client.get(
+            f"/jobs?worker_id={worker_id}", headers=self._admin_headers(),
+        ).json()
+        self.assertEqual([j["job_id"] for j in by_worker["jobs"]], [job_id])
+        self.assertEqual(by_worker["jobs"][0]["submitted_by_label"], "carol@example.com")
+        self.assertEqual(by_worker["filter_worker"]["owner_member_id"], member.member_id)
+        self.assertEqual(by_worker["filter_worker"]["owner_label"], "carol@example.com")
+
+        by_member = self.client.get(
+            f"/jobs?member_id={member.member_id}", headers=self._admin_headers(),
+        ).json()
+        self.assertEqual([j["job_id"] for j in by_member["jobs"]], [job_id])
+        self.assertEqual(by_member["filter_member"]["label"], "carol@example.com")
+        self.assertEqual(
+            [w["worker_id"] for w in by_member["filter_member"]["workers"]], [worker_id],
+        )
+
     def test_me_returns_tier_quota_and_earnings_envelope(self):
         """/me grows three new fields: tier_quota, daily_quota_images,
         earnings — the account-page activity card depends on all
