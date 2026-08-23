@@ -56,7 +56,7 @@
           <td>
             {{ j.status }}
             {% if j.error %}
-              — <span title="{{ j.error }}">{{ j.error[:80] }}{% if j.error|length > 80 %}…{% endif %}</span>
+              — <span title="{{ j.error }}">{{ j.error[:40] }}{% if j.error|length > 40 %}…{% endif %}</span>
             {% endif %}
           </td>
           <td>{{ j.tool }}</td>
@@ -76,7 +76,12 @@
           <td>{{ j.attempts }}</td>
           <td>{% if j.queue_seconds is not none %}{{ "%.1f"|format(j.queue_seconds) }}s{% else %}—{% endif %}</td>
           <td>{% if j.duration_seconds is not none %}{{ "%.1f"|format(j.duration_seconds) }}s{% else %}—{% endif %}</td>
-          <td title="{{ j.prompt }}">{{ j.prompt[:60] }}{% if j.prompt|length > 60 %}…{% endif %}</td>
+          <td>
+            <details class="prompt-reveal">
+              <summary>{{ j.prompt|length }} chars</summary>
+              {{ j.prompt }}
+            </details>
+          </td>
         </tr>
         {% endfor %}
       </tbody>

@@ -31,3 +31,17 @@
   background: #f5f5f5;
   z-index: 1;
 }
+
+/* Prompt column stays hidden until clicked — the community ToS asks
+   admins not to read prompts "unless debugging a specific incident,
+   not curiosity" (docs/community-tos.md §1). A native <details>
+   disclosure makes viewing a deliberate act instead of every page
+   load previewing everyone's prompt content by default. */
+.prompt-reveal summary {
+  cursor: pointer;
+  color: var(--brand);
+}
+.prompt-reveal[open] {
+  white-space: normal;
+  max-width: 420px;
+}
