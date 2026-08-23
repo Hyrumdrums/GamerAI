@@ -58,14 +58,13 @@ async def dashboard(
             '<p><a href="/">Back to chat</a></p>',
             status_code=403,
         )
-    # Three sequential reads — fetch_safe gives us a status check we
+    # Two sequential reads — fetch_safe gives us a status check we
     # don't currently act on but lets the facade own all the httpx
     # plumbing. If any starts feeling slow, parallelize with
     # asyncio.gather() in a follow-up; for now sequential matches
     # the historical behavior exactly.
     _, metrics = await api_client.fetch_safe(bearer=bearer, path="/metrics")
     _, workers_body = await api_client.fetch_safe(bearer=bearer, path="/workers")
-    _, earnings_body = await api_client.fetch_safe(bearer=bearer, path="/earnings")
 
     workers = sorted(
         workers_body["workers"],
@@ -73,12 +72,6 @@ async def dashboard(
         reverse=True,
     )
     active_workers_count = sum(1 for w in workers if w["status"] != "offline")
-    total_earnings = sum(w.get("total_usd", 0) for w in workers)
-    top_earners = sorted(
-        earnings_body.get("workers", []) or [],
-        key=lambda x: x["total_usd"],
-        reverse=True,
-    )[:5]
     return templates.TemplateResponse(
         request,
         "dashboard.html.j2",
@@ -86,8 +79,6 @@ async def dashboard(
             "metrics": metrics,
             "workers": workers,
             "active_workers_count": active_workers_count,
-            "total_earnings": total_earnings,
-            "top_earners": top_earners,
             "test_email_ok": test_email_ok,
             "test_email_msg": test_email_msg,
         },

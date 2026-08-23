@@ -83,7 +83,6 @@ async def account_page(request: Request, flash: Optional[str] = None):
             "contrib_status": contrib_status,
             "tier_quota_tokens": tier_quota.get("tokens"),
             "tier_quota_images": tier_quota.get("images"),
-            "earnings": me.get("earnings") or {},
             "usage_today": me.get("usage_today") or {},
             "can_invite": can_invite,
             "flash": flash,

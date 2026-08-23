@@ -161,10 +161,9 @@
   <section class="card">
     <h2>Your activity</h2>
     <p class="muted">
-      One member, two ledgers. <strong>Used today</strong> is what you
-      consumed; <strong>earned</strong> is what your paired machines
-      contributed. They're independent — running an agent doesn't
-      offset your own usage, it earns you the tier that sets the cap.
+      <strong>Used today</strong> is what you've consumed. Running a
+      paired agent doesn't offset that — it earns you the tier that
+      sets your cap.
     </p>
     <div class="kv">
       <div class="k">Used today (chat)</div>
@@ -180,12 +179,6 @@
         {% if me.daily_quota_images %}
           / {{ me.daily_quota_images }}
         {% endif %}
-      </div>
-      <div class="k">Earned (lifetime)</div>
-      <div class="v">
-        ${{ "%.4f"|format(earnings.get('total_usd', 0)) }}
-        across {{ earnings.get('machine_count', 0) }} machine{% if earnings.get('machine_count', 0) != 1 %}s{% endif %}
-        ({{ earnings.get('total_jobs', 0) }} jobs)
       </div>
     </div>
     {% if partial_contributor_count and partial_contributor_count > 0 %}

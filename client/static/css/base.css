@@ -117,9 +117,13 @@ input:focus, textarea:focus { outline: 0; border-color: var(--brand); }
 .topbar a { color: var(--brand); }
 .topbar a:visited { color: var(--brand); }
 /* On phones, hide non-essential topbar items; admin/terms/logout still
-   reachable from the dashboard. Override per page if needed. */
+   reachable from the dashboard. Override per page if needed.
+   :not([hidden]) guards keep an explicitly-hidden element (e.g. the
+   role-gated #adminlink, which starts `hidden` and is only unhidden by
+   JS for actual admins) hidden here too — author CSS otherwise beats
+   the UA default `[hidden]{display:none}` and forces it visible. */
 .topbar .hide-mobile { display: none; }
-.topbar .hide-desktop { display: inline; }
+.topbar .hide-desktop:not([hidden]) { display: inline; }
 
 /* Topbar "Contribute and invite friends" CTA — chip-style so it
    reads as a call-to-action rather than another nav link. Sits next
@@ -141,7 +145,7 @@ input:focus, textarea:focus { outline: 0; border-color: var(--brand); }
   h2 { font-size: 1.25rem; }
   table { display: table; overflow: visible; }
   .topbar { padding: .55rem 1.25rem; }
-  .topbar .hide-mobile { display: inline; }
+  .topbar .hide-mobile:not([hidden]) { display: inline; }
   .topbar .hide-desktop { display: none; }
   /* Buttons inside .topbar / forms stop trying to be full-width once
      we have horizontal room. */

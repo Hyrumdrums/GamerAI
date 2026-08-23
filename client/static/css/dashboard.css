@@ -7,8 +7,7 @@
 .section h2 { margin-top: 0; }
 .row-2 { display: grid; grid-template-columns: 1fr; gap: 1rem; }
 @media (min-width: 640px) {
-  .stats { grid-template-columns: repeat(4, 1fr); }
-  .row-2 { grid-template-columns: 1fr 1fr; }
+  .stats { grid-template-columns: repeat(3, 1fr); }
   .stat-value { font-size: 2rem; }
 }
 .inline-form { display: flex; gap: .5rem; flex-wrap: wrap; }
