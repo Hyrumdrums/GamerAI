@@ -53,7 +53,7 @@
       <td>{{ j.model or '—' }}</td>
       <td>
         {% if j.worker_id %}
-          <a href="/admin/jobs?worker_id={{ j.worker_id }}">{{ j.worker_id[-12:] }}</a>
+          <a href="/admin/jobs?worker_id={{ j.worker_id }}">{{ j.worker_label }}</a>
         {% else %}—{% endif %}
       </td>
       <td>

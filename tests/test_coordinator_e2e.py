@@ -346,6 +346,35 @@ class CoordinatorE2ETests(unittest.TestCase):
         rec = next(w for w in listing if w["worker_id"] == "legacy-wkr")
         self.assertIsNone(rec["capabilities"])
 
+    def test_register_with_display_name_surfaces_in_workers(self):
+        # display_name replaces the old hostname-embedded-in-worker_id
+        # trick — the agent now sends a chosen (or random-defaulted)
+        # name explicitly instead of the coordinator inferring one from
+        # the id.
+        worker_id = "win-" + uuid.uuid4().hex[:20]
+        resp = self.client.post(
+            "/register",
+            json={"worker_id": worker_id, "display_name": "Living Room PC"},
+        )
+        self.assertEqual(resp.status_code, 200)
+
+        listing = self.client.get("/workers").json()["workers"]
+        rec = next(w for w in listing if w["worker_id"] == worker_id)
+        self.assertEqual(rec["display_name"], "Living Room PC")
+
+    def test_register_without_display_name_falls_back_to_generic_label(self):
+        # An opaque worker_id (no embeddable hostname, no display_name)
+        # has nothing to show but "agent" — this documents that
+        # behavior rather than silently degrading.
+        worker_id = "win-" + uuid.uuid4().hex[:20]
+        self.assertEqual(
+            self.client.post("/register", json={"worker_id": worker_id}).status_code,
+            200,
+        )
+        listing = self.client.get("/workers").json()["workers"]
+        rec = next(w for w in listing if w["worker_id"] == worker_id)
+        self.assertEqual(rec["display_name"], "agent")
+
     # ------------------------------------------------------------------
     # abandon (voluntary requeue when contributor's user becomes active)
     # ------------------------------------------------------------------

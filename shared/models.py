@@ -129,6 +129,12 @@ class WorkerCapabilities(BaseModel):
 class WorkerIdent(BaseModel):
     worker_id: str
     capabilities: Optional[WorkerCapabilities] = None
+    # Contributor-chosen (or randomly-defaulted) machine name — how
+    # this worker is labeled on the dashboard/Machines page. Separate
+    # from capabilities: it's a display label, not something the
+    # machine can do. See coordinator/db.py's display_name migration
+    # for why this replaced hostname-in-worker_id.
+    display_name: Optional[str] = None
 
 
 class HeartbeatRequest(BaseModel):

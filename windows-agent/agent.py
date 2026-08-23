@@ -24,6 +24,7 @@ import logging.handlers
 import os
 import platform
 import queue
+import random
 import re
 import socket
 import subprocess
@@ -47,7 +48,7 @@ IS_WINDOWS = platform.system() == "Windows"
 # the moment it starts. The CI-generated version.txt (short-sha +
 # build timestamp) is still what the self-updater diffs against;
 # AGENT_VERSION is just the human-facing label.
-AGENT_VERSION = "1.3.9"
+AGENT_VERSION = "1.4.0"
 
 # Base64-encoded Ed25519 PUBLIC key used to verify self-update payloads.
 # When this is non-empty, the self-updater REQUIRES a valid signature on
@@ -2102,14 +2103,79 @@ def credit_completed_job(
 
 
 def resolve_worker_id(cfg_worker_id: Optional[str], state: dict) -> str:
+    """Stable per-install worker_id, generated once and persisted in
+    state.json (regenerated only by wiping state — e.g. a reinstall).
+
+    Deliberately opaque random, not win-<hostname>-<rand>: the
+    community ToS promises we don't collect hostnames, and embedding
+    one here was quietly breaking that promise every time the agent
+    registered. Human-friendly machine identification now comes from
+    display_name (see ensure_machine_name / ``/register``'s
+    display_name field) instead of being smuggled into the id."""
     if cfg_worker_id:
         return cfg_worker_id
     if state.get("worker_id"):
         return state["worker_id"]
-    new_id = f"win-{socket.gethostname()}-{uuid.uuid4().hex[:8]}"
+    new_id = f"win-{uuid.uuid4().hex[:20]}"
     state["worker_id"] = new_id
     save_state(state)
     return new_id
+
+
+# Tiny local word lists for the random machine-name default — no network
+# call, no external dependency, nothing that could identify the machine
+# or its owner. Same idea as the "quiet-badger"-style names other dev
+# tools (Docker containers, GitHub Codespaces) generate for the same
+# reason: something a human can tell apart at a glance.
+_MACHINE_NAME_ADJECTIVES = [
+    "amber", "brave", "bright", "calm", "cedar", "cobalt", "crimson",
+    "dusty", "faded", "gentle", "golden", "hidden", "humble", "jolly",
+    "lively", "misty", "quick", "quiet", "silent", "steady", "sunny",
+    "swift", "tiny", "vivid",
+]
+_MACHINE_NAME_NOUNS = [
+    "badger", "beetle", "cricket", "dolphin", "falcon", "gecko",
+    "hare", "heron", "ibis", "jackal", "kite", "lemur", "lynx",
+    "marten", "moth", "newt", "orca", "otter", "puffin", "raven",
+    "sparrow", "weasel", "wombat", "wren",
+]
+
+
+def random_machine_name() -> str:
+    return f"{random.choice(_MACHINE_NAME_ADJECTIVES)}_{random.choice(_MACHINE_NAME_NOUNS)}"
+
+
+_MACHINE_NAME_MAX_LEN = 48
+
+
+def ensure_machine_name(state: dict, *, _prompt=None) -> str:
+    """One-time (per install) prompt for a human-friendly machine name —
+    what identifies this PC on the dashboard/Machines page now that
+    worker_id is opaque random (see resolve_worker_id). Optional:
+    Enter alone, EOF, or Ctrl+C all fall through to a random
+    adjective_noun default rather than blocking setup on a cosmetic
+    choice. Persisted in state.json so this only runs once; every
+    later /register call just resends the stored value.
+
+    ``_prompt`` is injectable for tests (defaults to real ``input()``)."""
+    existing = state.get("machine_name")
+    if existing:
+        return existing
+    prompt = _prompt or (lambda p: input(p).strip())
+    sys.stdout.write(
+        "\nName this PC (optional — makes it easier to identify your "
+        "machine from the web console). Leave blank for a random name: "
+    )
+    sys.stdout.flush()
+    try:
+        chosen = prompt("")
+    except (EOFError, KeyboardInterrupt):
+        chosen = ""
+    chosen = (chosen or "").strip()[:_MACHINE_NAME_MAX_LEN]
+    name = chosen or random_machine_name()
+    state["machine_name"] = name
+    save_state(state)
+    return name
 
 
 # ---------------------------------------------------------------------------
@@ -2335,15 +2401,21 @@ class Coordinator:
             return None
 
     # ---------- registration ----------
-    def register(self, capabilities: Optional[dict] = None) -> bool:
+    def register(
+        self,
+        capabilities: Optional[dict] = None,
+        display_name: Optional[str] = None,
+    ) -> bool:
         body: dict = {"worker_id": self.worker_id}
         if capabilities:
             body["capabilities"] = capabilities
+        if display_name:
+            body["display_name"] = display_name
         for attempt in range(20):
             if self._post("/register", body) is not None:
                 self.log.info(
-                    "registered with coordinator at %s (capabilities=%s)",
-                    self.base, capabilities or {},
+                    "registered with coordinator at %s (display_name=%r, capabilities=%s)",
+                    self.base, display_name, capabilities or {},
                 )
                 return True
             time.sleep(min(2 * (attempt + 1), 15))
@@ -6859,11 +6931,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         cfg = Config.load(args.config if args.config.exists() else None)
         state = load_state()
         token = run_pair_flow(cfg.coordinator_url, state)
+        if token:
+            ensure_machine_name(state)
         return 0 if token else 2
     if args.signup:
         cfg = Config.load(args.config if args.config.exists() else None)
         state = load_state()
         token = run_signup_flow(cfg.coordinator_url, state)
+        if token:
+            ensure_machine_name(state)
         return 0 if token else 2
     if args.unpair:
         cfg = Config.load(args.config if args.config.exists() else None)
@@ -7131,8 +7207,19 @@ def main(argv: Optional[list[str]] = None) -> int:
             sys.stderr.write(msg + "\n")
             return 2
         cfg.api_token = token
+        # Console is already visible here (tray_active unhid it above,
+        # or this is a foreground run) — safe to prompt.
+        ensure_machine_name(state)
     else:
         cfg.api_token = cfg.api_token or state.get("api_token")
+        if not state.get("machine_name"):
+            # Pre-existing install updating to this version: backfill
+            # silently rather than prompting. This branch runs on every
+            # ordinary restart, including unattended tray autostart with
+            # no console shown — blocking on input() here would hang
+            # forever. Naming is cosmetic; a random default is fine.
+            state["machine_name"] = random_machine_name()
+            save_state(state)
 
     log.info(
         "GamerAI agent v%s (build %s) starting on %s — worker_id=%s",
@@ -7332,7 +7419,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             capabilities["gpu_model"] = gpu_name
         if gpu_vram_gb is not None:
             capabilities["vram_gb"] = gpu_vram_gb
-    if not coord.register(capabilities=capabilities):
+    if not coord.register(capabilities=capabilities, display_name=state.get("machine_name")):
         if keep_awake_active:
             keep_awake_end(log)
         return 1

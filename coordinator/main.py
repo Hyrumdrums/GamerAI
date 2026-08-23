@@ -1461,10 +1461,26 @@ def _worker_status(worker_id: str, now: float) -> str:
 _WORKER_ID_RE = re.compile(r"^win-(.+)-[0-9a-f]{8}$")
 
 
-def _machine_display_name(label: Optional[str], worker_id: Optional[str]) -> str:
-    """Friendly machine name for the UI. Prefer a custom label; else the
-    hostname embedded in worker_id (win-<hostname>-<rand>); else the
-    generic pairing label."""
+def _machine_display_name(
+    display_name: Optional[str],
+    label: Optional[str],
+    worker_id: Optional[str],
+) -> str:
+    """Friendly machine name for the UI. Preference order:
+
+    1. ``display_name`` — the agent's own chosen (or randomly
+       defaulted) machine name, sent on /register and stored on the
+       ``workers`` row. The intended path going forward.
+    2. A custom pairing ``label``.
+    3. The hostname embedded in a pre-migration ``worker_id``
+       (``win-<hostname>-<rand>``) — agents built before this slice
+       still send that shape until they update; new registrations use
+       an opaque random worker_id instead (see coordinator/db.py's
+       display_name migration for why: the ToS promises we don't
+       collect hostnames).
+    4. The generic pairing label, or "agent"."""
+    if display_name and display_name.strip():
+        return display_name.strip()
     if label and label.strip() and label.strip().lower() != "agent":
         return label.strip()
     if worker_id:
@@ -2757,6 +2773,8 @@ def register(req: WorkerIdent, request: Request):
             req.worker_id,
             json.dumps(list(req.capabilities.tools or [])),
         )
+    if req.display_name and req.display_name.strip():
+        db.set_worker_display_name(req.worker_id, req.display_name.strip())
     log.info(
         "worker registered",
         extra={"event": "worker_registered", "worker_id": req.worker_id},
@@ -3835,9 +3853,11 @@ def workers(request: Request):
         owner_label = (
             (owner["username"] or owner["email"] or owner_id) if owner else owner_id
         )
+        raw_display_name = w["display_name"] if "display_name" in w.keys() else None
         out.append(
             {
                 "worker_id": wid,
+                "display_name": _machine_display_name(raw_display_name, None, wid),
                 "status": live_status,
                 "last_seen": last_seen,
                 "seconds_since_heartbeat": round(now - last_seen, 2) if last_seen else None,
@@ -3887,6 +3907,15 @@ def jobs_listing(
         limit=limit,
     )
     members_by_id = {m["member_id"]: m for m in db.list_members()}
+    workers_by_id = {w["worker_id"]: w for w in db.list_workers()}
+
+    def _worker_label(wid: Optional[str]) -> Optional[str]:
+        if not wid:
+            return None
+        w = workers_by_id.get(wid)
+        raw = w["display_name"] if w is not None and "display_name" in w.keys() else None
+        return _machine_display_name(raw, None, wid)
+
     jobs_out = []
     for j in rows:
         jobs_out.append({
@@ -3895,6 +3924,7 @@ def jobs_listing(
             "status": j["status"],
             "tool": j["tool"] if "tool" in j.keys() else "chat",
             "worker_id": j["worker_id"],
+            "worker_label": _worker_label(j["worker_id"]),
             "model": j["model"],
             "prompt_tokens": j["prompt_tokens"],
             "completion_tokens": j["completion_tokens"],
@@ -3916,7 +3946,7 @@ def jobs_listing(
         caps = _load_capabilities(worker_id) or {}
         filter_worker = {
             "worker_id": worker_id,
-            "label": worker_id[-12:],
+            "label": _worker_label(worker_id),
             "owner_member_id": owner_id,
             "owner_label": _member_label(members_by_id.get(owner_id), owner_id) if owner_id else None,
             "gpu_model": caps.get("gpu_model"),
@@ -3931,7 +3961,7 @@ def jobs_listing(
             "member_id": member_id,
             "label": _member_label(m, member_id),
             "workers": [
-                {"worker_id": w["worker_id"], "label": w["worker_id"][-12:]}
+                {"worker_id": w["worker_id"], "label": _worker_label(w["worker_id"])}
                 for w in owned_workers
             ],
         }
@@ -4094,7 +4124,7 @@ def my_machines(request: Request):
                 status = _worker_status(wid, now)
         machines.append({
             "id": row["token_hash"][:12],
-            "name": _machine_display_name(row["label"], wid),
+            "name": _machine_display_name(row["worker_display_name"], row["label"], wid),
             "label": row["label"] or "agent",
             "worker_id": wid,
             "created_at": row["created_at"],

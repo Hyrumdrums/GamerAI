@@ -163,6 +163,14 @@ presence on your hardware.
   millions of other owners of that card would report, not a unique
   identifier — it's used to label your machine in the dashboard and
   is not cross-referenced against anything to re-identify you.
+- **Machine naming.** At setup the agent asks for an optional name
+  for the PC ("Living Room Rig," etc.) so you can tell your machines
+  apart on the dashboard. It's entirely your choice what (if
+  anything) you type there — leave it blank and the agent picks a
+  random two-word name instead, nothing about your machine or
+  identity. Whatever you enter is stored and shown back to you (and
+  to admins) verbatim, so don't put anything in it you wouldn't want
+  visible in the dashboard.
 - **Logs** rotate. Stored prompts are eligible for purge after a
   reasonable retention window. If you want yours purged sooner,
   email the admin.

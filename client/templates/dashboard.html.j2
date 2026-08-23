@@ -60,12 +60,12 @@
   <div class="section">
     <h2>All Workers</h2>
     <table>
-      <tr><th>Worker ID</th><th>Account</th><th>GPU</th><th>Status</th><th>Jobs</th><th>Tokens</th><th>Last Active</th></tr>
+      <tr><th>Machine</th><th>Account</th><th>GPU</th><th>Status</th><th>Jobs</th><th>Tokens</th><th>Last Active</th></tr>
       {% for x in workers %}
       <tr>
         <td>
           <span style="color:{% if x.status != 'offline' %}#4CAF50{% else %}#FF5722{% endif %};">●</span>
-          <a href="/admin/jobs?worker_id={{ x.worker_id }}">{{ x.worker_id[-12:] }}</a>
+          <a href="/admin/jobs?worker_id={{ x.worker_id }}">{{ x.display_name or x.worker_id[-12:] }}</a>
         </td>
         <td>
           {% if x.owner_member_id %}

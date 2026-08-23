@@ -551,6 +551,22 @@ class DB:
                 self._conn.execute(ddl)
             except sqlite3.OperationalError:
                 pass
+        # Contributor-chosen machine name. Replaces the old
+        # hostname-embedded-in-worker_id trick (win-<hostname>-<rand>)
+        # for identifying a machine on the dashboard/Machines page —
+        # the community ToS promises we don't collect hostnames, and
+        # worker_id was quietly violating that. The agent now prompts
+        # for an optional name at setup (defaulting to a random
+        # adjective_noun pair when left blank) and sends it as
+        # display_name on /register; worker_id itself is now opaque
+        # random. Existing machines that registered before this slice
+        # keep their hostname-bearing worker_id (regenerating it would
+        # orphan their job/earnings history) — display_name is NULL
+        # for those until their agent updates and re-registers.
+        try:
+            self._conn.execute("ALTER TABLE workers ADD COLUMN display_name TEXT")
+        except sqlite3.OperationalError:
+            pass
 
     # ---------- jobs ----------
     def insert_job(
@@ -774,6 +790,13 @@ class DB:
             except Exception:
                 self._conn.execute("ROLLBACK")
                 raise
+
+    def get_worker(self, worker_id: str) -> Optional[sqlite3.Row]:
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM workers WHERE worker_id=?", (worker_id,),
+            )
+            return cur.fetchone()
 
     def worker_owner(self, worker_id: str) -> Optional[str]:
         with self._lock:
@@ -1165,7 +1188,8 @@ class DB:
                 "t.worker_id, t.paused, t.sched_enabled, t.sched_start_min, "
                 "t.sched_end_min, t.sched_tz, "
                 "w.status AS worker_status, w.last_seen AS worker_last_seen, "
-                "w.tools_json AS worker_tools_json, w.registered_at AS worker_registered_at "
+                "w.tools_json AS worker_tools_json, w.registered_at AS worker_registered_at, "
+                "w.display_name AS worker_display_name "
                 "FROM member_tokens t "
                 "LEFT JOIN workers w ON w.worker_id = t.worker_id "
                 "WHERE t.member_id=? ORDER BY t.created_at DESC",
@@ -1646,6 +1670,17 @@ class DB:
                 "ORDER BY member_id"
             )
             return cur.fetchall()
+
+    def set_worker_display_name(self, worker_id: str, display_name: str) -> None:
+        """Persist the contributor-chosen (or randomly-defaulted)
+        machine name sent on /register. Idempotent UPDATE, same
+        precondition as set_worker_tools — claim_worker_ownership runs
+        first so the row already exists."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE workers SET display_name=? WHERE worker_id=?",
+                (display_name, worker_id),
+            )
 
     def set_worker_tools(self, worker_id: str, tools_json: str) -> None:
         """Persist the JSON-encoded tools list a worker last advertised

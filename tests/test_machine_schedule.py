@@ -228,6 +228,27 @@ class MachineScheduleE2ETests(unittest.TestCase):
         self.assertEqual(m["gpu_model"], "RTX 4090")
         self.assertEqual(m["vram_gb"], 24.0)
 
+    def test_display_name_wins_over_hostname_parsed_from_worker_id(self):
+        # A new-style agent sends both an opaque worker_id (no hostname)
+        # and an explicit display_name. The chosen name must win even
+        # though the pairing label is still the generic default that
+        # would otherwise fall through to worker_id parsing.
+        member_token = self._make_member()
+        member_id = self._member_id_for(member_token)
+        agent = self._pair_machine(member_id)  # label="agent" (generic)
+        wid = "win-" + uuid.uuid4().hex[:20]  # opaque, no embeddable name
+        resp = self.client.post(
+            "/register",
+            json={"worker_id": wid, "display_name": "Basement Rig"},
+            headers=self._agent_headers(agent),
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+
+        m = self.client.get(
+            "/me/machines", headers={"Authorization": f"Bearer {member_token}"}
+        ).json()["machines"][0]
+        self.assertEqual(m["name"], "Basement Rig")
+
     def test_patch_schedule_persists_and_round_trips(self):
         member_token = self._make_member()
         member_id = self._member_id_for(member_token)

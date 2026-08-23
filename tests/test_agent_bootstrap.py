@@ -905,5 +905,107 @@ class RunSignupFlowTests(unittest.TestCase):
         self.assertIsNone(token)
 
 
+class ResolveWorkerIdTests(unittest.TestCase):
+    """worker_id must never embed the machine's hostname — the
+    community ToS promises we don't collect it. See
+    coordinator/db.py's display_name migration for the replacement
+    (machine naming is now a separate, opt-in field)."""
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        self._tmp = Path(tempfile.mkstemp(suffix=".json")[1])
+        self._orig_state_path = agent.STATE_PATH
+        agent.STATE_PATH = self._tmp
+
+    def tearDown(self):
+        agent.STATE_PATH = self._orig_state_path
+        try:
+            self._tmp.unlink()
+        except OSError:
+            pass
+
+    def test_generated_id_does_not_contain_hostname(self):
+        with mock.patch.object(agent.socket, "gethostname", return_value="DESKTOP-SECRET"):
+            wid = agent.resolve_worker_id(None, {})
+        self.assertNotIn("DESKTOP-SECRET", wid)
+        self.assertTrue(wid.startswith("win-"))
+
+    def test_id_is_stable_across_calls_via_state(self):
+        state: dict = {}
+        first = agent.resolve_worker_id(None, state)
+        second = agent.resolve_worker_id(None, state)
+        self.assertEqual(first, second)
+
+    def test_explicit_cfg_worker_id_wins_and_is_not_persisted(self):
+        state: dict = {}
+        wid = agent.resolve_worker_id("custom-id", state)
+        self.assertEqual(wid, "custom-id")
+        self.assertNotIn("worker_id", state)
+
+
+class MachineNameTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        self._tmp = Path(tempfile.mkstemp(suffix=".json")[1])
+        self._orig_state_path = agent.STATE_PATH
+        agent.STATE_PATH = self._tmp
+
+    def tearDown(self):
+        agent.STATE_PATH = self._orig_state_path
+        try:
+            self._tmp.unlink()
+        except OSError:
+            pass
+
+    def test_random_machine_name_shape(self):
+        name = agent.random_machine_name()
+        parts = name.split("_")
+        self.assertEqual(len(parts), 2)
+        self.assertIn(parts[0], agent._MACHINE_NAME_ADJECTIVES)
+        self.assertIn(parts[1], agent._MACHINE_NAME_NOUNS)
+
+    def test_prompt_returns_typed_name_and_persists(self):
+        state: dict = {}
+        name = agent.ensure_machine_name(state, _prompt=lambda _: "Living Room PC")
+        self.assertEqual(name, "Living Room PC")
+        self.assertEqual(state["machine_name"], "Living Room PC")
+        import json
+        on_disk = json.loads(agent.STATE_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(on_disk["machine_name"], "Living Room PC")
+
+    def test_blank_answer_defaults_to_random_name(self):
+        state: dict = {}
+        name = agent.ensure_machine_name(state, _prompt=lambda _: "")
+        parts = name.split("_")
+        self.assertEqual(len(parts), 2)
+        self.assertEqual(state["machine_name"], name)
+
+    def test_eof_or_interrupt_falls_back_to_random_name(self):
+        for exc in (EOFError, KeyboardInterrupt):
+            state: dict = {}
+
+            def _raise(_prompt, _exc=exc):
+                raise _exc
+
+            name = agent.ensure_machine_name(state, _prompt=_raise)
+            self.assertTrue(name)
+            self.assertEqual(state["machine_name"], name)
+
+    def test_existing_name_short_circuits_without_prompting(self):
+        state = {"machine_name": "already-named"}
+        name = agent.ensure_machine_name(
+            state, _prompt=lambda _: (_ for _ in ()).throw(AssertionError("must not prompt")),
+        )
+        self.assertEqual(name, "already-named")
+
+    def test_long_input_is_truncated(self):
+        state: dict = {}
+        long_name = "x" * 200
+        name = agent.ensure_machine_name(state, _prompt=lambda _: long_name)
+        self.assertEqual(len(name), agent._MACHINE_NAME_MAX_LEN)
+
+
 if __name__ == "__main__":
     unittest.main()
