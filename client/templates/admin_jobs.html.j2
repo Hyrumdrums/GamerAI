@@ -42,7 +42,8 @@
   <table>
     <tr>
       <th>Submitted</th><th>Status</th><th>Tool</th><th>Model</th>
-      <th>Worker</th><th>Submitted by</th><th>Tokens</th><th>Duration</th>
+      <th>Worker</th><th>GPU</th><th>Submitted by</th><th>Tokens</th>
+      <th>Attempts</th><th>Queue</th><th>Duration</th>
       <th>Prompt</th>
     </tr>
     {% for j in jobs %}
@@ -56,12 +57,15 @@
           <a href="/admin/jobs?worker_id={{ j.worker_id }}">{{ j.worker_label }}</a>
         {% else %}—{% endif %}
       </td>
+      <td>{{ j.worker_gpu or '—' }}</td>
       <td>
         {% if j.submitted_by_member_id %}
           <a href="/admin/jobs?member_id={{ j.submitted_by_member_id }}">{{ j.submitted_by_label }}</a>
         {% else %}—{% endif %}
       </td>
       <td>{% if j.prompt_tokens is not none %}{{ j.prompt_tokens }}/{{ j.completion_tokens or 0 }}{% else %}—{% endif %}</td>
+      <td>{{ j.attempts }}</td>
+      <td>{% if j.queue_seconds is not none %}{{ "%.1f"|format(j.queue_seconds) }}s{% else %}—{% endif %}</td>
       <td>{% if j.duration_seconds is not none %}{{ "%.1f"|format(j.duration_seconds) }}s{% else %}—{% endif %}</td>
       <td title="{{ j.prompt }}">{{ j.prompt[:60] }}{% if j.prompt|length > 60 %}…{% endif %}</td>
     </tr>

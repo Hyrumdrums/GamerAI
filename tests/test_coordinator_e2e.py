@@ -243,6 +243,32 @@ class CoordinatorE2ETests(unittest.TestCase):
         self.assertEqual(body["filter_worker"]["gpu_model"], "RTX 4090")
         self.assertEqual(body["filter_worker"]["vram_gb"], 24.0)
 
+    def test_jobs_listing_rows_surface_gpu_attempts_and_queue_time(self):
+        job_id = self.client.post("/generate", json={"prompt": "hi"}).json()["job_id"]
+        worker_id = "wkr-" + uuid.uuid4().hex[:6]
+        self.client.post(
+            "/register",
+            json={
+                "worker_id": worker_id,
+                "capabilities": {"gpu_model": "RTX 4090", "vram_gb": 24.0},
+            },
+        )
+        self.assertIsNotNone(self.r.lpop("job_queue"))
+        claim_token = self.client.post(
+            "/jobs/claim",
+            json={"worker_id": worker_id, "job_id": job_id},
+        ).json()["claim_token"]
+        self.client.post(
+            "/jobs/complete",
+            json=_job_complete_payload(worker_id, job_id, claim_token=claim_token),
+        )
+
+        row = self.client.get(f"/jobs?worker_id={worker_id}").json()["jobs"][0]
+        self.assertEqual(row["worker_gpu"], "RTX 4090 (24.0 GB)")
+        self.assertEqual(row["attempts"], 1)
+        self.assertIsNotNone(row["queue_seconds"])
+        self.assertGreaterEqual(row["queue_seconds"], 0)
+
     # ------------------------------------------------------------------
     # no-workers-available gate (REQUIRE_LIVE_WORKER)
     # ------------------------------------------------------------------

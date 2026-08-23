@@ -3916,8 +3916,22 @@ def jobs_listing(
         raw = w["display_name"] if w is not None and "display_name" in w.keys() else None
         return _machine_display_name(raw, None, wid)
 
+    def _worker_gpu(wid: Optional[str]) -> Optional[str]:
+        if not wid:
+            return None
+        caps = _load_capabilities(wid)
+        if not caps or not caps.get("gpu_model"):
+            return None
+        vram = caps.get("vram_gb")
+        return f"{caps['gpu_model']} ({vram} GB)" if vram else caps["gpu_model"]
+
     jobs_out = []
     for j in rows:
+        started_at = j["started_at"]
+        queue_seconds = (
+            round(started_at - j["submitted_at"], 2)
+            if started_at is not None else None
+        )
         jobs_out.append({
             "job_id": j["job_id"],
             "prompt": j["prompt"],
@@ -3925,10 +3939,13 @@ def jobs_listing(
             "tool": j["tool"] if "tool" in j.keys() else "chat",
             "worker_id": j["worker_id"],
             "worker_label": _worker_label(j["worker_id"]),
+            "worker_gpu": _worker_gpu(j["worker_id"]),
             "model": j["model"],
             "prompt_tokens": j["prompt_tokens"],
             "completion_tokens": j["completion_tokens"],
             "earnings": j["earnings"],
+            "attempts": j["attempts"],
+            "queue_seconds": queue_seconds,
             "duration_seconds": j["duration_seconds"],
             "submitted_at": j["submitted_at"],
             "completed_at": j["completed_at"],
