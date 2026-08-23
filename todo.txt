@@ -192,3 +192,45 @@ DONE 2026-08-21: web signup flow + admin test-email tool + downloads-page
     suite: 606 passed.
 
 refactor god files like main.py... 4k+ lines
+
+DONE 2026-08-22: double-checked "usage only allowed once agent is
+  running" -- audited the code path + verified live on prod rather
+  than just reading it:
+  - coordinator/main.py's /generate calls _ensure_live_worker_or_503()
+    (gated by REQUIRE_LIVE_WORKER) BEFORE the quota check and before
+    any DB writes -- a submission with no live worker 503s with no
+    job queued and no usage row touched. Token/image/voice usage is
+    only ever credited from /jobs/complete (db.add_member_usage),
+    which structurally cannot fire without a worker actually claiming
+    and completing the job -- so there's no path where usage gets
+    debited without an agent having run. Already covered by
+    test_coordinator_e2e.py's three REQUIRE_LIVE_WORKER tests (503 +
+    empty queue when no worker, 200 when one is registered, gate
+    no-ops when disabled).
+  - The part worth actually checking live: is the gate ON in prod, or
+    just a dev-only toggle that happens to default false? Confirmed
+    via SSH: /opt/gamerai/.env.prod has REQUIRE_LIVE_WORKER=true and
+    it's live in the running gamerai-coordinator container's env; the
+    mock-worker compose profile is NOT up (no fake in-VPS worker to
+    silently answer everything). Read worker_heartbeats straight out
+    of prod Redis and found real win-*-prefixed worker IDs
+    heartbeating within the last ~15-20s at check time -- i.e. an
+    actual Windows agent was live and would have unblocked /generate
+    for real, not just in theory.
+  - Couldn't complete the loop with an actual curl'd /generate
+    against prod as "proof" -- the admin API_TOKEN in .env.prod no
+    longer authenticates (by design: it stops matching any member
+    once the founding admin sets a real username/password, see
+    ensure_admin_seed()'s docstring), and I'm not going to ask for or
+    use the account password. If you want the literal "send a prompt,
+    watch it go through" check, that's a 30-second manual pass at
+    https://ai.dallinlayton.com/ under your own login -- everything
+    else about the gate is now verified end-to-end.
+  - Side observation, not acted on: worker_heartbeats in prod Redis
+    has a long tail of stale entries (~100+ days old, mostly
+    non-win-prefixed "worker-xxxx" dev/test IDs) that nothing ever
+    prunes -- _worker_status() correctly ignores them for online/
+    offline classification, so this isn't a correctness bug, just
+    unbounded hash growth. Worth a cheap cron/reaper if it's ever
+    noticeably large; not touched here since it's outside what was
+    asked.
