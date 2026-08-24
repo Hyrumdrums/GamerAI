@@ -234,3 +234,99 @@ DONE 2026-08-22: double-checked "usage only allowed once agent is
     unbounded hash growth. Worth a cheap cron/reaper if it's ever
     noticeably large; not touched here since it's outside what was
     asked.
+
+DONE 2026-08-23: closed out a low-hanging-fruit / gaps review session.
+  Bundling the summary here since todo.txt is where open work actually
+  lives (retired the one-off project-review-todo.txt checklist file
+  after merging its still-open items into the backlog block below).
+  - Found docs/project-gaps.md's "2026-05-13 security review" section
+    (6 items, half marked critical) was entirely stale -- all six were
+    already fixed in code, the doc just never got updated. Verified
+    each against actual code, not commit messages: canary leak
+    (main.py:1990/:2434 drop submitted_by_member_id from the worker
+    envelope), worker/member spoofing (owner_member_id enforced,
+    main.py:2786/:2709), markdown XSS (DOMPurify in
+    messageRenderer.js), CDN SRI (moot -- marked.min.js is self-hosted
+    now), prompt-length cap (MAX_PROMPT_BYTES, shipped 2026-08-19),
+    /login rate limit (LOGIN_FAIL_MAX, on by default). Also fixed the
+    membership-identity "remaining polish" list (3 of 5 bullets were
+    actually done -- worker/member link, tier auto-promotion engine,
+    per-member web UI auth; one was superseded not done -- Caddy
+    basic_auth, replaced by session-cookie auth instead; confirmed
+    SMTP-delivered invites is still genuinely open) plus a stale line
+    in the 30-day priority list.
+  - Also did a fresh-eyes pass over the rest of the codebase for
+    low-hanging fruit and gaps not already tracked anywhere -- see the
+    backlog block immediately below for what came out of that.
+
+--- Feature/idea backlog (from the 2026-08-23 review, unordered) ----------
+
+Leaderboard: README.md promises "tier badges on the leaderboard"
+  (~line 335) -- doesn't exist, grepped repo-wide. Data's already
+  collected (members.tier, the 7-day uptime window tier_engine.py
+  already aggregates, jobs-served counts) -- rank by tier/uptime, NOT
+  $ earnings (consistent with fc8aa28 dropping the misleading earnings
+  display). Reuse tier_engine.py's query shape. Bonus: a "current
+  streak" stat is ~free on the same data. Pairs well with the
+  tier-history table below so promotions can show "promoted 3 days
+  ago". ~half a day.
+
+Tier-change + invite-accepted push notifications: coordinator/
+  events.py (the new in-process event bus) and coordinator/
+  notifications.py (send_to_member, opt-in prefs, push delivery) both
+  already exist but were never connected to each other for
+  member-facing notifications -- only the admin-alert emailer
+  subscribes to the event bus today. tier_engine.py:290 and :337
+  already log member_promoted/demoted with zero user-facing signal;
+  main.py:4744/:5407 already emit on invite accept. Wiring either to
+  send_to_member with a new category is ~15-30 min once the first one
+  establishes the pattern.
+
+503-loses-your-message composer bug: fully root-caused already in
+  docs/project-gaps.md (search "A 503 silently destroys the user's
+  message") -- don't clear the textarea until the fetch succeeds,
+  restore the prompt text on any error path, add a retry button.
+  client/static/js/chat.js, client-only fix. ~1-2 hours.
+
+Uptime Kuma (or equivalent) hitting /health every 30s -- the only real
+  monitoring gap between "site's down" and "a user tells you it's
+  down". Already scoped in project-gaps.md §2 / §7 item 6. ~half a
+  day.
+
+Supply/demand push nudge to idle contributors: per-tool Redis queues
+  (job_queue_for() in shared/config.py) + the event bus + push infra
+  all already exist independently; nobody's wired "the image queue is
+  backed up" into a push aimed at idle image-capable contributors. GET
+  /metrics (main.py:5642) only reports the legacy chat queue depth
+  today -- needs to loop over every job_queue_for() tool name first,
+  then a periodic threshold check (mirrors canaries.py's interval-task
+  pattern). ~1 day.
+
+Live power-cost / earnings-equivalent stat in the agent tray: makes
+  README §5's $/kWh economics pitch personal and real-time instead of
+  a static table. Agent already reports GPU model/VRAM (faef05c) --
+  poll `nvidia-smi --query-gpu=power.draw` and show "earned the
+  network N tokens today, ~$0.0X in power" in the tray/console.
+  windows-agent/agent.py. ~1 day.
+
+Community model-request wishlist: coordinator/model_registry.py is
+  maintainer-curated; a public "I wish X model were on the network"
+  page (one table + one page) turns curation into a bottom-up signal,
+  fits the community-powered framing, doesn't obligate building
+  support for whatever gets requested. ~half a day.
+
+Turn the incident write-ups in this file into a devlog/blog series --
+  the sd.exe STATUS_STACK_BUFFER_OVERRUN root-cause above, the Win11
+  ConPTY tray-hide investigation, the TOCTOU stowaway-instance race --
+  already written at near-publishable quality. public-launch-todo.txt
+  step 10.1 (docs/blurb.md) shows the portfolio angle is already a
+  goal; this is close to free content. No code, ~a few hours/post.
+
+Tier-change history table: checked every CREATE TABLE in
+  coordinator/db.py -- no promotion/demotion history exists. The only
+  record is a structured log line, wiped on container restart (see
+  project-gaps.md's own "no log retention" gap). Add
+  member_tier_events(member_id, from_tier, to_tier, at), written from
+  tier_engine.py's promote/demote path (~line 290/337 -- same spot as
+  the push-notification hook above, worth doing together). Also feeds
+  the leaderboard's "promoted 3 days ago" badge. ~2-3 hours.
