@@ -517,3 +517,38 @@ vision (image understanding in chat, agent side): already scoped in
   the most expensive of the three, and it doesn't share the
   "attach a file" composer plumbing the other two do until the UI
   stage.
+
+DONE 2026-08-24: real-hardware confirmation on image alteration --
+  owner tested live: agent 1.4.1 self-updated correctly, "Edit an
+  image" round-tripped through a real sd.exe img2img job. Closes the
+  "honest gap" noted when this shipped (subprocess.run was mocked in
+  every test since there was no Windows box available). Two follow-up
+  asks from that test, both shipped same day:
+  - Picked-image thumbnail: composer.js's file picker used to show
+    only a filename. renderEditThumb() now decodes via
+    createImageBitmap + draws a cover-cropped 64x64 canvas ->
+    dataURL(JPEG, q0.7) -- an actual small re-encoded image, not a
+    CSS-shrunk full-res one, so this stays cheap on a multi-MB phone
+    photo. A monotonic _thumbToken guards against a slow decode from
+    an earlier pick landing after a newer one supersedes it.
+  - Chain-edit: the lightbox (imageGallery.js) gained an "Edit"
+    action next to Save. Fetches the currently-viewed PNG from the
+    same /api/images URL the <img> already used (same ownership
+    check, no new surface), wraps it as a File, hands it to
+    composer.js's new setPickedEditFile() -- which flips the
+    composer into edit mode via a real dispatched 'change' event
+    (not a direct .checked assignment) so the existing mutual-
+    exclusion/persist/refresh handler runs unchanged, one code path
+    for both "user picked a file" and "reusing a generated one".
+    Deliberately NOT a per-bubble button -- the lightbox already had
+    a clean action-row pattern (Save) to extend, and putting Edit
+    there avoids cluttering every image bubble in the log.
+  - Verified locally (Playwright against tools/run_local.py): thumb
+    appears as a real data: URL (not hidden) on file pick and clears
+    on mode-exit; a stand-in <img class=generated> (the local harness
+    has no image-capable worker, so this used a real static PNG the
+    app already serves rather than an actual generation) opens the
+    lightbox, Edit closes it and correctly flips edit mode on with
+    the right filename + thumbnail. Zero console errors. Full Python
+    suite unaffected (pure client-side change): 673/673.
+  - CLIENT_CACHE_VERSION 25 -> 26.

@@ -9,8 +9,10 @@
 // Single overlay element, lazy-built on first open, so a session with
 // no image messages adds zero DOM at startup.
 
+import { setPickedEditFile } from './composer.js';
+
 const imageViewer = (() => {
-  let root, imgEl, counterEl, downloadEl, prevBtn, nextBtn;
+  let root, imgEl, counterEl, downloadEl, editEl, prevBtn, nextBtn;
   let images = [];
   let index = 0;
 
@@ -25,6 +27,8 @@ const imageViewer = (() => {
         <div class="iv-actions">
           <a class="iv-action iv-download" href="#" download
              title="Save image" aria-label="Save image">Save</a>
+          <button class="iv-action iv-edit" type="button"
+                  title="Use as the input for a new edit" aria-label="Edit this image">Edit</button>
           <button class="iv-action iv-close" type="button"
                   title="Close" aria-label="Close">×</button>
         </div>
@@ -39,6 +43,7 @@ const imageViewer = (() => {
     imgEl = root.querySelector('.iv-image');
     counterEl = root.querySelector('.iv-counter');
     downloadEl = root.querySelector('.iv-download');
+    editEl = root.querySelector('.iv-edit');
     prevBtn = root.querySelector('.iv-prev');
     nextBtn = root.querySelector('.iv-next');
 
@@ -50,6 +55,27 @@ const imageViewer = (() => {
     root.querySelector('.iv-close').addEventListener('click', close);
     prevBtn.addEventListener('click', () => step(-1));
     nextBtn.addEventListener('click', () => step(1));
+    // Chain edits: re-fetch the currently-viewed PNG (same /api/images
+    // URL the <img> already used, so the same ownership check applies)
+    // and hand it to the composer as the next edit's input image. The
+    // coordinator never sees "this came from a prior generation" as a
+    // distinct concept — from its POV this is just another upload.
+    editEl.addEventListener('click', async () => {
+      const src = imgEl.src;
+      const filename = decodeURIComponent(src.split('/').pop() || 'image.png');
+      close();
+      let blob;
+      try {
+        const resp = await fetch(src);
+        if (!resp.ok) throw new Error(`fetch failed: ${resp.status}`);
+        blob = await resp.blob();
+      } catch (_e) {
+        return;  // best-effort — the viewer's already closed, nothing else to roll back
+      }
+      setPickedEditFile(new File([blob], filename, {type: blob.type || 'image/png'}));
+      const ta = document.getElementById('prompt');
+      if (ta) ta.focus();
+    });
 
     // Esc / arrow keys — only while open, so they don't fight other
     // global handlers (or the composer textarea) when the viewer is

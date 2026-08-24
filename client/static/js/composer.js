@@ -196,13 +196,56 @@ for (const {checkbox} of TOOL_TOGGLES) {
 refreshComposerUI();
 
 // ---- edit-mode image picker --------------------------------------
+const editPickedThumb = document.getElementById('edit-picked-thumb');
 let _pickedEditFile = null;
+let _thumbToken = 0;  // guards against a slow-decoding old thumb landing after a newer pick
+
+// Small, actually-resized preview (not just a CSS-shrunk full image) —
+// createImageBitmap decodes off the main thread and the canvas draw
+// downsamples, so this stays cheap even for a multi-MB phone photo.
+// Cover-cropped to a square so mixed aspect ratios still look tidy at
+// this size.
+async function renderEditThumb(file) {
+  const myToken = ++_thumbToken;
+  if (!editPickedThumb) return;
+  try {
+    const bitmap = await createImageBitmap(file);
+    if (myToken !== _thumbToken) { bitmap.close(); return; }  // superseded mid-decode
+    const size = 64;  // CSS displays it smaller; 2x for retina crispness
+    const canvas = document.createElement('canvas');
+    canvas.width = size;
+    canvas.height = size;
+    const ctx = canvas.getContext('2d');
+    const scale = Math.max(size / bitmap.width, size / bitmap.height);
+    const sw = size / scale;
+    const sh = size / scale;
+    const sx = (bitmap.width - sw) / 2;
+    const sy = (bitmap.height - sh) / 2;
+    ctx.drawImage(bitmap, sx, sy, sw, sh, 0, 0, size, size);
+    bitmap.close();
+    editPickedThumb.src = canvas.toDataURL('image/jpeg', 0.7);
+    editPickedThumb.hidden = false;
+  } catch (_e) {
+    // Decode failure (corrupt file, unsupported format) — not fatal,
+    // the filename label + upload attempt still proceed without a
+    // preview.
+    editPickedThumb.hidden = true;
+  }
+}
+
+// Shared by both pick paths (local file input, and "edit this image"
+// from a previously generated one — see setPickedEditFile below).
+function showPickedEditFile(file) {
+  _pickedEditFile = file;
+  editPickedFilename.textContent = file ? file.name : '';
+  if (file) renderEditThumb(file);
+  else if (editPickedThumb) editPickedThumb.hidden = true;
+}
 
 if (editImagePickerBtn && editImageInput) {
   editImagePickerBtn.addEventListener('click', () => editImageInput.click());
   editImageInput.addEventListener('change', () => {
-    _pickedEditFile = (editImageInput.files && editImageInput.files[0]) || null;
-    editPickedFilename.textContent = _pickedEditFile ? _pickedEditFile.name : '';
+    showPickedEditFile((editImageInput.files && editImageInput.files[0]) || null);
   });
 }
 
@@ -211,9 +254,27 @@ export function getPickedEditFile() {
 }
 
 export function clearPickedEditFile() {
+  _thumbToken++;  // invalidate any in-flight decode
   _pickedEditFile = null;
   if (editImageInput) editImageInput.value = '';
   if (editPickedFilename) editPickedFilename.textContent = '';
+  if (editPickedThumb) { editPickedThumb.hidden = true; editPickedThumb.src = ''; }
+}
+
+// Feeds a previously generated/edited image back in as the next
+// edit's input — called from imageGallery.js's lightbox "Edit"
+// action with a File built from the fetched PNG. Flips the composer
+// into edit mode via a real 'change' event (not a direct assignment)
+// so the existing mutual-exclusion/persist/refresh handler runs
+// exactly as it would for a user click — one code path, not two.
+export function setPickedEditFile(file) {
+  if (editCheckbox.checked) {
+    showPickedEditFile(file);
+  } else {
+    editCheckbox.checked = true;
+    editCheckbox.dispatchEvent(new Event('change'));
+    showPickedEditFile(file);
+  }
 }
 
 export const EDIT_STRENGTH_PRESETS = {subtle: 0.3, moderate: 0.5, strong: 0.8};

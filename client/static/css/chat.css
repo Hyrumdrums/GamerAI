@@ -200,6 +200,11 @@ body { display: flex; flex-direction: column; }
   cursor: pointer;
 }
 .edit-picker-btn:hover { background: var(--border-soft); }
+.edit-picked-thumb {
+  width: 2.2rem; height: 2.2rem; object-fit: cover;
+  border-radius: 4px; border: 1px solid var(--border);
+  flex: 0 0 auto;
+}
 .edit-picked-filename {
   max-width: 12rem; overflow: hidden; text-overflow: ellipsis;
   white-space: nowrap; font-style: italic;
