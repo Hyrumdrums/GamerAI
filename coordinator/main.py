@@ -987,6 +987,7 @@ def _default_image_params():
 
 
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+_JPEG_SIGNATURE = b"\xff\xd8\xff"
 
 
 # ---------- NSFW output classifier (layer 2) ----------
@@ -1113,6 +1114,42 @@ def _classify_image_or_raise(png_bytes: bytes, job_id: str) -> None:
             "Generated image was filtered by the content classifier. "
             "Please try a different prompt."
         )
+
+
+def _validate_and_classify_init_image(image_b64: str, job_id: str) -> None:
+    """Gate a member-supplied init image for a tool=image edit job
+    before it ever reaches a queue: size cap, base64 shape, PNG/JPEG
+    magic header, then the same NSFW classifier generated OUTPUT
+    images get. An "edit" job hands a contributor's GPU someone
+    else's uploaded picture, not just a text prompt — it gets the
+    same content gate, not a weaker one. Raises HTTPException on any
+    failure."""
+    if len(image_b64) > int(MAX_IMAGE_BYTES * 4 / 3) + 16:
+        raise HTTPException(
+            status_code=413,
+            detail=f"init image too large (>{MAX_IMAGE_BYTES} bytes)",
+        )
+    try:
+        data = base64.b64decode(image_b64, validate=True)
+    except (binascii.Error, ValueError) as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"init_image_b64 not valid base64: {e}",
+        )
+    if len(data) > MAX_IMAGE_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"init image too large after decode (>{MAX_IMAGE_BYTES} bytes)",
+        )
+    if not (data.startswith(_PNG_SIGNATURE) or data.startswith(_JPEG_SIGNATURE)):
+        raise HTTPException(
+            status_code=400,
+            detail="init image bytes are not a PNG or JPEG (missing magic header)",
+        )
+    try:
+        _classify_image_or_raise(data, job_id)
+    except _NSFWFilteredError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 def _save_image_or_raise(
@@ -2055,6 +2092,19 @@ def generate(req: GenerateRequest, request: Request):
             image_env["height"] = _clamp_image_dim(params.height)
         if params.steps is not None:
             image_env["steps"] = max(1, min(50, int(params.steps)))
+        if params.init_image_b64:
+            # Image alteration (img2img). Validates + NSFW-classifies
+            # BEFORE this job ever reaches a queue — raises 4xx here,
+            # same as every other pre-dispatch input check in this
+            # handler, rather than letting a contributor's agent
+            # discover the problem after doing the work.
+            _validate_and_classify_init_image(params.init_image_b64, job_id)
+            image_env["init_image_b64"] = params.init_image_b64
+            if params.strength is not None:
+                # (0, 1] — 0 would mean "no change at all" (a wasted
+                # job); sd.exe's own default (0.75) applies when the
+                # client omits this entirely.
+                image_env["strength"] = min(1.0, max(0.01, float(params.strength)))
         job["image"] = image_env
     if tool == "search":
         # search_mode is validated above; carry it through so the agent

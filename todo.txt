@@ -425,25 +425,83 @@ DONE 2026-08-24: document/file upload (PDF, DOCX, TXT/MD, CSV) for
     much bigger cleanup than this slice; flagging here rather than
     scope-creeping into a full README API audit.
 
-image alteration (img2img / inpainting on an uploaded image, agent
-  side): NOT previously scoped anywhere -- found while researching the
-  upload feature. windows-agent/agent.py's run_image_inference()
-  (~line 4619) only does text->image today, but the pinned
-  stable-diffusion.cpp build (master-637-ef92a00, same binary already
-  on every contributor box) has gen_params.init_image_path AND
-  gen_params.mask_image_path as real, consumed fields in its CLI
-  parser (confirmed straight from upstream's examples/cli/main.cpp) --
-  img2img and inpainting are already compiled into the exact sd.exe
-  everyone's running, using the SAME SD1.5/SDXL models already
-  bootstrapped. No new model download, no new VRAM tier. The lift is
-  accepting a base64 input image (+ optional mask) in the image job
-  payload, writing it to a temp file the same way the prompt already
-  gets written to out_path.with_suffix(".prompt.txt"), and adding the
-  init-image/mask/strength flags to the existing argv list -- reuses
-  the image queue, capability routing, and PNG storage/serving path
-  wholesale. Exact CLI flag spelling wasn't nailed down from the docs
-  (upstream punts to `sd-cli -h`) -- confirm on a contributor box
-  before writing the argv change. ~1-2 days.
+DONE 2026-08-24: image alteration (img2img) on an uploaded image,
+  agent side. Scope cut deliberately to plain img2img -- masking/
+  inpainting needs a paint-a-mask UI, a bigger separate lift, not
+  built here (see "not done" list below).
+  - Nailed down the exact CLI flags before touching agent.py, since
+    the only verification path available (no Windows box / real
+    sd.exe here) was upstream's own source at the pinned commit
+    (master-637-ef92a00): fetched examples/common/common.cpp and
+    found the real option-registration table -- `-i`/`--init-img`
+    for the init image, `--strength` ("strength for noising/
+    unnoising", default 0.75), `--mask` for a mask image (unused --
+    see above). Also confirmed via resolve_and_validate() that
+    --init-img is OPTIONAL for -M img_gen mode (only UPSCALE/
+    ADETAILER modes require it) -- so the existing txt2img invocation
+    just gains flags when an init image is present, no mode switch.
+    And confirmed via load_image_and_update_size() that -W/-H still
+    apply with -i set (sd.cpp resizes the init image to them, doesn't
+    require an exact match) -- so no special-casing needed there.
+  - coordinator: ImageParams gained init_image_b64 + strength
+    (shared/models.py). New _validate_and_classify_init_image()
+    (coordinator/main.py) gates it before the job ever reaches a
+    queue -- size cap (reuses MAX_IMAGE_BYTES), base64 shape,
+    PNG-or-JPEG magic header, AND the same NudeNet NSFW classifier
+    generated OUTPUT images already get (_classify_image_or_raise,
+    now called from both directions) -- an edit job hands a
+    contributor's GPU someone else's uploaded picture, didn't want
+    that getting a weaker gate than a generated one. strength
+    clamped to (0, 1]. tool stays "image", no new capability/queue --
+    any worker already advertising tools=["image"] is already running
+    the sd.exe that supports this.
+  - agent: run_image_inference() (windows-agent/agent.py) decodes
+    init_image_b64, writes it next to the existing prompt-temp-file
+    (out_path.with_suffix(".init.png")), adds -i/--strength to argv
+    when present, cleans up in the same finally block as the prompt
+    file (including on subprocess failure). strength omitted from
+    argv (not defaulted) when the job didn't send one -- sd.exe's own
+    0.75 applies, matches this file's standing rule against
+    re-deciding model defaults agent-side. AGENT_VERSION -> 1.4.1.
+  - client: new "Edit an image" composer toggle, 4-way mutually
+    exclusive with generate/search/smart now (composer.js's
+    3-way pairwise-condition mutual exclusion got refactored to an
+    array-driven TOOL_TOGGLES loop rather than hand-writing a 4th
+    copy of the same logic). File picker + subtle/moderate/strong
+    strength preset; submit base64-encodes the picked file
+    client-side (chunked, to avoid blowing the call stack on a
+    multi-MB photo) and sends it with no width/height pin -- edit
+    mode keeps the source image's own dimensions rather than forcing
+    a generate-mode size preset. Validates a file was actually picked
+    before touching the chat pane, not after.
+  - Tests: tests/test_agent_image_edit.py (6 cases) mocks IS_WINDOWS
+    + sd.exe/model paths + subprocess.run to verify the actual argv
+    construction -- txt2img unaffected when no init image, -i/
+    --strength present and correctly valued when one is, cleanup
+    happens even on subprocess failure. tests/test_image_edit_e2e.py
+    (8 cases) covers the coordinator side: envelope forwarding,
+    strength clamping, oversize/bad-base64/bad-magic-bytes rejection,
+    and NSFW-wiring (classifier mocked to raise -- NOT testing
+    NudeNet's real detection accuracy, same precedent
+    test_coordinator_e2e.py already set for that). Full suite:
+    673/673 green.
+  - HONEST GAP: the real sd.exe subprocess was never actually run --
+    couldn't be, no Windows box here. Every agent-side test mocks
+    subprocess.run; the argv-construction logic is what's verified,
+    not that sd.exe accepts it and produces a sane edit. First real
+    contributor-hardware test is the thing that closes this out.
+  - Verified live (the part that COULD run here): Playwright against
+    tools/run_local.py -- 4-way toggle exclusivity, the "choose an
+    image first" validation path (no optimistic bubble leaks on
+    failure), a real file pick + strength selection + submit getting
+    a 200 back, composer reset after submit. Zero console errors.
+  - Not done: masking/inpainting (--mask, needs a paint-a-mask UI),
+    chaining from a previously-generated image in the same
+    conversation (the PNG already exists on disk at /data/images/ --
+    cheap data-wise, real UI lift), WEBP input.
+  - Not pushed -- windows-agent/agent.py changes auto-fire the
+    windows-agent-build CI workflow on push to main (CLAUDE.md §2);
+    holding off given the untested-on-real-hardware gap above.
 
 vision (image understanding in chat, agent side): already scoped in
   docs/project-gaps.md ("No image input (vision) on chat") -- called

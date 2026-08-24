@@ -13,8 +13,9 @@ import { stopReadAloud } from './readAloud.js';
 import { messageEl } from './messageRenderer.js';
 import { streamIntoBubble } from './streamingEngine.js';
 import {
-  imageCheckbox, searchCheckbox, smartCheckbox,
-  selectedSearchMode, selectedImageSize,
+  imageCheckbox, searchCheckbox, smartCheckbox, editCheckbox,
+  selectedSearchMode, selectedImageSize, selectedEditStrength,
+  getPickedEditFile, clearPickedEditFile,
   IMAGE_SIZE_PRESETS,
   refreshComposerUI,
   restoreModeFor,
@@ -23,6 +24,20 @@ import { initImageGallery } from './imageGallery.js';
 import { initPWAPrompts } from './installPrompt.js';
 import * as offlineQueue from './offlineQueue.js';
 import { initAttachments, loadAttachmentsFor, clearAttachmentsUI } from './attachments.js';
+
+// Base64-encode a File/Blob for image-edit submits (init_image_b64).
+// Chunked String.fromCharCode rather than a spread over the whole
+// byte array — a multi-MB photo blows the call-stack limit if you
+// try to spread it into fromCharCode's arguments in one shot.
+async function fileToBase64(file) {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
 
 // ---- bootstrap --------------------------------------------------------
 async function init() {
@@ -422,7 +437,11 @@ document.getElementById('composer').onsubmit = async (e) => {
   // resets when the user manually unchecks, opens a different
   // conversation, or starts a new chat.
   let submitTool = 'chat';
-  if (imageCheckbox.checked) submitTool = 'image';
+  // Edit rides the image tool too — same coordinator/agent path as
+  // generate, distinguished only by whether init_image_b64 is set
+  // (mirrors how stable-diffusion.cpp itself uses one mode for both).
+  const isEdit = editCheckbox.checked;
+  if (imageCheckbox.checked || isEdit) submitTool = 'image';
   else if (searchCheckbox.checked) submitTool = 'search';
   // Smart mode rides the chat tool — it's a routing flag, not a tool.
   // Sticky per conversation like search (see smartModeByConv).
@@ -430,8 +449,23 @@ document.getElementById('composer').onsubmit = async (e) => {
   const submitSearchMode = submitTool === 'search' ? selectedSearchMode() : null;
   // Snapshot before auto-clearing the image checkbox so the resolution
   // pick that the user saw on submit is what we actually send.
-  const submitImageSize = submitTool === 'image' ? selectedImageSize() : null;
+  const submitImageSize = submitTool === 'image' && !isEdit ? selectedImageSize() : null;
+  const submitEditStrength = isEdit ? selectedEditStrength() : null;
+  // Fail before touching the chat pane — a bare "choose an image"
+  // message with no optimistic bubble reads better than a bubble
+  // that appears and then silently does nothing.
+  let editFile = null;
+  if (isEdit) {
+    editFile = getPickedEditFile();
+    if (!editFile) {
+      statusEl.textContent = 'choose an image to edit first';
+      submitBtn.disabled = false; textarea.disabled = false;
+      return;
+    }
+  }
   imageCheckbox.checked = false;
+  editCheckbox.checked = false;
+  clearPickedEditFile();
   // searchCheckbox stays — sticky.
   refreshComposerUI();
 
@@ -453,7 +487,7 @@ document.getElementById('composer').onsubmit = async (e) => {
   textarea.style.height = 'auto';
 
   // Submit + stream.
-  if (submitTool === 'image') statusEl.textContent = 'rendering…';
+  if (submitTool === 'image') statusEl.textContent = isEdit ? 'editing…' : 'rendering…';
   else if (submitTool === 'search') statusEl.textContent = 'searching…';
   else if (submitSmart) statusEl.textContent = 'thinking (smart mode is slower)…';
   else statusEl.textContent = 'submitting…';
@@ -462,12 +496,23 @@ document.getElementById('composer').onsubmit = async (e) => {
   if (submitSmart) body.smart = true;
   if (submitTool === 'image') {
     body.tool = 'image';
-    // Always pin width/height so the worker doesn't fall through to
-    // the model's native default (1024² on SDXL Lightning) — that
-    // would silently bill the user the 4× large rate when they meant
-    // to pick small.
-    const preset = IMAGE_SIZE_PRESETS[submitImageSize] || IMAGE_SIZE_PRESETS.small;
-    body.image = {width: preset.width, height: preset.height};
+    if (isEdit) {
+      // No width/height pin here on purpose. sd.cpp resizes the init
+      // image to whatever's passed; for "edit my photo" the expected
+      // result keeps the source's own dimensions, not a generate-mode
+      // size preset the user never chose.
+      body.image = {
+        init_image_b64: await fileToBase64(editFile),
+        strength: submitEditStrength,
+      };
+    } else {
+      // Always pin width/height so the worker doesn't fall through to
+      // the model's native default (1024² on SDXL Lightning) — that
+      // would silently bill the user the 4× large rate when they meant
+      // to pick small.
+      const preset = IMAGE_SIZE_PRESETS[submitImageSize] || IMAGE_SIZE_PRESETS.small;
+      body.image = {width: preset.width, height: preset.height};
+    }
   } else if (submitTool === 'search') {
     body.tool = 'search';
     body.search_mode = submitSearchMode;

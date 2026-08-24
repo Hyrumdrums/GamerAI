@@ -28,11 +28,17 @@ import { stopReadAloud } from './readAloud.js';
 export const imageCheckbox = document.getElementById('tool-image-cb');
 export const searchCheckbox = document.getElementById('tool-search-cb');
 export const smartCheckbox = document.getElementById('tool-smart-cb');
+export const editCheckbox = document.getElementById('tool-edit-cb');
 const imageWrap = document.getElementById('image-toggle-wrap');
 const searchWrap = document.getElementById('search-toggle-wrap');
 const smartWrap = document.getElementById('smart-toggle-wrap');
+const editWrap = document.getElementById('edit-toggle-wrap');
 const searchModeWrap = document.getElementById('search-mode-wrap');
 const imageSizeWrap = document.getElementById('image-size-wrap');
+const editControlsWrap = document.getElementById('edit-controls-wrap');
+const editImageInput = document.getElementById('edit-image-input');
+const editImagePickerBtn = document.getElementById('edit-image-picker-btn');
+const editPickedFilename = document.getElementById('edit-picked-filename');
 const voiceToggleBtn = document.getElementById('voice-toggle');
 
 // Voice mode toggle. The click is what unlocks the browser's audio
@@ -84,14 +90,29 @@ export function selectedImageSize() {
   return (checked && checked.value) || 'small';
 }
 
+// The four tool checkboxes, mutually exclusive as a group — checking
+// any one clears the other three and claims the tool-row for its own
+// sub-controls. Array-driven (rather than four hand-written pairwise
+// conditions) so adding a fifth tool later is a one-line change here
+// instead of a new OR-clause in every existing wrap's visibility rule.
+const TOOL_TOGGLES = [
+  {checkbox: imageCheckbox, wrap: imageWrap},
+  {checkbox: searchCheckbox, wrap: searchWrap},
+  {checkbox: smartCheckbox, wrap: smartWrap},
+  {checkbox: editCheckbox, wrap: editWrap},
+];
+
 export function refreshComposerUI() {
   // Visibility: whichever checkbox is checked claims the row alone.
-  imageWrap.hidden = searchCheckbox.checked || smartCheckbox.checked;
-  searchWrap.hidden = imageCheckbox.checked || smartCheckbox.checked;
-  smartWrap.hidden = imageCheckbox.checked || searchCheckbox.checked;
+  for (const {checkbox, wrap} of TOOL_TOGGLES) {
+    wrap.hidden = TOOL_TOGGLES.some(
+      (t) => t.checkbox !== checkbox && t.checkbox.checked,
+    );
+  }
   // Sub-toggles only show under their parent checkbox.
   searchModeWrap.hidden = !searchCheckbox.checked;
   imageSizeWrap.hidden = !imageCheckbox.checked;
+  editControlsWrap.hidden = !editCheckbox.checked;
   // Placeholder cues the user about the active mode.
   const ta = document.getElementById('prompt');
   if (imageCheckbox.checked) {
@@ -100,6 +121,8 @@ export function refreshComposerUI() {
     ta.placeholder = 'Search the web for…';
   } else if (smartCheckbox.checked) {
     ta.placeholder = 'Ask the smart model (slower, smarter)…';
+  } else if (editCheckbox.checked) {
+    ta.placeholder = 'Describe how to change the image…';
   } else {
     ta.placeholder = 'Message GamerAI...';
   }
@@ -141,39 +164,63 @@ export function restoreModeFor(convId) {
   const want = !!searchModeByConv.get(convId);
   searchCheckbox.checked = want;
   smartCheckbox.checked = !want && !!smartModeByConv.get(convId);
+  // Image and edit are always restored to off (one-shot, never
+  // sticky) — editing also drops whatever image was picked so a
+  // stale filename doesn't linger into a different conversation.
   imageCheckbox.checked = false;
+  editCheckbox.checked = false;
+  clearPickedEditFile();
   refreshComposerUI();
 }
 
-imageCheckbox.addEventListener('change', () => {
-  // Mutually exclusive — checking any one clears the other two.
-  if (imageCheckbox.checked) {
-    searchCheckbox.checked = false;
-    smartCheckbox.checked = false;
-  }
-  persistSearchMode();
-  persistSmartMode();
-  refreshComposerUI();
-});
-searchCheckbox.addEventListener('change', () => {
-  if (searchCheckbox.checked) {
-    imageCheckbox.checked = false;
-    smartCheckbox.checked = false;
-  }
-  persistSearchMode();
-  persistSmartMode();
-  refreshComposerUI();
-});
-smartCheckbox.addEventListener('change', () => {
-  if (smartCheckbox.checked) {
-    imageCheckbox.checked = false;
-    searchCheckbox.checked = false;
-  }
-  persistSearchMode();
-  persistSmartMode();
-  refreshComposerUI();
-});
+// Shared mutual-exclusion handler for all four toggles: checking one
+// clears the other three. persistSearchMode/persistSmartMode run on
+// every change (not just their own checkbox's) because a toggle
+// stealing the row also changes what search/smart's *effective*
+// state is for this conversation — same behavior the three
+// hand-written listeners had before edit mode was added, just
+// generalized instead of repeated a fourth time.
+for (const {checkbox} of TOOL_TOGGLES) {
+  checkbox.addEventListener('change', () => {
+    if (checkbox.checked) {
+      for (const other of TOOL_TOGGLES) {
+        if (other.checkbox !== checkbox) other.checkbox.checked = false;
+      }
+    }
+    if (!editCheckbox.checked) clearPickedEditFile();
+    persistSearchMode();
+    persistSmartMode();
+    refreshComposerUI();
+  });
+}
 refreshComposerUI();
+
+// ---- edit-mode image picker --------------------------------------
+let _pickedEditFile = null;
+
+if (editImagePickerBtn && editImageInput) {
+  editImagePickerBtn.addEventListener('click', () => editImageInput.click());
+  editImageInput.addEventListener('change', () => {
+    _pickedEditFile = (editImageInput.files && editImageInput.files[0]) || null;
+    editPickedFilename.textContent = _pickedEditFile ? _pickedEditFile.name : '';
+  });
+}
+
+export function getPickedEditFile() {
+  return _pickedEditFile;
+}
+
+export function clearPickedEditFile() {
+  _pickedEditFile = null;
+  if (editImageInput) editImageInput.value = '';
+  if (editPickedFilename) editPickedFilename.textContent = '';
+}
+
+export const EDIT_STRENGTH_PRESETS = {subtle: 0.3, moderate: 0.5, strong: 0.8};
+export function selectedEditStrength() {
+  const checked = document.querySelector('input[name="edit-strength"]:checked');
+  return EDIT_STRENGTH_PRESETS[(checked && checked.value) || 'moderate'];
+}
 
 export function selectedSearchMode() {
   // Reads the radio group rather than tracking state — radios are

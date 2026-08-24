@@ -65,6 +65,21 @@
           <input type="checkbox" id="tool-smart-cb">
           <span>Smart mode</span>
         </label>
+        <label class="image-toggle" id="edit-toggle-wrap"
+               title="Upload an image and describe how to change it">
+          <input type="checkbox" id="tool-edit-cb">
+          <span>Edit an image</span>
+        </label>
+        <div class="edit-controls" id="edit-controls-wrap" hidden>
+          <input type="file" id="edit-image-input" accept="image/png,image/jpeg" hidden>
+          <button type="button" class="edit-picker-btn" id="edit-image-picker-btn">Choose image…</button>
+          <span class="edit-picked-filename" id="edit-picked-filename"></span>
+          <span class="edit-strength" id="edit-strength-wrap">
+            <label><input type="radio" name="edit-strength" value="subtle"> Subtle</label>
+            <label><input type="radio" name="edit-strength" value="moderate" checked> Moderate</label>
+            <label><input type="radio" name="edit-strength" value="strong"> Strong</label>
+          </span>
+        </div>
       </div>
       <div class="attachments-row" id="attachments-row" hidden></div>
       <div class="composer-inner">

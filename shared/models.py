@@ -19,6 +19,21 @@ class ImageParams(BaseModel):
     steps: Optional[int] = None
     seed: Optional[int] = None
     negative_prompt: Optional[str] = None
+    # Image alteration (img2img). When set, the agent passes -i/--init-img
+    # to the SAME sd.exe txt2img already uses — stable-diffusion.cpp's
+    # img_gen mode does both, distinguished only by whether an init
+    # image is present. base64-encoded PNG or JPEG; validated + NSFW-
+    # classified in coordinator.main before it ever reaches a queue.
+    # (Masked/inpainting edits — --mask — are a natural follow-up but
+    # need a paint-a-mask UI; not built yet, so not wired here either.)
+    init_image_b64: Optional[str] = None
+    # "strength for noising/unnoising" in upstream's own words — how
+    # much the init image is allowed to change. Client always sends
+    # this explicitly when editing (same reasoning as width/height:
+    # no silent fallback to a value the user didn't see). Optional
+    # here so a non-web caller hitting the API directly still works —
+    # sd.exe's own default (0.75) applies when omitted.
+    strength: Optional[float] = None
 
 
 class GenerateRequest(BaseModel):

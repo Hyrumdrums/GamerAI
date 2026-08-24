@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 import json
 import logging
 import logging.handlers
@@ -48,7 +49,7 @@ IS_WINDOWS = platform.system() == "Windows"
 # the moment it starts. The CI-generated version.txt (short-sha +
 # build timestamp) is still what the self-updater diffs against;
 # AGENT_VERSION is just the human-facing label.
-AGENT_VERSION = "1.4.0"
+AGENT_VERSION = "1.4.1"
 
 # Base64-encoded Ed25519 PUBLIC key used to verify self-update payloads.
 # When this is non-empty, the self-updater REQUIRES a valid signature on
@@ -4650,6 +4651,8 @@ def run_image_inference(
     sampler = str(params.get("sampler") or sd_defaults["default_sampler"])
     seed = params.get("seed")
     negative = params.get("negative_prompt") or ""
+    init_image_b64 = params.get("init_image_b64")
+    strength = params.get("strength")
     model_path = sd_model_path(model_slug)
     if not model_path.exists():
         raise RuntimeError(
@@ -4663,12 +4666,36 @@ def run_image_inference(
     # infra/setup-image-mirror.sh. The old `txt2img` mode name was
     # rejected with "must be one of [img_gen, vid_gen, convert,
     # upscale, metadata]". If you bump the mirror's pinned sd.cpp
-    # version, re-verify this flag still applies.
+    # version, re-verify this flag still applies. img2img rides the
+    # SAME mode — passing -i/--init-img is what switches it from
+    # generate to edit; confirmed against the pinned build's own CLI
+    # source (examples/common/common.cpp), since `sd-cli -h` isn't
+    # available to check from a non-Windows dev box. -W/-H still
+    # apply when -i is set: sd.cpp resizes the init image to them
+    # rather than requiring an exact match.
     # The prompt is passed via a temp file (sd.cpp tolerates long
     # multi-line prompts that way) — using argv directly hits Windows'
     # 32K command-line cap on pathological inputs.
     prompt_file = out_path.with_suffix(".prompt.txt")
     prompt_file.write_text(prompt, encoding="utf-8")
+    # Image alteration: the coordinator already validated + NSFW-
+    # classified this (coordinator.main._validate_and_classify_init_image)
+    # before the job ever reached a queue — decode failures here would
+    # mean transit corruption or a non-standard caller, not a hostile
+    # upload, so a clean RuntimeError (funneled to the same error-
+    # bubble path as every other failure in this function) is the
+    # right response, not a silent fallback to plain txt2img.
+    init_image_path: Optional[Path] = None
+    if init_image_b64:
+        try:
+            init_image_bytes = base64.b64decode(init_image_b64, validate=True)
+        except (binascii.Error, ValueError) as e:
+            raise RuntimeError(f"init_image_b64 not valid base64: {e}") from e
+        init_image_path = out_path.with_suffix(".init.png")
+        # ``.init.png`` regardless of the source format (PNG or JPEG) —
+        # sd.cpp's image loader sniffs actual file content, not the
+        # extension, so this is cosmetic naming only.
+        init_image_path.write_bytes(init_image_bytes)
     argv = [
         str(sd_binary_path()),
         "-M", "img_gen",
@@ -4693,9 +4720,19 @@ def run_image_inference(
         argv.extend(["--seed", str(int(seed))])
     if negative:
         argv.extend(["-n", negative])
+    if init_image_path is not None:
+        argv.extend(["-i", str(init_image_path)])
+        # Omitted (not defaulted here) when the coordinator didn't
+        # send one — sd.exe's own built-in default (0.75) applies.
+        # Matches this codebase's standing rule against re-deciding
+        # model defaults on the agent side (see the steps/cfg/sampler
+        # sidecar-lookup comment above).
+        if strength is not None:
+            argv.extend(["--strength", str(float(strength))])
     log.info(
-        "image: running sd.exe (model=%s %dx%d steps=%d cfg=%.1f sampler=%s)",
+        "image: running sd.exe (model=%s %dx%d steps=%d cfg=%.1f sampler=%s%s)",
         model_slug, width, height, steps, cfg_scale, sampler,
+        " edit" if init_image_path is not None else "",
     )
     try:
         # Hide stdout — sd.cpp is chatty with progress dots. We surface
@@ -4712,6 +4749,11 @@ def run_image_inference(
             prompt_file.unlink()
         except OSError:
             pass
+        if init_image_path is not None:
+            try:
+                init_image_path.unlink()
+            except OSError:
+                pass
     if result.returncode != 0:
         snippet = (result.stderr or result.stdout or "").strip()[:500]
         # rc=3221226505 (0xC0000409 / STATUS_STACK_BUFFER_OVERRUN, seen
