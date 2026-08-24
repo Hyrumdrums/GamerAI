@@ -60,19 +60,26 @@ gate consumption per cap, and onboard new invitees via copy-paste URL
 without admin involvement. Remaining work is not blocking external
 membership testing — it's polish:
 
-- **Worker → member link.** A contributor's `worker_id` is still
-  unconnected to their `member_id`. Earnings credit lives on
-  `worker_id` only. Add `owner_member_id` on `/register` to
-  consolidate contributor earnings per person, not per GPU. ~½ day.
-- **Tier auto-promotion engine.** Everyone stays BRONZE unless
-  bumped by hand. Daily cron driven by uptime + claim rate. ~1 day.
-- **Per-member auth on the web UI itself.** `client/web.py` talks
-  to the coordinator as admin for every viewer; Alice would see
-  admin data. Add cookie-session login against member tokens.
-- **Caddy basic_auth on the web UI** — required before opening
-  the web UI beyond an SSH tunnel.
-- **SMTP-delivered invites** (Resend / Postmark) — copy-paste URL
-  is the slice-2 cut, deferred until first usability complaint.
+- ~~**Worker → member link.**~~ Done. `owner_member_id` is stamped
+  on `workers` at `/register` time and enforced on job-completion
+  calls (`coordinator/main.py:2786`, `:2709`).
+- ~~**Tier auto-promotion engine.**~~ Done. `coordinator/
+  tier_engine.py` runs a daily promote/demote pass off a 7-day
+  uptime window, wired at `main.py:1239`.
+- ~~**Per-member auth on the web UI itself.**~~ Done — see
+  "~~Web UI dashboard has no auth~~ — done" below; `gai_session`
+  covers exactly this gap.
+- **Caddy basic_auth on the web UI** — superseded, not done: the
+  session-cookie auth above shipped instead of a separate basic_auth
+  layer, and covers the same "no anonymous access" requirement.
+  `infra/Caddyfile:9`'s "until Caddy basic_auth ships" comment is
+  itself stale now.
+- **SMTP-delivered invites** (Resend / Postmark) — still open,
+  verified 2026-08-23: `coordinator/email_send.py` sends
+  verification/alert/test mail only; `POST /invites` never calls
+  it. The Resend integration already exists (shipped 2026-08-21 for
+  signup verification), so wiring invite-creation to it is plumbing,
+  not new integration work.
 
 ### 🔴 No prompt safety / content controls
 
@@ -93,60 +100,44 @@ A malicious worker could return garbage and earn money for it.
 **Fix:** Phase 3 roadmap item; quickest win is k-of-n consensus on a
 random sample of jobs (run 5% of jobs on two workers, compare).
 
-### 🔴 Open security findings (2026-05-13 review) — next up
+### ~~🔴 Open security findings (2026-05-13 review)~~ — resolved
 
 A focused security pass surfaced three real, exploitable issues plus
-three high-severity items worth fixing this week. Listed here so we
-don't lose track; the **🔴 critical** items are the immediate next
-slice.
+three high-severity items. All six verified fixed against current
+code (not just against commit messages) on 2026-08-23 — this doc had
+them listed as still-open; it was the doc that was stale, not the
+code.
 
-**🔴 1. Canary detection leak.** `/jobs/next` and the queue-pushed
-job envelope include `submitted_by_member_id`. Canaries have this
-`null` (no human submitter). A worker can read its own incoming
-jobs, spot the null submitter, recognize it's a canary, pass that
-one cleanly, and cheat on real prompts. Defeats the integrity
-slice we just shipped. **Fix:** drop the field from the
-worker-facing payload. ~15 min.
+**~~🔴 1. Canary detection leak.~~** Fixed. `coordinator/main.py:1990`
+and `:2434` now explicitly exclude `submitted_by_member_id` from the
+worker-facing job envelope.
 
-**🔴 2. Worker→member link missing.** `/jobs/complete`,
-`/jobs/claim`, `/jobs/abandon`, `/heartbeat` accept any `worker_id`
-in the request body. Any authenticated member can spoof completions
-against another worker's `worker_id`, attributing earnings to
-someone else or returning bogus responses to other members'
-prompts. **Fix:** stamp `owner_member_id` on the `workers` table at
-`/register` time; reject calls where the authenticated member
-doesn't own the `worker_id` they reference. ~½ day. (Already noted
-elsewhere in this doc as polish; review elevated it to immediate.)
+**~~🔴 2. Worker→member link missing.~~** Fixed. Workers are claimed
+to an `owner_member_id` at `/register` (`main.py:2786`); an unowned
+or mismatched `worker_id` is rejected (`main.py:2709`).
 
-**🔴 3. Markdown XSS surface in the chat UI.** Assistant responses
-go through `marked.parse()` with raw HTML passthrough. A contributor
-running a tampered model could emit `<img src=x onerror=...>` and
-execute arbitrary JS in the user's browser. Canaries don't catch
-this (they check required tokens are present, not that HTML is
-absent). **Fix:** sanitize the marked output (DOMPurify, or
-escape-HTML option). ~30 min.
+**~~🔴 3. Markdown XSS surface in the chat UI.~~** Fixed.
+`client/static/js/messageRenderer.js:25-27` runs all assistant
+markdown through `DOMPurify.sanitize()` before setting `innerHTML`.
 
-**🟡 4. CDN scripts without Subresource Integrity.**
-`<script src="https://cdn.jsdelivr.net/.../marked.min.js">` has no
-`integrity=` attribute on the chat UI or the ToS page. CDN compromise
-→ arbitrary JS injected into authenticated pages. **Fix:** pin a
-version + add SRI hash, or self-host `marked.min.js` from
-`/static/`. ~30 min.
+**~~🟡 4. CDN scripts without Subresource Integrity.~~** Moot.
+`marked.min.js` is now self-hosted from `/static/marked.min.js`
+(`chat.html.j2`, `demo.html.j2`) instead of loaded from a CDN — no
+third-party origin left to pin an SRI hash against.
 
-**🟡 5. No prompt length cap on `/generate`.** A single request can
-submit an unboundedly large prompt; gets stored in SQLite and
-shoveled to a worker. Cheap DoS. **Fix:** `MAX_PROMPT_BYTES` env
-guard. ~15 min.
+**~~🟡 5. No prompt length cap on `/generate`.~~** Fixed.
+`MAX_PROMPT_BYTES` (`shared/config.py`), shipped 2026-08-19 — see
+`public-launch-todo.txt` step 3.1 and `PromptSizeLimitTests` in
+`tests/test_coordinator_e2e.py`.
 
-**🟡 6. No rate limit on `/login`.** 256-bit tokens make brute force
-infeasible in practice, but the principle is wrong and a real
-pentest will flag it. **Fix:** enable `RATE_LIMIT_PER_MIN` in
-production, or hook `/login` specifically. ~30 min.
+**~~🟡 6. No rate limit on `/login`.~~** Fixed. `LOGIN_FAIL_MAX`
+(`shared/config.py`, default 15 attempts / 15 min, keyed on IP) is
+on by default in every environment, not just production.
 
-Plus the medium items from the review (cookie value IS the bearer,
-agent state.json plaintext, no admin audit log, no token rotation
-policy) — flagged but accepted for now, see devlog for the full
-review.
+Plus the medium items from the original review (cookie value IS the
+bearer, agent state.json plaintext, no admin audit log, no token
+rotation policy) — not covered by this pass, still unverified either
+way.
 
 ### ~~🟡 Web UI dashboard has no auth~~ — done
 
@@ -1062,10 +1053,11 @@ work them in. Highest leverage first.
    ✅ Done — capability-aware *routing* deferred to Phase 4.
 6. **Uptime Kuma (or equivalent) hitting `/health`.** **~½ day.**
 7. **SQLite nightly backup cron with weekly rotation.** **~½ day.**
-8. ~~**Member identity + tier accounting**~~ — slice 1 done
-   (2026-05-11). Per-member tokens, jobs recorded against the
-   submitter, daily usage rollup. Tier auto-evaluation deferred to a
-   later slice. ✅ Done.
+8. ~~**Member identity + tier accounting**~~ — done. Slice 1
+   (2026-05-11): per-member tokens, jobs recorded against the
+   submitter, daily usage rollup. Tier auto-evaluation (the daily
+   promote/demote engine originally deferred here) shipped
+   separately — `coordinator/tier_engine.py`. ✅ Done.
 9. ~~**Invite / admin flow (Alice → Bob)**~~ — slice 2 done
    (2026-05-11). `invites` table, copy-paste invite URL, quota
    enforcement on `/generate`, minimal admin web UI in `client/`.

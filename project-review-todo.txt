@@ -1,0 +1,188 @@
+GamerAI — Project Review Follow-ups
+Generated from a full-project low-hanging-fruit / gaps review (chat
+session, 2026-08-23). Status legend: [ ] pending  [x] done+verified
+
+Ordering note: Section 1 is being worked first, per explicit go-ahead.
+Everything after that is unordered on purpose — pick whichever's most
+useful next.
+
+--- Section 1: doc accuracy fixes (project-gaps.md overstates risk) -------
+
+[x] 1.1  Mark the "Open security findings (2026-05-13 review)" section
+         in docs/project-gaps.md resolved. All six items verified
+         fixed against current CODE, not just against commit
+         messages:
+           1. Canary detection leak -> fixed. coordinator/main.py:1990
+              and :2434 explicitly drop submitted_by_member_id from
+              the worker-facing job envelope.
+           2. Worker->member spoofing -> fixed. owner_member_id is
+              stamped on `workers` at /register (main.py:2786) and
+              enforced on job-completion calls (main.py:2709).
+           3. Markdown XSS -> fixed. client/static/js/
+              messageRenderer.js:25-27 runs assistant markdown
+              through DOMPurify.sanitize() before setting innerHTML.
+           4. CDN script w/o SRI -> moot. marked.min.js is now
+              self-hosted from /static/marked.min.js (chat.html.j2,
+              demo.html.j2), no CDN origin left to pin against.
+           5. No prompt length cap -> fixed. MAX_PROMPT_BYTES
+              (shared/config.py), shipped 2026-08-19 per
+              public-launch-todo.txt step 3.1.
+           6. No /login rate limit -> fixed. LOGIN_FAIL_MAX
+              (shared/config.py, default 15/15min, keyed on IP),
+              on by default everywhere.
+         Leave the "medium items" paragraph (cookie value IS the
+         bearer, agent state.json plaintext, no admin audit log, no
+         token rotation policy) alone — not verified either way this
+         pass.
+         touches: docs/project-gaps.md
+         verify: section header now reads "~~Open security findings
+         (2026-05-13 review)~~ — resolved", all 6 items struck
+         through with file:line evidence. (2026-08-23)
+
+[x] 1.2  Fix the "remaining polish" bullet list under "No membership
+         identity / tier accounting" in docs/project-gaps.md — 3 of
+         5 bullets are done, 1 is superseded-not-done, 1 is
+         genuinely still open:
+           - Worker -> member link: DONE (same evidence as 1.1.2).
+           - Tier auto-promotion engine: DONE.
+             coordinator/tier_engine.py runs a daily promote/demote
+             pass off a 7-day uptime window, wired at main.py:1239.
+           - Per-member auth on the web UI: DONE — the doc's own
+             "Web UI dashboard has no auth — done" section (a few
+             screens further down the same file) already covers
+             this; the bullet contradicts the doc's other section.
+           - Caddy basic_auth on the web UI: SUPERSEDED, not done.
+             Session-cookie auth (gai_session) shipped instead of a
+             separate basic_auth layer and covers the same "no
+             anonymous access" requirement. infra/Caddyfile:9's
+             "until Caddy basic_auth ships" comment is itself stale.
+           - SMTP-delivered invites: STILL OPEN. Verified 2026-08-23
+             — coordinator/email_send.py only sends verification /
+             admin-alert / test mail; POST /invites never calls it.
+             The Resend integration already exists (shipped
+             2026-08-21 for signup verification), so this is wiring
+             an existing sender to a new call site, not new
+             integration work.
+         touches: docs/project-gaps.md
+         verify: 3 bullets now struck-through+done, 1 marked
+         superseded with the Caddyfile:9 note, invite-email bullet
+         left open (genuinely still true). (2026-08-23)
+
+[x] 1.3  Fix item 8 in "Suggested 30-day priority list" (docs/
+         project-gaps.md): it says "Tier auto-evaluation deferred to
+         a later slice" — that slice shipped (see 1.2). Update the
+         line so it doesn't contradict the rest of the doc.
+         touches: docs/project-gaps.md
+         verify: item 8 now reads "done" and names tier_engine.py
+         instead of "deferred to a later slice". (2026-08-23)
+
+--- Section 2: low-hanging fruit / easy wins -------------------------------
+
+[ ] 2.1  Leaderboard. README.md ~line 335 already promises "tier
+         badges on the leaderboard" — doesn't exist anywhere, grepped
+         repo-wide. Build: GET /leaderboard (rank by tier, then
+         7-day uptime / jobs-served — NOT $ earnings, consistent
+         with commit fc8aa28's removal of the misleading earnings
+         display), reusing tier_engine.py's existing uptime-
+         aggregation query shape. Username only, no other PII. New
+         template page off client/routes/. Bonus, ~free on the same
+         query: a "current streak" stat, since worker_uptime is
+         already sampled daily. Consider pairing with 4.1 (tier-
+         history table) so promotions can show "promoted 3 days ago"
+         on the board.
+         scope: ~half a day.
+
+[ ] 2.2  Wire tier promotion/demotion into a push notification.
+         coordinator/tier_engine.py:290 and :337 already log
+         "event": "member_promoted" / "member_demoted" — currently a
+         silent status change with zero user-facing signal.
+         coordinator/notifications.py already has send_to_member(db,
+         member_id, category, title, body, data) with opt-in
+         preferences + push delivery; just needs a new category
+         (e.g. CATEGORY_TIER_CHANGED) and a call at those two log
+         sites.
+         scope: ~15-30 min.
+
+[ ] 2.3  Wire invite-accepted into a push notification to the host.
+         main.py:4744 and :5407 already call events.emit(...) on
+         invite-related actions — add a notifications.send_to_member
+         subscriber so the host gets "Bob just joined using your
+         invite!" Reuses whatever category pattern 2.2 establishes,
+         or adds its own.
+         scope: ~30 min, easiest right after 2.2.
+
+[ ] 2.4  Fix the 503-loses-your-message composer bug. Already fully
+         root-caused with exact line numbers in docs/project-gaps.md
+         (search "A 503 silently destroys the user's message"):
+         don't clear the textarea until the fetch actually succeeds,
+         restore the exact prompt text on any error path, add a
+         retry button that re-POSTs the body already captured in the
+         submit handler's closure. Client-only fix, no backend
+         contract change needed.
+         touches: client/static/js/chat.js
+         scope: ~1-2 hours (doc's own estimate).
+
+[ ] 2.5  Uptime Kuma (or equivalent) hitting /health every 30s. The
+         only real monitoring gap between "site's down" and "a user
+         has to tell you the site's down." Already scoped in
+         docs/project-gaps.md §2 and §7 item 6.
+         scope: ~half a day (doc's own estimate).
+
+--- Section 3: out-of-the-box ideas -----------------------------------------
+
+[ ] 3.1  Supply/demand push nudge to idle contributors. Per-tool
+         Redis queues already exist (job_queue_for() in
+         shared/config.py); the event bus and push-notification
+         infra already exist. Nobody's wired "the image queue is
+         backed up" into a push aimed at idle image-capable
+         contributors. Needs: extend GET /metrics (main.py:5642) to
+         loop over every job_queue_for() tool name instead of just
+         the legacy chat queue (JOB_QUEUE) it reports today, then a
+         periodic check (mirrors canaries.py's interval-task
+         pattern) that fires the push once a queue's depth crosses a
+         threshold with idle capable workers on hand.
+         scope: ~1 day.
+
+[ ] 3.2  Live power-cost / earnings-equivalent stat in the agent
+         tray. README.md §5 sells the $/kWh economics in the
+         abstract; the agent already reports GPU model/VRAM (commit
+         faef05c). Poll `nvidia-smi --query-gpu=power.draw` and show
+         a live "earned the network N tokens today, ~$0.0X in power"
+         readout in the tray/console. Turns the economics pitch into
+         a personal real-time stat instead of a README table.
+         touches: windows-agent/agent.py
+         scope: ~1 day (agent-side polling + a small UI surface).
+
+[ ] 3.3  Community model-request wishlist. coordinator/
+         model_registry.py is maintainer-curated today; add a public
+         page where members can request "I wish X model were on the
+         network" (one table + one page). Turns model curation into
+         a bottom-up signal instead of founder guessing, fits the
+         community-powered framing, and doesn't obligate anyone to
+         actually build support for the requested model.
+         scope: ~half a day.
+
+[ ] 3.4  Turn the incident write-ups already in todo.txt into a
+         public devlog / blog series. The sd.exe
+         STATUS_STACK_BUFFER_OVERRUN root-cause, the Win11 ConPTY
+         tray-hide investigation, and the TOCTOU stowaway-instance
+         race are already written at near-publishable quality.
+         public-launch-todo.txt step 10.1 (docs/blurb.md) shows the
+         portfolio/distribution angle is already a goal — this is
+         close to free content, reusing material that would
+         otherwise just rot in a todo file.
+         scope: ~a few hours of editing per post, no code.
+
+--- Section 4: gaps worth addressing ----------------------------------------
+
+[ ] 4.1  Tier changes leave no durable trace. Checked every CREATE
+         TABLE in coordinator/db.py — no promotion/demotion history
+         table exists. The only record of a tier change is a
+         structured log line, which (per project-gaps.md's own "no
+         log retention" gap) gets wiped on container restart. Add
+         member_tier_events(member_id, from_tier, to_tier, at),
+         written from coordinator/tier_engine.py's promote/demote
+         path (~line 290 / 337 — same spot as 2.2's notification
+         hook, worth doing together). Also gives the leaderboard
+         (2.1) a "promoted 3 days ago" badge for free.
+         scope: ~2-3 hours (table + write path + a small admin read).
