@@ -7,6 +7,7 @@
 import {
   state, msgCache, searchModeByConv,
   setConvTokens, sumMessageTokens, renderStatsPanel,
+  ensureConversation,
 } from './state.js';
 import { stopReadAloud } from './readAloud.js';
 import { messageEl } from './messageRenderer.js';
@@ -21,6 +22,7 @@ import {
 import { initImageGallery } from './imageGallery.js';
 import { initPWAPrompts } from './installPrompt.js';
 import * as offlineQueue from './offlineQueue.js';
+import { initAttachments, loadAttachmentsFor, clearAttachmentsUI } from './attachments.js';
 
 // ---- bootstrap --------------------------------------------------------
 async function init() {
@@ -130,6 +132,7 @@ document.getElementById('new-chat').onclick = () => {
   // click handler is fine even before the file finishes parsing.
   searchModeByConv.delete(null);
   restoreModeFor(null);
+  clearAttachmentsUI();
   stopReadAloud();
   document.getElementById('chat-pane').innerHTML =
     '<div class="empty"><h2>What\'s on your mind?</h2><div>Start a new conversation by typing below.</div></div>';
@@ -267,6 +270,7 @@ async function openConversation(id) {
   // checkbox flips back on so a follow-up automatically searches —
   // no need to remember to re-check it.
   restoreModeFor(id);
+  loadAttachmentsFor(id);
   // Cancel any in-flight stream for the conversation we're leaving;
   // renderMessages may start a new one if the conversation we're
   // opening has a pending turn of its own.
@@ -386,35 +390,26 @@ document.getElementById('composer').onsubmit = async (e) => {
   // Hold the pre-create checkbox state so we can copy it onto the
   // freshly-minted conversation id below — without this, a "+ New
   // chat → check search → submit" flow would lose the sticky bit.
+  // (Conversation creation itself is shared with attachments.js —
+  // see ensureConversation in state.js.)
   const wasNewChat = !state.currentId;
   const newChatSearchState = wasNewChat ? searchCheckbox.checked : null;
-  if (!state.currentId) {
-    let cr;
-    try {
-      cr = await fetch('/api/conversations', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({}),
-      });
-    } catch (_netErr) {
-      // Brand-new chats can't be queued — we need a conversation_id
-      // before we have somewhere to attach the queued send. Drafts
-      // into an *existing* conversation queue fine below; this case
-      // only loses if the user opens the app, hits "+ New chat", and
-      // submits while offline. Telling them to try again is honest.
-      statusEl.textContent = "can't start a new chat while offline";
-      submitBtn.disabled = false; textarea.disabled = false;
-      return;
-    }
-    if (!cr.ok) {
-      statusEl.textContent = 'failed to create conversation';
-      submitBtn.disabled = false; textarea.disabled = false;
-      return;
-    }
-    state.currentId = (await cr.json()).conversation_id;
-    if (newChatSearchState !== null) {
-      searchModeByConv.set(state.currentId, newChatSearchState);
-    }
+  const ensured = await ensureConversation();
+  if (!ensured.ok) {
+    // Brand-new chats can't be queued — we need a conversation_id
+    // before we have somewhere to attach the queued send. Drafts
+    // into an *existing* conversation queue fine below; the offline
+    // case only bites when the user opens the app, hits "+ New
+    // chat", and submits while offline. Telling them to try again
+    // is honest.
+    statusEl.textContent = ensured.reason === 'offline'
+      ? "can't start a new chat while offline"
+      : 'failed to create conversation';
+    submitBtn.disabled = false; textarea.disabled = false;
+    return;
+  }
+  if (wasNewChat && newChatSearchState !== null) {
+    searchModeByConv.set(state.currentId, newChatSearchState);
   }
 
   // Snapshot the checkbox state at submit time. Mid-stream toggling
@@ -715,6 +710,9 @@ document.addEventListener('visibilitychange', () => {
 
 // Bind the image-lightbox click delegate once at startup.
 initImageGallery();
+
+// Wire the attach-file button + hidden <input type=file>.
+initAttachments();
 
 // PWA banners: push opt-in (when installed + push supported + permission
 // default) and Android install prompt capture (beforeinstallprompt).

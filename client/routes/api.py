@@ -11,7 +11,7 @@ All the underlying httpx wiring lives in
 data-shaping wrappers that name the path and let the facade do the
 forwarding.
 """
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 
 from client.services import api_client
 from client.services.guards import require_session_bearer
@@ -146,6 +146,32 @@ async def proxy_archive_conversation(conversation_id: str, request: Request):
     return await api_client.proxy_json(
         bearer=require_session_bearer(request),
         method="DELETE", path=f"/conversations/{conversation_id}",
+    )
+
+
+@router.post("/uploads")
+async def proxy_upload(
+    request: Request,
+    conversation_id: str = Form(...),
+    file: UploadFile = File(...),
+):
+    content = await file.read()
+    return await api_client.proxy_upload(
+        bearer=require_session_bearer(request),
+        path="/uploads",
+        filename=file.filename or "upload",
+        content=content,
+        content_type=file.content_type,
+        form={"conversation_id": conversation_id},
+        timeout=30,
+    )
+
+
+@router.get("/uploads/{conversation_id}")
+async def proxy_list_uploads(conversation_id: str, request: Request):
+    return await api_client.proxy_json(
+        bearer=require_session_bearer(request),
+        method="GET", path=f"/uploads/{conversation_id}",
     )
 
 

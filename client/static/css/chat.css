@@ -184,6 +184,30 @@ body { display: flex; flex-direction: column; }
   color: var(--muted); font-size: .85rem; margin-bottom: .35rem; font-style: italic;
 }
 
+/* Attached-document chips (PDF/DOCX/TXT/MD/CSV). Sits above the
+ * composer row, hidden entirely when nothing's attached. Pending
+ * (mid-upload) and failed states reuse the same chip shape with a
+ * color swap rather than separate markup — see attachments.js. */
+.attachments-row {
+  display: flex; flex-wrap: wrap; gap: .35rem; margin-bottom: .4rem;
+}
+.attachment-chip {
+  display: inline-flex; align-items: center;
+  max-width: 14rem;
+  padding: .2rem .55rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  font-size: .78rem; color: var(--muted);
+}
+.attachment-chip-label {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.attachment-chip.pending { opacity: .7; font-style: italic; }
+.attachment-chip.failed {
+  color: var(--err-text); border-color: var(--err-border); background: var(--err-bg);
+}
+
 .composer-inner { display: flex; gap: .5rem; align-items: flex-end; }
 .composer textarea {
   flex: 1; min-height: 2.5rem; max-height: 10rem; resize: none;

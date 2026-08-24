@@ -23,3 +23,16 @@ pywebpush==2.0.0
 # ZoneInfoNotFoundError without this. Used by coordinator.schedule for
 # the per-machine uptime window math.
 tzdata==2025.2
+# Document upload (coordinator/uploads.py): text extraction for
+# PDF/DOCX/CSV attachments folded into chat context. FastAPI's
+# UploadFile/File(...) form parsing requires python-multipart even
+# though nothing here imports it directly.
+python-multipart==0.0.32
+pypdf==6.16.2
+python-docx==1.2.0
+# Pinned to the last 2.x release on purpose — pandas 3.0+ requires
+# Python >=3.11 and the local dev .venv (as opposed to the 3.11
+# Docker image) is 3.10. Only CSV parsing/preview APIs are used here
+# (read_csv, head, to_string, columns), all stable across 2.x/3.x, so
+# there's no functional reason to force the newer major version.
+pandas==2.3.3

@@ -116,6 +116,27 @@ CAPACITY_JOBS_PER_WORKER = _int("CAPACITY_JOBS_PER_WORKER", 0)
 # surprised; prod should set this once public).
 MAX_PROMPT_BYTES = _int("MAX_PROMPT_BYTES", 0)
 
+# --- document upload (coordinator-only text extraction for chat context) ---
+# Ceiling on the raw uploaded file. Parsing happens straight off the
+# spooled upload stream (never written to a named file on disk), so
+# this is really a memory/CPU-time guard, not a disk-space one — still
+# worth keeping small since a contributor's chat worker eventually
+# pays prefill cost on whatever text comes out the other side.
+MAX_UPLOAD_BYTES = _int("MAX_UPLOAD_BYTES", 5_000_000)  # 5 MB
+# Per-file cap on extracted text folded into the prompt context. A
+# text-dense PDF can extract to far more than this from a 5 MB file;
+# truncated with an explicit marker (never silent — matches the
+# MAX_HISTORY_TOKENS precedent of "drop, but say so", not the
+# member-memory feature's "reject new, never truncate" one — different
+# content shape, different right answer).
+MAX_UPLOAD_EXTRACTED_CHARS = _int("MAX_UPLOAD_EXTRACTED_CHARS", 20_000)
+# Combined ceiling across every upload attached to one conversation
+# when building the <<document>> fence for a single /generate call.
+# Independent of MAX_HISTORY_TOKENS (which governs prior *chat turns*,
+# not document context) — a just-uploaded file is current-turn
+# context, not history to be pruned by age.
+MAX_UPLOAD_CONTEXT_CHARS = _int("MAX_UPLOAD_CONTEXT_CHARS", 30_000)
+
 # --- login brute-force throttle (per client IP; ON by default) ---
 # Separate from RATE_LIMIT_PER_MIN because it targets only POST /login
 # and so can't interfere with the streaming poll path. After
@@ -246,7 +267,7 @@ del _os
 # browser on next page load AND surfaces the new number in the UI so
 # operator and user can confirm at-a-glance which build is live.
 # Format: bare integer string. Display widget renders "v1.0.{N}".
-CLIENT_CACHE_VERSION = "23"
+CLIENT_CACHE_VERSION = "24"
 WORKER_REGISTRY = "worker_registry"
 WORKER_HEARTBEATS = "worker_heartbeats"
 WORKER_STATUS = "worker_status"

@@ -159,6 +159,30 @@ export function renderStatsPanel() {
   }
 }
 
+// Brand-new chats have no conversation_id until the first thing that
+// needs one (submit, or now an attachment) forces creation. Shared
+// so chat.js's submit handler and attachments.js's upload handler
+// don't each grow their own copy of the same POST /api/conversations
+// dance. Deliberately returns a plain result instead of touching the
+// DOM itself — callers render their own status text on failure,
+// since chat.js and attachments.js want different wording.
+export async function ensureConversation() {
+  if (state.currentId) return {ok: true, created: false};
+  let r;
+  try {
+    r = await fetch('/api/conversations', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({}),
+    });
+  } catch (_netErr) {
+    return {ok: false, reason: 'offline'};
+  }
+  if (!r.ok) return {ok: false, reason: 'failed'};
+  state.currentId = (await r.json()).conversation_id;
+  return {ok: true, created: true};
+}
+
 export function sumMessageTokens(messages) {
   let t = 0;
   for (const m of messages || []) {

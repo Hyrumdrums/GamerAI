@@ -90,6 +90,35 @@ async def proxy_json(
     return JSONResponse(body, status_code=r.status_code, headers=out_headers)
 
 
+async def proxy_upload(
+    *,
+    bearer: Optional[str],
+    path: str,
+    filename: str,
+    content: bytes,
+    content_type: Optional[str],
+    form: Optional[dict] = None,
+    timeout: float = 30.0,
+) -> JSONResponse:
+    """Forward a multipart file upload to the coordinator. Separate
+    from proxy_json because httpx needs the ``files=``/``data=`` split
+    (and computes its own multipart boundary header — don't set
+    Content-Type manually here, that would produce a boundary-less
+    header the coordinator can't parse)."""
+    async with _client_ctx(bearer) as c:
+        r = await c.request(
+            "POST", path,
+            data=form,
+            files={"file": (filename, content, content_type)},
+            timeout=timeout,
+        )
+    try:
+        body = r.json()
+    except ValueError:
+        body = {"detail": r.text}
+    return JSONResponse(body, status_code=r.status_code)
+
+
 async def proxy_raw(
     *,
     bearer: Optional[str],

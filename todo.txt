@@ -330,3 +330,132 @@ Tier-change history table: checked every CREATE TABLE in
   tier_engine.py's promote/demote path (~line 290/337 -- same spot as
   the push-notification hook above, worth doing together). Also feeds
   the leaderboard's "promoted 3 days ago" badge. ~2-3 hours.
+
+DONE 2026-08-24: document/file upload (PDF, DOCX, TXT/MD, CSV) for
+  chat context -- was already scoped in docs/project-gaps.md ("No
+  document upload"); shipped per the owner's storage steer (raw file
+  never touches disk, only extracted text persists) plus a few
+  design calls made while building:
+  - coordinator/uploads.py (new module, mirrors notifications.py's
+    build_router(db)-closure shape): extract_text() dispatches by
+    filename extension (pypdf / python-docx / plain decode / pandas
+    for csv -- pandas gets a compact "columns + row count + 20-row
+    preview" description, deliberately NOT full-fidelity data access;
+    real computation over a CSV needs a code-execution sandbox, out
+    of scope here same as the original doc's cut). Parses straight
+    off the in-memory upload bytes -- nothing is ever written to a
+    named file on the coordinator. New `uploads` table in
+    coordinator/db.py stores only the extracted text, same
+    plaintext-at-rest retention as jobs.prompt/messages.text (Phase
+    3b.iii encryption will cover both together, no separate carve-out
+    invented for this).
+  - Two caps, both truncate-with-an-explicit-marker rather than
+    silent drop: MAX_UPLOAD_EXTRACTED_CHARS per file (20k default,
+    applied at extraction) and MAX_UPLOAD_CONTEXT_CHARS combined
+    across every upload folded into one <<document>> fence (30k
+    default, newest-file-first so a just-attached file always makes
+    the cut even when older ones in the same conversation don't).
+    MAX_UPLOAD_BYTES (5MB default) caps the raw upload itself.
+  - Wired into coordinator/main.py: POST /uploads and GET
+    /uploads/{conversation_id} (member-auth + conversation-ownership
+    gated, same 404-not-403 convention as everything else conv-
+    scoped). _build_chat_messages_with_info() gained a
+    document_context param, folded in as a system message right
+    before the current turn (not up top with the rolling summary --
+    wanted the model's attention right next to the question it's
+    for). Sticky per conversation: every /generate for tool=chat
+    re-fetches that conversation's uploads, so a document attached on
+    turn 1 is still in context on turn 5 with no re-upload. Also
+    wired into POST /messages/{id}/retry, which had its own separate
+    context-rebuild path -- missed on the first pass, caught because
+    the test suite below covers it explicitly.
+  - Client: paperclip button + hidden file input in the composer
+    (client/templates/chat.html.j2), new client/static/js/
+    attachments.js module (upload, render removable-looking chips,
+    pending/failed states), wired into chat.js at the three lifecycle
+    points that matter (init, "+ New chat" clears chips, opening/
+    switching a conversation reloads them from the server so a page
+    refresh doesn't lose the chip row). Extracted the inline "create
+    a conversation if this is a brand-new chat" block that used to
+    live only in chat.js's submit handler into a shared
+    ensureConversation() in state.js, since attaching a file before
+    the first message needed the exact same lazy-create behavior
+    submit already had -- one shared helper instead of a second copy.
+    client/services/api_client.py gained proxy_upload() (multipart
+    forwarding; httpx computes its own boundary header, don't set
+    Content-Type by hand) alongside the existing proxy_json/proxy_raw.
+  - New deps: pypdf, python-docx, python-multipart in coordinator/
+    requirements.txt. pandas too, pinned to 2.3.3 (last 2.x release)
+    rather than the current 3.0.5 -- pandas 3.x requires Python
+    >=3.11 and the local dev .venv is 3.10 even though the Docker
+    image is 3.11; only stable read_csv/head/to_string/columns APIs
+    are used here so there's no functional reason to force the newer
+    major. reportlab added to requirements-dev.txt (test-only) to
+    generate a real PDF fixture rather than mocking pypdf.
+  - Tests: tests/test_uploads.py, 27 new cases -- extraction unit
+    tests against real generated PDF/DOCX/CSV fixtures (not mocks),
+    the <<document>> fence budget/truncation/ordering logic, router
+    auth/ownership/size/type validation, and integration tests that
+    inspect the actual queued job_queue envelope to confirm
+    document_context lands in messages[] on both /generate and
+    /messages/{id}/retry, and does NOT leak in when nothing's
+    attached. Full suite: 659/659 green.
+  - Verified live, not just unit-tested: ran tools/run_local.py and
+    drove the real browser UI with Playwright (login via the dev
+    bearer-token shortcut, attach a .txt through the actual file
+    picker, watched the chip go pending -> settled, sent a message,
+    confirmed "+ New chat" clears chips and switching back to the
+    conversation reloads them, zero console errors) -- then cross-
+    checked the dev SQLite DB directly and confirmed the extracted
+    text matched the uploaded file exactly.
+  - Bug caught by the test run, not by review: the upload-extracted
+    log.info() call used "filename" as an extra= key, which collides
+    with LogRecord's own reserved `filename` attribute (the source
+    file of the log call itself) and raised KeyError at log time on
+    every successful upload. Renamed to "upload_filename".
+  - Not deployed -- explicitly told to skip that this session. Bumped
+    CLIENT_CACHE_VERSION anyway (23 -> 24) since the diff touches
+    client/static/**, so whenever this does ship the PWA cache-bust
+    is already correct and nobody has to remember it later.
+  - Noticed, not touched: README.md's own §10 API table doesn't list
+    /uploads (or /conversations, /invites, /login, /me, and roughly
+    a dozen other real endpoints) -- it's stale from around the
+    original MVP and was never kept current as membership/
+    conversations/invites shipped. Predates this change and is a
+    much bigger cleanup than this slice; flagging here rather than
+    scope-creeping into a full README API audit.
+
+image alteration (img2img / inpainting on an uploaded image, agent
+  side): NOT previously scoped anywhere -- found while researching the
+  upload feature. windows-agent/agent.py's run_image_inference()
+  (~line 4619) only does text->image today, but the pinned
+  stable-diffusion.cpp build (master-637-ef92a00, same binary already
+  on every contributor box) has gen_params.init_image_path AND
+  gen_params.mask_image_path as real, consumed fields in its CLI
+  parser (confirmed straight from upstream's examples/cli/main.cpp) --
+  img2img and inpainting are already compiled into the exact sd.exe
+  everyone's running, using the SAME SD1.5/SDXL models already
+  bootstrapped. No new model download, no new VRAM tier. The lift is
+  accepting a base64 input image (+ optional mask) in the image job
+  payload, writing it to a temp file the same way the prompt already
+  gets written to out_path.with_suffix(".prompt.txt"), and adding the
+  init-image/mask/strength flags to the existing argv list -- reuses
+  the image queue, capability routing, and PNG storage/serving path
+  wholesale. Exact CLI flag spelling wasn't nailed down from the docs
+  (upstream punts to `sd-cli -h`) -- confirm on a contributor box
+  before writing the argv change. ~1-2 days.
+
+vision (image understanding in chat, agent side): already scoped in
+  docs/project-gaps.md ("No image input (vision) on chat") -- called
+  out there as the single most-cited capability gap vs. ChatGPT/
+  Copilot/Gemini. Unlike image alteration above, this genuinely is a
+  new tool: a VLM (Llama 3.2 11B Vision class) most contributors don't
+  have, its own agent bootstrap/download flow, its own `chat-vlm`
+  capability advertisement + queue, VRAM-gated eligibility the way
+  SDXL already is for image-gen. Budget closer to a full week once
+  agent-side bootstrap + real-hardware testing is counted, not the
+  doc's optimistic ~2-3 days. Do this one standalone, after doc
+  upload and image alteration land -- biggest perceived-IQ win but
+  the most expensive of the three, and it doesn't share the
+  "attach a file" composer plumbing the other two do until the UI
+  stage.

@@ -276,6 +276,32 @@ CREATE TABLE IF NOT EXISTS notification_preferences (
     enabled INTEGER NOT NULL DEFAULT 1,
     UNIQUE(member_id, category)
 );
+
+-- Extracted text from a member-uploaded document (PDF/DOCX/TXT/MD/
+-- CSV), attached to a conversation. The raw uploaded file is never
+-- written anywhere durable — coordinator/uploads.py parses it
+-- straight off the request's spooled upload stream and discards the
+-- bytes once extraction finishes. extracted_text is what persists,
+-- with the same plaintext-at-rest retention as everything else in
+-- this table's neighborhood (jobs.prompt, messages.text) — see
+-- project-gaps.md's "Stored prompt history is plaintext at rest" for
+-- the encryption plan that will eventually cover this column too.
+-- coordinator.main folds a member's uploads for a conversation into
+-- a <<document>> fence prepended to that conversation's chat turns.
+CREATE TABLE IF NOT EXISTS uploads (
+    upload_id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL,
+    member_id TEXT,
+    filename TEXT NOT NULL,
+    content_type TEXT,
+    extracted_text TEXT NOT NULL,
+    char_count INTEGER NOT NULL,
+    truncated INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_uploads_conversation
+    ON uploads(conversation_id, created_at);
 """
 
 
@@ -2025,6 +2051,10 @@ class DB:
                     (conversation_id,),
                 )
                 self._conn.execute(
+                    "DELETE FROM uploads WHERE conversation_id=?",
+                    (conversation_id,),
+                )
+                self._conn.execute(
                     "DELETE FROM conversations WHERE conversation_id=?",
                     (conversation_id,),
                 )
@@ -2194,6 +2224,43 @@ class DB:
                 (job_id,),
             )
             return cur.fetchone()
+
+    # ---------- uploads ----------
+    def insert_upload(
+        self,
+        upload_id: str,
+        conversation_id: str,
+        member_id: Optional[str],
+        filename: str,
+        content_type: Optional[str],
+        extracted_text: str,
+        truncated: bool,
+        created_at: Optional[float] = None,
+    ) -> None:
+        now = created_at if created_at is not None else time.time()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO uploads "
+                "(upload_id, conversation_id, member_id, filename, "
+                "content_type, extracted_text, char_count, truncated, "
+                "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    upload_id, conversation_id, member_id, filename,
+                    content_type, extracted_text, len(extracted_text),
+                    1 if truncated else 0, now,
+                ),
+            )
+
+    def list_uploads(self, conversation_id: str) -> list[sqlite3.Row]:
+        """Oldest-first — callers that want a recency-first read (e.g.
+        the fence-budget builder) reverse this themselves."""
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM uploads WHERE conversation_id=? "
+                "ORDER BY created_at ASC",
+                (conversation_id,),
+            )
+            return cur.fetchall()
 
     # ---------- canaries ----------
     def create_canary(

@@ -23,6 +23,7 @@ from coordinator import email_send
 from coordinator import events
 from coordinator import member_auth, model_registry, notifications
 from coordinator import schedule as machine_schedule
+from coordinator import uploads as uploads_lib
 from coordinator.canaries import CanaryInjector
 from coordinator.db import DB
 from coordinator.idempotency import IdempotencyStore
@@ -1279,6 +1280,11 @@ if not notifications.is_vapid_configured():
         extra={"event": "push_disabled"},
     )
 
+# Document-upload endpoints (PDF/DOCX/TXT/MD/CSV → extracted text
+# folded into chat context). Same closure-over-db reasoning as
+# notifications above.
+app.include_router(uploads_lib.build_router(db))
+
 
 def _is_public(method: str, path: str) -> bool:
     """Path+method auth exemption. ``/health`` is fully open. The
@@ -1935,10 +1941,19 @@ def generate(req: GenerateRequest, request: Request):
                 if "summary_through_seq" in conv_row.keys()
                 else None
             )
+            # Attached-document context (chat only — see the doc-upload
+            # scope note in coordinator/uploads.py; search jobs build
+            # their own worker-side context and don't need this).
+            document_context = (
+                uploads_lib.build_document_context(db.list_uploads(conversation_id))
+                if tool == "chat"
+                else None
+            )
             worker_messages, history_info = _build_chat_messages_with_info(
                 prior, req.prompt,
                 summary_text=summary_text,
                 summary_through_seq=summary_through_seq,
+                document_context=document_context,
             )
             # Fire-and-forget summarization for any newly-dropped turns.
             # The summary job runs through the normal worker pool; its
@@ -2328,6 +2343,7 @@ def _build_chat_messages_with_info(
     summary_text: Optional[str] = None,
     summary_through_seq: Optional[int] = None,
     cap_tokens: int = MAX_HISTORY_TOKENS,
+    document_context: Optional[str] = None,
 ) -> tuple[list[dict], dict]:
     """Build the Ollama /api/chat messages[] array from persisted
     conversation rows plus the new user turn, applying a tail-window
@@ -2340,6 +2356,13 @@ def _build_chat_messages_with_info(
     represented by the summary). Returns the messages array AND an
     info dict the response can surface to the client so the UI can
     display "older turns aren't in context".
+
+    ``document_context`` (from coordinator.uploads.build_document_context)
+    is inserted as its own system message immediately before the new
+    user turn — deliberately NOT subject to cap_tokens/MAX_HISTORY_TOKENS,
+    since an attached document is current-turn context to answer against,
+    not aging history to be pruned; it has its own independent budget
+    (MAX_UPLOAD_CONTEXT_CHARS, applied by the caller).
 
     Pending/empty assistant rows from a previous-failed-but-not-yet-
     retried turn are skipped so the model doesn't see a stray empty-
@@ -2403,6 +2426,18 @@ def _build_chat_messages_with_info(
         })
     for m in kept:
         out.append({"role": m["role"], "content": m["content"]})
+    if document_context:
+        # Placed right before the current turn (not up top with the
+        # summary) so the model's attention lands on it next to the
+        # question it's actually needed for.
+        out.append({
+            "role": "system",
+            "content": (
+                "The user has attached one or more documents to this "
+                "conversation. Use them to answer when relevant:\n\n"
+                + document_context
+            ),
+        })
     out.append({"role": "user", "content": (new_user_text or "").strip()})
 
     info = {
@@ -5040,7 +5075,15 @@ def retry_message(message_id: str, request: Request):
             status_code=500,
             detail="cannot find the user message that produced this failure",
         )
-    worker_messages = _build_chat_messages(prior, user_msg["text"] or "")
+    # Retries stay consistent with a normal /generate call: an
+    # attached document doesn't silently drop out of context just
+    # because this particular turn failed and got retried.
+    document_context = uploads_lib.build_document_context(
+        db.list_uploads(msg["conversation_id"])
+    )
+    worker_messages, _retry_history_info = _build_chat_messages_with_info(
+        prior, user_msg["text"] or "", document_context=document_context,
+    )
 
     # Pick a model: explicit conversation default → original message
     # model → coordinator default at job-fetch time. Keeping the same
