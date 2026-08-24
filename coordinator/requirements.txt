@@ -26,8 +26,12 @@ tzdata==2025.2
 # Document upload (coordinator/uploads.py): text extraction for
 # PDF/DOCX/CSV attachments folded into chat context. FastAPI's
 # UploadFile/File(...) form parsing requires python-multipart even
-# though nothing here imports it directly.
-python-multipart==0.0.32
+# though nothing here imports it directly. Pinned to match
+# client/requirements.txt's EXACT version, not just "latest" — CI
+# installs every requirements*.txt into one environment in a single
+# pip invocation, so two different pins for the same package here
+# and there is a hard ResolutionImpossible, not just a style mismatch.
+python-multipart==0.0.9
 pypdf==6.16.2
 python-docx==1.2.0
 # Pinned to the last 2.x release on purpose — pandas 3.0+ requires
