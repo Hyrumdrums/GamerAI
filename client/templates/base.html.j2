@@ -83,6 +83,41 @@
     banner.querySelector('.pwa-banner-action').onclick = () => window.location.reload();
     banner.querySelector('.pwa-banner-dismiss').onclick = () => banner.remove();
   }
+
+  // Surface uncaught errors instead of failing silently. Several
+  // mobile bug reports in a row have come back as "nothing happens,
+  // no errors" — there's no practical way to pull a console log off
+  // someone's phone, so the next best thing is putting the error on
+  // the page itself where it can be screenshotted. Only ever fires
+  // for exceptions the app's own code didn't already catch (anything
+  // wrapped in try/catch or a .catch() never reaches here), so this
+  // shouldn't add noise on top of normal best-effort failures.
+  function showErrorBanner(message) {
+    if (document.querySelector('.pwa-banner.error')) return;  // first one wins
+    const banner = document.createElement('div');
+    banner.className = 'pwa-banner error';
+    banner.innerHTML = `
+      <span class="pwa-banner-text"></span>
+      <button type="button" class="pwa-banner-dismiss" aria-label="Dismiss">Dismiss</button>
+    `;
+    banner.querySelector('.pwa-banner-text').textContent = 'Something went wrong: ' + message;
+    document.body.appendChild(banner);
+    banner.querySelector('.pwa-banner-dismiss').onclick = () => banner.remove();
+  }
+  window.addEventListener('error', (e) => {
+    // Cross-origin "Script error." with no filename is almost always
+    // a browser extension or an injected third-party script, not
+    // something in our code — and the browser withholds any real
+    // detail for it anyway (CORS), so there's nothing actionable to
+    // show.
+    if (e.message === 'Script error.' && !e.filename) return;
+    const where = e.filename ? ` (${e.filename.split('/').pop()}:${e.lineno || '?'})` : '';
+    showErrorBanner(e.message + where);
+  });
+  window.addEventListener('unhandledrejection', (e) => {
+    const reason = e.reason;
+    showErrorBanner((reason && (reason.message || String(reason))) || 'unhandled promise rejection');
+  });
 </script>
 </body>
 </html>

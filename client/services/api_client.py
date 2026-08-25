@@ -126,17 +126,28 @@ async def proxy_raw(
     path: str,
     timeout: float = 30.0,
     default_content_type: str = "application/octet-stream",
+    cache_control: Optional[str] = None,
 ) -> Response:
     """Forward a binary coordinator response (e.g. generated PNG)
     preserving the upstream ``Content-Type``. ``timeout`` defaults
     higher than :func:`proxy_json` because images can be larger
-    than the chat JSON payloads."""
+    than the chat JSON payloads.
+
+    ``cache_control``, when given, is set on our response only (the
+    coordinator's own headers -- ETag/Last-Modified included -- are
+    otherwise dropped, not forwarded). Opt-in rather than always-on
+    because most ``/api/*`` bodies are per-request JSON that must
+    never be cached; only a caller whose bytes are genuinely immutable
+    for a given path (e.g. a generated image, permanent once written)
+    should pass it."""
     async with _client_ctx(bearer) as c:
         r = await c.request(method, path, timeout=timeout)
+    headers = {"Cache-Control": cache_control} if cache_control else None
     return Response(
         content=r.content,
         status_code=r.status_code,
         media_type=r.headers.get("content-type", default_content_type),
+        headers=headers,
     )
 
 

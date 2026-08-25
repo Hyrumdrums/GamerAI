@@ -75,11 +75,21 @@ async def proxy_image(name: str, request: Request):
     can't send Authorization headers from <img> tags, so the chat UI
     references images at /api/images/<name>; this proxy attaches the
     coordinator bearer the same way other /api/* routes do. Coordinator
-    enforces conversation ownership before returning the bytes."""
+    enforces conversation ownership before returning the bytes.
+
+    Long-lived + immutable Cache-Control: `name` is a job id, and a
+    given job's PNG is written once and never changes, so the browser
+    can treat a copy it already fetched as good forever instead of
+    re-downloading the full image on every page navigation (that
+    re-fetch was the cause of images visibly re-painting row-by-row on
+    every chat load -- this route previously forwarded no caching
+    headers at all). `private` because it's proxied per-session, not
+    something a shared/intermediate cache should store."""
     return await api_client.proxy_raw(
         bearer=require_session_bearer(request),
         method="GET", path=f"/images/{name}",
         timeout=30, default_content_type="image/png",
+        cache_control="private, max-age=31536000, immutable",
     )
 
 

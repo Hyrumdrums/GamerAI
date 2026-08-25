@@ -618,3 +618,83 @@ DONE 2026-08-25: PWA update-propagation fix -- root cause of a second
     is never revisited and never regains focus still won't update
     until closed and reopened -- this narrows the staleness window
     from "indefinite" to "one page load," not to zero.
+
+DONE 2026-08-25: generated-image HTTP caching + global error banner --
+  two more reports right after the update-banner fix above.
+  - Owner: "images don't seem to be cached, on every page navigation
+    it slowly loads in a few dozen pixel rows at a time." Root cause
+    (not a caching-propagation issue this time, a real missing-header
+    bug): client/services/api_client.py's proxy_raw() -- the only
+    thing that serves /api/images/<name> to the browser -- built a
+    brand-new Response from just content/status_code/media_type,
+    dropping every header the coordinator's FileResponse would set
+    (ETag, Last-Modified, everything). No Cache-Control, no
+    validators -- the browser had zero basis to reuse a fetched image
+    across navigations, so every page load re-downloaded and re-
+    decoded every image in the thread from scratch (the row-by-row
+    paint is just that decode happening live over the network instead
+    of instantly from disk cache). sw.js was never in play here --
+    /api/* is deliberately network-only in the fetch handler (correct
+    for JSON, wrong for an immutable binary hiding under that prefix).
+  - Fix: proxy_raw() gained an opt-in `cache_control` param (opt-in,
+    not default-on -- most /api/* bodies are per-request JSON that
+    must never be cached, so this only applies where a caller
+    explicitly says its bytes are immutable). /api/images/{name}
+    passes "private, max-age=31536000, immutable" -- private because
+    it's a per-session proxied fetch, not something a shared cache
+    should store; immutable+1y because a given job's PNG is written
+    once and never changes. New test:
+    test_api_images_proxy_sets_immutable_cache_control in
+    test_web_ui_smoke.py (writes a fake PNG straight into
+    coordinator.main.IMAGE_DIR, hits the proxy as admin -- admin
+    bypasses the ownership walk in coordinator/main.py's serve_image,
+    so no conversation/job fixture needed -- asserts the header and
+    that bytes round-trip unchanged).
+  - Owner also, same message: after fully deleting + clearing the
+    installed PWA's app data on mobile, the attach (document upload)
+    button still does nothing and the "Edit an image" checkbox still
+    does nothing -- no errors. A full data clear rules out stale-SW
+    as the explanation (that's a clean-slate install), which the
+    previous two mobile reports in this session could plausibly still
+    have been.
+  - Investigated hard before guessing again: curled prod and diffed
+    composer.js/imageGallery.js byte-for-byte against the repo (still
+    identical -- server-side is correct); re-read attachments.js top
+    to bottom (no exotic APIs, nothing mobile-unsafe); ran the same
+    checkbox+file-picker flow under Playwright with Chromium's
+    iPhone-13 device emulation (real mobile viewport, touch taps via
+    page.tap, mobile UA) -- both features worked with zero console
+    errors, which rules out a generic touch-vs-click or narrow-
+    viewport bug. Tried to go one step further and reproduce under
+    real WebKit (Safari's engine) via Playwright, since that's the
+    one variable the Chromium test can't cover -- blocked on two
+    missing system libs (libevent-2.1-7, libavif13) that need sudo
+    apt-get and this box has no passwordless sudo, so left untested
+    rather than guess.
+  - Given three straight mobile reports of "nothing happens, no
+    errors" with no way to pull a real console log off the owner's
+    phone, added a standing diagnostic instead of one more guess:
+    base.html.j2 now has a global window.onerror +
+    unhandledrejection handler that renders any UNCAUGHT error as a
+    visible on-page banner (red, reuses the .pwa-banner shape) with
+    the message + file:line, so a future silent failure becomes a
+    screenshot instead of a dead end. Only fires for what the app's
+    own try/catch and .catch() didn't already handle, and filters out
+    bare cross-origin "Script error." (browser extensions / injected
+    third-party scripts, no real detail available for those anyway).
+    Verified via Playwright: no false-positive on a clean load, a
+    real thrown error and a real unhandled rejection both surface
+    correctly with the right text, second error while one's showing
+    doesn't duplicate it, dismiss works.
+  - Still open / needs the owner: what mobile OS + browser this is on
+    (materially changes both diagnosis and fix -- e.g. iOS home-
+    screen PWAs have a long-documented WebKit quirk where "delete the
+    icon" does NOT reliably clear the underlying site data the way
+    Android's Settings > Clear Data does; the real fix there is
+    Settings > Safari > Advanced > Website Data, a separate, non-
+    obvious step). Asked; waiting on a reply, ideally with the new
+    error banner's text if it fires on retry.
+  - CLIENT_CACHE_VERSION 26 -> 27 (base.css changed -- unlike the
+    update-banner fix above, this one DOES touch client/static/**).
+  - Full suite: 674/674 (added the one images-cache-header test;
+    everything else unaffected).

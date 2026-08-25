@@ -1043,6 +1043,24 @@ class WebUISmokeTests(unittest.TestCase):
         self.assertIn("total_jobs", body)
         self.assertIn("queue_depth", body)
 
+    def test_api_images_proxy_sets_immutable_cache_control(self):
+        # proxy_raw used to drop every coordinator response header, so
+        # the browser had no cache validators/freshness hint at all --
+        # every chat-page navigation re-fetched every image in the
+        # thread from scratch (visible as a slow row-by-row repaint).
+        # A job's PNG is written once and never changes, so this route
+        # should tell the browser to keep a fetched copy indefinitely.
+        job_id = "webui_test_cacheimg"
+        png_bytes = b"fake-png-bytes-for-cache-header-test"
+        (coordinator_main.IMAGE_DIR / f"{job_id}.png").write_bytes(png_bytes)
+        resp = self.web.get(f"/api/images/{job_id}.png")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            resp.headers.get("cache-control"),
+            "private, max-age=31536000, immutable",
+        )
+        self.assertEqual(resp.content, png_bytes)
+
     # ------------------------------------------------------------------
     # /api/notifications/* BFF proxies (Phase 6 of pwa-refactor.txt).
     # The coordinator-side endpoint logic is covered in

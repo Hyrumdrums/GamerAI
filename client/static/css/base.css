@@ -197,3 +197,7 @@ input:focus, textarea:focus { outline: 0; border-color: var(--brand); }
   opacity: .8;
 }
 .pwa-banner-dismiss:hover { opacity: 1; }
+
+/* Uncaught-error banner — same shape, red instead of brand blue so
+   it doesn't read as another "tap to proceed" prompt. */
+.pwa-banner.error { background: #b91c1c; }

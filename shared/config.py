@@ -267,7 +267,7 @@ del _os
 # browser on next page load AND surfaces the new number in the UI so
 # operator and user can confirm at-a-glance which build is live.
 # Format: bare integer string. Display widget renders "v1.0.{N}".
-CLIENT_CACHE_VERSION = "26"
+CLIENT_CACHE_VERSION = "27"
 WORKER_REGISTRY = "worker_registry"
 WORKER_HEARTBEATS = "worker_heartbeats"
 WORKER_STATUS = "worker_status"
