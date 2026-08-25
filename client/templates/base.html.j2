@@ -38,8 +38,50 @@
   if ('serviceWorker' in navigator && window.isSecureContext) {
     window.addEventListener('load', () => {
       navigator.serviceWorker.register('/sw.js', { scope: '/' })
+        .then((reg) => {
+          // The browser's own update check is heavily throttled — a
+          // backgrounded tab or a home-screen PWA reopened days later
+          // can sit on a stale SW indefinitely with no signal to the
+          // user. Force a check on load, on refocus, and on a slow
+          // timer, then surface it instead of leaving them silently
+          // stale (this is what a fresh deploy needs to actually reach
+          // an already-installed client).
+          reg.update().catch(() => {});
+          document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'visible') reg.update().catch(() => {});
+          });
+          setInterval(() => reg.update().catch(() => {}), 20 * 60 * 1000);
+
+          reg.addEventListener('updatefound', () => {
+            const installing = reg.installing;
+            if (!installing) return;
+            installing.addEventListener('statechange', () => {
+              // installed + an already-existing controller means this
+              // replaced a previously-active SW (a real update).
+              // installed with no controller yet is just the first-ever
+              // install for this browser — nothing to prompt about.
+              if (installing.state === 'installed' && navigator.serviceWorker.controller) {
+                showUpdateBanner();
+              }
+            });
+          });
+        })
         .catch((err) => console.warn('SW registration failed', err));
     });
+  }
+
+  function showUpdateBanner() {
+    if (document.querySelector('.pwa-banner.update')) return;
+    const banner = document.createElement('div');
+    banner.className = 'pwa-banner update';
+    banner.innerHTML = `
+      <span class="pwa-banner-text">A new version of GamerAI is ready.</span>
+      <button type="button" class="pwa-banner-action">Refresh</button>
+      <button type="button" class="pwa-banner-dismiss" aria-label="Not now">Not now</button>
+    `;
+    document.body.appendChild(banner);
+    banner.querySelector('.pwa-banner-action').onclick = () => window.location.reload();
+    banner.querySelector('.pwa-banner-dismiss').onclick = () => banner.remove();
   }
 </script>
 </body>

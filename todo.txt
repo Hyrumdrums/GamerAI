@@ -552,3 +552,69 @@ DONE 2026-08-24: real-hardware confirmation on image alteration --
     the right filename + thumbnail. Zero console errors. Full Python
     suite unaffected (pure client-side change): 673/673.
   - CLIENT_CACHE_VERSION 25 -> 26.
+
+DONE 2026-08-25: PWA update-propagation fix -- root cause of a second
+  round of "the feature I just shipped isn't showing up" reports.
+  - Owner reported (after the thumbnail/chain-edit deploy above): no
+    thumbnail on desktop file-pick, no Edit button in the lightbox on
+    desktop, and on mobile the "Edit an image" checkbox does nothing
+    at all (no error, edit-controls never reveal). Browser's version
+    chip read v1.0.26 -- the current build -- which looked like it
+    ruled out staleness.
+  - It didn't. v1.0.26 is server-rendered straight from
+    shared.config.CLIENT_CACHE_VERSION on every navigation (network-
+    first per sw.js's fetch handler), so the chip always reflects
+    what the SERVER is running, not what the ACTIVE service worker
+    has cached. A tab/PWA stuck on an old SW shows the new number
+    while every cache-first JS fetch (composer.js, imageGallery.js)
+    still resolves to whatever SHELL_CACHE that old SW populated --
+    exactly the false-negative this session's earlier "checkbox does
+    nothing" bug already hit once, now resurfaced one deploy later.
+  - Confirmed it wasn't a real code regression first: curled prod and
+    diffed composer.js/imageGallery.js byte-for-byte against the repo
+    (identical), grepped chat.css's mobile breakpoint for anything
+    that could hide .edit-controls/.iv-edit (nothing does -- only
+    .iv-nav prev/next arrows are mobile-hidden). Server side was
+    already correct; the gap was purely client-side propagation.
+  - Fix: client/templates/base.html.j2's SW registration (the one
+    script block every page loads, not just chat.html.j2) now calls
+    registration.update() on load, on visibilitychange->visible, and
+    every 20 min on a timer, instead of relying solely on the
+    browser's own heavily-throttled background check. On
+    updatefound -> installing.statechange === 'installed' with an
+    already-existing controller (i.e. a real update, not a first-ever
+    install), it shows a small "A new version of GamerAI is ready"
+    banner with Refresh/Not now, reusing the existing .pwa-banner
+    CSS (same class the install/push-opt-in banners already use --
+    zero new CSS). Not auto-reloading on its own: this app has no
+    draft-preservation for an in-flight message, so silently yanking
+    the page out from under a mid-type or mid-stream user would trade
+    one bug for a worse one.
+  - This fix reaches every client on their next page load with zero
+    SW dependency (HTML navigations are network-first, so the new
+    inline script itself can't be stuck behind the exact staleness
+    problem it's fixing) -- and because CLIENT_CACHE_VERSION (26) is
+    unchanged, it also resolves the owner's CURRENT stuck state: the
+    next load fetches the new base.html.j2, immediately calls
+    reg.update(), finds their old SW's script byte-differs from the
+    live v26 one, installs+activates it (skipWaiting/clients.claim
+    already unconditional), and prompts Refresh -- no DevTools
+    unregister instructions needed this time.
+  - Verified locally (Playwright against tools/run_local.py): no
+    spurious banner on a normal load; window.showUpdateBanner (a bare
+    function decl in the inline script, so it lands on window for
+    free) renders the correct text/buttons, a second call doesn't
+    duplicate it, Not now removes it, Refresh triggers a real
+    navigation. Zero console errors. Full Python suite unaffected
+    (template + inline JS only, no backend touched): 673/673.
+  - Template-only change -- no client/static/** files touched, so no
+    CLIENT_CACHE_VERSION bump needed (see CLAUDE.md's cache-bust
+    gotcha: it's scoped to client/static/**, and this is the one kind
+    of client change that's exempt by construction).
+  - HONEST GAP: no automated test exercises the real two-SW-versions
+    lifecycle (would need a second live deploy mid-test to produce an
+    actual updatefound event) -- the banner's own rendering/dismiss/
+    refresh mechanics are verified directly instead. Also: a tab that
+    is never revisited and never regains focus still won't update
+    until closed and reopened -- this narrows the staleness window
+    from "indefinite" to "one page load," not to zero.
