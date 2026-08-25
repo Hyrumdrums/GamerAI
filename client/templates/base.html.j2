@@ -104,7 +104,18 @@
     document.body.appendChild(banner);
     banner.querySelector('.pwa-banner-dismiss').onclick = () => banner.remove();
   }
+  // Admin-only: a raw error message is a debugging aid for whoever's
+  // driving development, not something an ordinary member should see
+  // for a benign edge case (e.g. a vendored lib hiccup that used to
+  // fail silently and harmlessly). /api/me 401s quietly on anonymous
+  // pages (login, landing, /tos) -- isAdmin just stays false.
+  let isAdmin = false;
+  fetch('/api/me').then((r) => (r.ok ? r.json() : null)).then((me) => {
+    isAdmin = !!(me && me.role === 'admin');
+  }).catch(() => {});
+
   window.addEventListener('error', (e) => {
+    if (!isAdmin) return;
     // Cross-origin "Script error." with no filename is almost always
     // a browser extension or an injected third-party script, not
     // something in our code — and the browser withholds any real
@@ -115,6 +126,7 @@
     showErrorBanner(e.message + where);
   });
   window.addEventListener('unhandledrejection', (e) => {
+    if (!isAdmin) return;
     const reason = e.reason;
     showErrorBanner((reason && (reason.message || String(reason))) || 'unhandled promise rejection');
   });

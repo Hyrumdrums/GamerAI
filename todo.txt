@@ -721,3 +721,20 @@ DONE 2026-08-25: visited-link CTA buttons fading to plain-link blue --
   permanent test here would just be a fragile screenshot diff for
   something an eyeball check already settled). Full suite unaffected:
   674/674.
+
+DONE 2026-08-25: gated the uncaught-error banner to admin only -- owner
+  flagged it (asked "did we overengineer anything in those last two
+  commits") as the one piece worth reconsidering: it shipped to 100%
+  of traffic, so a benign uncaught error from a vendored lib would now
+  show ordinary members a scary "Something went wrong" they can't act
+  on, in exchange for a debugging convenience that only helps
+  development. Agreed, kept the mechanism (still the only real lead on
+  the open mobile attach/edit bug) but scoped it: base.html.j2 fetches
+  /api/me once on load (mirrors the pattern chat.js already uses for
+  #adminlink, just without its redirect-to-/login-on-401 since base.html.j2
+  loads on anonymous pages too) and the error/unhandledrejection
+  listeners no-op unless role === 'admin'. Verified both directions
+  live against tools/run_local.py: the admin dev-token session still
+  gets the banner; a freshly signed-up member (role=contributor) sees
+  nothing for the identical thrown error. Template-only change, no
+  CLIENT_CACHE_VERSION bump needed. Full suite: 674/674.
