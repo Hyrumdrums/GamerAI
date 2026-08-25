@@ -100,6 +100,7 @@ button, .btn {{
   font-family: inherit; line-height: 1.3;
 }}
 .btn {{ text-decoration: none; }}
+.btn:visited {{ color: #fff; }}
 .btn:hover, button:hover {{ background: var(--brand-hover); }}
 button:disabled, .btn[disabled] {{
   background: #aaa; cursor: not-allowed;
@@ -108,6 +109,7 @@ button:disabled, .btn[disabled] {{
   background: var(--surface); color: var(--text);
   border: 1px solid var(--border);
 }}
+.btn-quiet:visited {{ color: var(--text); }}
 .btn-quiet:hover {{ background: #f5f5f5; }}
 input[type=text], input[type=email], input[type=password], textarea {{
   width: 100%; padding: .6rem; font-size: 1rem;

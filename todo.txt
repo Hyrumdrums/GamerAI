@@ -698,3 +698,26 @@ DONE 2026-08-25: generated-image HTTP caching + global error banner --
     update-banner fix above, this one DOES touch client/static/**).
   - Full suite: 674/674 (added the one images-cache-header test;
     everything else unaffected).
+
+DONE 2026-08-25: visited-link CTA buttons fading to plain-link blue --
+  pre-existing bug, unrelated to the two commits above (owner asked
+  "did we overengineer anything in those" while reporting this
+  separately). base.css's top-level `a:visited { color: var(--brand) }`
+  (specificity 0,1,1) outranks `.btn`'s `color: #fff` (0,1,0), so any
+  visited .btn/.btn-quiet anchor lost its button styling and read as a
+  plain visited link. Landing page has four (Try the demo, Download
+  the agent, Create an account, View on GitHub); topbar's
+  .contribute-cta had the same latent gap. Added the missing
+  `:visited` pairs to both base.css and its mirrored copy in
+  shared/ui.py (BASE_CSS, used by /tos -- the two are meant to stay in
+  sync per the comment already at the top of base.css). Verified for
+  real with Playwright: screenshotted the landing page, actually
+  clicked through to /demo (real browser visited-state, not a
+  simulated one -- getComputedStyle() lies about :visited for privacy
+  so only a real paint proves it), navigated back, screenshotted again
+  -- button stayed white-on-blue both times. CLIENT_CACHE_VERSION 27
+  -> 28. No new automated test (CSS-cascade-only fix, and browsers
+  deliberately can't be probed for :visited state from JS -- a
+  permanent test here would just be a fragile screenshot diff for
+  something an eyeball check already settled). Full suite unaffected:
+  674/674.
