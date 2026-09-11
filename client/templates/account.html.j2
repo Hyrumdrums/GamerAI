@@ -8,6 +8,7 @@
 {% block topbar_actions %}
     <a href="/" class="hide-mobile">← chat</a>
     <a href="/machines" class="hide-mobile">machines</a>
+    <a href="/api-keys" class="hide-mobile">API keys</a>
     {% if me.role == 'admin' %}
     <a href="/dashboard" class="hide-mobile">admin</a>
     {% endif %}
@@ -390,6 +391,15 @@
       can pause contributing, set a daily uptime window so a machine only
       works while you're not gaming, or remove a machine.</p>
     <p><a class="btn" href="/machines">Manage machines →</a></p>
+  </section>
+
+  <section class="card">
+    <h2>API keys</h2>
+    <p class="muted">Use your own contributor quota from another tool —
+      Home Assistant, Open WebUI, a script — with a personal key against
+      the same OpenAI-compatible API you'd use with any other provider.
+      A key can only generate, not manage your account.</p>
+    <p><a class="btn" href="/api-keys">Manage API keys →</a></p>
   </section>
 
   <section class="card cta">

@@ -77,6 +77,15 @@ class GenerateRequest(BaseModel):
     # together. Ignored for tool != "chat". Default false keeps the
     # text-only path bit-identical to before.
     voice_mode: bool = False
+    # Stateless OpenAI-compatible callers (coordinator/openai_compat.py)
+    # pass their full messages[] array directly instead of a conversation_id
+    # — there's no GamerAI conversation row to rebuild history from, the
+    # external caller manages its own history and resends it each call,
+    # same as the OpenAI /v1/chat/completions contract. Chat-only; mirrors
+    # the same worker_messages the conversation_id path already builds, so
+    # the worker envelope is identical either way (main.py job["messages"]
+    # already prefers this over the bare prompt).
+    messages: Optional[List[dict]] = None
 
 
 class GenerateResponse(BaseModel):
@@ -419,3 +428,21 @@ class JobRecord(BaseModel):
     completed_at: Optional[float] = None
     error: Optional[str] = None
     attempts: int = 0
+
+
+# ---------- OpenAI-compatible surface (coordinator/openai_compat.py) ----------
+# Deliberately minimal: only the fields GamerAI's job envelope can actually
+# honor today. temperature/max_tokens/etc. are accepted (so well-behaved
+# OpenAI clients that always send them don't 422) but silently ignored —
+# there's no sampling-knob passthrough in the job envelope yet.
+class OpenAIChatMessage(BaseModel):
+    role: str
+    content: str
+
+
+class OpenAIChatCompletionRequest(BaseModel):
+    model: Optional[str] = None
+    messages: List[OpenAIChatMessage]
+    stream: bool = False
+    temperature: Optional[float] = None
+    max_tokens: Optional[int] = None

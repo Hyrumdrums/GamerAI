@@ -66,6 +66,12 @@
     # coordinator default and 401 (the coord owns /me/machines, but the
     # browser-facing /machines surface is the client's).
     @web_ui_machines path /machines /machines/*
+    # API keys page (create/list/revoke self-serve keys) — same
+    # reasoning as machines above: the coordinator owns /me/api-keys,
+    # but the browser-facing /api-keys page + its create/revoke form
+    # posts live on the client. Without this matcher they'd fall
+    # through to the coordinator catch-all, which has no such route.
+    @web_ui_api_keys path /api-keys /api-keys/*
     # Public web signup form. Deliberately NOT at /signup — the
     # coordinator already owns that path for its own public JSON API
     # (POST /signup, used directly by the Windows agent's console
@@ -120,6 +126,9 @@
         reverse_proxy client:8080
     }
     handle @web_ui_machines {
+        reverse_proxy client:8080
+    }
+    handle @web_ui_api_keys {
         reverse_proxy client:8080
     }
     handle @web_ui_join {

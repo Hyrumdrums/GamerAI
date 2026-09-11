@@ -49,6 +49,11 @@ def redis_kwargs() -> dict:
 COORDINATOR_URL = os.getenv("COORDINATOR_URL", "http://coordinator:8000")
 DB_PATH = os.getenv("DB_PATH", "/data/gamerai.db")
 JOB_TIMEOUT_SECONDS = _int("JOB_TIMEOUT_SECONDS", 120)
+# How long POST /v1/chat/completions (coordinator/openai_compat.py) waits
+# for a job to finish before returning a 504 to the external caller —
+# comfortably above JOB_TIMEOUT_SECONDS plus the reaper's retry headroom
+# so a legitimately-requeued job isn't cut off before the fleet recovers it.
+V1_CHAT_TIMEOUT_SECONDS = _int("V1_CHAT_TIMEOUT_SECONDS", 240)
 WORKER_TIMEOUT_SECONDS = _int("WORKER_TIMEOUT_SECONDS", 15)
 REAPER_INTERVAL_SECONDS = _float("REAPER_INTERVAL_SECONDS", 5.0)
 # If true, /generate (and retry) refuses to enqueue when no worker has
@@ -267,7 +272,7 @@ del _os
 # browser on next page load AND surfaces the new number in the UI so
 # operator and user can confirm at-a-glance which build is live.
 # Format: bare integer string. Display widget renders "v1.0.{N}".
-CLIENT_CACHE_VERSION = "28"
+CLIENT_CACHE_VERSION = "29"
 WORKER_REGISTRY = "worker_registry"
 WORKER_HEARTBEATS = "worker_heartbeats"
 WORKER_STATUS = "worker_status"

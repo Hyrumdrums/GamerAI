@@ -32,6 +32,10 @@ from argon2.exceptions import (
 
 TOKEN_PREFIX = "gai_"
 _TOKEN_BYTES = 32  # → 64 hex chars after the prefix
+# Self-serve API keys get their own visually-distinct prefix (same idea as
+# INVITE_PREFIX below) so a key is identifiable in logs, support requests,
+# or a member's own config files without cross-referencing the DB.
+API_KEY_TOKEN_PREFIX = "gai_api_"
 
 # Username constraints. Kept loose enough for casual handles ("dallin",
 # "alex_h", "rkc-1") while excluding shell-special and url-special
@@ -51,8 +55,8 @@ PASSWORD_MIN_LEN = 8
 PASSWORD_MAX_LEN = 1024
 
 
-def generate_token() -> str:
-    return TOKEN_PREFIX + secrets.token_hex(_TOKEN_BYTES)
+def generate_token(prefix: str = TOKEN_PREFIX) -> str:
+    return prefix + secrets.token_hex(_TOKEN_BYTES)
 
 
 INVITE_PREFIX = "inv_"
@@ -213,30 +217,61 @@ def _row_to_member(row) -> Member:
     )
 
 
-def lookup_member_by_token(db, raw_token: str) -> Optional[Member]:
-    """Resolve a raw bearer token to a Member, or None if not found / revoked.
+@dataclass(frozen=True)
+class TokenResolution:
+    """Everything the auth middleware needs from a resolved bearer, in one
+    DB round trip: the member it authenticates as, the hash actually
+    presented (for touch_member_token), whether it came from the
+    secondary member_tokens table (vs. the primary members.token_hash web
+    credential), and its scope (None = unrestricted; 'generation' = a
+    self-serve API key limited to generation endpoints — see
+    _is_generation_scoped_allowed in coordinator/main.py)."""
+    member: Member
+    token_hash: str
+    is_secondary: bool
+    scope: Optional[str]
 
-    Checks the additive ``member_tokens`` table first (per-agent and per-
-    CLI tokens added after the multi-token slice landed), then falls
-    back to the single ``members.token_hash`` that holds the web-session
-    credential. The raw_token is hashed before the DB hit, so callers
-    can pass the string straight from the Authorization header.
+
+def resolve_token(db, raw_token: str) -> Optional[TokenResolution]:
+    """Resolve a raw bearer token to a TokenResolution, or None if not
+    found / revoked.
+
+    Checks the additive ``member_tokens`` table first (agent-pairing and
+    self-serve API-key tokens), then falls back to the single
+    ``members.token_hash`` that holds the web-session credential. The
+    raw_token is hashed before the DB hit, so callers can pass the string
+    straight from the Authorization header.
     """
     if not raw_token:
         return None
     th = hash_token(raw_token)
-    secondary_member_id = db.lookup_member_id_by_token_hash_in_tokens_table(th)
-    if secondary_member_id is not None:
-        row = db.get_member(secondary_member_id)
+    secondary = db.get_secondary_token_row(th)
+    if secondary is not None:
+        row = db.get_member(secondary["member_id"])
         if row is None or row["revoked_at"] is not None:
             return None
-        return _row_to_member(row)
+        return TokenResolution(
+            member=_row_to_member(row),
+            token_hash=th,
+            is_secondary=True,
+            scope=secondary["scope"],
+        )
     row = db.get_member_by_token_hash(th)
     if row is None:
         return None
     if row["revoked_at"] is not None:
         return None
-    return _row_to_member(row)
+    return TokenResolution(
+        member=_row_to_member(row), token_hash=th, is_secondary=False, scope=None,
+    )
+
+
+def lookup_member_by_token(db, raw_token: str) -> Optional[Member]:
+    """Resolve a raw bearer token to a Member, or None if not found /
+    revoked. Thin wrapper over resolve_token for callers that only need
+    the member (most of the existing test suite)."""
+    resolution = resolve_token(db, raw_token)
+    return resolution.member if resolution is not None else None
 
 
 def tokens_match(a: str, b: str) -> bool:

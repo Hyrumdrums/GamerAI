@@ -548,6 +548,23 @@ class DB:
             "CREATE INDEX IF NOT EXISTS idx_member_tokens_worker "
             "ON member_tokens(worker_id)"
         )
+        # Self-serve API keys slice. ``kind`` distinguishes an
+        # agent-pairing token (the only kind that existed before this)
+        # from a member-minted ``api_key`` — 'agent' is the DEFAULT so
+        # SQLite backfills every pre-existing row, not just future
+        # inserts. ``scope`` is NULL for unrestricted tokens (every
+        # agent token, and the primary members.token_hash which never
+        # has a row here) or 'generation' for a key restricted to
+        # generation-only endpoints — see _is_generation_scoped_allowed
+        # in coordinator/main.py.
+        for ddl in (
+            "ALTER TABLE member_tokens ADD COLUMN kind TEXT NOT NULL DEFAULT 'agent'",
+            "ALTER TABLE member_tokens ADD COLUMN scope TEXT",
+        ):
+            try:
+                self._conn.execute(ddl)
+            except sqlite3.OperationalError:
+                pass
         # History summarization (Phase 3 of the long-context fix).
         # ``summary_text`` is a short natural-language recap of every
         # turn up through ``summary_through_seq``. _build_chat_messages
@@ -1118,38 +1135,38 @@ class DB:
         member_id: str,
         label: Optional[str],
         when: float,
+        kind: str = "agent",
+        scope: Optional[str] = None,
     ) -> None:
         """Register an additional bearer for ``member_id``. The hash is
         the PRIMARY KEY so the same token can't be re-added twice —
         callers regenerate on collision (statistically impossible at
-        256 bits)."""
+        256 bits). ``kind``/``scope`` default to the pre-existing
+        agent-pairing shape (unrestricted 'agent' token) so the
+        /agents/pair/confirm call site is unaffected; self-serve API
+        keys pass kind="api_key", scope="generation"."""
         with self._lock:
             self._conn.execute(
                 "INSERT INTO member_tokens "
-                "(token_hash, member_id, label, created_at, last_used_at) "
-                "VALUES (?, ?, ?, ?, NULL)",
-                (token_hash, member_id, label, when),
+                "(token_hash, member_id, label, created_at, last_used_at, kind, scope) "
+                "VALUES (?, ?, ?, ?, NULL, ?, ?)",
+                (token_hash, member_id, label, when, kind, scope),
             )
 
-    def lookup_member_id_by_token_hash_in_tokens_table(
-        self,
-        token_hash: str,
-    ) -> Optional[str]:
-        """Return ``member_id`` if the hash is registered in
-        ``member_tokens``, else None. Distinct from the legacy
-        single-token lookup that reads ``members.token_hash`` — that's
-        the wire credential rotated by /login, while this is the
-        secondary-token table populated by pairing and future API
-        keys."""
+    def get_secondary_token_row(self, token_hash: str) -> Optional[sqlite3.Row]:
+        """Return the full ``member_tokens`` row (member_id, kind, scope)
+        for a hash, or None. Distinct from the legacy single-token lookup
+        that reads ``members.token_hash`` — that's the wire credential
+        rotated by /login, while this is the secondary-token table
+        populated by pairing and self-serve API keys. Supersedes
+        ``lookup_member_id_by_token_hash_in_tokens_table`` (member_id
+        only) now that callers also need to know kind/scope in one trip."""
         with self._lock:
             cur = self._conn.execute(
-                "SELECT member_id FROM member_tokens WHERE token_hash=?",
+                "SELECT member_id, kind, scope FROM member_tokens WHERE token_hash=?",
                 (token_hash,),
             )
-            row = cur.fetchone()
-        if row is None:
-            return None
-        return row["member_id"]
+            return cur.fetchone()
 
     def touch_member_token(self, token_hash: str, when: float) -> None:
         with self._lock:
@@ -1158,23 +1175,47 @@ class DB:
                 (when, token_hash),
             )
 
-    def list_member_tokens(self, member_id: str) -> list[sqlite3.Row]:
-        """Returns rows for the Account page's "This PC" section.
-        Excludes the legacy single token stored on ``members``."""
+    def list_member_tokens(
+        self, member_id: str, kind: Optional[str] = None,
+    ) -> list[sqlite3.Row]:
+        """Returns rows for the Account page's "This PC" / "API keys"
+        sections. Excludes the legacy single token stored on ``members``.
+        ``kind`` filters to just 'agent' (Machines page) or 'api_key'
+        (API keys page) — omit for both."""
         with self._lock:
-            cur = self._conn.execute(
-                "SELECT token_hash, label, created_at, last_used_at "
-                "FROM member_tokens WHERE member_id=? ORDER BY created_at DESC",
-                (member_id,),
-            )
+            if kind is not None:
+                cur = self._conn.execute(
+                    "SELECT token_hash, label, created_at, last_used_at "
+                    "FROM member_tokens WHERE member_id=? AND kind=? "
+                    "ORDER BY created_at DESC",
+                    (member_id, kind),
+                )
+            else:
+                cur = self._conn.execute(
+                    "SELECT token_hash, label, created_at, last_used_at "
+                    "FROM member_tokens WHERE member_id=? ORDER BY created_at DESC",
+                    (member_id,),
+                )
             return cur.fetchall()
 
-    def delete_member_token(self, member_id: str, token_hash: str) -> bool:
+    def delete_member_token(
+        self, member_id: str, token_hash: str, kind: Optional[str] = None,
+    ) -> bool:
+        """``kind``, when given, scopes the delete so machine-unpair and
+        API-key-revoke can never cross-delete each other's rows even if a
+        prefix somehow collided."""
         with self._lock:
-            cur = self._conn.execute(
-                "DELETE FROM member_tokens WHERE member_id=? AND token_hash=?",
-                (member_id, token_hash),
-            )
+            if kind is not None:
+                cur = self._conn.execute(
+                    "DELETE FROM member_tokens WHERE member_id=? AND "
+                    "token_hash=? AND kind=?",
+                    (member_id, token_hash, kind),
+                )
+            else:
+                cur = self._conn.execute(
+                    "DELETE FROM member_tokens WHERE member_id=? AND token_hash=?",
+                    (member_id, token_hash),
+                )
             return cur.rowcount > 0
 
     # ---------- machines (member_tokens as the durable machine record) ----------
@@ -1207,7 +1248,8 @@ class DB:
         """One row per paired machine, joined to its runtime registration
         in ``workers`` (LEFT JOIN — a freshly-paired machine has no worker
         row until the agent calls /register). This is the single source
-        for the Machines page."""
+        for the Machines page. ``kind='agent'`` excludes self-serve API
+        keys, which live in the same table but aren't machines."""
         with self._lock:
             cur = self._conn.execute(
                 "SELECT t.token_hash, t.label, t.created_at, t.last_used_at, "
@@ -1218,23 +1260,26 @@ class DB:
                 "w.display_name AS worker_display_name "
                 "FROM member_tokens t "
                 "LEFT JOIN workers w ON w.worker_id = t.worker_id "
-                "WHERE t.member_id=? ORDER BY t.created_at DESC",
+                "WHERE t.member_id=? AND t.kind='agent' ORDER BY t.created_at DESC",
                 (member_id,),
             )
             return cur.fetchall()
 
-    def resolve_machine_token_hash(
-        self, member_id: str, id_prefix: str,
+    def resolve_member_token_hash(
+        self, member_id: str, id_prefix: str, kind: str,
     ) -> Optional[str]:
-        """Map the 12-char machine ``id`` the UI carries back to a full
-        token_hash, scoped to the caller. Returns None if no match or an
+        """Map the 12-char ``id`` a UI/API carries back to a full
+        token_hash, scoped to the caller AND to ``kind`` ('agent' for the
+        Machines page, 'api_key' for the API keys page) — so a machine
+        unpair and a key revoke can never resolve into each other's rows
+        even on a prefix collision. Returns None if no match or an
         ambiguous prefix (collision is statistically impossible at 12 hex
         chars, but we refuse rather than guess)."""
         with self._lock:
             cur = self._conn.execute(
                 "SELECT token_hash FROM member_tokens "
-                "WHERE member_id=? AND token_hash LIKE ?",
-                (member_id, id_prefix.replace("%", "") + "%"),
+                "WHERE member_id=? AND kind=? AND token_hash LIKE ?",
+                (member_id, kind, id_prefix.replace("%", "") + "%"),
             )
             rows = cur.fetchall()
         if len(rows) != 1:

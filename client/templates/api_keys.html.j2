@@ -1,0 +1,84 @@
+{% extends "base_app.html.j2" %}
+{% block title %}API keys — GamerAI{% endblock %}
+{% block extra_css %}
+<link rel="stylesheet" href="/static/css/account.css">
+<link rel="stylesheet" href="/static/css/api_keys.css">
+{% endblock %}
+
+{% block brand_suffix %} · API keys{% endblock %}
+{% block topbar_actions %}
+    <a href="/" class="hide-mobile">← chat</a>
+    <a href="/account" class="hide-mobile">account</a>
+    <a href="/logout">sign out</a>
+{% endblock %}
+
+{% block content %}
+<div class="page">
+  {% if flash %}
+  <div class="flash">{{ flash }}</div>
+  {% endif %}
+
+  <section class="card">
+    <h1>API keys</h1>
+    <p class="muted">
+      A personal key onto the same contributor network and daily quota
+      your web chat already uses — paste it into a tool that expects an
+      OpenAI-compatible API (Home Assistant, Open WebUI, a script) as
+      <code>Authorization: Bearer &lt;key&gt;</code> against
+      <code>/v1/chat/completions</code>, the same way you'd use a key
+      from any other API provider. A key only has access to generation
+      — it can't manage your account, invites, or other machines.
+    </p>
+  </section>
+
+  {% if created_key %}
+  <section class="card">
+    <h2>Your new key</h2>
+    <p class="muted small">
+      Shown once — GamerAI never stores it in plaintext, so if you lose
+      it you'll need to revoke this one and create another.
+    </p>
+    <div class="key-secret-box">
+      <code>{{ created_key }}</code>
+      <button class="copy-value" type="button" data-value="{{ created_key }}">copy</button>
+    </div>
+    {% if created_label %}<p class="muted small">Label: {{ created_label }}</p>{% endif %}
+  </section>
+  {% endif %}
+
+  <section class="card">
+    <h2>Create a key</h2>
+    <form method="POST" action="/api-keys" class="create-key-form">
+      <input type="text" name="label" placeholder="Label (optional), e.g. home assistant" maxlength="80">
+      <button type="submit" class="btn">Create key</button>
+    </form>
+  </section>
+
+  <section class="card">
+    <h2>Your keys</h2>
+    {% if not api_keys %}
+    <p class="muted">No API keys yet.</p>
+    {% endif %}
+    {% for k in api_keys %}
+    <div class="key-row" data-key-id="{{ k.id }}">
+      <div class="key-meta">
+        <strong>{{ k.label or 'unlabeled' }}</strong>
+        <span class="muted small">
+          {{ k.id }}…
+          {% if k.created_at %} · created {{ k.created_at | epoch_date }}{% endif %}
+          {% if k.last_used_at %} · last used {{ k.last_used_at | epoch_date }}{% else %} · never used{% endif %}
+        </span>
+      </div>
+      <form method="POST" action="/api-keys/{{ k.id }}/revoke" class="inline"
+            onsubmit="return confirm('Revoke this key? Anything using it stops working immediately.');">
+        <button type="submit" class="danger linklike">Revoke</button>
+      </form>
+    </div>
+    {% endfor %}
+  </section>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script src="/static/js/api_keys.js"></script>
+{% endblock %}

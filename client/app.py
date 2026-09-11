@@ -31,6 +31,7 @@ from client.routes import (
     account,
     admin_ui,
     api,
+    api_keys,
     auth,
     chat,
     demo,
@@ -88,6 +89,7 @@ app.include_router(invites.router)
 app.include_router(signup.router)
 app.include_router(account.router)
 app.include_router(machines.router)
+app.include_router(api_keys.router)
 app.include_router(admin_ui.router)
 app.include_router(api.router)
 app.include_router(demo.router)

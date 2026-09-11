@@ -34,9 +34,18 @@ os.environ.pop("API_TOKEN", None)
 os.environ.pop("RATE_LIMIT_PER_MIN", None)
 os.environ.pop("STRICT_MODELS", None)
 
-# 2. Drop any cached modules so they re-read the env above.
+# 2. Drop any cached modules so they re-read the env above. Must also
+#    clear the bare "shared"/"coordinator" package objects, not just
+#    their dotted submodules — if an earlier-run test module already
+#    imported e.g. coordinator.main, the coordinator package object
+#    carries a `.main` attribute alongside the sys.modules entry: `from
+#    coordinator import main` resolves via that attribute directly when
+#    present, without re-executing coordinator/main.py, even after
+#    `del sys.modules["coordinator.main"]`. Clearing the bare package
+#    too forces a genuinely fresh import. See tests/test_api_keys.py /
+#    tests/test_pairing.py for the same (correct) pattern.
 for _mod in list(sys.modules):
-    if _mod.startswith(("shared.", "coordinator.")):
+    if _mod in ("shared", "coordinator") or _mod.startswith(("shared.", "coordinator.")):
         del sys.modules[_mod]
 
 # 3. Patch the Redis factory before main imports it.

@@ -21,6 +21,12 @@ os.environ["DB_PATH"] = os.path.join(_TMPDIR, "test.db")
 os.environ["API_TOKEN"] = "admin-seed-token-for-tests"
 os.environ.pop("RATE_LIMIT_PER_MIN", None)
 os.environ.pop("STRICT_MODELS", None)
+# Must be unset, not just left alone — test_verify_link_is_an_absolute_url
+# below is a regression guard specifically for PUBLIC_BASE_URL leaking in
+# from another test module's env (e.g. tests/test_api_keys.py,
+# tests/test_pairing.py both set it); pop it explicitly rather than
+# relying on nothing else having set it first.
+os.environ.pop("PUBLIC_BASE_URL", None)
 
 # 2. Drop cached coordinator/shared modules so they pick up the env above.
 #    Includes the package modules themselves — otherwise the stale package

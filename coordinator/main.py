@@ -18,10 +18,12 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTex
 from fastapi.staticfiles import StaticFiles
 
 from coordinator import admin_alerts  # noqa: F401 — import wires its event subscriptions
+from coordinator import api_keys
 from coordinator import canaries as canary_lib
 from coordinator import email_send
 from coordinator import events
 from coordinator import member_auth, model_registry, notifications
+from coordinator import openai_compat
 from coordinator import schedule as machine_schedule
 from coordinator import uploads as uploads_lib
 from coordinator.canaries import CanaryInjector
@@ -1399,10 +1401,29 @@ def _load_tos_text() -> str:
         )
 
 
+def _is_generation_scoped_allowed(method: str, path: str) -> bool:
+    """Routes a generation-scoped self-serve API key may call. Everything
+    else — invites, friends' quotas, password/machine management, admin —
+    is refused with 403 regardless of the member's own role, since a key
+    like this may end up pasted into a third-party tool's config file.
+    Closed by default (mirrors _is_public's shape above) so every current
+    and future account-management route stays blocked without anyone
+    needing to remember a per-route check."""
+    if method == "POST" and path in ("/generate", "/v1/chat/completions"):
+        return True
+    if method == "GET" and path in ("/me", "/models", "/v1/models"):
+        return True
+    parts = path.strip("/").split("/")
+    if method == "GET" and len(parts) == 2 and parts[0] in ("result", "images"):
+        return True
+    return False
+
+
 # ---------- auth (no-op when API_TOKEN env is unset) ----------
 @app.middleware("http")
 async def _auth_middleware(request: Request, call_next):
     request.state.member = None
+    request.state.token_scope = None
     if _is_public(request.method, request.url.path):
         return await call_next(request)
     if not AUTH_ENABLED:
@@ -1410,11 +1431,21 @@ async def _auth_middleware(request: Request, call_next):
     raw_token = member_auth.parse_bearer(request.headers.get("authorization"))
     if not raw_token:
         return JSONResponse({"detail": "unauthorized"}, status_code=401)
-    member = member_auth.lookup_member_by_token(db, raw_token)
-    if member is None:
+    resolution = member_auth.resolve_token(db, raw_token)
+    if resolution is None:
         return JSONResponse({"detail": "unauthorized"}, status_code=401)
-    request.state.member = member
-    db.touch_member(member.member_id, time.time())
+    request.state.member = resolution.member
+    request.state.token_scope = resolution.scope
+    if resolution.is_secondary:
+        db.touch_member_token(resolution.token_hash, time.time())
+    if resolution.scope == "generation" and not _is_generation_scoped_allowed(
+        request.method, request.url.path
+    ):
+        return JSONResponse(
+            {"detail": "this API key is scoped to generation endpoints"},
+            status_code=403,
+        )
+    db.touch_member(resolution.member.member_id, time.time())
     return await call_next(request)
 
 
@@ -1750,6 +1781,14 @@ def generate(req: GenerateRequest, request: Request):
         raise HTTPException(
             status_code=400, detail=f"unknown tool: {tool!r}",
         )
+    # messages[] is the stateless OpenAI-compatible path (see
+    # coordinator/openai_compat.py) — chat-only, since image/search/tts
+    # don't take a chat-style history.
+    if req.messages and tool != "chat":
+        raise HTTPException(
+            status_code=400,
+            detail="messages[] is only supported for tool=\"chat\"",
+        )
     # search_mode is validated here so a typo from the UI fails fast
     # instead of leaking through to the agent (which would silently
     # default to "fast"). Only checked when the caller actually
@@ -2025,6 +2064,13 @@ def generate(req: GenerateRequest, request: Request):
                 req_model = model_registry.DEFAULT_IMAGE_MODEL if tool == "image" else None
         else:
             req_model = req.model
+    elif req.messages:
+        # Stateless OpenAI-compatible path (coordinator/openai_compat.py):
+        # no conversation row to rebuild history from — the external
+        # caller manages its own history and resends the full array each
+        # call, so pass it straight through to the worker envelope.
+        worker_messages = req.messages
+        req_model = req.model
     else:
         req_model = req.model
 
@@ -2679,6 +2725,15 @@ def result(job_id: str, request: Request):
         "audio_chunks": audio_chunks_list,
         "done": status in ("complete", "error"),
     }
+
+
+# Self-serve API keys + the OpenAI-compatible chat surface. Registered
+# here (rather than up with notifications/uploads) because openai_compat
+# needs generate()/result() already defined — same closure-over-db
+# reasoning as those two, extended to inject generate/result themselves
+# so openai_compat.py never has to import anything from this module.
+app.include_router(api_keys.build_router(db))
+app.include_router(openai_compat.build_router(db, generate, result, model_registry))
 
 
 # ---------- image serving ----------
@@ -4294,7 +4349,7 @@ def update_machine_schedule(
         if not AUTH_ENABLED:
             return {"ok": True}
         raise HTTPException(status_code=401, detail="unauthorized")
-    token_hash = db.resolve_machine_token_hash(member.member_id, machine_id)
+    token_hash = db.resolve_member_token_hash(member.member_id, machine_id, kind="agent")
     if token_hash is None:
         raise HTTPException(status_code=404, detail="machine not found")
     if req.enabled:
@@ -4434,16 +4489,17 @@ def unpair_my_machine(prefix: str, request: Request):
         if not AUTH_ENABLED:
             return {"deleted": False}
         raise HTTPException(status_code=401, detail="unauthorized")
-    # Lookup the full hash by scanning the caller's own tokens.
-    # member_tokens for a single member is tiny (one row per paired
-    # PC), so this is cheap.
-    rows = db.list_member_tokens(member.member_id)
+    # Lookup the full hash by scanning the caller's own machine tokens
+    # (kind="agent" — never matches a self-serve API key row). A single
+    # member's machine count is tiny (one row per paired PC), so this
+    # is cheap.
+    rows = db.list_member_tokens(member.member_id, kind="agent")
     target = next((r["token_hash"] for r in rows if r["token_hash"].startswith(prefix)), None)
     if target is None:
         # 404 leaks no info — the prefix just doesn't match anything
         # in the caller's scope, whether or not it exists elsewhere.
         raise HTTPException(status_code=404, detail="machine not found")
-    deleted = db.delete_member_token(member.member_id, target)
+    deleted = db.delete_member_token(member.member_id, target, kind="agent")
     return {"deleted": deleted}
 
 
