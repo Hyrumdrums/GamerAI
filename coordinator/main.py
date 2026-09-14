@@ -86,8 +86,6 @@ from coordinator.tiers import (
 from shared.models import (
     GenerateRequest,
     GenerateResponse,
-    JobCancelRequest,
-    JobDisplayedRequest,
 )
 
 
@@ -1697,120 +1695,6 @@ app.include_router(openai_compat.build_router(db, generate, result, model_regist
 
 
 app.include_router(routes_images.build_router(db))
-
-
-# ---------- worker lifecycle ----------
-@app.post("/jobs/cancel")
-def cancel_job(req: JobCancelRequest, request: Request):
-    """Member-initiated cancellation. The worker (if still processing)
-    discovers the cancellation when its /jobs/complete returns 410 —
-    we don't have a worker-side push channel, so the contract is "the
-    worker's eventual result is dropped on the floor."
-
-    Idempotent: cancelling an already-terminal job is a 200 no-op so
-    a double-click from a flaky network can't 404 the second click."""
-    row = db.get_job(req.job_id)
-    if row is None:
-        raise HTTPException(status_code=404, detail="job not found")
-
-    # Ownership: the submitter (or admin) can cancel. Auth-off mode
-    # permits everything (dev/test) — same shape as the conversation
-    # owner check.
-    if AUTH_ENABLED:
-        member = getattr(request.state, "member", None)
-        if member is None:
-            raise HTTPException(status_code=401, detail="unauthorized")
-        submitted_by = (
-            row["submitted_by_member_id"]
-            if "submitted_by_member_id" in row.keys() else None
-        )
-        if (
-            submitted_by is not None
-            and submitted_by != member.member_id
-            and member.role != "admin"
-        ):
-            raise HTTPException(status_code=404, detail="job not found")
-
-    # Idempotency: already terminal → no-op. We do this AFTER the
-    # ownership check so a guess at someone else's job_id still gets
-    # 404, not "already complete."
-    current_status = row["status"]
-    if current_status in ("complete", "error", "cancelled"):
-        return {"ok": True, "already_terminal": True, "status": current_status}
-
-    now = time.time()
-    user_message = "Cancelled by you."
-    payload = {
-        "job_id": req.job_id,
-        "status": "cancelled",
-        "worker_id": row["worker_id"],
-        "model": row["model"],
-        "text": user_message,
-        "prompt_tokens": 0,
-        "completion_tokens": 0,
-        "earnings": 0.0,
-        "duration_seconds": 0.0,
-        "error": "cancelled",
-    }
-    r.hset(JOB_RESULTS, req.job_id, json.dumps(payload))
-    # Remove JOB_PROCESSING so the worker's eventual /complete sees no
-    # active claim and returns 410. Also blow away any stale partials.
-    r.hdel(JOB_PROCESSING, req.job_id)
-    r.hdel(JOB_PARTIALS, req.job_id)
-    r.delete(f"{JOB_AUDIO_CHUNKS}:{req.job_id}")
-    db.mark_job_complete(
-        job_id=req.job_id,
-        worker_id=row["worker_id"] or "",
-        model=row["model"] or "",
-        text=user_message,
-        prompt_tokens=0,
-        completion_tokens=0,
-        earnings=0.0,
-        duration_seconds=0.0,
-        completed_at=now,
-        status="cancelled",
-        error="cancelled by user",
-    )
-    msg = db.get_message_by_job(req.job_id)
-    if msg is not None:
-        db.finalize_message(
-            message_id=msg["message_id"],
-            text=user_message,
-            status="error",
-        )
-    log.info(
-        "job cancelled",
-        extra={"event": "job_cancelled", "job_id": req.job_id},
-    )
-    return {"ok": True, "status": "cancelled"}
-
-
-@app.post("/jobs/displayed")
-def displayed(req: JobDisplayedRequest, request: Request):
-    """Client signals it rendered the final text. Closes the end-to-end
-    timing trail (submitted_at → started_at → first_partial_at →
-    completed_at → client_displayed_at) on the jobs row. Ownership-
-    gated like /jobs/cancel; idempotent so a duplicate POST from a
-    queue replay can't move the first-display moment."""
-    row = db.get_job(req.job_id)
-    if row is None:
-        raise HTTPException(status_code=404, detail="job not found")
-    if AUTH_ENABLED:
-        member = getattr(request.state, "member", None)
-        if member is None:
-            raise HTTPException(status_code=401, detail="unauthorized")
-        submitted_by = (
-            row["submitted_by_member_id"]
-            if "submitted_by_member_id" in row.keys() else None
-        )
-        if (
-            submitted_by is not None
-            and submitted_by != member.member_id
-            and member.role != "admin"
-        ):
-            raise HTTPException(status_code=404, detail="job not found")
-    db.mark_job_displayed(req.job_id, float(req.displayed_at_ms) / 1000.0)
-    return {"ok": True}
 
 
 _workers_router, _schedule_payload, _require_worker_owner, _verify_claim_or_410 = (
