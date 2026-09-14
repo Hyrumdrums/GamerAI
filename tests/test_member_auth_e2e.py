@@ -48,6 +48,7 @@ coordinator.redis_client.get_client = lambda: _FAKE  # type: ignore[assignment]
 from fastapi.testclient import TestClient  # noqa: E402
 
 from coordinator import admin as coordinator_admin  # noqa: E402
+from coordinator import email_send  # noqa: E402
 from coordinator import main as coordinator_main  # noqa: E402
 from coordinator import member_auth  # noqa: E402
 
@@ -1434,9 +1435,9 @@ class SignupEmailVerificationTests(unittest.TestCase):
         )
         self.assertEqual(generate.status_code, 200)
 
-    @mock.patch.object(coordinator_main.email_send, "send_verification_email",
+    @mock.patch.object(email_send, "send_verification_email",
                         return_value=True)
-    @mock.patch.object(coordinator_main.email_send, "is_configured",
+    @mock.patch.object(email_send, "is_configured",
                         return_value=True)
     def test_signup_gates_generate_until_verified(self, _is_cfg, _send):
         resp = self.client.post("/signup", json=_signup_payload())
@@ -1468,9 +1469,9 @@ class SignupEmailVerificationTests(unittest.TestCase):
         reused = self.client.get(f"/verify-email?code={code}")
         self.assertEqual(reused.status_code, 400)
 
-    @mock.patch.object(coordinator_main.email_send, "send_verification_email",
+    @mock.patch.object(email_send, "send_verification_email",
                         return_value=True)
-    @mock.patch.object(coordinator_main.email_send, "is_configured",
+    @mock.patch.object(email_send, "is_configured",
                         return_value=True)
     def test_verify_link_is_an_absolute_url(self, _is_cfg, send_mock):
         # PUBLIC_BASE_URL is unset in this test env, so the link must
@@ -1491,9 +1492,9 @@ class SignupEmailVerificationTests(unittest.TestCase):
         resp = self.client.get("/verify-email?code=not-a-real-code")
         self.assertEqual(resp.status_code, 400)
 
-    @mock.patch.object(coordinator_main.email_send, "send_verification_email",
+    @mock.patch.object(email_send, "send_verification_email",
                         return_value=True)
-    @mock.patch.object(coordinator_main.email_send, "is_configured",
+    @mock.patch.object(email_send, "is_configured",
                         return_value=True)
     def test_resend_verification_rejects_already_verified_member(self, _c, _s):
         resp = self.client.post(
@@ -1502,9 +1503,9 @@ class SignupEmailVerificationTests(unittest.TestCase):
         )
         self.assertEqual(resp.status_code, 400)
 
-    @mock.patch.object(coordinator_main.email_send, "send_verification_email",
+    @mock.patch.object(email_send, "send_verification_email",
                         return_value=True)
-    @mock.patch.object(coordinator_main.email_send, "is_configured",
+    @mock.patch.object(email_send, "is_configured",
                         return_value=True)
     def test_resend_verification_issues_a_new_working_code(self, _c, _s):
         signup = self.client.post("/signup", json=_signup_payload()).json()

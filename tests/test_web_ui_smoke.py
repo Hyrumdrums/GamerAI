@@ -41,8 +41,10 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from client import web as client_web  # noqa: E402
 from client.services import coordinator_client as _coord_client  # noqa: E402
+from coordinator import email_send  # noqa: E402
 from coordinator import main as coordinator_main  # noqa: E402
 from coordinator import member_auth  # noqa: E402
+from coordinator import routes_account as coordinator_routes_account  # noqa: E402
 
 ADMIN_TOKEN = os.environ["API_TOKEN"]
 
@@ -309,9 +311,9 @@ class WebUISmokeTests(unittest.TestCase):
             resp.cookies[client_web.SESSION_COOKIE].startswith("gai_")
         )
 
-    @mock.patch.object(coordinator_main.email_send, "send_verification_email",
+    @mock.patch.object(email_send, "send_verification_email",
                         return_value=True)
-    @mock.patch.object(coordinator_main.email_send, "is_configured",
+    @mock.patch.object(email_send, "is_configured",
                         return_value=True)
     def test_signup_lands_on_account_with_flash_when_unverified(self, _c, _s):
         self.web.cookies.clear()
@@ -362,9 +364,9 @@ class WebUISmokeTests(unittest.TestCase):
     # ------------------------------------------------------------------
     # account page email verification (status badge + resend button)
     # ------------------------------------------------------------------
-    @mock.patch.object(coordinator_main.email_send, "send_verification_email",
+    @mock.patch.object(email_send, "send_verification_email",
                         return_value=True)
-    @mock.patch.object(coordinator_main.email_send, "is_configured",
+    @mock.patch.object(email_send, "is_configured",
                         return_value=True)
     def test_account_page_shows_unverified_badge_and_resend_button(self, _c, _s):
         self.web.cookies.clear()
@@ -384,9 +386,9 @@ class WebUISmokeTests(unittest.TestCase):
         self.assertIn("not verified", resp.text)
         self.assertIn("Resend verification email", resp.text)
 
-    @mock.patch.object(coordinator_main.email_send, "send_verification_email",
+    @mock.patch.object(email_send, "send_verification_email",
                         return_value=True)
-    @mock.patch.object(coordinator_main.email_send, "is_configured",
+    @mock.patch.object(email_send, "is_configured",
                         return_value=True)
     def test_account_resend_verification_sends_a_new_email(self, _c, _s):
         self.web.cookies.clear()
@@ -517,7 +519,7 @@ class WebUISmokeTests(unittest.TestCase):
         # than the generic "didn't match", so a locked-out user isn't told
         # their password is wrong.
         self.web.cookies.clear()  # anonymous
-        with mock.patch.object(coordinator_main, "LOGIN_FAIL_MAX", 2):
+        with mock.patch.object(coordinator_routes_account, "LOGIN_FAIL_MAX", 2):
             for _ in range(2):
                 r = self.web.post(
                     "/login",
@@ -897,9 +899,9 @@ class WebUISmokeTests(unittest.TestCase):
     # ------------------------------------------------------------------
     # admin "Email delivery test" card
     # ------------------------------------------------------------------
-    @mock.patch.object(coordinator_main.email_send, "send_test_email",
+    @mock.patch.object(email_send, "send_test_email",
                         return_value=(True, ""))
-    @mock.patch.object(coordinator_main.email_send, "is_configured",
+    @mock.patch.object(email_send, "is_configured",
                         return_value=True)
     def test_admin_test_email_success_shows_confirmation(self, _c, _s):
         resp = self.web.post(

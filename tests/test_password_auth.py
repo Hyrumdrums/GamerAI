@@ -35,6 +35,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 from coordinator import admin as coordinator_admin  # noqa: E402
 from coordinator import main as coordinator_main  # noqa: E402
 from coordinator import member_auth  # noqa: E402
+from coordinator import routes_account as coordinator_routes_account  # noqa: E402
 
 ADMIN_TOKEN = os.environ["API_TOKEN"]
 
@@ -510,7 +511,7 @@ class LoginThrottleTests(unittest.TestCase):
 
     def test_locks_after_max_failures_even_with_correct_password(self):
         self._set_creds("throttleme", "correct-horse-battery")
-        with mock.patch.object(coordinator_main, "LOGIN_FAIL_MAX", 3):
+        with mock.patch.object(coordinator_routes_account, "LOGIN_FAIL_MAX", 3):
             for _ in range(3):
                 r = self.client.post(
                     "/login",
@@ -528,7 +529,7 @@ class LoginThrottleTests(unittest.TestCase):
 
     def test_successful_login_resets_the_counter(self):
         self._set_creds("resetme", "correct-horse-battery")
-        with mock.patch.object(coordinator_main, "LOGIN_FAIL_MAX", 3):
+        with mock.patch.object(coordinator_routes_account, "LOGIN_FAIL_MAX", 3):
             for _ in range(2):  # under the cap
                 self.client.post(
                     "/login",
@@ -551,7 +552,7 @@ class LoginThrottleTests(unittest.TestCase):
         # Varying case must not mint a fresh counter (the username lookup
         # is case-insensitive, so the throttle key is lowercased too).
         self._set_creds("MixedThrottle", "correct-horse-battery")
-        with mock.patch.object(coordinator_main, "LOGIN_FAIL_MAX", 2):
+        with mock.patch.object(coordinator_routes_account, "LOGIN_FAIL_MAX", 2):
             self.client.post(
                 "/login", json={"username": "mixedthrottle", "password": "x"},
             )
@@ -568,7 +569,7 @@ class LoginThrottleTests(unittest.TestCase):
     def test_unknown_username_also_throttles(self):
         # 429 fires for a nonexistent account too, so throttle behavior
         # doesn't reveal which usernames exist.
-        with mock.patch.object(coordinator_main, "LOGIN_FAIL_MAX", 2):
+        with mock.patch.object(coordinator_routes_account, "LOGIN_FAIL_MAX", 2):
             for _ in range(2):
                 r = self.client.post(
                     "/login", json={"username": "ghost-user", "password": "x"},

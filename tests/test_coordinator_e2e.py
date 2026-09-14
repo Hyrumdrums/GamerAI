@@ -62,6 +62,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 from coordinator import main as coordinator_main  # noqa: E402
 from coordinator import member_auth  # noqa: E402
 from coordinator import model_registry  # noqa: E402
+from coordinator import routes_account as coordinator_routes_account  # noqa: E402
 from coordinator.scheduler import Reaper  # noqa: E402
 
 
@@ -1376,10 +1377,10 @@ class SignupTests(unittest.TestCase):
         # safe (and necessary, since signups persist to SQLite, not
         # the per-test-flushed fake Redis) to reset it here.
         self.db._conn.execute("DELETE FROM members")
-        self._orig_max = coordinator_main.SIGNUP_MAX_PER_IP
+        self._orig_max = coordinator_routes_account.SIGNUP_MAX_PER_IP
 
     def tearDown(self):
-        coordinator_main.SIGNUP_MAX_PER_IP = self._orig_max
+        coordinator_routes_account.SIGNUP_MAX_PER_IP = self._orig_max
 
     def test_signup_creates_a_working_account(self):
         resp = self.client.post("/signup", json=_signup_payload())
@@ -1436,7 +1437,7 @@ class SignupTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 409)
 
     def test_throttle_blocks_after_max_signups_from_one_ip(self):
-        coordinator_main.SIGNUP_MAX_PER_IP = 2
+        coordinator_routes_account.SIGNUP_MAX_PER_IP = 2
         self.client.post("/signup", json=_signup_payload(
             username="capuser1", email="cap1@example.com"))
         self.client.post("/signup", json=_signup_payload(
@@ -1447,7 +1448,7 @@ class SignupTests(unittest.TestCase):
 
     def test_throttle_does_not_count_failed_attempts(self):
         # A rejected (bad ToS) attempt shouldn't burn a real user's quota.
-        coordinator_main.SIGNUP_MAX_PER_IP = 1
+        coordinator_routes_account.SIGNUP_MAX_PER_IP = 1
         rejected = self.client.post(
             "/signup", json=_signup_payload(tos_accepted=False),
         )
