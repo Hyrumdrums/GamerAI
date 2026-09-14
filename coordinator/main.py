@@ -37,6 +37,7 @@ from coordinator.image_params import (
 )
 from coordinator import member_auth, model_registry, notifications
 from coordinator import openai_compat
+from coordinator import routes_misc
 from coordinator import schedule as machine_schedule
 from coordinator import uploads as uploads_lib
 from coordinator.canaries import CanaryInjector
@@ -5385,60 +5386,7 @@ def admin_test_email(req: TestEmailRequest, request: Request):
     return {"sent": True, "to": to}
 
 
-@app.get("/models")
-def models():
-    """Catalog of models the coordinator knows about. See coordinator/model_registry.py."""
-    return {
-        "strict": STRICT_MODELS,
-        "models": [m.to_dict() for m in model_registry.list_all()],
-    }
-
-
-@app.get("/earnings")
-def earnings(request: Request):
-    _require_admin(request)
-    rows = db.list_earnings()
-    workers_list = [
-        {
-            "worker_id": row["worker_id"],
-            "total_tokens": int(row["total_tokens"]),
-            "total_jobs": int(row["total_jobs"]),
-            "total_usd": round(float(row["total_usd"]), 8),
-        }
-        for row in rows
-    ]
-    return {
-        "workers": workers_list,
-        "total_usd": round(sum(w["total_usd"] for w in workers_list), 8),
-    }
-
-
-@app.get("/earnings/{worker_id}")
-def earnings_for(worker_id: str, request: Request):
-    _require_admin(request)
-    row = db.earnings_for(worker_id)
-    if row is None:
-        return {"worker_id": worker_id, "total_tokens": 0, "total_usd": 0.0}
-    return {
-        "worker_id": row["worker_id"],
-        "total_tokens": int(row["total_tokens"]),
-        "total_usd": round(float(row["total_usd"]), 8),
-    }
-
-
-@app.get("/metrics")
-def metrics(request: Request):
-    _require_admin(request)
-    m = db.metrics()
-    m["queue_depth"] = r.llen(JOB_QUEUE)
-    m["processing"] = r.hlen(JOB_PROCESSING)
-    now = time.time()
-    workers_rows = db.list_workers()
-    m["active_workers"] = sum(
-        1 for w in workers_rows if (now - float(w["last_seen"] or 0)) < WORKER_TIMEOUT_SECONDS
-    )
-    m["registered_workers"] = len(workers_rows)
-    return m
+app.include_router(routes_misc.build_router(db, r, require_admin_fn=_require_admin))
 
 
 # ---------- agent pairing (browser handoff) ----------
