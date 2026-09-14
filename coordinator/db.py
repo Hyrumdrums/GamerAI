@@ -8,6 +8,9 @@ from typing import Optional
 
 from shared.config import DB_PATH
 
+from coordinator.db_mixins.metrics import MetricsMixin
+from coordinator.db_mixins.uploads import UploadsMixin
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
     job_id TEXT PRIMARY KEY,
@@ -309,7 +312,7 @@ def _utc_day(ts: float) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
 
 
-class DB:
+class DB(MetricsMixin, UploadsMixin):
     def __init__(self, path: str = DB_PATH):
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         self._conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
@@ -2270,43 +2273,6 @@ class DB:
             )
             return cur.fetchone()
 
-    # ---------- uploads ----------
-    def insert_upload(
-        self,
-        upload_id: str,
-        conversation_id: str,
-        member_id: Optional[str],
-        filename: str,
-        content_type: Optional[str],
-        extracted_text: str,
-        truncated: bool,
-        created_at: Optional[float] = None,
-    ) -> None:
-        now = created_at if created_at is not None else time.time()
-        with self._lock:
-            self._conn.execute(
-                "INSERT INTO uploads "
-                "(upload_id, conversation_id, member_id, filename, "
-                "content_type, extracted_text, char_count, truncated, "
-                "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    upload_id, conversation_id, member_id, filename,
-                    content_type, extracted_text, len(extracted_text),
-                    1 if truncated else 0, now,
-                ),
-            )
-
-    def list_uploads(self, conversation_id: str) -> list[sqlite3.Row]:
-        """Oldest-first — callers that want a recency-first read (e.g.
-        the fence-budget builder) reverse this themselves."""
-        with self._lock:
-            cur = self._conn.execute(
-                "SELECT * FROM uploads WHERE conversation_id=? "
-                "ORDER BY created_at ASC",
-                (conversation_id,),
-            )
-            return cur.fetchall()
-
     # ---------- canaries ----------
     def create_canary(
         self,
@@ -2559,29 +2525,3 @@ class DB:
             ).fetchall()
         return {r["category"]: bool(r["enabled"]) for r in rows}
 
-    # ---------- metrics ----------
-    def metrics(self) -> dict:
-        with self._lock:
-            cur = self._conn.execute(
-                "SELECT "
-                "COUNT(*) AS total, "
-                "SUM(CASE WHEN status='complete' THEN 1 ELSE 0 END) AS completed, "
-                "SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) AS failed, "
-                "SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending, "
-                "SUM(CASE WHEN status='running' THEN 1 ELSE 0 END) AS running, "
-                "AVG(CASE WHEN status='complete' THEN duration_seconds END) AS avg_latency, "
-                "COALESCE(SUM(completion_tokens), 0) AS tokens, "
-                "COALESCE(SUM(earnings), 0) AS paid "
-                "FROM jobs"
-            )
-            row = cur.fetchone()
-        return {
-            "total_jobs": row["total"] or 0,
-            "completed_jobs": row["completed"] or 0,
-            "failed_jobs": row["failed"] or 0,
-            "pending_jobs": row["pending"] or 0,
-            "running_jobs": row["running"] or 0,
-            "avg_latency_seconds": round(row["avg_latency"], 4) if row["avg_latency"] else 0.0,
-            "tokens_processed": int(row["tokens"] or 0),
-            "total_paid_usd": round(float(row["paid"] or 0), 8),
-        }
