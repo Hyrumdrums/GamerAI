@@ -8,6 +8,7 @@ from typing import Optional
 
 from shared.config import DB_PATH
 
+from coordinator.db_mixins.canaries import CanariesMixin
 from coordinator.db_mixins.metrics import MetricsMixin
 from coordinator.db_mixins.uploads import UploadsMixin
 
@@ -312,7 +313,7 @@ def _utc_day(ts: float) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
 
 
-class DB(MetricsMixin, UploadsMixin):
+class DB(CanariesMixin, MetricsMixin, UploadsMixin):
     def __init__(self, path: str = DB_PATH):
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         self._conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
@@ -2272,81 +2273,6 @@ class DB(MetricsMixin, UploadsMixin):
                 (job_id,),
             )
             return cur.fetchone()
-
-    # ---------- canaries ----------
-    def create_canary(
-        self,
-        canary_id: str,
-        prompt: str,
-        required_tokens_json: str,
-        model: str,
-        active: bool = True,
-        created_at: Optional[float] = None,
-    ) -> None:
-        now = created_at if created_at is not None else time.time()
-        with self._lock:
-            self._conn.execute(
-                "INSERT INTO canaries "
-                "(canary_id, prompt, required_tokens, model, active, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (canary_id, prompt, required_tokens_json, model, 1 if active else 0, now),
-            )
-
-    def list_active_canaries(self) -> list[sqlite3.Row]:
-        with self._lock:
-            cur = self._conn.execute(
-                "SELECT * FROM canaries WHERE active=1 ORDER BY created_at"
-            )
-            return cur.fetchall()
-
-    def get_canary(self, canary_id: str) -> Optional[sqlite3.Row]:
-        with self._lock:
-            cur = self._conn.execute(
-                "SELECT * FROM canaries WHERE canary_id=?", (canary_id,)
-            )
-            return cur.fetchone()
-
-    def record_canary_result(
-        self,
-        result_id: str,
-        canary_id: str,
-        worker_id: Optional[str],
-        job_id: str,
-        response_text_snippet: Optional[str],
-        matched: bool,
-        created_at: Optional[float] = None,
-    ) -> None:
-        now = created_at if created_at is not None else time.time()
-        with self._lock:
-            self._conn.execute(
-                "INSERT INTO canary_results "
-                "(result_id, canary_id, worker_id, job_id, "
-                "response_text_snippet, matched, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (result_id, canary_id, worker_id, job_id,
-                 response_text_snippet, 1 if matched else 0, now),
-            )
-
-    def canary_score_for_worker(
-        self,
-        worker_id: str,
-        limit: int = 50,
-    ) -> dict:
-        """Per-worker canary pass rate over the last ``limit`` checks.
-        Returns ``{passed, total, score}`` where score is 0.0-1.0, or
-        None when the worker has no canary history yet."""
-        with self._lock:
-            cur = self._conn.execute(
-                "SELECT matched FROM canary_results WHERE worker_id=? "
-                "ORDER BY created_at DESC LIMIT ?",
-                (worker_id, limit),
-            )
-            rows = cur.fetchall()
-        if not rows:
-            return {"passed": 0, "total": 0, "score": None}
-        passed = sum(1 for r in rows if r["matched"])
-        total = len(rows)
-        return {"passed": passed, "total": total, "score": passed / total}
 
     # ---------- push subscriptions (Phase 6 — Web Push) ----------
     def upsert_push_subscription(
