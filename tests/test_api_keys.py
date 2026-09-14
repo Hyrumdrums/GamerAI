@@ -116,7 +116,10 @@ class ApiKeysTestBase(unittest.TestCase):
         )
         self.assertEqual(resp.status_code, 200, resp.text)
 
-    def _complete_next_chat_job_soon(self, worker_id: str, text: str = "hi there", delay: float = 0.05) -> None:
+    def _complete_next_chat_job_soon(
+        self, worker_id: str, text: str = "hi there", delay: float = 0.05,
+        status: str = "complete", error: str | None = None,
+    ) -> None:
         """Background thread: shortly after the caller starts a blocking
         or streaming /v1/chat/completions call, pop the job a mock worker
         would see and complete it — same shape test_coordinator_e2e.py
@@ -142,7 +145,8 @@ class ApiKeysTestBase(unittest.TestCase):
                     "prompt_tokens": 5,
                     "completion_tokens": 7,
                     "duration_seconds": 0.1,
-                    "status": "complete",
+                    "status": status,
+                    "error": error,
                 },
                 headers=admin_headers,
             )
@@ -210,6 +214,20 @@ class ApiKeyLifecycleTests(ApiKeysTestBase):
         # Still authenticates — the cross-member revoke was a no-op.
         key_headers = {"Authorization": f"Bearer {created['api_key']}"}
         self.assertEqual(self.client.get("/me", headers=key_headers).status_code, 200)
+
+    def test_eleventh_key_hits_the_per_member_cap(self):
+        _, headers = self._make_member()
+        for i in range(10):
+            self._mint_api_key(headers, label=f"key {i}")
+
+        resp = self.client.post("/me/api-keys", json={"label": "one too many"}, headers=headers)
+        self.assertEqual(resp.status_code, 429, resp.text)
+
+        # Revoking one frees up a slot — the cap is a live count, not a
+        # lifetime count.
+        listed = self.client.get("/me/api-keys", headers=headers).json()["api_keys"]
+        self.client.post(f"/me/api-keys/{listed[0]['id']}/revoke", headers=headers)
+        self._mint_api_key(headers, label="fits now")
 
 
 class ScopeEnforcementTests(ApiKeysTestBase):
@@ -375,6 +393,98 @@ class OpenAICompatTests(ApiKeysTestBase):
         # A couple of known non-chat models must never appear here.
         ids = {entry["id"] for entry in body["data"]}
         self.assertNotIn("dreamshaperXL-lightning", ids)
+
+
+class OpenAICompatErrorTests(ApiKeysTestBase):
+    """Error/edge paths through /v1/chat/completions that the happy-path
+    tests in OpenAICompatTests don't exercise."""
+
+    def _key_headers(self) -> dict:
+        _, headers = self._make_member()
+        created = self._mint_api_key(headers)
+        return {"Authorization": f"Bearer {created['api_key']}"}
+
+    def test_no_user_message_returns_openai_400(self):
+        key_headers = self._key_headers()
+        resp = self.client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "llama3.2:3b",
+                "messages": [{"role": "system", "content": "you are terse"}],
+            },
+            headers=key_headers,
+        )
+        self.assertEqual(resp.status_code, 400, resp.text)
+        body = resp.json()
+        self.assertEqual(body["error"]["type"], "invalid_request_error")
+        self.assertEqual(body["error"]["code"], 400)
+
+    def test_generate_fn_http_exception_passthrough(self):
+        # generate()'s model/tool cross-check (main.py's model-kind guard)
+        # raises a plain HTTPException(400) — unrelated to REQUIRE_LIVE_WORKER
+        # (off by default in tests) — when a non-chat model is submitted on
+        # the chat-only messages[] path. openai_compat must translate that
+        # into an OpenAI-shaped error rather than leaking a raw 500.
+        key_headers = self._key_headers()
+        resp = self.client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "dreamshaperXL-lightning",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            headers=key_headers,
+        )
+        self.assertEqual(resp.status_code, 400, resp.text)
+        body = resp.json()
+        self.assertEqual(body["error"]["type"], "invalid_request_error")
+        self.assertEqual(body["error"]["code"], 400)
+        self.assertIn("image model", body["error"]["message"])
+
+    def test_completion_timeout_returns_504(self):
+        key_headers = self._key_headers()
+        self._register_chat_worker("wkr-openai-timeout")
+        # Never complete the job — force the blocking poll loop to hit
+        # its deadline. Shrink the timeout so the test doesn't actually
+        # wait out the module's normal 5s test-wide setting.
+        original_timeout = openai_compat.V1_CHAT_TIMEOUT_SECONDS
+        openai_compat.V1_CHAT_TIMEOUT_SECONDS = 0.3
+        try:
+            resp = self.client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "llama3.2:3b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": False,
+                },
+                headers=key_headers,
+            )
+        finally:
+            openai_compat.V1_CHAT_TIMEOUT_SECONDS = original_timeout
+        self.assertEqual(resp.status_code, 504, resp.text)
+        body = resp.json()
+        self.assertEqual(body["error"]["type"], "timeout")
+        self.assertEqual(body["error"]["code"], 504)
+
+    def test_upstream_job_error_returns_502(self):
+        key_headers = self._key_headers()
+        self._register_chat_worker("wkr-openai-error")
+        self._complete_next_chat_job_soon(
+            "wkr-openai-error", status="error", error="worker blew up",
+        )
+        resp = self.client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "llama3.2:3b",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": False,
+            },
+            headers=key_headers,
+        )
+        self.assertEqual(resp.status_code, 502, resp.text)
+        body = resp.json()
+        self.assertEqual(body["error"]["type"], "upstream_error")
+        self.assertEqual(body["error"]["code"], 502)
+        self.assertIn("worker blew up", body["error"]["message"])
 
 
 if __name__ == "__main__":
