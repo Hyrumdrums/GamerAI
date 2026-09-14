@@ -45,10 +45,16 @@ class _BaseE2E(unittest.TestCase):
         from fastapi.testclient import TestClient
 
         from coordinator import main as coord_main
+        from coordinator import prompt_rewrite as coord_prompt_rewrite
 
         coord_main.r = fakeredis.FakeRedis(decode_responses=True)
         cls.r = coord_main.r
         cls.coord_main = coord_main
+        # _clean_rewritten_prompt / _build_rewrite_meta_prompt /
+        # _clean_rewritten_search_query live in coordinator.prompt_rewrite
+        # now (main.py only re-exports the names generate()/`/jobs/complete`
+        # still call directly) — read them off their owning module.
+        cls.coord_prompt_rewrite = coord_prompt_rewrite
         cls.db = coord_main.db
         coord_main.ensure_admin_seed()
         cls.client = TestClient(coord_main.app)
@@ -1193,13 +1199,14 @@ class ImagePromptRewriteTests(_BaseE2E):
 class RewriteHelperUnitTests(_BaseE2E):
     """Unit-level tests for the rewrite helpers, in isolation from the
     /generate + /jobs/complete plumbing. Lives alongside the
-    integration tests because the helpers live in coordinator.main."""
+    integration tests even though the helpers live in
+    coordinator.prompt_rewrite now, not coordinator.main."""
 
     def test_clean_preserves_multi_sentence_output(self):
         # sd.cpp does fine with multi-sentence prompts; the cleaner
         # used to truncate to the first line and threw away the rich
         # description the intent-aware meta-prompt now asks for.
-        clean = self.coord_main._clean_rewritten_prompt
+        clean = self.coord_prompt_rewrite._clean_rewritten_prompt
         raw = (
             "A standard-sized can of corn with a brown and tan label.\n"
             "The label reads Green Giant in bold lettering.\n"
@@ -1211,19 +1218,19 @@ class RewriteHelperUnitTests(_BaseE2E):
         self.assertIn("store shelf", out)
 
     def test_clean_strips_echoed_headers(self):
-        clean = self.coord_main._clean_rewritten_prompt
+        clean = self.coord_prompt_rewrite._clean_rewritten_prompt
         for header in ("PROMPT:", "FINAL PROMPT:", "Image:", "Rewritten:"):
             out = clean(f"{header} a red apple", fallback="orig")
             self.assertEqual(out, "a red apple", f"header={header!r}")
 
     def test_clean_strips_wrapping_quotes(self):
-        clean = self.coord_main._clean_rewritten_prompt
+        clean = self.coord_prompt_rewrite._clean_rewritten_prompt
         self.assertEqual(
             clean('"a red apple"', fallback="orig"), "a red apple",
         )
 
     def test_clean_falls_back_on_empty_or_oversized(self):
-        clean = self.coord_main._clean_rewritten_prompt
+        clean = self.coord_prompt_rewrite._clean_rewritten_prompt
         self.assertEqual(clean("", "orig"), "orig")
         self.assertEqual(clean(None, "orig"), "orig")
         # Over 500 chars → fall back rather than ship a runaway
@@ -1234,7 +1241,7 @@ class RewriteHelperUnitTests(_BaseE2E):
         # The meta-prompt has to teach a 1-3B model how to interpret
         # follow-ups; the worked examples are the load-bearing part.
         # Smoke-check that the four intent rules survive future edits.
-        build = self.coord_main._build_rewrite_meta_prompt
+        build = self.coord_prompt_rewrite._build_rewrite_meta_prompt
         prompt = build("User: hi\nAssistant: hi", "yes")
         lower = prompt.lower()
         self.assertIn("yes", lower)         # rule 1: agreement
@@ -1805,7 +1812,7 @@ class SearchQueryCleanerUnitTests(_BaseE2E):
     (search queries are short by nature; multi-line is wrong)."""
 
     def test_strips_quotes_and_headers(self):
-        clean = self.coord_main._clean_rewritten_search_query
+        clean = self.coord_prompt_rewrite._clean_rewritten_search_query
         self.assertEqual(clean('"recent news today"', "orig"), "recent news today")
         self.assertEqual(clean("QUERY: SVB collapse 2023", "orig"), "SVB collapse 2023")
         self.assertEqual(clean("Search: latest iPhone", "orig"), "latest iPhone")
@@ -1815,7 +1822,7 @@ class SearchQueryCleanerUnitTests(_BaseE2E):
         # rich prompts; DDG does NOT — extra words are hard
         # requirements. Multi-line model output is the rewriter
         # rambling; take the first line and drop the rest.
-        clean = self.coord_main._clean_rewritten_search_query
+        clean = self.coord_prompt_rewrite._clean_rewritten_search_query
         raw = (
             "recent news today\n"
             "Also you might want to search for...\n"
@@ -1824,7 +1831,7 @@ class SearchQueryCleanerUnitTests(_BaseE2E):
         self.assertEqual(clean(raw, "orig"), "recent news today")
 
     def test_falls_back_on_empty_or_oversized(self):
-        clean = self.coord_main._clean_rewritten_search_query
+        clean = self.coord_prompt_rewrite._clean_rewritten_search_query
         self.assertEqual(clean("", "orig"), "orig")
         self.assertEqual(clean(None, "orig"), "orig")
         # 200-char cap — anything longer is the model writing prose.
