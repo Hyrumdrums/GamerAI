@@ -46,6 +46,7 @@ class _BaseE2E(unittest.TestCase):
 
         from coordinator import main as coord_main
         from coordinator import prompt_rewrite as coord_prompt_rewrite
+        from coordinator import routes_generate as coord_routes_generate
 
         coord_main.r = fakeredis.FakeRedis(decode_responses=True)
         cls.r = coord_main.r
@@ -55,6 +56,9 @@ class _BaseE2E(unittest.TestCase):
         # now (main.py only re-exports the names generate()/`/jobs/complete`
         # still call directly) — read them off their owning module.
         cls.coord_prompt_rewrite = coord_prompt_rewrite
+        # _build_chat_messages / _build_chat_messages_with_info /
+        # _estimate_history_tokens live in coordinator.routes_generate now.
+        cls.coord_routes_generate = coord_routes_generate
         cls.db = coord_main.db
         coord_main.ensure_admin_seed()
         cls.client = TestClient(coord_main.app)
@@ -217,7 +221,7 @@ class ConversationCrudTests(_BaseE2E):
         # messages, no jobs, no PNG, no Redis residue. The "obese cow"
         # incident is the motivating scenario.
         import os
-        from coordinator.main import IMAGE_DIR
+        from coordinator.image_moderation import IMAGE_DIR
         _, t = self._make_member(email="purge@x.com")
         conv = self.client.post(
             "/conversations", json={}, headers={"Authorization": f"Bearer {t}"},
@@ -471,7 +475,7 @@ class ChatMessagesBuilderTests(_BaseE2E):
     transcript that the model would echo back at us."""
 
     def test_builds_role_tagged_messages(self):
-        _build_chat_messages = self.coord_main._build_chat_messages
+        _build_chat_messages = self.coord_routes_generate._build_chat_messages
         prior = [
             {"role": "user", "text": "hi", "status": "complete"},
             {"role": "assistant", "text": "hello!", "status": "complete"},
@@ -491,7 +495,7 @@ class ChatMessagesBuilderTests(_BaseE2E):
         # row in the history. It must NOT appear in the messages array
         # we send to the model, or we'd inject a blank assistant turn
         # mid-conversation.
-        _build_chat_messages = self.coord_main._build_chat_messages
+        _build_chat_messages = self.coord_routes_generate._build_chat_messages
         prior = [
             {"role": "user", "text": "first", "status": "complete"},
             {"role": "assistant", "text": "", "status": "pending"},
@@ -515,7 +519,7 @@ class ChatMessagesBuilderTests(_BaseE2E):
         # back the old [1] claim, I must have been wrong"). The fix
         # is to scrub citation markers from prior assistant content
         # before handing the history to ANY model.
-        _build_chat_messages = self.coord_main._build_chat_messages
+        _build_chat_messages = self.coord_routes_generate._build_chat_messages
         prior = [
             {"role": "user", "text": "Kevin O'Leary Utah data center",
              "status": "complete"},
@@ -539,7 +543,7 @@ class ChatMessagesBuilderTests(_BaseE2E):
         # numbers in a user message (e.g. quoting a research paper)
         # should survive unchanged. Only assistant turns produce
         # citation markers we need to defuse.
-        _build_chat_messages = self.coord_main._build_chat_messages
+        _build_chat_messages = self.coord_routes_generate._build_chat_messages
         prior = [
             {"role": "user",
              "text": "from the abstract: 'we found [1] that LLMs ...'",

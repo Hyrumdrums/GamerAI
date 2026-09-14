@@ -42,6 +42,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 from client import web as client_web  # noqa: E402
 from client.services import coordinator_client as _coord_client  # noqa: E402
 from coordinator import email_send  # noqa: E402
+from coordinator.image_moderation import IMAGE_DIR  # noqa: E402
 from coordinator import main as coordinator_main  # noqa: E402
 from coordinator import member_auth  # noqa: E402
 from coordinator import routes_account as coordinator_routes_account  # noqa: E402
@@ -1054,7 +1055,7 @@ class WebUISmokeTests(unittest.TestCase):
         # should tell the browser to keep a fetched copy indefinitely.
         job_id = "webui_test_cacheimg"
         png_bytes = b"fake-png-bytes-for-cache-header-test"
-        (coordinator_main.IMAGE_DIR / f"{job_id}.png").write_bytes(png_bytes)
+        (IMAGE_DIR / f"{job_id}.png").write_bytes(png_bytes)
         resp = self.web.get(f"/api/images/{job_id}.png")
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(

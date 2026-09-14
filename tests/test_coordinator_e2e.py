@@ -63,6 +63,7 @@ from coordinator import main as coordinator_main  # noqa: E402
 from coordinator import member_auth  # noqa: E402
 from coordinator import model_registry  # noqa: E402
 from coordinator import routes_account as coordinator_routes_account  # noqa: E402
+from coordinator import routes_generate as coordinator_routes_generate  # noqa: E402
 from coordinator import routes_workers as coordinator_routes_workers  # noqa: E402
 from coordinator.scheduler import Reaper  # noqa: E402
 
@@ -710,7 +711,7 @@ class ImageGenerationTests(unittest.TestCase):
         # least one surface has it.
         image_path = result.get("image_path")
         if not image_path:
-            from coordinator.main import IMAGE_DIR
+            from coordinator.image_moderation import IMAGE_DIR
             self.assertTrue((IMAGE_DIR / f"{job_id}.png").exists())
 
     def test_image_complete_rejects_non_png(self):
@@ -1215,23 +1216,23 @@ class PromptSizeLimitTests(unittest.TestCase):
         cls.client = TestClient(coordinator_main.app)
 
     def setUp(self):
-        self._orig = coordinator_main.MAX_PROMPT_BYTES
+        self._orig = coordinator_routes_generate.MAX_PROMPT_BYTES
 
     def tearDown(self):
-        coordinator_main.MAX_PROMPT_BYTES = self._orig
+        coordinator_routes_generate.MAX_PROMPT_BYTES = self._orig
 
     def test_disabled_by_default_accepts_any_size(self):
-        self.assertEqual(coordinator_main.MAX_PROMPT_BYTES, 0)
+        self.assertEqual(coordinator_routes_generate.MAX_PROMPT_BYTES, 0)
         resp = self.client.post("/generate", json={"prompt": "x" * 5000})
         self.assertEqual(resp.status_code, 200, resp.text)
 
     def test_under_cap_accepted(self):
-        coordinator_main.MAX_PROMPT_BYTES = 100
+        coordinator_routes_generate.MAX_PROMPT_BYTES = 100
         resp = self.client.post("/generate", json={"prompt": "hello"})
         self.assertEqual(resp.status_code, 200, resp.text)
 
     def test_over_cap_rejected_with_413(self):
-        coordinator_main.MAX_PROMPT_BYTES = 100
+        coordinator_routes_generate.MAX_PROMPT_BYTES = 100
         resp = self.client.post("/generate", json={"prompt": "x" * 101})
         self.assertEqual(resp.status_code, 413, resp.text)
         self.assertIn("MAX_PROMPT_BYTES", resp.json()["detail"])
@@ -1240,7 +1241,7 @@ class PromptSizeLimitTests(unittest.TestCase):
         # Multi-byte characters should count by encoded size, not by
         # Python string length, so the cap can't be undercounted with
         # non-ASCII input.
-        coordinator_main.MAX_PROMPT_BYTES = 10
+        coordinator_routes_generate.MAX_PROMPT_BYTES = 10
         # "e"-acute is 1 char but 2 UTF-8 bytes: 6 chars == 6 (would
         # pass a char-length check) but 12 bytes (fails a 10-byte cap).
         resp = self.client.post("/generate", json={"prompt": "é" * 6})
