@@ -47,6 +47,24 @@
   {% endif %}
 
   <section class="card">
+    <h2>Connect it</h2>
+    <p class="muted">
+      Works with anything that speaks the OpenAI API — Home Assistant's
+      "OpenAI Conversation" integration, Open WebUI's connection settings,
+      a script, whatever. If you'd rather not click through the setup
+      screens yourself, copy the block below and hand it to your AI
+      agent of choice with "set this up for me" — it has everything a
+      coding agent needs: the base URL, the endpoints, and the gotchas
+      (quota limits, what the key can't do, why responses are sometimes
+      slower than a paid API).
+    </p>
+    <pre class="agent-spec" id="agent-spec" data-key="{{ created_key or '' }}"></pre>
+    <button class="copy-spec" type="button" data-target="agent-spec">
+      Copy spec for your AI agent
+    </button>
+  </section>
+
+  <section class="card">
     <h2>Create a key</h2>
     <form method="POST" action="/api-keys" class="create-key-form">
       <input type="text" name="label" placeholder="Label (optional), e.g. home assistant" maxlength="80">

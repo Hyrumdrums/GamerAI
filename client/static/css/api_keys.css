@@ -42,3 +42,31 @@
 }
 
 .create-key-form input[type="text"] { flex: 1 1 220px; }
+
+.agent-spec {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: .8rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: var(--code-bg, #f4f4f4);
+  border: 1px solid var(--border, #ddd);
+  border-radius: 6px;
+  padding: .75rem;
+  margin: .5rem 0;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+/* Copy-* buttons share one look regardless of what they copy. */
+button.copy-value,
+button.copy-spec {
+  background: transparent;
+  color: var(--brand);
+  border: 1px solid var(--border, #ccc);
+  padding: .2rem .5rem; font-size: .85rem; cursor: pointer;
+}
+button.copy-value:hover,
+button.copy-spec:hover {
+  background: var(--surface, #f3f3f3);
+}
