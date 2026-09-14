@@ -10,7 +10,7 @@ the [agent](https://ai.dallinlayton.com/download/), which is also how you
 join: running it *is* signing up, no invite code required.
 
 <p align="center">
-  <img src="docs/images/demo-page.png" alt="The no-install /demo chat page" width="620">
+  <img src="docs/images/mobile-chat.png" alt="The GamerAI chat UI on mobile — image generation, web search, and smart mode toggles alongside the composer" width="300">
 </p>
 
 This is a real, running distributed system, not a demo repo: a FastAPI
