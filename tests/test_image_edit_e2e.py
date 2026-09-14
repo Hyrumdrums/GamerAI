@@ -58,11 +58,17 @@ class _BaseE2E(unittest.TestCase):
         import fakeredis
         from fastapi.testclient import TestClient
 
+        from coordinator import image_moderation as coord_image_moderation
         from coordinator import main as coord_main
 
         coord_main.r = fakeredis.FakeRedis(decode_responses=True)
         cls.r = coord_main.r
         cls.coord_main = coord_main
+        # MAX_IMAGE_BYTES / _classify_image_or_raise live in
+        # coordinator.image_moderation now (main.py just imports
+        # _validate_and_classify_init_image from there) — patch/read
+        # them on their owning module, not the re-exporting one.
+        cls.coord_image_moderation = coord_image_moderation
         cls.db = coord_main.db
         coord_main.ensure_admin_seed()
         cls.client = TestClient(coord_main.app)
@@ -203,8 +209,8 @@ class ImageEditGenerateTests(_BaseE2E):
 
     def test_oversized_init_image_rejected(self):
         self._register_image_worker()
-        old = self.coord_main.MAX_IMAGE_BYTES
-        self.coord_main.MAX_IMAGE_BYTES = 32
+        old = self.coord_image_moderation.MAX_IMAGE_BYTES
+        self.coord_image_moderation.MAX_IMAGE_BYTES = 32
         try:
             _, t = self._make_member(email="ie7@x.com")
             r = self.client.post(
@@ -218,7 +224,7 @@ class ImageEditGenerateTests(_BaseE2E):
             self.assertEqual(r.status_code, 413)
             self.assertEqual(self.r.llen("job_queue:image"), 0)
         finally:
-            self.coord_main.MAX_IMAGE_BYTES = old
+            self.coord_image_moderation.MAX_IMAGE_BYTES = old
 
     def test_nsfw_rejection_wiring(self):
         """Not testing NudeNet's real detection — mocking the
@@ -228,8 +234,8 @@ class ImageEditGenerateTests(_BaseE2E):
         self._register_image_worker()
         _, t = self._make_member(email="ie8@x.com")
         with mock.patch.object(
-            self.coord_main, "_classify_image_or_raise",
-            side_effect=self.coord_main._NSFWFilteredError("blocked"),
+            self.coord_image_moderation, "_classify_image_or_raise",
+            side_effect=self.coord_image_moderation._NSFWFilteredError("blocked"),
         ):
             r = self.client.post(
                 "/generate",
