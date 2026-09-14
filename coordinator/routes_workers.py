@@ -1,26 +1,31 @@
 """Worker lifecycle: registration, heartbeat, job long-poll/claim/abandon/
-partial (and, in a later commit of this same god-file split,
-/jobs/complete + /jobs/cancel + /jobs/displayed). ``db`` is closed over
-directly; ``r`` as ``get_r`` (a zero-arg getter — see
-coordinator/prompt_rewrite.py for why); ``write_heartbeat_fn`` /
-``job_row_to_envelope_fn`` because ``_write_heartbeat`` /
-``_job_row_to_envelope`` still live in coordinator/main.py's shared
-worker-status-helpers / not-yet-extracted generate() sections.
+partial/complete (and, in a later commit of this same god-file split,
+/jobs/cancel + /jobs/displayed). ``db`` is closed over directly; ``r``
+as ``get_r`` (a zero-arg getter — see coordinator/prompt_rewrite.py for
+why); ``write_heartbeat_fn`` / ``job_row_to_envelope_fn`` /
+``dispatch_image_after_rewrite_fn`` / ``dispatch_search_after_rewrite_fn``
+because ``_write_heartbeat`` / ``_job_row_to_envelope`` still live in
+coordinator/main.py's shared worker-status-helpers / not-yet-extracted
+generate() sections, and the two rewrite-dispatch callables are
+coordinator/main.py-local names bound from
+``coordinator.prompt_rewrite.build_rewrite_helpers(...)``'s own return
+tuple — not directly importable from prompt_rewrite.py itself.
 
 ``build_router`` returns ``(router, schedule_payload_fn,
 require_worker_owner_fn, verify_claim_or_410_fn)`` rather than a bare
 router: ``coordinator/routes_observability.py``'s
 ``update_machine_schedule`` needs the same ``_schedule_payload`` this
 module's own ``heartbeat``/``next_job`` handlers call, and main.py's
-not-yet-extracted ``/jobs/complete`` still calls ``_require_worker_owner``
-and ``_verify_claim_or_410`` as bare names — all three get handed back
-for main.py to bind, same shape as ``coordinator/openai_compat.py``
+not-yet-extracted ``/jobs/cancel``/``/jobs/displayed`` still call
+``_require_worker_owner`` as a bare name — all get handed back for
+main.py to bind, same shape as ``coordinator/openai_compat.py``
 receiving ``generate``/``result`` from the (still main.py-local)
 generate()/result() pair. main.py wires it once:
 
     _workers_router, _schedule_payload, _require_worker_owner, _verify_claim_or_410 = (
         routes_workers.build_router(
             db, lambda: r, _write_heartbeat, _job_row_to_envelope,
+            _dispatch_image_after_rewrite, _dispatch_search_after_rewrite,
         )
     )
     app.include_router(_workers_router)
@@ -39,23 +44,36 @@ from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request
 
-from coordinator import events, member_auth, model_registry
+from coordinator import canaries as canary_lib
+from coordinator import events, member_auth, model_registry, notifications
 from coordinator import schedule as machine_schedule
+from coordinator.image_moderation import _save_image_or_raise
+from coordinator.image_params import image_cost_multiplier
 from shared.auth import AUTH_ENABLED
 from shared.config import (
+    CANARY_PENDING,
+    IMAGE_REWRITE_PENDING,
+    IMAGE_UNIT_COST_BASE,
     JOB_AUDIO_CHUNKS,
     JOB_PARTIALS,
     JOB_PROCESSING,
     JOB_RESULTS,
     JOB_TIMEOUT_SECONDS,
+    RATE_PER_TOKEN,
+    SEARCH_AUTO_DISABLED,
+    SEARCH_REWRITE_PENDING,
+    SUMMARY_PENDING,
     WORKER_CAPABILITIES,
+    WORKER_EARNINGS,
     WORKER_REGISTRY,
+    WORKER_SHARE,
     WORKER_STATUS,
     job_queue_for,
 )
 from shared.models import (
     HeartbeatRequest,
     JobClaimRequest,
+    JobCompleteRequest,
     JobNextRequest,
     JobPartialRequest,
     WorkerIdent,
@@ -86,7 +104,10 @@ DOWNTIME_HEARTBEAT_SECONDS = 300
 MAX_LONGPOLL_SECONDS = 30.0
 
 
-def build_router(db, get_r, write_heartbeat_fn, job_row_to_envelope_fn):
+def build_router(
+    db, get_r, write_heartbeat_fn, job_row_to_envelope_fn,
+    dispatch_image_after_rewrite_fn, dispatch_search_after_rewrite_fn,
+):
     router = APIRouter()
 
     def _schedule_payload(token_hash: Optional[str]) -> dict:
@@ -559,5 +580,553 @@ def build_router(db, get_r, write_heartbeat_fn, job_row_to_envelope_fn):
         if msg is not None:
             db.update_message_partial(msg["message_id"], text)
         return {"ok": True}
+
+    @router.post("/jobs/complete")
+    def complete(req: JobCompleteRequest, request: Request):
+        """Worker submits result. Coordinator writes Redis result, earnings, SQLite row."""
+        r = get_r()
+        _require_worker_owner(request, req.worker_id)
+        # Canaries are issued straight into JOB_PROCESSING but the canary
+        # path predates claim tokens — skip the gate for those so the
+        # canary scheduler doesn't have to thread a token through. Real
+        # jobs always carry one.
+        canary_id = r.hget(CANARY_PENDING, req.job_id)
+        if canary_id is None:
+            # 410 here propagates back to the worker so it knows the
+            # result isn't being accepted — agent code interprets this
+            # as "lost the race / cancelled" and skips local earnings
+            # credit.
+            _verify_claim_or_410(req.job_id, req.worker_id, req.claim_token)
+        now = time.time()
+        tokens = int(req.completion_tokens or 0)
+
+        # Canary check: if this job_id was injected as a canary, divert to
+        # the verification path and skip earnings + usage rollup. The worker
+        # is told "ok" the same way as a real job — we don't surface canary
+        # status, because doing so would let a malicious worker special-case
+        # canary handling and pass every check.
+        if canary_id:
+            canary_row = db.get_canary(canary_id)
+            matched = (
+                req.status == "complete"
+                and canary_row is not None
+                and canary_lib.verify_response(canary_row, req.text or "")
+            )
+            snippet = (req.text or "")[:500]
+            db.record_canary_result(
+                result_id="cr_" + uuid.uuid4().hex[:12],
+                canary_id=canary_id,
+                worker_id=req.worker_id,
+                job_id=req.job_id,
+                response_text_snippet=snippet,
+                matched=matched,
+            )
+            db.mark_job_complete(
+                job_id=req.job_id,
+                worker_id=req.worker_id,
+                model=req.model,
+                text=req.text,
+                prompt_tokens=req.prompt_tokens,
+                completion_tokens=tokens,
+                earnings=0.0,
+                duration_seconds=req.duration_seconds,
+                completed_at=now,
+                status="canary_complete" if matched else "canary_failed",
+                error=req.error,
+            )
+            r.hdel(CANARY_PENDING, req.job_id)
+            r.hdel(JOB_PROCESSING, req.job_id)
+            r.hset(WORKER_STATUS, req.worker_id, "idle")
+            log.info(
+                "canary verified" if matched else "canary failed",
+                extra={
+                    "event": "canary_matched" if matched else "canary_mismatch",
+                    "job_id": req.job_id,
+                    "worker_id": req.worker_id,
+                    "canary_id": canary_id,
+                },
+            )
+            return {"ok": True, "earnings": 0.0}
+
+        # Image-prompt rewrite: this completion is a hidden chat job whose
+        # only purpose is to produce a context-aware rewrite of a queued
+        # image job's prompt. Dispatching happens BEFORE the rest of the
+        # complete flow runs, so the image lands on the image queue at the
+        # earliest moment after the rewrite text is available. The rewrite
+        # job itself then falls through to the normal chat-completion path
+        # so the worker gets paid for its compute (it really did inference
+        # work) and the rewrite job's ledger row is recorded normally.
+        rewrite_link_raw = r.hget(IMAGE_REWRITE_PENDING, req.job_id)
+        if rewrite_link_raw:
+            try:
+                link = json.loads(rewrite_link_raw)
+            except json.JSONDecodeError:
+                link = None
+            if link:
+                rewritten = req.text if req.status == "complete" else None
+                try:
+                    dispatch_image_after_rewrite_fn(req.job_id, link, rewritten)
+                except Exception as exc:
+                    log.warning(
+                        "image-rewrite dispatch failed; falling back to raw prompt",
+                        extra={
+                            "event": "rewrite_dispatch_failed",
+                            "rewrite_job_id": req.job_id,
+                            "error": str(exc),
+                        },
+                    )
+                    # Best-effort recovery: push the image envelope with
+                    # the original prompt so the user still gets SOMETHING
+                    # rather than a stuck pending bubble.
+                    try:
+                        fallback_env = link.get("image_envelope") or {}
+                        fallback_env["prompt"] = link.get("original_prompt", "")
+                        image_job_id = link.get("image_job_id")
+                        if image_job_id:
+                            db.set_job_pending_with_prompt(
+                                image_job_id, fallback_env["prompt"],
+                            )
+                        r.rpush(job_queue_for("image"), json.dumps(fallback_env))
+                    except Exception:
+                        pass
+                    r.hdel(IMAGE_REWRITE_PENDING, req.job_id)
+
+        # Same pattern as the image-rewrite handler above but for the
+        # search-query rewrite pipeline. Linkage lives in a separate hash
+        # so we don't have to inspect the original job's tool field to
+        # pick the right dispatcher.
+        search_rewrite_link_raw = r.hget(SEARCH_REWRITE_PENDING, req.job_id)
+        if search_rewrite_link_raw:
+            try:
+                srlink = json.loads(search_rewrite_link_raw)
+            except json.JSONDecodeError:
+                srlink = None
+            if srlink:
+                rewritten = req.text if req.status == "complete" else None
+                try:
+                    dispatch_search_after_rewrite_fn(req.job_id, srlink, rewritten)
+                except Exception as exc:
+                    log.warning(
+                        "search-rewrite dispatch failed; falling back to raw query",
+                        extra={
+                            "event": "search_rewrite_dispatch_failed",
+                            "rewrite_job_id": req.job_id,
+                            "error": str(exc),
+                        },
+                    )
+                    # Best-effort recovery: push the search envelope with
+                    # the original query so the user still gets SOMETHING
+                    # rather than a stuck pending bubble.
+                    try:
+                        fallback_env = srlink.get("search_envelope") or {}
+                        fallback_env["prompt"] = srlink.get("original_prompt", "")
+                        search_job_id = srlink.get("search_job_id")
+                        if search_job_id:
+                            db.set_job_pending_with_prompt(
+                                search_job_id, fallback_env["prompt"],
+                            )
+                        r.rpush(job_queue_for("search"), json.dumps(fallback_env))
+                    except Exception:
+                        pass
+                    r.hdel(SEARCH_REWRITE_PENDING, req.job_id)
+
+        # Conversation-summary linkage. Same shape as the rewrite paths
+        # above: if this job_id is mapped in SUMMARY_PENDING, persist the
+        # produced text as the conversation's summary, then fall through
+        # to the normal complete flow so the worker is paid and the job
+        # row is marked. The job is orphan (no conversation_id on it) so
+        # no message-row writes happen downstream.
+        summary_link_raw = r.hget(SUMMARY_PENDING, req.job_id)
+        if summary_link_raw:
+            try:
+                slink = json.loads(summary_link_raw)
+            except json.JSONDecodeError:
+                slink = None
+            clean_text = (req.text or "").strip()
+            if slink and req.status == "complete" and clean_text:
+                try:
+                    db.set_conversation_summary(
+                        slink["conversation_id"],
+                        clean_text,
+                        int(slink["through_seq"]),
+                    )
+                    log.info(
+                        "summary stored",
+                        extra={
+                            "event": "summary_stored",
+                            "conversation_id": slink["conversation_id"],
+                            "through_seq": slink["through_seq"],
+                            "job_id": req.job_id,
+                            "chars": len(clean_text),
+                        },
+                    )
+                except Exception as e:
+                    log.warning(
+                        "summary store failed: %s", e,
+                        extra={
+                            "event": "summary_store_failed",
+                            "job_id": req.job_id,
+                        },
+                    )
+            elif slink:
+                # Distinguishes "agent returned empty text" (prompt-shape bug,
+                # model refusal, etc.) from "agent failed loudly". Without
+                # this log, an empty-text summary just silently drops on the
+                # floor and the client's spinner spins forever.
+                log.warning(
+                    "summary job returned empty/non-complete result — skipping store",
+                    extra={
+                        "event": "summary_empty_result",
+                        "job_id": req.job_id,
+                        "conversation_id": slink["conversation_id"],
+                        "status": req.status,
+                        "chars": len(clean_text),
+                    },
+                )
+            r.hdel(SUMMARY_PENDING, req.job_id)
+
+        # Look up the original job row so we can branch image vs. chat
+        # before touching earnings + storage.
+        pre_complete_row = db.get_job(req.job_id)
+        pre_complete_tool = (
+            pre_complete_row["tool"]
+            if pre_complete_row is not None and "tool" in pre_complete_row.keys()
+            else "chat"
+        )
+
+        # Image jobs: decode + store the PNG, set image_path. Earnings are
+        # currently chat-token-priced; per-image pricing ships with the
+        # paid-customer slice (Phase 3b.ii). For MVP image earnings are
+        # flat-rated as if the job produced ~200 tokens of work — gives the
+        # contributor a non-zero credit without standing up a whole new
+        # pricing table.
+        image_path: Optional[str] = None
+        image_save_error: Optional[str] = None
+        image_width: int = 0
+        image_height: int = 0
+        if pre_complete_tool == "image" and req.status == "complete":
+            try:
+                image_path, image_width, image_height = _save_image_or_raise(
+                    req.job_id, req.image_b64,
+                )
+            except HTTPException:
+                # Re-raise — the worker sent malformed bytes; surface a 400.
+                raise
+            except Exception as e:
+                image_save_error = str(e)
+                log.warning(
+                    "image save failed",
+                    extra={
+                        "event": "image_save_failed",
+                        "job_id": req.job_id,
+                        "worker_id": req.worker_id,
+                    },
+                )
+
+        earnings = round(tokens * RATE_PER_TOKEN * WORKER_SHARE, 10) if req.status == "complete" else 0.0
+        if (
+            pre_complete_tool == "image"
+            and req.status == "complete"
+            and image_save_error is None
+        ):
+            # Flat-rate image earnings: treat each image as the rough work
+            # equivalent of a 200-token chat completion. Replaced by per-
+            # image pricing in Phase 3b.ii.
+            earnings = round(200 * RATE_PER_TOKEN * WORKER_SHARE, 10)
+        if pre_complete_tool == "tts" and req.status == "complete":
+            # TTS earnings model: pay per-second of audio produced rather
+            # than per-token, since the unit of work the contributor is
+            # selling is "audio you can listen to" not "tokens you can
+            # read." 50 token-equivalents per audio-second lands a 5-second
+            # sentence at the same payout as a 250-token chat completion,
+            # which roughly matches the GPU-vs-CPU work delta (Piper is
+            # cheap, so under-priced vs chat is correct). Tuned in
+            # Phase 2 once per-second TTS demand data exists; tracked in
+            # project_open_strategy_questions § 6.
+            audio_secs = float(req.audio_seconds or 0.0)
+            earnings = round(
+                audio_secs * 50.0 * RATE_PER_TOKEN * WORKER_SHARE, 10,
+            )
+
+        payload = {
+            "job_id": req.job_id,
+            "status": req.status if image_save_error is None else "error",
+            "worker_id": req.worker_id,
+            "model": req.model,
+            "text": req.text,
+            "prompt_tokens": req.prompt_tokens,
+            "completion_tokens": tokens,
+            "earnings": earnings,
+            "duration_seconds": req.duration_seconds,
+            "error": image_save_error or req.error,
+        }
+        if image_path:
+            payload["image_path"] = image_path
+        if pre_complete_tool == "tts" and req.audio_b64:
+            # Ephemeral — never written to disk. Client reads it off
+            # /result/{job_id}, plays it, drops it. Saves a /audio/<name>
+            # round-trip per sentence, which matters for voice-mode latency.
+            payload["audio_b64"] = req.audio_b64
+            payload["audio_seconds"] = float(req.audio_seconds or 0.0)
+        if pre_complete_tool == "chat" and req.audio_chunks:
+            # Voice-mode chat: agent emitted N chunks during the LLM stream
+            # (exponential batching). The complete request carries the full
+            # ordered list so a client that reloaded the page after the
+            # job finished still gets every chunk. Sort by seq defensively;
+            # the agent emits in order but a future retry path or merge of
+            # late partials might not.
+            chunks = list(req.audio_chunks)
+            chunks.sort(key=lambda c: int(c.get("seq", 0)))
+            payload["audio_chunks"] = chunks
+        if req.sources:
+            # Render-only data: the polling client reads it from
+            # /result/{job_id} and shows it under the bubble. We don't
+            # persist sources to the jobs row — the DB-fallback path on
+            # /result loses them after JOB_RESULTS eviction, which is fine
+            # for a feature that's about "now I see the answer with its
+            # links" rather than long-term archive.
+            payload["sources"] = req.sources
+        # Reverse-detection signal. If the rewrite classifier rerouted
+        # this job from search → chat ("That's cool!"-style closure), the
+        # dispatcher set a marker in SEARCH_AUTO_DISABLED. Surface it on
+        # the result so the client auto-unchecks the sticky search box.
+        if r.hdel(SEARCH_AUTO_DISABLED, req.job_id):
+            payload["search_was_skipped"] = True
+        r.hset(JOB_RESULTS, req.job_id, json.dumps(payload))
+        r.hdel(JOB_PROCESSING, req.job_id)
+        r.hdel(JOB_PARTIALS, req.job_id)
+        r.delete(f"{JOB_AUDIO_CHUNKS}:{req.job_id}")
+        r.hset(WORKER_STATUS, req.worker_id, "idle")
+        db.mark_job_complete(
+            job_id=req.job_id,
+            worker_id=req.worker_id,
+            model=req.model,
+            text=req.text,
+            prompt_tokens=req.prompt_tokens,
+            completion_tokens=tokens,
+            earnings=earnings,
+            duration_seconds=req.duration_seconds,
+            completed_at=now,
+            status=req.status,
+            error=req.error,
+        )
+        job_row = db.get_job(req.job_id)
+        conv_id = (
+            job_row["conversation_id"]
+            if job_row is not None and "conversation_id" in job_row.keys()
+            else None
+        )
+        # Finalize the pending assistant message that was created at
+        # enqueue time. On success we write the final text + tokens; on
+        # error we write a short user-facing reason as the bubble text
+        # and flip status to 'error' so the client can render a retry
+        # button. The user turn is already in the table from enqueue, so
+        # we never insert it here.
+        if conv_id:
+            existing_msg = db.get_message_by_job(req.job_id)
+            if existing_msg is not None:
+                terminal_status = (
+                    "complete"
+                    if req.status == "complete" and image_save_error is None
+                    else "error"
+                )
+                if terminal_status == "complete":
+                    # For image jobs the body text is the original prompt
+                    # (we already stored that on the user message at enqueue
+                    # time); the bubble itself is rendered as <img> off
+                    # image_path. We persist the prompt as the assistant-
+                    # bubble text too so a no-CSS fallback still shows
+                    # something useful instead of an empty row.
+                    bubble_text = (
+                        f"[image: {existing_msg['text'] or req.text or ''}]"
+                        if pre_complete_tool == "image"
+                        else (req.text or "")
+                    )
+                    db.finalize_message(
+                        message_id=existing_msg["message_id"],
+                        text=bubble_text,
+                        status="complete",
+                        prompt_tokens=int(req.prompt_tokens or 0),
+                        completion_tokens=tokens,
+                        model=req.model,
+                        image_path=image_path,
+                    )
+                else:
+                    db.finalize_message(
+                        message_id=existing_msg["message_id"],
+                        text=(
+                            image_save_error or req.error or "Generation failed."
+                        )[:500],
+                        status="error",
+                        model=req.model,
+                    )
+            db.touch_conversation(conv_id, now)
+
+        # Credit on completion.
+        #
+        # Chat jobs credit by completion_tokens against both the worker
+        # earnings ledger (for payout) and the member usage ledger (for
+        # quota). Image jobs are independent: they credit IMAGE_UNIT_COST_BASE
+        # to a dedicated image_units column on member_usage (gated by
+        # daily_quota_images) and credit a small token-equivalent to the
+        # earnings ledger only — the per-image USD amount comes from
+        # ``earnings`` computed upstream. Pre-image-limits behavior was to
+        # fake a 200-token credit on the chat ledger; that conflated two
+        # resources and broke the token ledger as a chat-throughput
+        # signal. See business.md → "Dual-role accounting" for the model.
+        is_image_complete = (
+            pre_complete_tool == "image"
+            and req.status == "complete"
+            and image_save_error is None
+        )
+        is_tts_complete = (
+            pre_complete_tool == "tts"
+            and req.status == "complete"
+        )
+        is_chat_complete = (
+            req.status == "complete"
+            and not is_image_complete
+            and not is_tts_complete
+            and tokens > 0
+            and image_save_error is None
+        )
+        submitter = (
+            job_row["submitted_by_member_id"]
+            if job_row is not None and "submitted_by_member_id" in job_row.keys()
+            else None
+        )
+        earnings_token_credit = 0
+        if is_chat_complete:
+            db.add_earnings(req.worker_id, tokens, earnings)
+            earnings_token_credit = tokens
+            if submitter:
+                db.add_member_usage(
+                    submitter,
+                    now,
+                    tokens_in=int(req.prompt_tokens or 0),
+                    tokens_out=tokens,
+                )
+                # Voice-mode chat: the worker also produced TTS audio inline
+                # with the LLM stream. Bill the user's voice_minutes ledger
+                # for the sum of all chunks. Earnings for the TTS work
+                # itself stay with the chat job's per-token credit rather
+                # than re-priced as standalone TTS — separate ledger lines
+                # per chunk is more bookkeeping than we want until per-tool
+                # pricing lands (project_open_strategy_questions § 6).
+                voice_secs_total = 0.0
+                for c in (req.audio_chunks or []):
+                    voice_secs_total += float(c.get("audio_seconds") or 0.0)
+                if voice_secs_total > 0:
+                    db.add_member_voice_usage(
+                        submitter,
+                        now,
+                        seconds=voice_secs_total,
+                    )
+        elif is_image_complete:
+            # Earnings still posts USD for the image; the synthesized 200
+            # is preserved here ONLY as a tokens-equivalent so the
+            # earnings ledger's tokens column stays additive across both
+            # tools. The member-side quota uses image_units, not tokens.
+            earnings_token_credit = 200
+            db.add_earnings(req.worker_id, earnings_token_credit, earnings)
+            if submitter:
+                # Charge by rendered resolution, not a flat per-image rate:
+                # a 1024² image is ~4× the GPU work of a 512², and the
+                # multiplier (see image_cost_multiplier) tracks pixel area
+                # so the daily image quota measures actual cost. PNG dims
+                # come from the saved file's IHDR — the worker can't bias
+                # the bill by lying about width/height in the envelope.
+                units = IMAGE_UNIT_COST_BASE * image_cost_multiplier(
+                    image_width, image_height,
+                )
+                db.add_member_image_usage(
+                    submitter,
+                    now,
+                    units=units,
+                )
+        elif is_tts_complete:
+            # Voice charges by the audio's playback duration, not by the
+            # worker's wall-clock synthesis time — the user thinks in
+            # "minutes of voice consumed," not "compute spent." The audio
+            # length comes from the worker's audio_seconds (Piper reports
+            # frame count / sample rate), which the agent cannot inflate
+            # without producing a longer file: the audio_b64 we just stored
+            # is the ground-truth artifact a future audit could re-measure.
+            # The tokens-equivalent for the earnings ledger mirrors the
+            # earnings rate used above (50 token-equivalents / audio-second).
+            audio_secs = float(req.audio_seconds or 0.0)
+            earnings_token_credit = int(round(audio_secs * 50.0))
+            db.add_earnings(req.worker_id, earnings_token_credit, earnings)
+            if submitter:
+                db.add_member_voice_usage(
+                    submitter,
+                    now,
+                    seconds=audio_secs,
+                )
+        if is_chat_complete or is_image_complete or is_tts_complete:
+            # mirror to redis hash for backwards compat
+            existing = r.hget(WORKER_EARNINGS, req.worker_id)
+            if existing:
+                try:
+                    cur = json.loads(existing)
+                except json.JSONDecodeError:
+                    cur = {"earnings": 0.0, "jobs": 0, "tokens": 0}
+            else:
+                cur = {"earnings": 0.0, "jobs": 0, "tokens": 0}
+            cur["earnings"] = round(float(cur.get("earnings", 0)) + earnings, 10)
+            cur["jobs"] = int(cur.get("jobs", 0)) + 1
+            cur["tokens"] = int(cur.get("tokens", 0)) + earnings_token_credit
+            cur["worker_id"] = req.worker_id
+            r.hset(WORKER_EARNINGS, req.worker_id, json.dumps(cur))
+
+        # Phase 6: push notification on long-running tool completion. Chat
+        # is streamed live so the user is presumably watching; image and
+        # voice often run for many seconds and the user switches away.
+        # The notification deep-links back to "/" — chat.js auto-opens the
+        # most-recent conversation on load, which is the one that just
+        # completed. The delivery is best-effort: send_to_member persists
+        # the in-app row regardless of push success, respects per-member
+        # opt-out, and short-circuits to a no-op when VAPID isn't configured.
+        if submitter and req.status == "complete":
+            push_title = None
+            push_body = None
+            push_category = None
+            if is_image_complete:
+                push_category = notifications.CATEGORY_IMAGE_DONE
+                push_title = "Your image is ready"
+                push_body = "Tap to view it."
+            elif is_tts_complete:
+                push_category = notifications.CATEGORY_VOICE_DONE
+                push_title = "Your audio is ready"
+                push_body = "Tap to listen."
+            if push_category:
+                try:
+                    notifications.send_to_member(
+                        db, submitter, push_category,
+                        title=push_title, body=push_body,
+                        data={
+                            "url": "/",
+                            "conversation_id": conv_id,
+                            "job_id": req.job_id,
+                        },
+                    )
+                except Exception as e:
+                    # Never let a push-delivery hiccup fail /jobs/complete —
+                    # the worker already did its work and the caller
+                    # depends on a 200 to release its claim token.
+                    log.warning(
+                        "push send failed: %s",
+                        e, extra={"event": "push_send_failed"},
+                    )
+
+        log.info(
+            "job complete" if req.status == "complete" else "job error",
+            extra={
+                "event": "job_complete" if req.status == "complete" else "job_error",
+                "job_id": req.job_id,
+                "worker_id": req.worker_id,
+            },
+        )
+        return {"ok": True, "earnings": earnings}
 
     return router, _schedule_payload, _require_worker_owner, _verify_claim_or_410

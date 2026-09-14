@@ -494,19 +494,19 @@ class ImageCostMultiplierTests(unittest.TestCase):
     1×, a 513² image costs 2×)."""
 
     def test_small_bucket_at_and_below_512_squared(self):
-        from coordinator.main import image_cost_multiplier
+        from coordinator.image_params import image_cost_multiplier
         self.assertEqual(image_cost_multiplier(512, 512), 1.0)
         self.assertEqual(image_cost_multiplier(256, 256), 1.0)
         self.assertEqual(image_cost_multiplier(1, 1), 1.0)
 
     def test_medium_bucket_between_513_and_768_squared(self):
-        from coordinator.main import image_cost_multiplier
+        from coordinator.image_params import image_cost_multiplier
         # First step above the small boundary.
         self.assertEqual(image_cost_multiplier(513, 513), 2.0)
         self.assertEqual(image_cost_multiplier(768, 768), 2.0)
 
     def test_large_bucket_above_768_squared(self):
-        from coordinator.main import image_cost_multiplier
+        from coordinator.image_params import image_cost_multiplier
         self.assertEqual(image_cost_multiplier(769, 769), 4.0)
         self.assertEqual(image_cost_multiplier(1024, 1024), 4.0)
         self.assertEqual(image_cost_multiplier(1536, 1536), 4.0)
@@ -515,7 +515,7 @@ class ImageCostMultiplierTests(unittest.TestCase):
         # A worker output we couldn't parse (PNG too short, dims=0)
         # should bill 1× rather than 4× — better to undercount the
         # edge case than blindside a BRONZE user.
-        from coordinator.main import image_cost_multiplier
+        from coordinator.image_params import image_cost_multiplier
         self.assertEqual(image_cost_multiplier(0, 0), 1.0)
         self.assertEqual(image_cost_multiplier(-1, 1024), 1.0)
 
@@ -523,7 +523,7 @@ class ImageCostMultiplierTests(unittest.TestCase):
         # A 256x1024 image (262,144 px) is still small-bucket area
         # even though its long side is large. Confirms we're billing
         # by compute (area) and not by max-dim.
-        from coordinator.main import image_cost_multiplier
+        from coordinator.image_params import image_cost_multiplier
         self.assertEqual(image_cost_multiplier(256, 1024), 1.0)
 
 
