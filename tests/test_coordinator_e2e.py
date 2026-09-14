@@ -63,6 +63,7 @@ from coordinator import main as coordinator_main  # noqa: E402
 from coordinator import member_auth  # noqa: E402
 from coordinator import model_registry  # noqa: E402
 from coordinator import routes_account as coordinator_routes_account  # noqa: E402
+from coordinator import routes_workers as coordinator_routes_workers  # noqa: E402
 from coordinator.scheduler import Reaper  # noqa: E402
 
 
@@ -980,8 +981,7 @@ class ClaimTokenEnforcementTests(unittest.TestCase):
         # A worker requesting an absurdly long wait gets capped at
         # MAX_LONGPOLL_SECONDS rather than holding a coordinator
         # thread for hours.
-        from coordinator import main as coord_main
-        self.assertLessEqual(coord_main.MAX_LONGPOLL_SECONDS, 60.0)
+        self.assertLessEqual(coordinator_routes_workers.MAX_LONGPOLL_SECONDS, 60.0)
 
     def test_atomic_claim_complete_round_trip(self):
         # Happy path via the new atomic /jobs/next: the returned
