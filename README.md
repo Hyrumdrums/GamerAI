@@ -56,8 +56,8 @@ GamerAI is a **community-powered AI suite** running on a network of
 contributor gaming PCs. Three actors:
 
 - **Contributors** install a small agent and advertise the tools their
-  hardware can run (chat, image generation, eventually doc/code/voice).
-  When the machine is idle, the agent serves jobs from the network's
+  hardware can run (chat, image generation, web search, voice, eventually
+  doc/code). When the machine is idle, the agent serves jobs from the network's
   **shared queue** — anonymously from the contributor's POV. In return,
   contributors get tier-based access to the network's full AI suite for
   themselves and the people they invite. Tier (BRONZE → PLATINUM) is
@@ -85,14 +85,15 @@ for search) and credited to the contributor's ledger.
 
 | Status   | Tool          | Model class            | Why it fits a distributed network |
 | -------- | ------------- | ---------------------- | --------------------------------- |
-| **MVP, live** | Chat          | 7B–13B (currently 1B for VPS demo) | Independent jobs, latency-tolerant, low VRAM |
-| **New** | Smart-mode chat | 14B-class (Qwen2.5-14B Q4) split across two LAN-linked contributor machines via llama.cpp RPC | Pools VRAM no single contributor card has; slower, a capability class up — see [`docs/smart-mode.md`](docs/smart-mode.md) |
-| Next     | Web-augmented answers | small chat + search API | No GPU lift; centralized; biggest perceived-IQ bump for small models |
-| Next     | Image generation | SDXL-class (~8–12 GB VRAM) | Independent jobs, async-friendly, high demo wow |
+| **MVP, live** | Chat          | 7B–13B (currently 3B for the default fleet) | Independent jobs, latency-tolerant, low VRAM |
+| **MVP, live** | Smart-mode chat | 14B-class (Qwen2.5-14B Q4) split across two LAN-linked contributor machines via llama.cpp RPC | Pools VRAM no single contributor card has; slower, a capability class up — see [`docs/smart-mode.md`](docs/smart-mode.md) |
+| **MVP, live** | Web-augmented answers | worker-side DDG fetch + chat model summary | No new VRAM needed, but ships as its own worker capability (`tools=["search"]`), not automatic on every chat worker |
+| **MVP, live** | Image generation | SDXL-class (dreamshaperXL-lightning, ~6.5 GB VRAM) | Independent jobs, async-friendly, high demo wow |
+| **MVP, live** | Voice (read-aloud TTS) | Piper, CPU-only | Runs alongside chat on the same contributor's idle CPU; no batch/STT yet — see below |
 | Expansion | Document tools (summarize, rewrite, chunked analysis) | 7B–13B | High retention, same hardware envelope as chat |
 | Expansion | Coding assistant | 7B–13B | Frequent, small jobs, plays to the chat envelope |
 | Later    | Music generation (MusicGen) | varies | Async / queued; longer runtimes |
-| Later    | Voice (batch STT/TTS) | varies | Real-time voice deliberately out of scope |
+| Later    | Voice input (STT) | varies | Real-time voice deliberately out of scope |
 | Out of scope | Tightly-coupled multi-node, real-time low-latency, frontier training | — | Network constraints make these unwise |
 
 The principle behind the list: pick tools that are **independent, retryable,
@@ -131,6 +132,14 @@ Nothing in the architecture assumes a single host beyond the default
 `host.docker.internal` URL workers use to reach Ollama.
 
 ## 4. Architecture
+
+This diagram is the **local dev harness** you get from `docker compose up
+--build` — Python `worker` containers simulate contributor machines. In
+production the `worker` containers don't run at all; real contributors'
+Windows agents (`windows-agent/`) talk to the same coordinator over the
+public internet instead, polling `/jobs/next` and posting to
+`/jobs/complete` exactly like the simulator does (see § 14 Phase 2 for how
+that fleet is deployed).
 
 ```
                         ┌──────────────────────┐
@@ -486,8 +495,8 @@ curl -sSL https://raw.githubusercontent.com/Hyrumdrums/GamerAI/main/infra/bootst
   | sudo bash -s -- --domain coordinator.example.com --email you@example.com
 ```
 
-The script installs Docker, configures `ufw`, clones the repo, generates a
-`WORKER_TOKEN`, and brings up the stack with Caddy in front of it
+The script installs Docker, configures `ufw`, clones the repo, generates an
+`API_TOKEN`, and brings up the stack with Caddy in front of it
 (automatic Let's Encrypt TLS). Total time: ~10 minutes.
 
 See `infra/README.md` for the full runbook including auth-on procedure,
@@ -495,27 +504,56 @@ backups, and graduation criteria for moving to Terraform / AWS.
 
 ## 10. API
 
+The coordinator exposes ~65 routes total; this table curates the ones an
+external integrator actually needs. For everything else (invites,
+conversations, notifications, document uploads, agent pairing, machine
+management, admin) — the full list is one grep away:
+`grep -n '@app\.\|@router\.' coordinator/main.py coordinator/api_keys.py
+coordinator/openai_compat.py coordinator/notifications.py
+coordinator/uploads.py`.
+
+**Job lifecycle**
+
 | method | path                       | description                                           |
 | ------ | -------------------------- | ----------------------------------------------------- |
-| POST   | `/generate`                | `{prompt, model?}` → `{job_id}`. Optional `Idempotency-Key` header makes retries safe. |
+| POST   | `/generate`                | `{prompt, model?, tool?}` → `{job_id}`. `tool` is `chat` (default) / `image` / `search` / `tts`. Optional `Idempotency-Key` header makes retries safe. |
 | GET    | `/result/{job_id}`         | result JSON (status: `pending`/`running`/`complete`/`error`) |
-| GET    | `/workers`                 | list of workers + status, last_seen, totals, capabilities |
-| GET    | `/earnings`                | per-worker `{worker_id, total_tokens, total_usd}`    |
-| GET    | `/earnings/{worker_id}`    | single worker earnings record                         |
-| GET    | `/metrics`                 | totals, completed, avg latency, queue depth, etc.    |
+| GET    | `/images/{name}`           | serves a generated PNG                                |
 | GET    | `/models`                  | catalog of known models + strict-mode flag           |
-| POST   | `/register`                | worker self-registration; optional `capabilities` body (`vram_gb`, `gpu_model`, `tools[]`, `models[]`) |
-| POST   | `/heartbeat`               | worker liveness + status (`idle`/`busy`/`offline`)   |
-| POST   | `/jobs/claim`              | worker reports it has claimed a job                   |
-| POST   | `/jobs/complete`           | worker submits result; coordinator credits earnings   |
 | GET    | `/health`                  | redis ping                                            |
 
-> Multi-tool API (planned, see § 14 Phase 3). `/generate` will accept a
-> `job_type` field (`chat` | `image` | `search`) discriminating a typed
-> `params` block; legacy `{prompt, model}` payloads will still work as
-> implicit `job_type=chat`. Routing is via per-tool Redis queues
-> (`job_queue:chat`, `job_queue:image`, …) that workers subscribe to based
-> on their advertised `tools[]` capability.
+**OpenAI-compatible surface** (`coordinator/openai_compat.py`) — for any
+tool that already speaks the OpenAI API (Home Assistant, Open WebUI, the
+`openai` SDK directly), not just GamerAI's own web client:
+
+| method | path                       | description                                           |
+| ------ | -------------------------- | ----------------------------------------------------- |
+| POST   | `/v1/chat/completions`     | OpenAI-shaped chat completion; `stream: true` for SSE. Wraps `/generate` + `/result` internally — same quota/auth. |
+| GET    | `/v1/models`               | chat-kind models only, in OpenAI's `{"object":"list","data":[...]}` shape |
+
+**Membership** — `/login` and `/signup` are the public entry points;
+everything else below requires the `Authorization: Bearer <token>` they
+return, once `API_TOKEN` is set (see § 11):
+
+| method | path                       | description                                           |
+| ------ | -------------------------- | ----------------------------------------------------- |
+| POST   | `/login` / `/signup`       | username+password sign-in / invite-free account creation |
+| GET    | `/me`                      | identity, tier, quota, usage-today, earnings          |
+| POST   | `/me/api-keys`             | mint a self-serve API key (generation-scoped, `gai_api_…`) |
+| GET    | `/me/api-keys`             | list your keys (label, created/last-used — never the raw value) |
+| POST   | `/me/api-keys/{id}/revoke` | revoke one of your keys                                |
+
+**Worker/agent protocol** — the Windows agent's own long-poll loop; not
+meant for external callers:
+
+| method | path                       | description                                           |
+| ------ | -------------------------- | ----------------------------------------------------- |
+| POST   | `/register`                | worker self-registration; optional `capabilities` body (`vram_gb`, `gpu_model`, `tools[]`, `models[]`) |
+| POST   | `/heartbeat`               | worker liveness + status (`idle`/`busy`/`offline`)   |
+| POST   | `/jobs/next`               | long-poll claim of the next queued job for this worker's advertised tools |
+| POST   | `/jobs/complete`           | worker submits result; coordinator credits earnings   |
+| GET    | `/workers`                 | list of workers + status, last_seen, totals, capabilities |
+| GET    | `/earnings`, `/earnings/{worker_id}` | per-worker earnings                         |
 
 ## 11. Configuration
 
@@ -551,26 +589,39 @@ All services read from environment variables (see `shared/config.py`).
 
 ```
 .
-├── coordinator/           FastAPI app, SQLite, scheduler
-│   ├── main.py
+├── coordinator/           FastAPI app: job routing, membership/tier
+│   │                      engine, SQLite write-through, reaper
+│   ├── main.py              ~65 routes — auth middleware, /generate,
+│   │                        /result, invites, conversations, admin
+│   ├── api_keys.py          self-serve API keys (§ 14 Phase 2b)
+│   ├── openai_compat.py     OpenAI-compatible /v1/chat/completions, /v1/models
 │   ├── db.py
-│   ├── scheduler.py
-│   ├── redis_client.py
+│   ├── tier_engine.py       nightly BRONZE → PLATINUM promotion/demotion
+│   ├── model_registry.py
 │   ├── requirements.txt
 │   └── Dockerfile
-├── worker/                worker daemon (gamer simulation)
-│   ├── worker.py
-│   ├── requirements.txt
-│   └── Dockerfile
-├── client/                CLI + web UI
-│   ├── client.py          ← `python client/client.py "prompt"`
-│   ├── web.py             ← FastAPI web UI on :8080
+├── windows-agent/         the real contributor fleet — production
+│   │                      worker, not the local-dev simulator below;
+│   │                      self-updates via signed releases (§ 14 Phase 2a)
+│   └── agent.py
+├── worker/                local-dev worker simulator (gamer realism sim
+│                          — network delay, cold start, availability)
+├── client/                FastAPI web UI + installable PWA
+│   ├── app.py               route registration; see `client/routes/*`
+│   ├── routes/, services/, templates/, static/
+│   ├── client.py            ← `python client/client.py "prompt"` (CLI)
 │   ├── requirements.txt
 │   └── Dockerfile
 ├── shared/                shared schemas + config
 │   ├── config.py
 │   └── models.py
-├── infra/                 placeholder for future Terraform/CDK
+├── infra/                 VPS bootstrap + redeploy scripts, Caddyfile,
+│                          contributor download-mirror setup scripts
+├── docs/                  runbooks (`OPERATOR.md`), `project-gaps.md`,
+│                          `auth-design.md`, `smart-mode.md`, devlog
+├── tests/                 unittest suite — `python -m unittest discover tests`
+├── tools/                 dev-only helpers (`run_local.py` no-Docker
+│                          harness, `cchat.py` CLI chat client)
 ├── data/                  SQLite volume (gitignored)
 ├── docker-compose.yml
 └── README.md
@@ -590,7 +641,7 @@ All services read from environment variables (see `shared/config.py`).
 
 ## 14. Roadmap
 
-### Phase 1 — local MVP (current)
+### Phase 1 — local MVP (done)
 
 - [x] Coordinator + Redis + workers running locally
 - [x] SQLite write-through; per-job payout ledger
@@ -601,20 +652,21 @@ All services read from environment variables (see `shared/config.py`).
 
 ### Phase 2 — public deployment + real GPU nodes
 
-**Phase 2a — single-VPS MVP test (current)**
+**Phase 2a — single-VPS MVP test (done)**
 
 - [x] One-shot VPS bootstrap script (`infra/bootstrap.sh`)
 - [x] Caddy-fronted TLS via Let's Encrypt
 - [x] Production docker-compose overlay; internal services on localhost only
-- [x] `.env.prod` with generated `WORKER_TOKEN` (auth-ready, opt-in)
-- [ ] Bearer-auth wired through worker + Windows agent code
-- [ ] Real worker installer (one-line `curl | sh`, with auto-update)
-- [ ] Connect 3–5 real gamer machines and validate end-to-end loop
+- [x] `.env.prod` with generated `API_TOKEN` (auth-ready, opt-in)
+- [x] Bearer-auth wired through worker + Windows agent code
+- [x] Real worker installer with signed auto-update (Inno Setup installer, CI-built + SFTP-published on every push to `main`, Ed25519-signed self-update — not literally `curl | sh` since it targets Windows)
+- [x] Connect real gamer machines and validate end-to-end loop — production fleet running on `ai.dallinlayton.com`
 
 **Phase 2b — production AWS (after MVP signal)**
 
 - [ ] Terraform under `infra/` (VPC, ECS Fargate, ElastiCache, RDS)
-- [ ] API keys for customers, signed registration for workers
+- [x] Self-serve API keys — contributor-scoped (`coordinator/api_keys.py`), spending the member's own free tier quota; not the paid-customer billing version this item originally meant
+- [ ] Signed registration for workers (the Ed25519 signing that exists today is for agent *update binaries*, not `/register` calls)
 - [ ] Move SQLite → Postgres / DynamoDB
 - [ ] CloudWatch / OTLP log + metric ingestion
 - [ ] Multi-region for latency to gamers
@@ -655,14 +707,18 @@ optional paid customer revenue.
       composer (no separate route). Image messages render as inline
       `<img>` bubbles via `/api/images/<name>` proxy. (Shipped
       2026-05-20.)
-- [ ] Web-search tool — runs *server-side* on the coordinator.
-      Fetches results from a search API, prepends them to the prompt
-      as context, then dispatches a chat job. No new worker type
-      needed; biggest perceived-intelligence boost for small models.
-- [ ] SDXL on the mirror — currently MVP ships SD 1.5 (1.5 GB Q4_0).
-      SDXL (~6.5 GB) is registered in the model catalog but the
-      mirror only serves it when promoted. See
-      `infra/setup-image-mirror.sh` TODO.
+- [x] Web-search tool — ships as a worker-side capability
+      (`tools=["search"]`), not centralized on the coordinator as
+      originally planned here: the worker fetches DDG results itself
+      (so the request comes from the contributor's IP, not the
+      coordinator's) and prepends them to the prompt before calling
+      its local chat model. See `docs/project-gaps.md`'s search-runway
+      section for the full architecture.
+- [x] SDXL-class imagery on the mirror — `dreamshaperXL-lightning`
+      (SDXL-Lightning derived, ~6.5 GB) is the shipped default
+      (`model_registry.py: DEFAULT_IMAGE_MODEL`). Plain base SDXL
+      (non-Lightning) remains a stub for a future higher-quality/
+      slower option.
 - [ ] Per-image-job pricing — image earnings are flat-rated as
       ~200-token equivalents for MVP. Real per-image rates ship
       alongside paid-customer pricing in Phase 3b.ii.
@@ -701,24 +757,32 @@ quotas.
       Unpair button, plus a "Contribute and invite friends" CTA that
       links to /contribute. Topbar CTA hides itself once
       `paired_machines_count > 0`.
-- [ ] Tier promotion engine — measures uptime + capability + claimed-
-      jobs-per-hour; promotes/demotes contributors across BRONZE →
-      PLATINUM nightly.
-- [ ] Per-tier quota enforcement on `/generate`. Free quota = sum of
-      contributor's own + each invitee's remaining allowance.
+- [x] Tier promotion engine — `coordinator/tier_engine.py`
+      (`UptimeSampler` + `TierEngine`, both started at
+      `coordinator/main.py`'s startup). Promotes/demotes contributors
+      across BRONZE → PLATINUM nightly off a 7-day uptime window; see
+      `docs/project-gaps.md` for the promotion/demotion-grace details.
+- [x] Per-member daily quota enforcement on `/generate` (tokens /
+      images / voice-minutes; 429 on exceeding the cap).
+- [ ] Pooled invitee quota — free quota = sum of a contributor's own
+      remaining allowance + each invitee's. Not yet true: an invitee
+      today gets an independent, static cap set once at invite
+      creation, not a live draw against the inviter's pool.
 - [x] Invitee/invite flow — admin or contributor creates an invite
       from `/account`; sets daily cap + optional expiry; user redeems
-      at `/invite/<code>` with their own username/password. Email
-      collected for recognition but not yet used (host-can-reset-link
-      is deferred until an email service is wired up — see
-      `docs/auth-design.md` for the cascading-takeover threat model).
+      at `/invite/<code>` with their own username/password. Resend
+      email (`coordinator/email_send.py`) is now wired up for signup
+      verification, but host-can-reset-link for invitees specifically
+      hasn't been extended to use it yet — see `docs/auth-design.md`
+      for the cascading-takeover threat model.
 - [x] Host account UI — `/account` shows your host (for invitees),
       your friends list + open invites + revoke (for hosts), the
       paired-machines list with per-PC unpair, and a CTA to
       `/contribute` for hosts who haven't paired anything yet.
-- [ ] Per-tier per-contributor invite quotas (admin-only invite
-      creation in v1; tier-gated slots when the promotion engine
-      lands).
+- [ ] Per-tier per-contributor invite quotas — any admin or
+      contributor can already create invites (`POST /invites`), but
+      the number of invite slots isn't yet tied to the caller's tier;
+      the promotion engine landed without this piece.
 
 **3b.ii — Paid customer layer**
 

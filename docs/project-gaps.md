@@ -80,6 +80,13 @@ membership testing — it's polish:
   it. The Resend integration already exists (shipped 2026-08-21 for
   signup verification), so wiring invite-creation to it is plumbing,
   not new integration work.
+- ~~**Self-serve API keys.**~~ Done (2026-09-14). `member_tokens`
+  gained `kind` ('agent' vs 'api_key') and `scope` ('generation'
+  restricts a key to `/generate`, `/v1/*`, `/me`, `/result/*`,
+  `/images/*` — everything else 403s) columns; `coordinator/api_keys.py`
+  handles create/list/revoke. Pairs with the "No customer SDK" entry
+  in § 3 below — a key here is what a caller authenticates the
+  OpenAI-compatible endpoint with.
 
 ### 🔴 No prompt safety / content controls
 
@@ -645,23 +652,36 @@ local dev with custom models keep working.
 Still pending: per-model pricing, license-aware routing, shard plans
 for big models. Same Phase 4 boundary as routing above.
 
-### 🟡 No customer SDK
+### 🟢 No customer SDK — mostly moot (2026-09-14)
 
 Customers use raw curl. That's fine for the founder. It's not fine
 for indie devs who are our Phase 1 ICP.
 
-**Fix:** thin Python + JS clients (`pip install gamerai`,
-`npm i gamerai`) that wrap `/generate` + `/result` polling, expose an
-OpenAI-compatible `chat.completions.create` interface, and handle
-auth/retries.
+Downgraded 🟡 → 🟢. `POST /v1/chat/completions` + `GET /v1/models`
+(`coordinator/openai_compat.py`) now expose exactly the OpenAI-compatible
+`chat.completions.create` interface this gap called for — but from the
+server side. A customer or contributor points the stock `openai`
+Python/JS SDK straight at the coordinator with their `gai_api_…` key
+(`coordinator/api_keys.py`) and gets auth/retries/streaming for free.
+The originally-scoped bespoke wrapper (`pip install gamerai`,
+`npm i gamerai`) was never built and probably isn't worth building now —
+the stock SDK is a better answer for anyone already on it.
 
-### 🟡 No streaming / SSE on `/result`
+### 🟡 No streaming / SSE on `/result` — partially resolved (2026-09-14)
 
 Customers must poll. Adds latency, wastes their CPU and our requests.
 
 **Fix:** add a Server-Sent Events stream on the coordinator that
 forwards tokens as the worker produces them. Cheap once worker
 reports per-token.
+
+Partial: `POST /v1/chat/completions` now streams via SSE
+(`_stream_chat_completion` in `coordinator/openai_compat.py`, `stream:
+true`) — but that's a separate endpoint layered on top, not `/result`
+itself. `GET /result/{job_id}` is unchanged and still meant to be
+polled; the web client's own `streamingEngine.js` still polls it every
+200ms. Anyone on the native `/generate`+`/result` contract still pays
+the original cost this gap describes.
 
 ### 🟡 No batch endpoint
 
@@ -679,14 +699,21 @@ when done.
 **Fix:** load the model's tokenizer in the worker and use it for
 counts. Adds a few MB per worker, removes the drift.
 
-### 🟢 Auto-update for the Windows agent
+### ~~🟢 Auto-update for the Windows agent~~ — done
 
 Today: gamer manually downloads new exe. With even mild adoption that
 becomes a maintenance nightmare and a security liability (no way to
 ship a fix).
 
-**Fix:** signed binaries + on-startup version check + self-replace.
-Or, easier, ship via Squirrel / NSIS auto-updater.
+Resolved. `.github/workflows/windows-agent-build.yml` builds + SFTP-
+publishes `agent.exe` + `version.txt` on every push to `main` touching
+`windows-agent/**`; the installed fleet polls `/download/version.txt`
+and self-replaces (`windows-agent/agent.py:803-834` for the version-
+check path, `AGENT_VERSION` at line 52). Signature verification
+(`_verify_ed25519`, line ~1276) is built and mandatory whenever
+`UPDATE_PUBLIC_KEY` is configured — falls back to SHA-256 integrity-
+only when it isn't (line 1245). See `docs/OPERATOR.md` §6.8 for the
+signing-key provisioning/rotation runbook.
 
 ### 🟢 No customer dashboard
 
@@ -715,7 +742,7 @@ Scope estimate: ~2–3 days for routing + UI + agent bootstrap. Pulls the
 README Phase 4 vision item forward into Phase 3 — the perceived-IQ gap
 from "can't see images" is bigger than the gap from "small chat model."
 
-### 🟡 No document upload (PDF / DOCX / CSV)
+### ~~🟡 No document upload (PDF / DOCX / CSV)~~ — done
 
 Paired with vision: ChatGPT lets you drop a PDF and ask "summarize this."
 We have no document path at all. The natural shape isn't a new tool — it
@@ -723,18 +750,17 @@ mirrors the existing search-prepend: extract text on the coordinator,
 prepend to the chat prompt as fenced context, dispatch as a normal chat
 job. No new worker capability needed.
 
-**Fix:** `POST /uploads` accepting PDF / DOCX / TXT / MD / CSV up to a cap
-(5 MB to start). Extract with `pypdf` + `python-docx` + `pandas.read_csv`.
-Store extracted text against the conversation; `/generate` for that
-conversation prepends it inside a `<<document>> … <</document>>` fence.
+Resolved (`ef90e3a`), shipped essentially as scoped. `coordinator/uploads.py`
+implements `POST /uploads` (PDF/DOCX/TXT/MD/CSV, `MAX_UPLOAD_BYTES` =
+5 MB — `shared/config.py:130`) via `pypdf` + `pandas.read_csv`
+(`python-docx` handles DOCX). Extracted text is stored against the
+conversation and folded into a `<<document>>…` fence
+(`build_document_context`) that `/generate` prepends for that
+conversation's future chat turns.
 
-Explicitly out of scope for v1: image-only PDFs (needs OCR — Tesseract or
-PaddleOCR sidecar), structured spreadsheet QA (needs a code-execution
-sandbox), >20-page docs (needs chunking + retrieval). Ship the simple
-path first; revisit each only after first user complaint.
-
-Scope estimate: ~2 days. Slot alongside the vision work — "drag a thing
-into chat" is one UX gesture either way.
+Still out of scope, as planned: image-only/scanned PDFs (needs OCR),
+real computation over structured data (needs a code-execution sandbox —
+CSVs get a compact text description instead of full-fidelity analysis).
 
 ### 🟡 Piper cold-starts on every TTS job — agent should keep it warm
 
