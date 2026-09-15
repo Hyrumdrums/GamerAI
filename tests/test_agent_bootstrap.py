@@ -17,6 +17,7 @@ import httpx
 AGENT_DIR = Path(__file__).resolve().parent.parent / "windows-agent"
 sys.path.insert(0, str(AGENT_DIR))
 import agent  # noqa: E402  (path injection above is intentional)
+from gamerai_agent import idle as agent_idle  # noqa: E402
 
 
 class ModelSlugTests(unittest.TestCase):
@@ -700,7 +701,7 @@ class GpuHardwareInfoTests(unittest.TestCase):
         wmi_completed = mock.Mock(returncode=0, stdout="AMD Radeon RX 7900 XTX\n")
         with mock.patch.object(agent.subprocess, "run",
                                 side_effect=[FileNotFoundError, wmi_completed]), \
-             mock.patch.object(agent, "IS_WINDOWS", True):
+             mock.patch.object(agent_idle, "IS_WINDOWS", True):
             name, vram_gb = agent.gpu_hardware_info()
         self.assertEqual(name, "AMD Radeon RX 7900 XTX")
         # VRAM intentionally not reported from the WMI path — AdapterRAM
@@ -709,7 +710,7 @@ class GpuHardwareInfoTests(unittest.TestCase):
 
     def test_returns_none_when_both_probes_unavailable(self):
         with mock.patch.object(agent.subprocess, "run", side_effect=FileNotFoundError), \
-             mock.patch.object(agent, "IS_WINDOWS", True):
+             mock.patch.object(agent_idle, "IS_WINDOWS", True):
             name, vram_gb = agent.gpu_hardware_info()
         self.assertIsNone(name)
         self.assertIsNone(vram_gb)
@@ -719,7 +720,7 @@ class GpuHardwareInfoTests(unittest.TestCase):
         # it); force it to fail, then confirm subprocess.run was only
         # called once — no WMI/PowerShell fallback off Windows.
         with mock.patch.object(agent.subprocess, "run", side_effect=FileNotFoundError) as run, \
-             mock.patch.object(agent, "IS_WINDOWS", False):
+             mock.patch.object(agent_idle, "IS_WINDOWS", False):
             name, vram_gb = agent.gpu_hardware_info()
         run.assert_called_once()
         self.assertIsNone(name)
