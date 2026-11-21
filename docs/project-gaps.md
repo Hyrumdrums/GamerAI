@@ -591,52 +591,135 @@ and `_ensure_live_worker_or_503` is tool-aware so image submissions
 return a 503 specific to "no image workers" instead of falling through
 to a chat worker.
 
-Still pending: **load balancing across tools** — see next section.
+Still pending: **VRAM-aware routing** and **coordinator-assigned
+models / load balancing** — see the next two sections.
 
-### 🟢 No load balancing across multi-tool agents
+### 🟡 Routing ignores VRAM — small GPUs get jobs they can't run
 
-A dual-capable agent (chat + image) today polls chat queue first, then
-image queue if chat is empty. That's adequate for the small-network
-phase but leaves three gaps the bigger network will surface:
+Surfaced 2026-11-21 by the first outside contributor: an **RTX 3050
+Laptop GPU, 4 GB**, which registered fine but hadn't served jobs yet.
 
-- **Warm-model affinity (partially done, 2026-05-20).** Each agent
-  now persists its last-served tool in `state.json` and polls *that*
-  queue first on the next tick, so a chat streak keeps the LLM warm
-  in VRAM and an image streak keeps sd.cpp warm. Coordinator state
-  is untouched — affinity lives entirely in the agent. Sufficient
-  while the network is demand-shaped (chat traffic dominates → most
-  agents serve mostly chat and only flip when a chat lull lets an
-  image job through). Will *not* prevent thrashing once chat and
-  image queues are routinely non-empty in parallel.
+Current state:
 
-- **Soft pinning (Phase 2 — deferred).** Coordinator records each
-  registered agent's GPU class + contributor preference and pins
-  the agent to one tool at registration time. Two viable signals:
-  (a) contributor opts in via `config.json` (`agent.role: "image"`),
-  (b) coordinator infers from advertised VRAM (`vram_gb >= 12` →
-  eligible to specialize on image). No dynamic flipping; promotion
-  requires an agent restart. Plumbing is small and gives a reliable
-  starting role without committing to a real balancer.
+- The agent reports `gpu_model` + `vram_gb` at `/register`, but this
+  is explicitly *informational only* (dashboard display) — see the
+  comment at the capabilities merge in `windows-agent/agent.py`
+  (`gpu_hardware_info()` call before `coord.register`).
+- `coordinator/model_registry.py` has `min_vram_gb` per model, but
+  nothing in routing reads it.
+- The agent decides what to advertise purely from which bootstraps
+  succeeded. A 4 GB card goes through the same bootstrap as a 12 GB
+  card.
 
-- **Dynamic rebalancing (Phase 3 — deferred until ≥50 contributors).**
-  Coordinator measures per-queue depth + worker utilization, demotes
-  idle image workers to chat (and vice versa, *subject to VRAM
-  asymmetry — see below*) above a hysteresis threshold. Requires
-  careful design around: (1) not yanking a busy worker mid-job;
-  (2) charging swap cost (~10-30s sd.cpp cold start) only when the
-  new role keeps the worker busy long enough to amortize it;
-  (3) per-contributor opt-outs for specialists; (4) flap dampening
-  on bursty demand.
+Effect on a 4 GB card:
 
-**GPU asymmetry caveat.** A naive "70% chat / 30% image at rest" ratio
-glosses over a real constraint: a contributor running an 8 GB GPU on
-7B chat *cannot* run SDXL (needs ~12 GB). Conversion is one-way —
-big GPUs can always fall back to chat, but small GPUs are chat-only.
-Any rebalancer needs per-agent VRAM-aware eligibility, not a global
-ratio. The natural breakdown is something like: small GPUs (4-8 GB) →
-chat-only or sd1.5-only; big GPUs (12 GB+) → swappable. The current
-capability-advertisement system already exposes the data needed; the
-balancer just hasn't been written.
+| Tool | Model | Registry `min_vram_gb` | On 4 GB |
+| --- | --- | --- | --- |
+| chat / search | `llama3.2:3b` | 3.0 | OK. Ollama spills layers to CPU if a game holds VRAM. Slower, but works. |
+| image | `dreamshaperXL-lightning` | 6.0 | **Broken.** Advertised as long as the GGUF downloads, then out of memory or extremely slow. Failed jobs get retried elsewhere (user-visible latency) and count against the worker's canary score. |
+| tts | Piper | 0 (CPU) | OK. |
+
+**Stopgap (do first, small):**
+
+1. *Agent:* if `vram_gb < 6`, don't advertise `image` (or bootstrap
+   `dreamshaper8`, the 4 GB model, instead; see the tier table below).
+2. *Coordinator:* in `/jobs/next`, skip handing a worker a job whose
+   model's `min_vram_gb` exceeds the worker's advertised `vram_gb`.
+   This covers agents that haven't auto-updated yet. A missing
+   `vram_gb` means "unknown"; allow it, to keep old behavior.
+
+The stopgap becomes the eligibility check inside the assignment
+design below. It isn't throwaway work.
+
+### 🟢 Coordinator-assigned models / network load balancing
+
+**Decision (2026-11-21):** the coordinator, not the agent, decides
+which model(s) each agent loads. This is the **default** behavior.
+Contributors can **manually override** what their machine is set to.
+Small GPUs are **automatically set to the smallest model** that fits.
+This replaces the earlier "soft pinning" idea (agent self-selects
+via `config.json` role) as the main mechanism.
+
+Today a dual-capable agent (chat + image) polls the chat queue first,
+then image. It has warm-model affinity: the last-served tool is
+persisted in `state.json` and polled first, so a streak keeps that
+model resident. All of this lives in the agent, and the coordinator
+has no say. That's fine for a handful of contributors but can't
+balance a network.
+
+#### Decisions
+
+1. **Coordinator assigns, agent obeys (default).** On `/register`,
+   and on any later change, the coordinator tells the agent which
+   *assignment* to run: a set of `(tool, model)` pairs, e.g.
+   `[("chat","llama3.2:3b"), ("tts","piper:…")]`. The agent
+   bootstraps / loads exactly that and advertises exactly that.
+   Changes are delivered in the `/heartbeat` response so no new
+   channel is needed. The agent applies a change only between jobs.
+   It never interrupts a running one.
+2. **Hardware eligibility is computed, not configured.** The
+   coordinator filters the model registry by the worker's `vram_gb`
+   (`min_vram_gb <= vram_gb`) before choosing. When no larger option
+   fits, a small GPU automatically gets the smallest model in each
+   tool it can run. If no model fits a tool at all, that tool is off.
+3. **Contributor override.** A per-machine setting on the
+   **Machines** page (same pattern as the existing per-machine
+   schedule, `PATCH /me/machines/{id}/schedule`): `Auto
+   (recommended)` or a specific role/model. Default is `Auto`.
+   An override is stored coordinator-side, so it survives agent
+   reinstalls. The coordinator honors it over its own choice.
+   * Proposed: the override menu only lists models the machine is
+     eligible for (rule 2), so a contributor can't pick a model that
+     will fail every job. To confirm when building.
+   * Overridden machines are excluded from rebalancing (rule 5).
+4. **Proposed VRAM tiers for `Auto`** (based on current registry
+   numbers; revisit as the catalog changes):
+
+   | Advertised VRAM | chat | image | Notes |
+   | --- | --- | --- | --- |
+   | < 3 GB or unknown-and-failing | `llama3.2:1b` | off | |
+   | 3 to <6 GB (e.g. 3050 Laptop 4 GB) | `llama3.2:3b` | off, or `dreamshaper8` with `--vae-tiling` if tested OK at 4 GB | Chat-first |
+   | 6 to <12 GB | `llama3.2:3b` | `dreamshaperXL-lightning` | Today's standard contributor |
+   | 12 GB+ | `llama3.2:3b` (or larger later) | SDXL-class | Swappable; first in line for rebalancing |
+   | smart-mode pair | `qwen2.5:14b` (pipeline) | — | Unchanged; smart agents stay out of the standard pool |
+
+5. **Load balancing (phase 3, after the above ships).** With
+   assignments owned by the coordinator, balancing becomes the
+   coordinator changing assignments for `Auto` machines based on
+   per-queue depth and worker utilization. Constraints carried over
+   from the earlier design:
+   - never yank a busy worker mid-job;
+   - only pay the swap cost (~10–30 s sd.cpp / Ollama cold load)
+     when the new role will keep the worker busy long enough to make
+     it worthwhile;
+   - hysteresis / flap dampening on bursty demand;
+   - one-way GPU asymmetry: big GPUs can always fall back to chat,
+     small GPUs are chat-only. Eligibility is per machine (rule 2),
+     never a global ratio like "70% chat / 30% image."
+   Hold the real balancer until there are enough contributors (~50)
+   for it to matter. Until then `Auto` = "best eligible model per
+   tool" with the existing agent-side warm-model affinity.
+
+#### Build order
+
+1. Stopgap VRAM floor (previous section). Agent + coordinator, small.
+2. Coordinator assignment in `/register` + `/heartbeat` response;
+   agent applies it between jobs. `Auto` only, VRAM tiers from rule 4.
+3. Machines-page override (`Auto` / specific), stored per machine.
+4. Admin dashboard: show each worker's assignment and whether it's
+   `Auto` or overridden, next to the existing GPU column.
+5. Dynamic rebalancing (rule 5), once there are enough contributors.
+
+#### Open questions
+
+- Should an override that's ineligible today (e.g. after a VRAM
+  misdetection) be silently downgraded, or shown as an error on the
+  Machines page?
+- Gaming detection already pauses work on GPU utilization; should
+  `Auto` also step down to a smaller model on machines whose free
+  VRAM is routinely low while gaming, not just total VRAM?
+- Old agents that don't understand assignments: keep today's
+  self-advertised behavior, gated by the stopgap VRAM floor.
 
 ### ~~🔴 Model registry missing~~ — done (catalog + validation)
 
@@ -1091,6 +1174,12 @@ work them in. Highest leverage first.
 10. **Community ToS + contributor agreement** from a template. **~½ day.**
 11. **Recruit 3 real gamer contributors and run end-to-end.** The
     actual experiment. **~½ day, plus calendar time.**
+    In progress: first outside contributor registered 2026-11-21
+    (RTX 3050 Laptop, 4 GB). No jobs served yet.
+12. **VRAM floor stopgap** (§ 3 "Routing ignores VRAM"). Stop
+    advertising / routing image jobs to sub-6 GB cards. **~½ day.**
+    Then coordinator-assigned models with contributor override
+    (§ 3 "Coordinator-assigned models").
 
 Notably *not* on this list anymore: per-token pricing rollout, Stripe
 Connect, customer signup, marketing landing page, Python SDK. Those all
